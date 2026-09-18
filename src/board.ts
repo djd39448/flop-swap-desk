@@ -71,6 +71,19 @@ function buildLegRecords(
   return records;
 }
 
+/** The accept from `counterparty` if one exists, else the earliest; undefined when none. */
+function chooseAccept(
+  accepts: readonly AuthenticatedFrame[] | undefined,
+  counterparty: string | undefined,
+): AuthenticatedFrame | undefined {
+  if (accepts === undefined || accepts.length === 0) return undefined;
+  if (counterparty !== undefined) {
+    const own = accepts.find((candidate) => candidate.frame.from === counterparty);
+    if (own !== undefined) return own;
+  }
+  return accepts[0];
+}
+
 /** Fold every offer in `input.offers` (all of `tclk-offers`, venue order) into a board. */
 export function buildBoard(input: BoardInput): Board {
   const authed = authenticateOffers(input.offers);
@@ -80,7 +93,11 @@ export function buildBoard(input: BoardInput): Board {
   const seenOfferIds = new Set<string>();
   // First accept seen (in venue order) per `ref`, provided its offer already appeared —
   // mirrors tclk's own handshake rule: an accept cannot rewrite board history.
-  const acceptsByRef = new Map<string, AuthenticatedFrame>();
+  // Every authenticated accept per offer id, in venue order. A busy board accepts a bid within
+  // seconds from strangers; the accept that belongs to a swap is the one from the counterparty
+  // who opened the other leg (leg A: the Seller who opened leg B; leg B: the Buyer who opened
+  // leg A). Only when no other leg exists does the earliest accept stand in.
+  const acceptsByRef = new Map<string, AuthenticatedFrame[]>();
 
   for (const authenticated of authed) {
     const { record, frame } = authenticated;
@@ -109,7 +126,9 @@ export function buildBoard(input: BoardInput): Board {
     }
     if (frame.type === "accept") {
       if (!seenOfferIds.has(frame.ref)) continue;
-      if (!acceptsByRef.has(frame.ref)) acceptsByRef.set(frame.ref, authenticated);
+      const list = acceptsByRef.get(frame.ref);
+      if (list === undefined) acceptsByRef.set(frame.ref, [authenticated]);
+      else list.push(authenticated);
     }
   }
 
@@ -136,9 +155,10 @@ export function buildBoard(input: BoardInput): Board {
   const swaps: SwapView[] = [];
   for (const [legAOfferId, legA] of legAByOfferId) {
     const legB = legBByLegAOfferId.get(legAOfferId);
-    const legARecords = buildLegRecords(legA.record, acceptsByRef.get(legAOfferId), input.dealRooms);
+    const acceptA = chooseAccept(acceptsByRef.get(legAOfferId), legB?.offer.from);
+    const legARecords = buildLegRecords(legA.record, acceptA, input.dealRooms);
     const legBRecords = legB
-      ? buildLegRecords(legB.record, acceptsByRef.get(legB.offer.id), input.dealRooms)
+      ? buildLegRecords(legB.record, chooseAccept(acceptsByRef.get(legB.offer.id), legA.offer.from), input.dealRooms)
       : [];
     const evidence = input.evidence?.get(legA.swapId);
     swaps.push(

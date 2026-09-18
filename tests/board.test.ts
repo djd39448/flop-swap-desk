@@ -5,7 +5,7 @@
 // earliest-seq tie-break, reported in `unpaired`), and forged/unsigned noise (skipped
 // before it ever reaches a fold).
 
-import { encodeFrame, generateHashLock, makeOffer, OFFER_ROOM, type TranscriptRecord } from "@flop-labs/tclk";
+import { encodeFrame, generateHashLock, makeAccept, makeOffer, OFFER_ROOM, type TranscriptRecord } from "@flop-labs/tclk";
 import { describe, expect, it } from "vitest";
 
 import { buildBoard } from "../src/board.js";
@@ -104,6 +104,39 @@ describe("buildBoard", () => {
     expect(bySwapId.get(s2.swapId)?.status).toBe("paired");
     // Non-swap traffic never produces a swap view or an unpaired entry.
     expect(board.unpaired).toHaveLength(0);
+  });
+
+  it("pairs leg A with the Seller's accept even when a stranger accepted the bid first (live 2026-09-18)", () => {
+    // On the real board, bots accepted our leg A bid within seconds. The accept that belongs to
+    // the swap is the one from the party who opened leg B; the stranger's earlier accept is a
+    // different, unrelated contract and must not capture the pairing.
+    const s1 = scenario({ buyer, seller, t0: T0, swapNonce: "4444444444444444" });
+    const strangerAccept = makeAccept(s1.frames.offerA, {
+      from: stranger.did,
+      statement: generateHashLock().hash,
+      nonce: "abababababababab",
+    });
+
+    const seq = seqCounter();
+    const offers: TranscriptRecord[] = [
+      seq(s1.records.offerA),
+      seq(record(OFFER_ROOM, 0, T0 + 500, stranger, encodeFrame(strangerAccept))), // first accept
+      seq(s1.records.acceptA), // the Seller's accept, later
+      seq(s1.records.offerB),
+      seq(s1.records.acceptB),
+    ];
+
+    const board = buildBoard({ offers, dealRooms: new Map(), nowMs: T0 + 4 * MIN });
+
+    expect(board.swaps).toHaveLength(1);
+    expect(board.swaps[0]?.status).toBe("paired");
+    expect(board.swaps[0]?.sellerDid).toBe(seller.did);
+    expect(board.unpaired).toEqual([]);
+
+    // With no leg B at all, the earliest accept stands in (an ordinary accepted bid).
+    const lone = buildBoard({ offers: offers.slice(0, 3), dealRooms: new Map(), nowMs: T0 + 4 * MIN });
+    expect(lone.swaps[0]?.status).toBe("accepted");
+    expect(lone.swaps[0]?.sellerDid).toBe(stranger.did);
   });
 
   it("reports a competing second leg B as unpaired, loses the earliest-seq tie-break", () => {
