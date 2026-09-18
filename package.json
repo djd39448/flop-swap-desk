@@ -1,0 +1,27 @@
+{
+  "name": "flop-swap-desk",
+  "version": "0.0.1",
+  "description": "Atomic swap desk on FLOP: a non-custodial swap profile over tclk/1 (two HTLC legs, one statement), a read-only board/watcher, and a keyed local client. Alpha; no rail holds mainnet value.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/djd39448/flop-swap-desk.git"
+  },
+  "workspaces": [
+    "vendor/tclk"
+  ],
+  "scripts": {
+    "build:vendor": "tsc -p vendor/tclk/tsconfig.json",
+    "build": "npm run build:vendor && tsc -p tsconfig.json",
+    "test": "npm run build:vendor && vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "watch": "node bin/watch.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}
