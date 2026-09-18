@@ -71,7 +71,7 @@ function summarize(report) {
     : "none";
   return (
     `offers=${report.offerRecords} swapLegs=${report.swapLegOffers} ` +
-    `dealRooms=${report.dealRoomsFetched} swaps[${statusPart}] ` +
+    `dealRooms=${report.dealRoomsFetched} notes=${report.noteFetches} swaps[${statusPart}] ` +
     `swapsWritten=${report.swapsWritten} hit=${report.hitCreated} ok=${report.ok}`
   );
 }

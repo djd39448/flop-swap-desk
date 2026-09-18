@@ -9,8 +9,14 @@
 
 import { foldTranscript, type TranscriptFoldResult, type TranscriptRecord } from "@flop-labs/tclk";
 
+import { PAPER_RAIL_ID } from "./paper-evidence.js";
 import { checkOrientation, classifySwapOffer } from "./profile.js";
 import type { SwapFoldInput, SwapView } from "./types.js";
+
+/** Pushed once, on every status (including `settled`), when either leg's lock evidence
+ *  came from tclk's `paper` rail — a rehearsal record, never a payment (see
+ *  vendor/tclk/src/paper-rail.ts's own warning). */
+export const PAPER_REHEARSAL_REASON = "paper rail: rehearsal only, no value";
 
 function foldLeg(records: readonly TranscriptRecord[]): TranscriptFoldResult | null {
   return records.length === 0 ? null : foldTranscript(records);
@@ -70,6 +76,10 @@ export function foldSwap(input: SwapFoldInput): SwapView {
   const legBFold = foldLeg(input.legB);
   collectStepReasons(legAFold, "legA", reasons);
   collectStepReasons(legBFold, "legB", reasons);
+
+  if (evidence.a?.rail === PAPER_RAIL_ID || evidence.b?.rail === PAPER_RAIL_ID) {
+    reasons.push(PAPER_REHEARSAL_REASON);
+  }
 
   const view: SwapView = {
     swapId: null,

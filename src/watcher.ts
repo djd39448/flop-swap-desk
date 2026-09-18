@@ -13,16 +13,20 @@ import { dirname, join, relative } from "node:path";
 import {
   OFFER_ROOM,
   dealRoom,
+  paperNote,
   parseTranscriptExport,
   transcriptRecord,
   tryDecodeFrame,
   verifyTranscriptRecord,
+  type AcceptFrame,
+  type OfferFrame,
   type TclkFrame,
   type TranscriptRecord,
 } from "@flop-labs/tclk";
 
+import { paperEvidence, stripNoteBanner, PAPER_RAIL_ID } from "./paper-evidence.js";
 import { classifySwapOffer } from "./profile.js";
-import type { Board, BoardInput, SwapStatus } from "./types.js";
+import type { Board, BoardInput, SwapEvidence, SwapLeg, SwapStatus } from "./types.js";
 
 // SPEC §4 order; "reaches paired or later" = rank ≥ `paired`, never the two failure states
 // (`unpaired`, `orientation-unsupported`), which never passed through it.
@@ -44,6 +48,7 @@ const STATUS_RANK: Record<SwapStatus, number> = {
 
 export interface SweepTransportError { url: string; error: string }
 export interface DealRoomSkip { room: string; contract: string; reason: string }
+export interface NoteFetchSkip { note: string; contract: string; reason: string }
 
 export interface SweepReport {
   ok: boolean;
@@ -54,6 +59,8 @@ export interface SweepReport {
   swapLegOffers: number; // authenticated offers classified as a swap leg (SPEC §3.3)
   dealRoomsFetched: number;
   dealRoomsSkipped: DealRoomSkip[];
+  noteFetches: number; // paper-rail /kv notes fetched (200) and folded into evidence
+  noteFetchesSkipped: NoteFetchSkip[]; // non-404 note-fetch failures; 404 = absent, not a skip
   swapsByStatus?: Record<string, number>; // board.swaps grouped by status
   swapsWritten: number; // lines appended to swaps.jsonl this sweep (status changes only)
   hitCreated: boolean;
@@ -76,7 +83,8 @@ const DEFAULT_BASE_URL = "https://technocore.chat";
 const DEFAULT_MAX_DEAL_ROOMS = 50;
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_USER_AGENT = "flop-swap-desk-watcher/0.1 (+https://github.com/djd39448/flop-swap-desk)";
-const NO_EVIDENCE_NOTE = "no rail evidence: states beyond paired are unreachable in Phase 0";
+const NO_EVIDENCE_NOTE =
+  "rail evidence: paper notes only (rehearsal records, no value); chain rails have no read path in Phase 0";
 
 interface StateFile {
   statuses: Record<string, SwapStatus>;
@@ -151,33 +159,65 @@ function authenticatedOfferRoomFrame(record: TranscriptRecord): TclkFrame | null
   return frame !== null && frame.from === record.sender ? frame : null;
 }
 
-interface CandidateContract { contract: string; offerSeq: number }
+// Same authentication (signed lane, unforged `from`) without the room restriction, for
+// scanning a swap's own derived deal room.
+function authenticatedFrame(record: TranscriptRecord): TclkFrame | null {
+  if (!verifyTranscriptRecord(record).ok) return null;
+  const frame = tryDecodeFrame(record.line);
+  return frame !== null && frame.from === record.sender ? frame : null;
+}
+
+interface SwapLegOffer { seq: number; swapId: string; leg: SwapLeg; offer: OfferFrame }
+
+interface CandidateContract {
+  contract: string;
+  offerSeq: number;
+  swapId: string;
+  leg: SwapLeg;
+  offer: OfferFrame;
+  accept: AcceptFrame;
+}
 
 // Which contracts' deal rooms are worth polling: authenticated offers that declare
 // themselves a swap leg (SPEC §3.3), matched to their authenticated accept for the contract
 // id. Ordered by the offer's own seq (it always precedes the accept), so a cap keeps the
-// earliest bids.
+// earliest bids. Carries the offer/accept frames along too, so the paper-note terms (offer
+// .lock, offer.refundAfterMs, accept.statement) and the candidate's swapId/leg (for
+// BoardInput.evidence) never need a second pass over the export.
 function findSwapLegCandidates(offerRoomRecords: readonly TranscriptRecord[]): {
   candidates: CandidateContract[];
   swapLegOffers: number;
 } {
-  const swapLegOfferIds = new Map<string, number>(); // offer id -> record seq
+  const swapLegOfferIds = new Map<string, SwapLegOffer>(); // offer id -> {seq, swapId, leg, offer}
   for (const record of offerRoomRecords) {
     const frame = authenticatedOfferRoomFrame(record);
-    if (frame !== null && frame.type === "offer" && classifySwapOffer(frame) !== null) {
-      swapLegOfferIds.set(frame.id, record.seq);
-    }
+    if (frame === null || frame.type !== "offer") continue;
+    const classification = classifySwapOffer(frame);
+    if (classification === null) continue;
+    swapLegOfferIds.set(frame.id, {
+      seq: record.seq,
+      swapId: classification.swapId,
+      leg: classification.context.leg,
+      offer: frame,
+    });
   }
 
   const byContract = new Map<string, CandidateContract>();
   for (const record of offerRoomRecords) {
     const frame = authenticatedOfferRoomFrame(record);
     if (frame === null || frame.type !== "accept") continue;
-    const offerSeq = swapLegOfferIds.get(frame.ref);
-    if (offerSeq === undefined) continue;
+    const legOffer = swapLegOfferIds.get(frame.ref);
+    if (legOffer === undefined) continue;
     const existing = byContract.get(frame.contract);
-    if (existing === undefined || offerSeq < existing.offerSeq) {
-      byContract.set(frame.contract, { contract: frame.contract, offerSeq });
+    if (existing === undefined || legOffer.seq < existing.offerSeq) {
+      byContract.set(frame.contract, {
+        contract: frame.contract,
+        offerSeq: legOffer.seq,
+        swapId: legOffer.swapId,
+        leg: legOffer.leg,
+        offer: legOffer.offer,
+        accept: frame,
+      });
     }
   }
 
@@ -185,6 +225,23 @@ function findSwapLegCandidates(offerRoomRecords: readonly TranscriptRecord[]): {
     candidates: [...byContract.values()].sort((a, b) => a.offerSeq - b.offerSeq),
     swapLegOffers: swapLegOfferIds.size,
   };
+}
+
+// A candidate's deal room carries an authenticated paper-rail lock for its own contract iff
+// some record decodes to `{type:"lock", contract, rail:"paper", ref:contract}` — the
+// convention the live G0 rehearsal used (P05-SPEC.md "Live facts": the paper rail's `ref`
+// is the contract id itself, since paperNote() is keyed by contract, not a separate escrow).
+function hasAuthenticatedPaperLock(records: readonly TranscriptRecord[], contract: string): boolean {
+  return records.some((record) => {
+    const frame = authenticatedFrame(record);
+    return (
+      frame !== null &&
+      frame.type === "lock" &&
+      frame.contract === contract &&
+      frame.rail === PAPER_RAIL_ID &&
+      frame.ref === contract
+    );
+  });
 }
 
 async function readStateFile(path: string): Promise<StateFile> {
@@ -248,6 +305,8 @@ function emptyReport(nowMs: number, baseUrl: string, notes: string[]): SweepRepo
     swapLegOffers: 0,
     dealRoomsFetched: 0,
     dealRoomsSkipped: [],
+    noteFetches: 0,
+    noteFetchesSkipped: [],
     swapsWritten: 0,
     hitCreated: false,
     notes,
@@ -316,8 +375,10 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   const { candidates, swapLegOffers } = findSwapLegCandidates(offerRoomRecords);
   report.swapLegOffers = swapLegOffers;
   const dealRooms = new Map<string, readonly TranscriptRecord[]>();
+  const cappedCandidates = candidates.slice(0, maxDealRooms);
+  const roomByContract = new Map<string, string>();
 
-  for (const candidate of candidates.slice(0, maxDealRooms)) {
+  for (const candidate of cappedCandidates) {
     let room: string;
     try {
       room = dealRoom(candidate.contract);
@@ -359,12 +420,72 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
     await writeFileAtomic(underRoot(root, "raw", room, `${sweepIso}.json`), body);
     const { records, skippedCount } = normalizeDealRoomBody(room, body);
     dealRooms.set(room, records);
+    roomByContract.set(candidate.contract, room);
     report.dealRoomsFetched += 1;
     if (skippedCount > 0) notes.push(`${room}: skipped ${skippedCount} malformed message(s)`);
   }
 
-  // Step 3: fold the board. `evidence` is always absent in Phase 0 (no rail read paths).
-  const board = buildBoard({ offers: offerRoomRecords, dealRooms, nowMs });
+  // Step 2.5: for every candidate whose (successfully fetched) deal room shows an
+  // authenticated paper-rail lock on its own contract, read the paper rail's note — the
+  // only rail with a read path in Phase 0 (see src/paper-evidence.ts). Terms come from the
+  // offer/accept already parsed out of tclk-offers, never from the deal room itself.
+  const evidenceBySwap = new Map<string, SwapEvidence>();
+
+  for (const candidate of cappedCandidates) {
+    const room = roomByContract.get(candidate.contract);
+    if (room === undefined) continue; // deal room wasn't fetched this sweep (404/error)
+    const dealRoomRecords = dealRooms.get(room) ?? [];
+    if (!hasAuthenticatedPaperLock(dealRoomRecords, candidate.contract)) continue;
+
+    const { ns, key } = paperNote(candidate.contract);
+    const noteUrl = `${baseUrl}/kv/${ns}/${key}`;
+    const noteLabel = `${ns}/${key}`;
+
+    let noteBody: string;
+    try {
+      const response = await fetchWithTimeout(fetchImpl, noteUrl, timeoutMs, userAgent);
+      if (response.status === 404) continue; // absent record: nothing written, evidence absent
+      if (response.status < 200 || response.status >= 300) {
+        report.noteFetchesSkipped.push({
+          note: noteLabel,
+          contract: candidate.contract,
+          reason: `http ${response.status}`,
+        });
+        continue;
+      }
+      noteBody = response.body;
+    } catch (error) {
+      report.noteFetchesSkipped.push({
+        note: noteLabel,
+        contract: candidate.contract,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+
+    await writeFileAtomic(underRoot(root, "raw", "kv", ns, key, `${sweepIso}.txt`), noteBody);
+    report.noteFetches += 1;
+
+    const noteValue = stripNoteBanner(noteBody);
+    const result = paperEvidence(
+      { contract: candidate.contract, lock: candidate.offer.lock, statement: candidate.accept.statement, refundAfterMs: candidate.offer.refundAfterMs },
+      noteValue,
+      nowMs,
+      noteUrl,
+    );
+    const entry: SwapEvidence = evidenceBySwap.get(candidate.swapId) ?? {};
+    if (candidate.leg === "a") {
+      entry.a = result.lock;
+      if (result.rail !== undefined) entry.aRail = result.rail;
+    } else {
+      entry.b = result.lock;
+      if (result.rail !== undefined) entry.bRail = result.rail;
+    }
+    evidenceBySwap.set(candidate.swapId, entry);
+  }
+
+  // Step 3: fold the board.
+  const board = buildBoard({ offers: offerRoomRecords, dealRooms, evidence: evidenceBySwap, nowMs });
 
   const swapsByStatus: Record<string, number> = {};
   for (const swap of board.swaps) swapsByStatus[swap.status] = (swapsByStatus[swap.status] ?? 0) + 1;

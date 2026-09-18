@@ -205,6 +205,23 @@ describe("foldSwap — SPEC §4 states", () => {
     expect(view.status).toBe("settled");
   });
 
+  it("settled: a full paper rehearsal (both legs' evidence from the paper rail) still settles, with the rehearsal reason", () => {
+    const s = build();
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.revealA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.revealB],
+      evidence: {
+        a: { rail: "paper", ref: s.frames.lockA.contract, verified: false, checkedAtMs: T0 + 9 * MIN, reason: "paper record is claimed; paper rail holds no value and a stranger can overwrite it" },
+        b: { rail: "paper", ref: s.frames.lockB.contract, verified: false, checkedAtMs: T0 + 9 * MIN, reason: "paper record is claimed; paper rail holds no value and a stranger can overwrite it" },
+        aRail: { status: "claimed", final: true, checkedAtMs: T0 + 9 * MIN },
+        bRail: { status: "claimed", final: true, checkedAtMs: T0 + 9 * MIN },
+      },
+      nowMs: T0 + 9 * MIN,
+    });
+    expect(view.status).toBe("settled");
+    expect(view.reasons).toContain("paper rail: rehearsal only, no value");
+  });
+
   it("refunded-a: leg A refunded via tclk state", () => {
     const s = build();
     const view = foldSwap({

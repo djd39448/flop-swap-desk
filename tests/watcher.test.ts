@@ -6,7 +6,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { dealRoom, encodeFrame, generateHashLock, makeAccept, makeOffer } from "@flop-labs/tclk";
+import {
+  dealRoom,
+  encodeFrame,
+  encodePaperRecord,
+  generateHashLock,
+  makeAccept,
+  makeOffer,
+  paperNote,
+  type LockFrame,
+  type ReceiptFrame,
+  type RevealFrame,
+} from "@flop-labs/tclk";
+import { buildBoard } from "../src/board.js";
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
 import { quoteBigNonces, runSweep, type RunSweepOptions } from "../src/watcher.js";
 import { identity, record } from "./helpers/identity.js";
@@ -81,6 +93,112 @@ function buildSwap(nonceHex: string, baseSeq: number, baseMs: number) {
   ].map(rowFromRecord);
 
   return { swapId, lock, legAOffer, legAAccept, legBOffer, legBAccept, rows };
+}
+
+/**
+ * Same shape as `buildSwap`, but both legs offer (and lock on) the `paper` rail — the way
+ * the live G0 rehearsal actually ran (P05-SPEC.md "Live facts": both deal rooms' lock
+ * frames say `"rail":"paper","ref":"<contract>"`). Leg B keeps `flop-htlc` alongside
+ * `paper` in its offered rails so `checkOrientation` (src/profile.ts, decision D-01) still
+ * accepts it. Deal-room frames (lock/reveal/receipt) are built on request so each test can
+ * choose how far a leg gets.
+ */
+function buildPaperSwap(nonceHex: string, baseSeq: number, baseMs: number) {
+  const swapId = makeSwapId(buyer.did, nonceHex);
+  const lock = generateHashLock();
+
+  const legAOffer = makeOffer({
+    from: buyer.did,
+    role: "payer",
+    amount: "1000",
+    asset: "USDC",
+    lock: "hash",
+    rails: ["paper"],
+    claimByMs: baseMs + 3_600_000,
+    refundAfterMs: baseMs + 7_200_000,
+    expiresMs: baseMs + 600_000,
+    job: { proto: "swap", id: swapId, context: legAContext({ wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc" }) },
+  });
+  const legAAccept = makeAccept(legAOffer, { from: seller.did, statement: lock.hash });
+
+  const legBOffer = makeOffer({
+    from: seller.did,
+    role: "payer",
+    amount: "52070000",
+    asset: "FLOP",
+    lock: "hash",
+    rails: ["flop-htlc", "paper"],
+    claimByMs: baseMs + 10_800_000,
+    refundAfterMs: baseMs + 14_400_000,
+    expiresMs: baseMs + 600_000,
+    job: { proto: "swap", id: swapId, context: legBContext(legAOffer.id) },
+  });
+  const legBAccept = makeAccept(legBOffer, { from: buyer.did, statement: lock.hash });
+
+  const offerRows = [
+    record(OFFER_ROOM, baseSeq, baseMs, buyer, encodeFrame(legAOffer)),
+    record(OFFER_ROOM, baseSeq + 1, baseMs + 1, seller, encodeFrame(legAAccept)),
+    record(OFFER_ROOM, baseSeq + 2, baseMs + 2, seller, encodeFrame(legBOffer)),
+    record(OFFER_ROOM, baseSeq + 3, baseMs + 3, buyer, encodeFrame(legBAccept)),
+  ].map(rowFromRecord);
+
+  const dealRoomA = dealRoom(legAAccept.contract);
+  const dealRoomB = dealRoom(legBAccept.contract);
+
+  // Leg A: Buyer is payer (locks), Seller is payee (reveals). Leg B: Seller is payer
+  // (locks), Buyer is payee (reveals) — SPEC §2, "the Seller always holds the secret".
+  const lockA: LockFrame = { type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "paper", ref: legAAccept.contract };
+  const lockB: LockFrame = { type: "lock", from: seller.did, contract: legBAccept.contract, rail: "paper", ref: legBAccept.contract };
+  const revealA: RevealFrame = { type: "reveal", from: seller.did, contract: legAAccept.contract, ref: legAAccept.contract, secret: lock.preimage };
+  const revealB: RevealFrame = { type: "reveal", from: buyer.did, contract: legBAccept.contract, ref: legBAccept.contract, secret: lock.preimage };
+  const receiptA: ReceiptFrame = { type: "receipt", from: buyer.did, contract: legAAccept.contract, outcome: "claimed", rail: "paper", ref: legAAccept.contract };
+  const receiptB: ReceiptFrame = { type: "receipt", from: seller.did, contract: legBAccept.contract, outcome: "claimed", rail: "paper", ref: legBAccept.contract };
+
+  function dealRowsA(baseDealMs: number, throughReceipt = true) {
+    const rows = [
+      rowFromRecord(record(dealRoomA, 1, baseDealMs, buyer, encodeFrame(lockA))),
+      rowFromRecord(record(dealRoomA, 2, baseDealMs + 1, seller, encodeFrame(revealA))),
+    ];
+    if (throughReceipt) rows.push(rowFromRecord(record(dealRoomA, 3, baseDealMs + 2, buyer, encodeFrame(receiptA))));
+    return rows;
+  }
+  function dealRowsB(baseDealMs: number, throughReceipt = true) {
+    const rows = [
+      rowFromRecord(record(dealRoomB, 1, baseDealMs, seller, encodeFrame(lockB))),
+      rowFromRecord(record(dealRoomB, 2, baseDealMs + 1, buyer, encodeFrame(revealB))),
+    ];
+    if (throughReceipt) rows.push(rowFromRecord(record(dealRoomB, 3, baseDealMs + 2, seller, encodeFrame(receiptB))));
+    return rows;
+  }
+  /** Just the lock frame — leg stops at `locked`, never reveals. */
+  function lockOnlyRowsB(baseDealMs: number) {
+    return [rowFromRecord(record(dealRoomB, 1, baseDealMs, seller, encodeFrame(lockB)))];
+  }
+
+  const noteA = paperNote(legAAccept.contract);
+  const noteB = paperNote(legBAccept.contract);
+
+  return {
+    swapId,
+    lock,
+    legAOffer,
+    legAAccept,
+    legBOffer,
+    legBAccept,
+    offerRows,
+    dealRoomA,
+    dealRoomB,
+    dealRowsA,
+    dealRowsB,
+    lockOnlyRowsB,
+    noteA,
+    noteB,
+  };
+}
+
+/** Wrap a note value the way technocore's `/kv` GET does: banner line, blank line, value. */
+function bannered(value: string): string {
+  return `!! UNTRUSTED CONTENT — read-only rehearsal record, world-writable, not authoritative\n\n${value}\n`;
 }
 
 interface FakeResponse {
@@ -364,5 +482,143 @@ describe("runSweep", () => {
     const newEntries = afterSiblings.filter((e) => !beforeSiblings.includes(e));
     expect(newEntries).toEqual([]);
     expect(existsSync(join(root, "board.json"))).toBe(true);
+  });
+
+  describe("paper-rail note evidence (P0.5)", () => {
+    async function soleFile(...dir: string[]): Promise<string> {
+      const entries = await readdir(join(root, ...dir));
+      expect(entries.length).toBe(1);
+      return readFile(join(root, ...dir, entries[0]!), "utf8");
+    }
+
+    function findSwap(board: { swaps: Array<{ swapId: string | null }> }, swapId: string) {
+      const found = board.swaps.find((s) => s.swapId === swapId);
+      expect(found).toBeDefined();
+      return found as { swapId: string; status: string; reasons: string[] };
+    }
+
+    it("fetches both legs' paper notes, persists them byte-exact, and folds a full rehearsal to settled with the rehearsal reason", async () => {
+      const swap = buildPaperSwap("eeee0001", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+      const dealBRows = swap.dealRowsB(NOW - 49_000);
+
+      const noteAValue = encodePaperRecord({
+        status: "claimed",
+        lock: "hash",
+        statement: swap.lock.hash,
+        refundAfterMs: swap.legAOffer.refundAfterMs,
+        secret: swap.lock.preimage,
+      });
+      const noteBValue = encodePaperRecord({
+        status: "claimed",
+        lock: "hash",
+        statement: swap.lock.hash,
+        refundAfterMs: swap.legBOffer.refundAfterMs,
+        secret: swap.lock.preimage,
+      });
+      const noteABody = bannered(noteAValue);
+      const noteBBody = bannered(noteBValue);
+
+      const calls: Array<{ url: string; init: unknown }> = [];
+      const fetchImpl = makeFetch((url) => {
+        if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+        if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+        if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody(dealBRows) };
+        if (url.includes(`/kv/${swap.noteA.ns}/${swap.noteA.key}`)) return { status: 200, body: noteABody };
+        if (url.includes(`/kv/${swap.noteB.ns}/${swap.noteB.key}`)) return { status: 200, body: noteBBody };
+        return { status: 404, body: "" };
+      }, calls);
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.dealRoomsFetched).toBe(2);
+      expect(report.noteFetches).toBe(2);
+      expect(report.noteFetchesSkipped).toEqual([]);
+      // Only the offer export, the two deal rooms, and the two notes — nothing else.
+      expect(calls.length).toBe(5);
+
+      expect(await soleFile("raw", "kv", swap.noteA.ns, swap.noteA.key)).toBe(noteABody);
+      expect(await soleFile("raw", "kv", swap.noteB.ns, swap.noteB.key)).toBe(noteBBody);
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = findSwap(board, swap.swapId);
+      expect(view.status).toBe("settled");
+      expect(view.reasons).toContain("paper rail: rehearsal only, no value");
+    });
+
+    it("a 404 note leaves the swap at revealed/awaiting finality", async () => {
+      const swap = buildPaperSwap("eeee0002", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+      const dealBRows = swap.dealRowsB(NOW - 49_000);
+
+      const noteBValue = encodePaperRecord({
+        status: "claimed",
+        lock: "hash",
+        statement: swap.lock.hash,
+        refundAfterMs: swap.legBOffer.refundAfterMs,
+        secret: swap.lock.preimage,
+      });
+      const noteBBody = bannered(noteBValue);
+
+      const calls: Array<{ url: string; init: unknown }> = [];
+      const fetchImpl = makeFetch((url) => {
+        if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+        if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+        if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody(dealBRows) };
+        if (url.includes(`/kv/${swap.noteA.ns}/${swap.noteA.key}`)) return { status: 404, body: "" };
+        if (url.includes(`/kv/${swap.noteB.ns}/${swap.noteB.key}`)) return { status: 200, body: noteBBody };
+        return { status: 404, body: "" };
+      }, calls);
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.noteFetches).toBe(1); // only B — A's note is absent
+      expect(report.noteFetchesSkipped).toEqual([]); // a 404 is absence, not a skip
+      expect(existsSync(join(root, "raw", "kv", swap.noteA.ns, swap.noteA.key))).toBe(false);
+      expect(calls.length).toBe(5);
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = findSwap(board, swap.swapId);
+      expect(view.status).toBe("revealed");
+      expect(view.reasons).toContain("awaiting finality");
+      expect(view.reasons).toContain("paper rail: rehearsal only, no value");
+    });
+
+    it("a note whose statement differs from the contract leaves the lock unverified", async () => {
+      const swap = buildPaperSwap("eeee0003", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      // Leg A never locks; leg B locks but does not reveal.
+      const dealBRows = swap.lockOnlyRowsB(NOW - 49_000);
+
+      const wrongStatement = generateHashLock().hash; // deliberately not swap.lock.hash
+      const noteBValue = encodePaperRecord({
+        status: "locked",
+        lock: "hash",
+        statement: wrongStatement,
+        refundAfterMs: swap.legBOffer.refundAfterMs,
+      });
+      const noteBBody = bannered(noteBValue);
+
+      const calls: Array<{ url: string; init: unknown }> = [];
+      const fetchImpl = makeFetch((url) => {
+        if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+        if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody([]) };
+        if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody(dealBRows) };
+        if (url.includes(`/kv/${swap.noteB.ns}/${swap.noteB.key}`)) return { status: 200, body: noteBBody };
+        return { status: 404, body: "" };
+      }, calls);
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.noteFetches).toBe(1); // A never locked on paper: no note candidate for it
+      expect(calls.length).toBe(4); // export, dealRoomA, dealRoomB, noteB — no noteA
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = findSwap(board, swap.swapId);
+      expect(view.status).toBe("paired");
+      expect(view.reasons).toContain("leg B lock unverified");
+    });
   });
 });
