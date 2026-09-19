@@ -19,8 +19,9 @@
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { OFFER_ROOM, paperNote, parseTranscriptExport, transcriptRecord } from "@flop-labs/tclk";
+import { OFFER_ROOM, paperNote, transcriptRecord } from "@flop-labs/tclk";
 
 import { quoteBigNonces } from "../dist/watcher.js";
 import { findSwapLegCandidates, foldCaptured } from "../dist/replay.js";
@@ -83,17 +84,60 @@ function listFiles(dir) {
   }
 }
 
-/** Union of every `raw/tclk-offers/*.jsonl` export, deduped by seq (later files win a
- *  collision — captures overlap by design, since the venue serves a rolling export ring). */
+/**
+ * Union of every `raw/tclk-offers/*.jsonl` export, deduped by seq — on the RAW parsed line,
+ * BEFORE the expensive step (`transcriptRecord`'s field validation, and later the live
+ * candidate scan's Ed25519 signature verification). A real watch root's export ring
+ * recaptures the same ~36-minute window of venue-wide traffic in every sweep, so a swap
+ * desk watching for hours accumulates dozens of files whose line sets mostly overlap;
+ * fully validating (and, downstream, cryptographically verifying) the same line once per
+ * file it appears in is pure waste that scales with wall-clock time, not with data. Only
+ * the seq-deduped survivors are ever run through `transcriptRecord`.
+ *
+ * Later files (in `listFiles`'s name order — ISO-stamped filenames sort chronologically)
+ * win a seq collision; the venue never rewrites a seq's content, so this is only ever a
+ * tie-break among byte-identical copies, never a real conflict. A line that is not valid
+ * JSON (at either stage) is skipped and counted, never thrown — a captured file, like any
+ * `/kv` or room read, is anonymous input.
+ */
 function loadOffers(root) {
   const dir = join(root, "raw", OFFER_ROOM);
-  const bySeq = new Map();
+  const bySeq = new Map(); // seq -> parsed envelope (pre transcriptRecord validation)
+  let malformedLines = 0;
+
   for (const name of listFiles(dir)) {
     const text = readFileSync(join(dir, name), "utf8");
-    const records = parseTranscriptExport(OFFER_ROOM, quoteBigNonces(text));
-    for (const record of records) bySeq.set(record.seq, record);
+    const normalized = quoteBigNonces(text); // same normalization the live sweep applies
+    for (const line of normalized.split("\n")) {
+      if (line.trim() === "") continue;
+      let value;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        malformedLines += 1;
+        continue;
+      }
+      if (value === null || typeof value !== "object" || !Number.isSafeInteger(value.seq) || value.seq < 0) {
+        malformedLines += 1;
+        continue;
+      }
+      bySeq.set(value.seq, value); // `value.text` — the byte-exact signed line — is untouched
+    }
   }
-  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+
+  const records = [];
+  for (const value of bySeq.values()) {
+    try {
+      records.push(transcriptRecord(OFFER_ROOM, value));
+    } catch {
+      // Passed the cheap seq check but failed transcriptRecord's full field validation
+      // (bad timestamp, wrong field types, …): skipped and counted, same as above — never
+      // lets one bad line in a huge capture discard every other record with it.
+      malformedLines += 1;
+    }
+  }
+  records.sort((a, b) => a.seq - b.seq);
+  return { records, malformedLines };
 }
 
 /** Normalize a captured `?format=json` deal-room body — `{messages:[...]}` or a bare array
@@ -220,15 +264,18 @@ function main() {
     return 3;
   }
 
-  const offers = loadOffers(args.root);
+  const { records: offers, malformedLines } = loadOffers(args.root);
   const dealRooms = loadDealRooms(args.root);
   const notes = loadNotes(args.root, offers);
   const board = foldCaptured({ offers, dealRooms, notes, nowMs: Date.now() });
   const swaps = board.swaps.map(describeSwap);
 
   if (args.json) {
-    process.stdout.write(`${JSON.stringify({ swaps, unpaired: board.unpaired }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ swaps, unpaired: board.unpaired, malformedOfferLines: malformedLines }, null, 2)}\n`);
   } else {
+    if (malformedLines > 0) {
+      process.stdout.write(`offers: skipped ${malformedLines} malformed line(s) across raw/${OFFER_ROOM}/*.jsonl\n`);
+    }
     printReport(swaps, board.unpaired);
   }
 
@@ -245,4 +292,10 @@ function main() {
   return ok ? 0 : 1;
 }
 
-process.exitCode = main();
+// Only run as a CLI when invoked directly (`node examples/audit-export.mjs ...`); importing
+// this module (e.g. from a test, to exercise `loadOffers` directly) must not have the side
+// effect of running the whole program.
+export { loadOffers, loadDealRooms, loadNotes, describeSwap, parseArgs };
+if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
+  process.exitCode = main();
+}

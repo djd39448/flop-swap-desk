@@ -59,41 +59,54 @@ export interface SwapLegCandidate {
  * offer/accept frames along too, so a paper note's terms (offer.lock, offer.refundAfterMs,
  * accept.statement) and the candidate's swapId/leg (for `BoardInput.evidence`) never need a
  * second pass over the export.
+ *
+ * Single pass over `offerRoomRecords`, in order: authenticates (and Ed25519-verifies) each
+ * record exactly once, same as `src/board.ts`'s own `authenticateOffers`/pairing already
+ * does — an accept is only matched if its offer already appeared earlier in `offerRoomRecords`,
+ * which is always true for real venue traffic (an accept can only name an offer id that
+ * already exists) and for any caller here (the live watcher's export order; the offline
+ * replay's `loadOffers`, which explicitly seq-sorts before returning). A two-pass version
+ * that re-verified every record for each pass was the actual cost behind a slow replay
+ * against a watch root accumulating many overlapping exports — Ed25519 verification, not
+ * JSON parsing, dominates at that scale.
  */
 export function findSwapLegCandidates(offerRoomRecords: readonly TranscriptRecord[]): {
   candidates: SwapLegCandidate[];
   swapLegOffers: number;
 } {
   const swapLegOfferIds = new Map<string, SwapLegOffer>(); // offer id -> {seq, swapId, leg, offer}
-  for (const record of offerRoomRecords) {
-    const frame = authenticatedOfferRoomFrame(record);
-    if (frame === null || frame.type !== "offer") continue;
-    const classification = classifySwapOffer(frame);
-    if (classification === null) continue;
-    swapLegOfferIds.set(frame.id, {
-      seq: record.seq,
-      swapId: classification.swapId,
-      leg: classification.context.leg,
-      offer: frame,
-    });
-  }
-
   const byContract = new Map<string, SwapLegCandidate>();
+
   for (const record of offerRoomRecords) {
     const frame = authenticatedOfferRoomFrame(record);
-    if (frame === null || frame.type !== "accept") continue;
-    const legOffer = swapLegOfferIds.get(frame.ref);
-    if (legOffer === undefined) continue;
-    const existing = byContract.get(frame.contract);
-    if (existing === undefined || legOffer.seq < existing.offerSeq) {
-      byContract.set(frame.contract, {
-        contract: frame.contract,
-        offerSeq: legOffer.seq,
-        swapId: legOffer.swapId,
-        leg: legOffer.leg,
-        offer: legOffer.offer,
-        accept: frame,
+    if (frame === null) continue;
+
+    if (frame.type === "offer") {
+      const classification = classifySwapOffer(frame);
+      if (classification === null) continue;
+      swapLegOfferIds.set(frame.id, {
+        seq: record.seq,
+        swapId: classification.swapId,
+        leg: classification.context.leg,
+        offer: frame,
       });
+      continue;
+    }
+
+    if (frame.type === "accept") {
+      const legOffer = swapLegOfferIds.get(frame.ref);
+      if (legOffer === undefined) continue;
+      const existing = byContract.get(frame.contract);
+      if (existing === undefined || legOffer.seq < existing.offerSeq) {
+        byContract.set(frame.contract, {
+          contract: frame.contract,
+          offerSeq: legOffer.seq,
+          swapId: legOffer.swapId,
+          leg: legOffer.leg,
+          offer: legOffer.offer,
+          accept: frame,
+        });
+      }
     }
   }
 
