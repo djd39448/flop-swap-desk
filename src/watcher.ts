@@ -16,17 +16,11 @@ import {
   paperNote,
   parseTranscriptExport,
   transcriptRecord,
-  tryDecodeFrame,
-  verifyTranscriptRecord,
-  type AcceptFrame,
-  type OfferFrame,
-  type TclkFrame,
   type TranscriptRecord,
 } from "@flop-labs/tclk";
 
-import { paperEvidence, stripNoteBanner, PAPER_RAIL_ID } from "./paper-evidence.js";
-import { classifySwapOffer } from "./profile.js";
-import type { Board, BoardInput, SwapEvidence, SwapLeg, SwapStatus } from "./types.js";
+import { findSwapLegCandidates, foldCaptured, hasAuthenticatedPaperLock, type CapturedNote } from "./replay.js";
+import type { Board, BoardInput, SwapStatus } from "./types.js";
 
 // SPEC §4 order; "reaches paired or later" = rank ≥ `paired`, never the two failure states
 // (`unpaired`, `orientation-unsupported`), which never passed through it.
@@ -149,99 +143,6 @@ async function fetchWithTimeout(
   } finally {
     clearTimeout(timer);
   }
-}
-
-// An offer/accept authenticated for the signed lane in tclk-offers (the same checks as
-// transcript.ts's private authenticatedFrame, built from the exported primitives only).
-function authenticatedOfferRoomFrame(record: TranscriptRecord): TclkFrame | null {
-  if (record.room !== OFFER_ROOM || !verifyTranscriptRecord(record).ok) return null;
-  const frame = tryDecodeFrame(record.line);
-  return frame !== null && frame.from === record.sender ? frame : null;
-}
-
-// Same authentication (signed lane, unforged `from`) without the room restriction, for
-// scanning a swap's own derived deal room.
-function authenticatedFrame(record: TranscriptRecord): TclkFrame | null {
-  if (!verifyTranscriptRecord(record).ok) return null;
-  const frame = tryDecodeFrame(record.line);
-  return frame !== null && frame.from === record.sender ? frame : null;
-}
-
-interface SwapLegOffer { seq: number; swapId: string; leg: SwapLeg; offer: OfferFrame }
-
-interface CandidateContract {
-  contract: string;
-  offerSeq: number;
-  swapId: string;
-  leg: SwapLeg;
-  offer: OfferFrame;
-  accept: AcceptFrame;
-}
-
-// Which contracts' deal rooms are worth polling: authenticated offers that declare
-// themselves a swap leg (SPEC §3.3), matched to their authenticated accept for the contract
-// id. Ordered by the offer's own seq (it always precedes the accept), so a cap keeps the
-// earliest bids. Carries the offer/accept frames along too, so the paper-note terms (offer
-// .lock, offer.refundAfterMs, accept.statement) and the candidate's swapId/leg (for
-// BoardInput.evidence) never need a second pass over the export.
-function findSwapLegCandidates(offerRoomRecords: readonly TranscriptRecord[]): {
-  candidates: CandidateContract[];
-  swapLegOffers: number;
-} {
-  const swapLegOfferIds = new Map<string, SwapLegOffer>(); // offer id -> {seq, swapId, leg, offer}
-  for (const record of offerRoomRecords) {
-    const frame = authenticatedOfferRoomFrame(record);
-    if (frame === null || frame.type !== "offer") continue;
-    const classification = classifySwapOffer(frame);
-    if (classification === null) continue;
-    swapLegOfferIds.set(frame.id, {
-      seq: record.seq,
-      swapId: classification.swapId,
-      leg: classification.context.leg,
-      offer: frame,
-    });
-  }
-
-  const byContract = new Map<string, CandidateContract>();
-  for (const record of offerRoomRecords) {
-    const frame = authenticatedOfferRoomFrame(record);
-    if (frame === null || frame.type !== "accept") continue;
-    const legOffer = swapLegOfferIds.get(frame.ref);
-    if (legOffer === undefined) continue;
-    const existing = byContract.get(frame.contract);
-    if (existing === undefined || legOffer.seq < existing.offerSeq) {
-      byContract.set(frame.contract, {
-        contract: frame.contract,
-        offerSeq: legOffer.seq,
-        swapId: legOffer.swapId,
-        leg: legOffer.leg,
-        offer: legOffer.offer,
-        accept: frame,
-      });
-    }
-  }
-
-  return {
-    candidates: [...byContract.values()].sort((a, b) => a.offerSeq - b.offerSeq),
-    swapLegOffers: swapLegOfferIds.size,
-  };
-}
-
-// A candidate's deal room carries an authenticated paper-rail lock for its own contract iff
-// some record decodes to `{type:"lock", contract, rail:"paper", ref:contract}` — the
-// convention the live G0 rehearsal used (P05-SPEC.md "Live facts": the paper rail's `ref`
-// is the contract id itself, since paperNote() is keyed by contract, not a separate escrow).
-function hasAuthenticatedPaperLock(records: readonly TranscriptRecord[], contract: string): boolean {
-  return records.some((record) => {
-    const frame = authenticatedFrame(record);
-    return (
-      frame !== null &&
-      frame.type === "lock" &&
-      frame.contract === contract &&
-      frame.rail === PAPER_RAIL_ID &&
-      frame.ref === contract
-    );
-  });
 }
 
 async function readStateFile(path: string): Promise<StateFile> {
@@ -427,9 +328,10 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
 
   // Step 2.5: for every candidate whose (successfully fetched) deal room shows an
   // authenticated paper-rail lock on its own contract, read the paper rail's note — the
-  // only rail with a read path in Phase 0 (see src/paper-evidence.ts). Terms come from the
-  // offer/accept already parsed out of tclk-offers, never from the deal room itself.
-  const evidenceBySwap = new Map<string, SwapEvidence>();
+  // only rail with a read path in Phase 0 (see src/paper-evidence.ts). Just fetches and
+  // persists; turning a captured note into evidence is `foldCaptured`'s job (src/replay.ts),
+  // shared with the offline replay so the two can never fold differently.
+  const capturedNotes = new Map<string, CapturedNote>();
 
   for (const candidate of cappedCandidates) {
     const room = roomByContract.get(candidate.contract);
@@ -465,27 +367,11 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
 
     await writeFileAtomic(underRoot(root, "raw", "kv", ns, key, `${sweepIso}.txt`), noteBody);
     report.noteFetches += 1;
-
-    const noteValue = stripNoteBanner(noteBody);
-    const result = paperEvidence(
-      { contract: candidate.contract, lock: candidate.offer.lock, statement: candidate.accept.statement, refundAfterMs: candidate.offer.refundAfterMs },
-      noteValue,
-      nowMs,
-      noteUrl,
-    );
-    const entry: SwapEvidence = evidenceBySwap.get(candidate.swapId) ?? {};
-    if (candidate.leg === "a") {
-      entry.a = result.lock;
-      if (result.rail !== undefined) entry.aRail = result.rail;
-    } else {
-      entry.b = result.lock;
-      if (result.rail !== undefined) entry.bRail = result.rail;
-    }
-    evidenceBySwap.set(candidate.swapId, entry);
+    capturedNotes.set(candidate.contract, { body: noteBody, endpoint: noteUrl });
   }
 
-  // Step 3: fold the board.
-  const board = buildBoard({ offers: offerRoomRecords, dealRooms, evidence: evidenceBySwap, nowMs });
+  // Step 3: fold the board — the same code path an offline replay uses.
+  const board = foldCaptured({ offers: offerRoomRecords, dealRooms, notes: capturedNotes, nowMs, board: buildBoard });
 
   const swapsByStatus: Record<string, number> = {};
   for (const swap of board.swaps) swapsByStatus[swap.status] = (swapsByStatus[swap.status] ?? 0) + 1;

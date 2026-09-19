@@ -20,10 +20,14 @@ Design document: `SPEC-ATOMIC-SWAP-DESK.md` in
 ## Status
 
 **Alpha, Phase 0, keyless.** Nothing here moves value. There is no FLOP testnet RPC yet; the
-FLOP leg is bound through tclk PR #171's mock chain only. No rail evidence exists, so the board
-cannot advance a swap past `paired` today — by design, not by accident (fail closed). Every
-end-to-end atomicity claim remains PENDING until yellow paper open item E.48 closes, and this
-repository does not present one.
+FLOP leg is bound through tclk PR #171's mock chain only. The only rail with a read path today
+is tclk's `paper` rail (`vendor/tclk/src/paper-rail.ts`) — a rehearsal surface that holds no
+value and whose records anyone can overwrite; the board can fold a fully-rehearsed swap all the
+way to `settled` on paper evidence, but every reason trail it produces says so
+(`"paper rail: rehearsal only, no value"`). Chain rails (`evm-htlc`, `flop-htlc`, …) still have
+no read path, so a swap settling for real cannot advance past `paired` today — by design, not by
+accident (fail closed). Every end-to-end atomicity claim remains PENDING until yellow paper open
+item E.48 closes, and this repository does not present one.
 
 ## The one rule that makes it work
 
@@ -44,6 +48,25 @@ npm test
 `@flop-labs/tclk` is vendored as a git submodule (`vendor/tclk`) pinned to upstream `main`
 commit `5cc4ab9`, because the npm release `0.1.0` predates the transcript fold this desk
 depends on. `npm test` builds it first. Clone with `--recurse-submodules`.
+
+## Audit replay
+
+`examples/audit-export.mjs --root DIR [--expect <swapId>=<status>] [--json]` reproduces a
+watch root's board — every swap's status, reasons, buyer/seller DIDs, the offer-room and
+deal-room seqs it was derived from, and each paper note's `finalizedRef` — purely from what
+`src/watcher.ts` already wrote to `DIR/raw/`. It opens no network connection: the offer-room
+export(s), each deal room's capture(s), and any paper-rail note(s) are read straight off disk
+and folded through the same `foldCaptured` (`src/replay.ts`) the live watcher uses, so a
+capture can be re-verified without trusting the process that produced it.
+
+`fixtures/rehearsal-2026-09-18/` is a byte-exact, watch-root-shaped capture of the real
+2026-09-18 G0 rehearsal on `paper` — the four `tclk-offers` lines that made the pair, both
+deal rooms' lock/reveal/receipt, and both paper notes fetched once, live, with curl. Run it:
+
+```bash
+node examples/audit-export.mjs --root fixtures/rehearsal-2026-09-18 \
+  --expect 0xb0fa70a3c2a914134967fa423ae3295c2e35b6c3dfd6d461fb7a17fef2430d46=settled
+```
 
 ## What this is not
 
