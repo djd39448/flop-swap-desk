@@ -11,9 +11,8 @@ can be changed quietly.
 
 ## Today: zero on every deployment we operate
 
-Every `flop-swap-desk` deployment we run sets the fee to **zero on every deployment we
-operate**. Leg A's offer declares `feeBps: 0` (`legAContext()`'s default, `src/profile.ts`); the
-board shows `feeBps` for every swap, and it reads `0`. No deployment we control charges anything.
+The fee is **zero on every deployment we operate**. Leg A's offer declares `feeBps: 0`
+(`legAContext()`'s default, `src/profile.ts`); the board shows `feeBps` for every swap, and it reads `0`. No deployment we control charges anything.
 
 ## The mechanism (how a fee would work, if one were ever nonzero)
 
@@ -37,7 +36,7 @@ board shows `feeBps` for every swap, and it reads `0`. No deployment we control 
 ## Recipient
 
 **None published yet.** No fee recipient address exists today because no deployment we operate
-charges a fee. A Phase 2 testnet recipient is TBD by Dave; a mainnet recipient (and its legal
+charges a fee. A Phase 2 testnet recipient is to be named by the desk operator; a mainnet recipient (and its legal
 owner) is decided at Phase 5, after the counsel read decision D-17 requires. Whenever a recipient
 is published, it will be receive-only — its key will never touch a machine that also holds
 trading keys.
@@ -61,7 +60,7 @@ should be read as one.
 
 ## See also
 
-- `PROFILE.md` §3.7 — the profile-level specification of `<fee-bps>` and the well-formed-pair
+- `PROFILE.md` §3.3 — the profile-level specification of `<fee-bps>` and the well-formed-pair
   rule it participates in.
 - `flop-contrib/SPEC-ATOMIC-SWAP-DESK.md` §3.7 — the design source (decisions D-12…D-17).
-- `flop-contrib/handoff/FEES-PLAN-2026-09-19.md` — the plan this page and §3.7 implement.
+- `flop-contrib/handoff/FEES-PLAN-2026-09-19.md` — the plan this page and PROFILE.md §3.3 implement.

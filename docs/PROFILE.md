@@ -1,6 +1,6 @@
 # The swap profile (`job.proto = "swap"`)
 
-Version: profile v1.1 (adds leg A's `<fee-bps>` segment, §3.7; the v1.0 4-segment grammar
+Version: profile v1.1 (adds leg A's `<fee-bps>` segment, §3.3; the v1.0 4-segment grammar
 still reads, as `feeBps: 0`).
 
 Status: draft, Phase 0 (keyless, no posts). Design source: `flop-contrib/SPEC-ATOMIC-SWAP-DESK.md`
@@ -99,7 +99,7 @@ reserved      job.context = "f|<leg-B offer id>|<fee-amount>"                (fe
   `flop-htlc.` is rejected, not silently normalized, because the context is inside the
   Ed25519-signed offer and normalizing it after the fact would let two implementations disagree
   about what was signed.
-- **`<fee-bps>` (v1.1, §3.7):** a fifth segment, `^(0|[1-9][0-9]{0,3}|10000)$` — a decimal integer
+- **`<fee-bps>` (v1.1, §3.3):** a fifth segment, `^(0|[1-9][0-9]{0,3}|10000)$` — a decimal integer
   0…10000, no leading zeros, no sign, no decimals, basis points of leg A's `amount`. A 4-segment
   leg A (the v1.0 grammar) is still read, as `feeBps: 0`, so Phase 0 vectors and the
   2026-09-18 rehearsal fixture stay valid. `legAContext()` (`src/profile.ts`) emits the 5-segment
@@ -108,7 +108,7 @@ reserved      job.context = "f|<leg-B offer id>|<fee-amount>"                (fe
   without trusting `swapId` alone — the offer id is itself a hash committing to leg A's full
   content, so leg B is provably answering that specific offer and no other. Leg B carries no fee
   in v1.1.
-- `job.context = "f|…"` is **reserved** for the Phase 3 fee leg (§3.7, F4) — a third `tclk/1`
+- `job.context = "f|…"` is **reserved** for the Phase 3 fee leg (§3.3, F4) — a third `tclk/1`
   contract under the shared statement `H`, needed only once a claiming agent holds FLOP keys
   online. It is not implemented in v1.1: `parseSwapContext` always returns `null` for it.
 - `parseSwapContext` (`src/profile.ts`) is fail-closed: exactly one of the grammars above parses;
@@ -124,7 +124,7 @@ A pair of offers is a well-formed swap iff **all** of:
 2. Leg B's context names leg A's offer id.
 3. Leg A: `role == "payer"`, `lock == "hash"`, `asset != "FLOP"`, `rails` does **not** include
    `flop-htlc`, its context's `wantRail == "flop-htlc"`, and its context's `<fee-bps>` parses
-   (§3.7).
+   (§3.3).
 4. Leg B: `role == "payer"`, `lock == "hash"`, `asset == "FLOP"`, `rails` includes `flop-htlc`.
 5. The two offers name the same two DIDs with roles crossed (leg A's `from` is the Buyer, leg B's
    `from` is the Seller, and leg A's counterparty at accept is leg B's `from` and vice versa).
@@ -138,7 +138,7 @@ board's job (`SPEC-ATOMIC-SWAP-DESK.md` §4 P0.2), not this document's — this 
 the predicate, not the code that walks live transcripts to evaluate it. Anything that fails any
 rule is `unpaired` and never advances a swap's composite state.
 
-### 3.7 Fees (profile v1.1 — decisions D-12…D-17; plan in `flop-contrib/handoff/FEES-PLAN-2026-09-19.md`)
+### 3.3 Fees (profile v1.1; design source SPEC §3.7, decisions D-12…D-17; plan in `flop-contrib/handoff/FEES-PLAN-2026-09-19.md`)
 
 The profile carries a fee field. Every deployment we operate sets it to zero. A fee, if ever
 charged, is a fixed number in an immutable contract, paid only on a completed swap, published in
@@ -161,7 +161,7 @@ advance, and the same for everyone.
   one; it refuses bids or accepts above a policy maximum (default 100 bps = 1%) without an
   explicit override. The board shows `feeBps` and the escrow address for every swap; nothing
   about fees is hidden or discretionary.
-- **Recipient is receive-only.** The fee address per chain is one Dave controls; its key never
+- **Recipient is receive-only.** The fee address per chain is one the desk operator controls; its key never
   touches this machine. G1 (trading keys) does not gate the recipient (D-14).
 - **FLOP-side fee is Phase 3 (F4), not v1.1.** FLOP has no contract layer, so a fee on the FLOP
   leg can only be a third `tclk/1` contract to the desk under the same shared statement `H`
