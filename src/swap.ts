@@ -88,6 +88,7 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     legBOfferId: null,
     buyerDid: null,
     sellerDid: null,
+    feeBps: null,
     legA: legAFold,
     legB: legBFold,
     evidence,
@@ -113,6 +114,7 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     return view;
   }
   view.swapId = legAClass.swapId;
+  view.feeBps = legAClass.context.feeBps;
 
   const legAOrientation = checkOrientation(legAOffer, legAClass.context);
   if (!legAOrientation.ok) {

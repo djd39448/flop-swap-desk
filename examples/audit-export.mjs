@@ -226,6 +226,7 @@ function describeSwap(view) {
     reasons: view.reasons,
     buyerDid: view.buyerDid,
     sellerDid: view.sellerDid,
+    feeBps: view.feeBps,
     offerRoomSeqs: [...offerRoomSeqs].sort((a, b) => a - b),
     dealRoomSeqs: [...dealRoomSeqs].sort((a, b) => a - b),
     finalizedRefs,
@@ -235,7 +236,7 @@ function describeSwap(view) {
 function printReport(swaps, unpaired) {
   for (const swap of swaps) {
     process.stdout.write(`swap ${swap.swapId ?? "(unpaired)"} -> ${swap.status}\n`);
-    process.stdout.write(`  buyer=${swap.buyerDid ?? "?"} seller=${swap.sellerDid ?? "?"}\n`);
+    process.stdout.write(`  buyer=${swap.buyerDid ?? "?"} seller=${swap.sellerDid ?? "?"} feeBps=${swap.feeBps ?? "?"}\n`);
     process.stdout.write(`  offer-room seqs: ${swap.offerRoomSeqs.join(", ") || "(none)"}\n`);
     process.stdout.write(`  deal-room seqs:  ${swap.dealRoomSeqs.join(", ") || "(none)"}\n`);
     for (const ref of swap.finalizedRefs) process.stdout.write(`  finalizedRef: ${ref}\n`);

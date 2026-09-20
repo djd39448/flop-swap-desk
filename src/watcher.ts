@@ -406,6 +406,7 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
           legBOfferId: swap.legBOfferId,
           buyerDid: swap.buyerDid,
           sellerDid: swap.sellerDid,
+          feeBps: swap.feeBps,
           reasons: swap.reasons,
         }),
       );
