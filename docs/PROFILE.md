@@ -1,5 +1,8 @@
 # The swap profile (`job.proto = "swap"`)
 
+Version: profile v1.1 (adds leg A's `<fee-bps>` segment, §3.7; the v1.0 4-segment grammar
+still reads, as `feeBps: 0`).
+
 Status: draft, Phase 0 (keyless, no posts). Design source: `flop-contrib/SPEC-ATOMIC-SWAP-DESK.md`
 §3 (this document rewrites that section for an outside `tclk/1` implementer who has never seen
 the FLOP repos). Nothing here has been proposed upstream, posted, or deployed.
@@ -83,8 +86,10 @@ Both legs carry `job.proto = "swap"` and the same `job.id = swapId`. `swapId` is
 can never collide with a `tclk/1` offer or contract id.
 
 ```
-leg A: job.context = "a|<want-asset>|<want-amount>|<want-rail>"
-leg B: job.context = "b|<leg-A offer id>"
+leg A (v1.1)  job.context = "a|<want-asset>|<want-amount>|<want-rail>|<fee-bps>"
+leg A (v1.0)  job.context = "a|<want-asset>|<want-amount>|<want-rail>"        → reads as feeBps 0
+leg B         job.context = "b|<leg-A offer id>"                              (unchanged)
+reserved      job.context = "f|<leg-B offer id>|<fee-amount>"                (fee leg, Phase 3/F4; parses to null until then)
 ```
 
 - Leg A's context states what the Buyer wants for the counter-asset it pays: the FLOP amount (in
@@ -94,12 +99,21 @@ leg B: job.context = "b|<leg-A offer id>"
   `flop-htlc.` is rejected, not silently normalized, because the context is inside the
   Ed25519-signed offer and normalizing it after the fact would let two implementations disagree
   about what was signed.
+- **`<fee-bps>` (v1.1, §3.7):** a fifth segment, `^(0|[1-9][0-9]{0,3}|10000)$` — a decimal integer
+  0…10000, no leading zeros, no sign, no decimals, basis points of leg A's `amount`. A 4-segment
+  leg A (the v1.0 grammar) is still read, as `feeBps: 0`, so Phase 0 vectors and the
+  2026-09-18 rehearsal fixture stay valid. `legAContext()` (`src/profile.ts`) emits the 5-segment
+  form, defaulting `feeBps` to `0` when the caller omits it.
 - Leg B's context names leg A's **offer id** (not the `swapId`) so a fold can pair the two legs
   without trusting `swapId` alone — the offer id is itself a hash committing to leg A's full
-  content, so leg B is provably answering that specific offer and no other.
-- `parseSwapContext` (`src/profile.ts`) is fail-closed: exactly one of the two grammars above
-  parses; anything else — wrong part count, a non-canonical rail spelling, a malformed amount or
-  asset, an offer id that is not `0x` + 64 lowercase hex — returns `null`, never a guess and
+  content, so leg B is provably answering that specific offer and no other. Leg B carries no fee
+  in v1.1.
+- `job.context = "f|…"` is **reserved** for the Phase 3 fee leg (§3.7, F4) — a third `tclk/1`
+  contract under the shared statement `H`, needed only once a claiming agent holds FLOP keys
+  online. It is not implemented in v1.1: `parseSwapContext` always returns `null` for it.
+- `parseSwapContext` (`src/profile.ts`) is fail-closed: exactly one of the grammars above parses;
+  anything else — wrong part count, a non-canonical rail spelling, a malformed amount, asset or
+  fee-bps, an offer id that is not `0x` + 64 lowercase hex — returns `null`, never a guess and
   never a throw.
 
 ### 3.2 The well-formed-pair predicate
@@ -109,7 +123,8 @@ A pair of offers is a well-formed swap iff **all** of:
 1. Both `job.proto == "swap"` and `job.id` (the `swapId`) is equal on both.
 2. Leg B's context names leg A's offer id.
 3. Leg A: `role == "payer"`, `lock == "hash"`, `asset != "FLOP"`, `rails` does **not** include
-   `flop-htlc`, and its context's `wantRail == "flop-htlc"`.
+   `flop-htlc`, its context's `wantRail == "flop-htlc"`, and its context's `<fee-bps>` parses
+   (§3.7).
 4. Leg B: `role == "payer"`, `lock == "hash"`, `asset == "FLOP"`, `rails` includes `flop-htlc`.
 5. The two offers name the same two DIDs with roles crossed (leg A's `from` is the Buyer, leg B's
    `from` is the Seller, and leg A's counterparty at accept is leg B's `from` and vice versa).
@@ -122,6 +137,40 @@ accepted contracts) and the fold that actually walks a transcript to find candid
 board's job (`SPEC-ATOMIC-SWAP-DESK.md` §4 P0.2), not this document's — this document specifies
 the predicate, not the code that walks live transcripts to evaluate it. Anything that fails any
 rule is `unpaired` and never advances a swap's composite state.
+
+### 3.7 Fees (profile v1.1 — decisions D-12…D-17; plan in `flop-contrib/handoff/FEES-PLAN-2026-09-19.md`)
+
+The profile carries a fee field. Every deployment we operate sets it to zero. A fee, if ever
+charged, is a fixed number in an immutable contract, paid only on a completed swap, published in
+advance, and the same for everyone.
+
+- **Declared, signed, fixed.** Leg A's context carries `<fee-bps>` (§3.1): a decimal integer
+  `^(0|[1-9][0-9]{0,3}|10000)$`, basis points of leg A's `amount` (the counter-asset the Buyer
+  pays). The Buyer signs it in the offer; the Seller signs it by accepting. The 4-segment v1.0
+  grammar is still read (`feeBps: 0`), so Phase 0 vectors and the 2026-09-18 rehearsal fixture
+  stay valid.
+- **Enforced only by an immutable contract, paid only on success.** On the counter-asset leg the
+  escrow contract (`EvmHashRailFee.sol`, derived from the vendored `EvmHashRail.sol`) holds
+  `feeBps` and `feeRecipient` as immutables: a successful `claim` pays
+  `amount − floor(amount · feeBps / 10000)` to the payee and the remainder to the recipient in
+  one transaction; a `refund` returns `amount` in full to the payer. Zero-fee deployments use the
+  unmodified vendored contract. A different fee or recipient is a different deployment, published
+  in `docs/FEES.md` and pinned in the desk's own config — never chosen at runtime.
+- **Client and board rules.** A compliant client refuses any leg-A offer whose declared bps
+  differs from the on-chain value of the escrow it names, or whose recipient is not the published
+  one; it refuses bids or accepts above a policy maximum (default 100 bps = 1%) without an
+  explicit override. The board shows `feeBps` and the escrow address for every swap; nothing
+  about fees is hidden or discretionary.
+- **Recipient is receive-only.** The fee address per chain is one Dave controls; its key never
+  touches this machine. G1 (trading keys) does not gate the recipient (D-14).
+- **FLOP-side fee is Phase 3 (F4), not v1.1.** FLOP has no contract layer, so a fee on the FLOP
+  leg can only be a third `tclk/1` contract to the desk under the same shared statement `H`
+  (`job.context = "f|<leg-B offer id>|<fee-amount>"`, `claimBy ≥ B.claimBy`) — it needs a
+  claiming agent with FLOP keys online, so it is designed and decided in Phase 3. v1.1 only
+  reserves the prefix: `parseSwapContext` returns `null` for it (§3.1).
+- **Every deployment we operate sets the fee to zero until Phase 5**, when the mainnet number,
+  the recipient and its legal owner are decided after the counsel read decision D-17 requires.
+  No promises are made here about future fees, tokens, or airdrops — see `docs/FEES.md`.
 
 ## 4. Sequence
 
@@ -251,13 +300,17 @@ complete, deterministic swap pair built with `@flop-labs/tclk`'s own `makeOffer`
 identities, fixed nonces, and a fixed (non-secret) 32-byte preimage, so every value in it is
 reproducible from the source alone.
 
-For this repo's checked-in vectors:
+For this repo's checked-in vectors (regenerated for profile v1.1 — leg A's context now has five
+segments, `…|flop-htlc|0`, so leg A/B offer id, contract id and deal room changed from the v1.0
+vectors; `swapId` did not, since it hashes only the buyer DID and nonce, never the context):
 
-- `swapId`: `0x73f7f4ef83a7da782f5f72f952db20fad75f99b76e6e374ea1a1e0dc88116995`
-- leg A `contractId`: `0x7f0fcdc4a437068a9f819aa3a3600d0490c16e198ec62342c829692a28e5b7ea`
-  (deal room `mb-p-tclk-7f0fcdc4a437068a`)
-- leg B `contractId`: `0x7e9ad5ed9a1815eee4aefba8c197f68e67e9e2d4456b5401d5ef13b0f1f2881b`
-  (deal room `mb-p-tclk-7e9ad5ed9a1815ee`)
+- `swapId`: `0x73f7f4ef83a7da782f5f72f952db20fad75f99b76e6e374ea1a1e0dc88116995` (unchanged)
+- leg A `offerId`: `0x4b9fc7e830d489c0942b598d86d2929bc9aaa6cfd78796b6cab526b1975fbc27`
+- leg A `contractId`: `0xc91eb92501b6d2a3f9d9289a8cc316bb49667da763c0cb47cafa6c6697b006d5`
+  (deal room `mb-p-tclk-c91eb92501b6d2a3`)
+- leg B `offerId`: `0x4c4c316777a8759d936f1a09029ad0fab1df7f9ba73a423018d9138acdd98f2e`
+- leg B `contractId`: `0xd326a2290f6e5b4ba79e05e685c94f069a94fc5754ba1f47fc87c4b09bbdf94d`
+  (deal room `mb-p-tclk-d326a2290f6e5b4b`)
 - `deadlineCheck.ok`: `true` (the §5 worked example, verbatim)
 
 Regenerate with `WRITE_VECTORS=1 npx vitest run tests/vectors.test.ts` after reviewing the diff —
