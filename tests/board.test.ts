@@ -246,4 +246,40 @@ describe("buildBoard", () => {
     expect(board.swaps).toHaveLength(1);
     expect(board.swaps[0]?.status).toBe("paired");
   });
+
+  it("pairs a swap whose leg A declares feeBps 25 (profile v1.1) and reports it on the board", () => {
+    const s1 = scenario({ buyer, seller, t0: T0, swapNonce: "6666666666666666", feeBps: 25 });
+    const seq = seqCounter();
+    const offers: TranscriptRecord[] = [
+      seq(s1.records.offerA),
+      seq(s1.records.acceptA),
+      seq(s1.records.offerB),
+      seq(s1.records.acceptB),
+    ];
+    const board = buildBoard({ offers, dealRooms: new Map(), nowMs: T0 + 4 * MIN });
+    expect(board.swaps).toHaveLength(1);
+    expect(board.swaps[0]?.status).toBe("paired");
+    expect(board.swaps[0]?.feeBps).toBe(25);
+  });
+
+  it("pairs a legacy 4-segment leg A (v1.0 grammar, no fee-bps segment) and reports feeBps 0", () => {
+    const s1 = scenario({
+      buyer,
+      seller,
+      t0: T0,
+      swapNonce: "7777777777777777",
+      legAContextRaw: "a|FLOP|52070000|flop-htlc",
+    });
+    const seq = seqCounter();
+    const offers: TranscriptRecord[] = [
+      seq(s1.records.offerA),
+      seq(s1.records.acceptA),
+      seq(s1.records.offerB),
+      seq(s1.records.acceptB),
+    ];
+    const board = buildBoard({ offers, dealRooms: new Map(), nowMs: T0 + 4 * MIN });
+    expect(board.swaps).toHaveLength(1);
+    expect(board.swaps[0]?.status).toBe("paired");
+    expect(board.swaps[0]?.feeBps).toBe(0);
+  });
 });

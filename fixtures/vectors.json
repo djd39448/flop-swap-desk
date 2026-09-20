@@ -11,18 +11,18 @@
     "violations": []
   },
   "legA": {
-    "acceptLine": "tclk1 {\"contract\":\"0xd23ea225c4f1652a58da75fda55ef949fda23e6522f299ca9341a40a4c6d91f5\",\"from\":\"did:key:z6MkiaMbhXHNA4eJVCCj8dbzKzTgYDKf6crKgHVHid1F1WCT\",\"nonce\":\"c3c3c3c3\",\"ref\":\"0x3bdd1b6e250a3791882a82e1fda73ff0d4f74c4d2cd37a3c2e0f326aa3c6c3ee\",\"statement\":\"0x02d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc\",\"type\":\"accept\"}",
-    "contractId": "0x7f0fcdc4a437068a9f819aa3a3600d0490c16e198ec62342c829692a28e5b7ea",
-    "dealRoom": "mb-p-tclk-7f0fcdc4a437068a",
-    "offerId": "0x3bdd1b6e250a3791882a82e1fda73ff0d4f74c4d2cd37a3c2e0f326aa3c6c3ee",
-    "offerLine": "tclk1 {\"amount\":\"1000000\",\"asset\":\"USDC\",\"claimByMs\":1735002700000,\"expiresMs\":1734999700000,\"from\":\"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw\",\"id\":\"0x3bdd1b6e250a3791882a82e1fda73ff0d4f74c4d2cd37a3c2e0f326aa3c6c3ee\",\"job\":{\"context\":\"a|FLOP|52070000|flop-htlc\",\"id\":\"0x73f7f4ef83a7da782f5f72f952db20fad75f99b76e6e374ea1a1e0dc88116995\",\"proto\":\"swap\"},\"lock\":\"hash\",\"nonce\":\"a1a1a1a1\",\"rails\":[\"evm-htlc\"],\"refundAfterMs\":1735003600000,\"role\":\"payer\",\"type\":\"offer\"}"
+    "acceptLine": "tclk1 {\"contract\":\"0x739490528429f1338abee0c459b866c9d741b6a1bae1d16e10e0f8ed7d6f3a5e\",\"from\":\"did:key:z6MkiaMbhXHNA4eJVCCj8dbzKzTgYDKf6crKgHVHid1F1WCT\",\"nonce\":\"c3c3c3c3\",\"ref\":\"0x4b9fc7e830d489c0942b598d86d2929bc9aaa6cfd78796b6cab526b1975fbc27\",\"statement\":\"0x02d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc\",\"type\":\"accept\"}",
+    "contractId": "0xc91eb92501b6d2a3f9d9289a8cc316bb49667da763c0cb47cafa6c6697b006d5",
+    "dealRoom": "mb-p-tclk-c91eb92501b6d2a3",
+    "offerId": "0x4b9fc7e830d489c0942b598d86d2929bc9aaa6cfd78796b6cab526b1975fbc27",
+    "offerLine": "tclk1 {\"amount\":\"1000000\",\"asset\":\"USDC\",\"claimByMs\":1735002700000,\"expiresMs\":1734999700000,\"from\":\"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw\",\"id\":\"0x4b9fc7e830d489c0942b598d86d2929bc9aaa6cfd78796b6cab526b1975fbc27\",\"job\":{\"context\":\"a|FLOP|52070000|flop-htlc|0\",\"id\":\"0x73f7f4ef83a7da782f5f72f952db20fad75f99b76e6e374ea1a1e0dc88116995\",\"proto\":\"swap\"},\"lock\":\"hash\",\"nonce\":\"a1a1a1a1\",\"rails\":[\"evm-htlc\"],\"refundAfterMs\":1735003600000,\"role\":\"payer\",\"type\":\"offer\"}"
   },
   "legB": {
-    "acceptLine": "tclk1 {\"contract\":\"0x3703153854c6d168094bb68ddeaef571090777761096d899a599fb13912c17ee\",\"from\":\"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw\",\"nonce\":\"d4d4d4d4\",\"ref\":\"0x54f920d94acb6cf0d919872e067fe8be74a0189c9a4b9541d5ae242dd55b99e3\",\"statement\":\"0x02d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc\",\"type\":\"accept\"}",
-    "contractId": "0x7e9ad5ed9a1815eee4aefba8c197f68e67e9e2d4456b5401d5ef13b0f1f2881b",
-    "dealRoom": "mb-p-tclk-7e9ad5ed9a1815ee",
-    "offerId": "0x54f920d94acb6cf0d919872e067fe8be74a0189c9a4b9541d5ae242dd55b99e3",
-    "offerLine": "tclk1 {\"amount\":\"52070000\",\"asset\":\"FLOP\",\"claimByMs\":1735004200000,\"expiresMs\":1734999760000,\"from\":\"did:key:z6MkiaMbhXHNA4eJVCCj8dbzKzTgYDKf6crKgHVHid1F1WCT\",\"id\":\"0x54f920d94acb6cf0d919872e067fe8be74a0189c9a4b9541d5ae242dd55b99e3\",\"job\":{\"context\":\"b|0x3bdd1b6e250a3791882a82e1fda73ff0d4f74c4d2cd37a3c2e0f326aa3c6c3ee\",\"id\":\"0x73f7f4ef83a7da782f5f72f952db20fad75f99b76e6e374ea1a1e0dc88116995\",\"proto\":\"swap\"},\"lock\":\"hash\",\"nonce\":\"b2b2b2b2\",\"rails\":[\"flop-htlc\"],\"refundAfterMs\":1735010800000,\"role\":\"payer\",\"type\":\"offer\"}"
+    "acceptLine": "tclk1 {\"contract\":\"0x08e62fabd2738b522abd9ba08adfef1d65e2e9215795a0c5be45e2f7c3d61b9e\",\"from\":\"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw\",\"nonce\":\"d4d4d4d4\",\"ref\":\"0x4c4c316777a8759d936f1a09029ad0fab1df7f9ba73a423018d9138acdd98f2e\",\"statement\":\"0x02d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc\",\"type\":\"accept\"}",
+    "contractId": "0xd326a2290f6e5b4ba79e05e685c94f069a94fc5754ba1f47fc87c4b09bbdf94d",
+    "dealRoom": "mb-p-tclk-d326a2290f6e5b4b",
+    "offerId": "0x4c4c316777a8759d936f1a09029ad0fab1df7f9ba73a423018d9138acdd98f2e",
+    "offerLine": "tclk1 {\"amount\":\"52070000\",\"asset\":\"FLOP\",\"claimByMs\":1735004200000,\"expiresMs\":1734999760000,\"from\":\"did:key:z6MkiaMbhXHNA4eJVCCj8dbzKzTgYDKf6crKgHVHid1F1WCT\",\"id\":\"0x4c4c316777a8759d936f1a09029ad0fab1df7f9ba73a423018d9138acdd98f2e\",\"job\":{\"context\":\"b|0x4b9fc7e830d489c0942b598d86d2929bc9aaa6cfd78796b6cab526b1975fbc27\",\"id\":\"0x73f7f4ef83a7da782f5f72f952db20fad75f99b76e6e374ea1a1e0dc88116995\",\"proto\":\"swap\"},\"lock\":\"hash\",\"nonce\":\"b2b2b2b2\",\"rails\":[\"flop-htlc\"],\"refundAfterMs\":1735010800000,\"role\":\"payer\",\"type\":\"offer\"}"
   },
   "lockTimeMs": 1735000000000,
   "preimage": "0x1111111111111111111111111111111111111111111111111111111111111111",

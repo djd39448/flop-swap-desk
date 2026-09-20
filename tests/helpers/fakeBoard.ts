@@ -59,6 +59,7 @@ export function fakeBuildBoard({ offers, dealRooms }: BoardInput): Board {
       legBOfferId: legB?.id ?? null,
       buyerDid: legA?.from ?? null,
       sellerDid: legB?.from ?? null,
+      feeBps: null,
       legA: null,
       legB: null,
       evidence: {},

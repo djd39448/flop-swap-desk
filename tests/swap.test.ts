@@ -79,6 +79,29 @@ describe("foldSwap — SPEC §4 states", () => {
     expect(view.status).toBe("paired");
     expect(view.buyerDid).toBe(buyer.did);
     expect(view.sellerDid).toBe(seller.did);
+    expect(view.feeBps).toBe(0);
+  });
+
+  it("paired: leg A declares feeBps 25 (profile v1.1, SPEC §3.7) — pairs and reports feeBps 25", () => {
+    const s = scenario({ buyer, seller, t0: T0, feeBps: 25 });
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB],
+      nowMs: T0 + 4 * MIN,
+    });
+    expect(view.status).toBe("paired");
+    expect(view.feeBps).toBe(25);
+  });
+
+  it("paired: a legacy 4-segment leg A context still pairs, reporting feeBps 0", () => {
+    const s = scenario({ buyer, seller, t0: T0, legAContextRaw: "a|FLOP|52070000|flop-htlc" });
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB],
+      nowMs: T0 + 4 * MIN,
+    });
+    expect(view.status).toBe("paired");
+    expect(view.feeBps).toBe(0);
   });
 
   it("paired with a reason when leg B is locked but unverified (evidence absent)", () => {

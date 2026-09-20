@@ -40,6 +40,11 @@ export interface ScenarioOptions {
   acceptBNonce?: string;
   buyerPayAmount?: string;
   wantAmount?: string;
+  /** Leg A's declared fee, in basis points (profile v1.1, SPEC §3.7). Defaults to 0. */
+  feeBps?: number;
+  /** Raw override for leg A's `job.context`, bypassing `legAContext()` entirely — for
+   *  scenarios that need the legacy v1.0 4-segment grammar on the wire. */
+  legAContextRaw?: string;
 }
 
 export interface ScenarioFrames {
@@ -108,11 +113,14 @@ export function scenario(options: ScenarioOptions): Scenario {
     job: {
       proto: "swap",
       id: swap,
-      context: legAContext({
-        wantAsset: "FLOP",
-        wantAmount: options.wantAmount ?? "52070000",
-        wantRail: "flop-htlc",
-      }),
+      context:
+        options.legAContextRaw ??
+        legAContext({
+          wantAsset: "FLOP",
+          wantAmount: options.wantAmount ?? "52070000",
+          wantRail: "flop-htlc",
+          feeBps: options.feeBps,
+        }),
     },
     nonce: options.offerANonce ?? "a001a001a001a001",
   });

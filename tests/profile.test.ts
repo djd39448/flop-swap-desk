@@ -48,12 +48,40 @@ describe("swapId", () => {
 });
 
 describe("legAContext / legBContext round-trip through parseSwapContext", () => {
-  it("leg A", () => {
+  it("leg A (feeBps defaults to 0, profile v1.1's 5-segment form)", () => {
     const ctx = legAContext({ wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc" });
-    expect(ctx).toBe("a|FLOP|52070000|flop-htlc");
+    expect(ctx).toBe("a|FLOP|52070000|flop-htlc|0");
     const parsed = parseSwapContext(ctx);
-    const expected: LegAContext = { leg: "a", wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc" };
+    const expected: LegAContext = {
+      leg: "a",
+      wantAsset: "FLOP",
+      wantAmount: "52070000",
+      wantRail: "flop-htlc",
+      feeBps: 0,
+    };
     expect(parsed).toEqual(expected);
+  });
+
+  it("leg A with an explicit feeBps round-trips", () => {
+    const ctx = legAContext({ wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc", feeBps: 25 });
+    expect(ctx).toBe("a|FLOP|52070000|flop-htlc|25");
+    const parsed = parseSwapContext(ctx);
+    const expected: LegAContext = {
+      leg: "a",
+      wantAsset: "FLOP",
+      wantAmount: "52070000",
+      wantRail: "flop-htlc",
+      feeBps: 25,
+    };
+    expect(parsed).toEqual(expected);
+  });
+
+  it("legAContext rejects a bad feeBps", () => {
+    const base = { wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc" };
+    expect(() => legAContext({ ...base, feeBps: -1 })).toThrow();
+    expect(() => legAContext({ ...base, feeBps: 10001 })).toThrow();
+    expect(() => legAContext({ ...base, feeBps: 2.5 })).toThrow();
+    expect(() => legAContext({ ...base, feeBps: Number.NaN })).toThrow();
   });
 
   it("leg B", () => {
@@ -85,7 +113,13 @@ describe("parseSwapContext — malformed input returns null, never throws", () =
     ["not a string (object)", { leg: "a" }],
     ["empty string", ""],
     ["leg a, too few parts", "a|FLOP|100"],
-    ["leg a, too many parts", "a|FLOP|100|flop-htlc|extra"],
+    ["leg a, too many parts (6 segments)", "a|FLOP|100|flop-htlc|0|extra"],
+    ["leg a, 5 segments but feeBps 10001 (over max)", "a|FLOP|100|flop-htlc|10001"],
+    ["leg a, 5 segments but feeBps 01 (leading zero)", "a|FLOP|100|flop-htlc|01"],
+    ["leg a, 5 segments but feeBps +5 (sign)", "a|FLOP|100|flop-htlc|+5"],
+    ["leg a, 5 segments but feeBps 2.5 (decimal)", "a|FLOP|100|flop-htlc|2.5"],
+    ["leg a, 5 segments but feeBps -1 (negative)", "a|FLOP|100|flop-htlc|-1"],
+    ["leg a, 5 segments but feeBps empty", "a|FLOP|100|flop-htlc|"],
     ["leg a, non-canonical rail spelling FLOP-HTLC", "a|FLOP|100|FLOP-HTLC"],
     ["leg a, non-canonical rail spelling with trailing dot", "a|FLOP|100|flop-htlc."],
     ["leg a, unregistered rail", "a|FLOP|100|not-a-rail"],
@@ -99,11 +133,49 @@ describe("parseSwapContext — malformed input returns null, never throws", () =
     ["leg b, offer id not hex32", "b|not-a-contract-id"],
     ["leg b, offer id missing 0x", `b|${legAOfferId.slice(2)}`],
     ["unknown leg letter", `c|${legAOfferId}`],
+    ["reserved fee-leg prefix (Phase 3, F4)", `f|${legAOfferId}|100`],
   ];
 
   it.each(cases)("%s", (_label, input) => {
     expect(() => parseSwapContext(input as never)).not.toThrow();
     expect(parseSwapContext(input as never)).toBeNull();
+  });
+});
+
+describe("parseSwapContext — leg A's <fee-bps> segment (profile v1.1, SPEC §3.7)", () => {
+  it("a 4-segment leg A reads as feeBps 0 (v1.0 legacy compat)", () => {
+    const parsed = parseSwapContext("a|FLOP|52070000|flop-htlc");
+    expect(parsed).toEqual({
+      leg: "a",
+      wantAsset: "FLOP",
+      wantAmount: "52070000",
+      wantRail: "flop-htlc",
+      feeBps: 0,
+    });
+  });
+
+  it.each([0, 1, 25, 100, 9999, 10000])("a 5-segment leg A with feeBps %i parses", (feeBps) => {
+    const parsed = parseSwapContext(`a|FLOP|52070000|flop-htlc|${feeBps}`);
+    expect(parsed).toEqual({
+      leg: "a",
+      wantAsset: "FLOP",
+      wantAmount: "52070000",
+      wantRail: "flop-htlc",
+      feeBps,
+    });
+  });
+
+  it.each(["10001", "01", "+5", "2.5", "-1", ""])("feeBps %j is rejected (whole context -> null)", (feeBps) => {
+    expect(parseSwapContext(`a|FLOP|52070000|flop-htlc|${feeBps}`)).toBeNull();
+  });
+
+  it("a sixth segment makes the whole context null", () => {
+    expect(parseSwapContext("a|FLOP|52070000|flop-htlc|0|extra")).toBeNull();
+  });
+
+  it("f|<leg-B offer id>|<fee-amount> is reserved (Phase 3, F4) and always parses to null", () => {
+    const legBOfferId = `0x${"c".repeat(64)}`;
+    expect(parseSwapContext(`f|${legBOfferId}|100`)).toBeNull();
   });
 });
 
@@ -114,7 +186,7 @@ describe("classifySwapOffer", () => {
   it("classifies a well-formed leg A offer", () => {
     expect(classifySwapOffer(legA)).toEqual({
       swapId: SWAP_ID,
-      context: { leg: "a", wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc" },
+      context: { leg: "a", wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc", feeBps: 0 },
     });
   });
 
@@ -150,7 +222,13 @@ describe("classifySwapOffer", () => {
 describe("checkOrientation (SPEC §3.1, decision D-01)", () => {
   const legA = buildLegA(T0, { claimByMs: T0 + 45 * 60_000, refundAfterMs: T0 + 60 * 60_000 });
   const legB = buildLegB(T0, legA, { claimByMs: T0 + 70 * 60_000, refundAfterMs: T0 + 3 * 60 * 60_000 });
-  const legAContextValue: LegAContext = { leg: "a", wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc" };
+  const legAContextValue: LegAContext = {
+    leg: "a",
+    wantAsset: "FLOP",
+    wantAmount: "52070000",
+    wantRail: "flop-htlc",
+    feeBps: 0,
+  };
   const legBContextValue: LegBContext = { leg: "b", legAOfferId: legA.id };
 
   it("accepts a well-formed leg A (Buyer-opened, payer, non-FLOP asset)", () => {
