@@ -18,15 +18,29 @@ export const FLOP_RAIL = "flop-htlc";
 
 export type SwapLeg = "a" | "b";
 
+/** Maximum value of leg A's `<fee-bps>` segment (profile v1.1, SPEC §3.7). */
+export const FEE_BPS_MAX = 10000;
+
 /**
- * Leg A (`job.context = "a|<want-asset>|<want-amount>|<want-rail>"`): the Buyer pays the
- * counter-asset and states what it wants in return (FLOP amount in VFY, rail `flop-htlc`).
+ * Grammar for leg A's `<fee-bps>` segment: a decimal integer 0…10000, no leading zeros, no
+ * sign, no decimals — it sits inside the Ed25519-signed, id-committed offer, so the grammar
+ * is exact and never normalized after the fact (same rule as the rail id today).
+ */
+export const FEE_BPS_PATTERN = /^(0|[1-9][0-9]{0,3}|10000)$/;
+
+/**
+ * Leg A (`job.context = "a|<want-asset>|<want-amount>|<want-rail>|<fee-bps>"`, profile v1.1):
+ * the Buyer pays the counter-asset and states what it wants in return (FLOP amount in VFY,
+ * rail `flop-htlc`). `feeBps` is basis points of leg A's `amount` (the counter-asset the
+ * Buyer pays), declared in the signed offer; it is paid only on a completed claim, never on
+ * refund, and is `0` on every deployment we operate (the 4-segment v1.0 form reads as `0`).
  */
 export interface LegAContext {
   leg: "a";
   wantAsset: string;
   wantAmount: string;
   wantRail: string;
+  feeBps: number;
 }
 
 /** Leg B (`job.context = "b|<legA offer id>"`): the Seller pays FLOP against a named leg A. */
@@ -104,6 +118,9 @@ export interface SwapView {
   legBOfferId: string | null;
   buyerDid: string | null;
   sellerDid: string | null;
+  /** Leg A's declared `<fee-bps>` (profile v1.1, SPEC §3.7), once leg A's context is known;
+   *  `null` before then (e.g. `unpaired`/`orientation-unsupported` with no usable context). */
+  feeBps: number | null;
   legA: TranscriptFoldResult | null;
   legB: TranscriptFoldResult | null;
   evidence: SwapEvidence;
