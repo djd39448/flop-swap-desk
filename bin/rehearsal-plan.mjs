@@ -3,6 +3,11 @@
 // The G0 rehearsal plan builder, shared by `rehearsal.mjs` (print for approval) and
 // `rehearse-post.mjs` (regenerate at the real t0 and post byte-identical lines). Pure: no
 // clock, no network, no files. Same inputs → same bytes. The `paper` rail holds no value.
+//
+// This plan is the one that was reviewed and posted for the 2026-09-18 G0 rehearsal. Any
+// *new* rehearsal run from this builder -- a different t0, different parties, or after any
+// change to this file -- is a new plan and needs its own approval before it is posted; past
+// approval of one plan is not standing approval for another.
 
 import { createHash } from "node:crypto";
 
@@ -41,7 +46,7 @@ export function buildPlan(inputs) {
   const offerA = makeOffer({
     from: buyerDid, role: "payer", amount: counterAmount, asset: counterAsset, lock: "hash",
     rails: ["evm-htlc", "paper"], ...A,
-    job: { proto: "swap", id, context: legAContext({ wantAsset: "FLOP", wantAmount: flopAmount, wantRail: "flop-htlc" }) },
+    job: { proto: "swap", id, context: legAContext({ wantAsset: "FLOP", wantAmount: flopAmount, wantRail: "flop-htlc", feeBps: 0 }) },
     nonce: nonce("offerA"),
   });
   const acceptA = makeAccept(offerA, { from: sellerDid, statement: lock.hash, nonce: nonce("acceptA") });

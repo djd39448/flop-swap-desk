@@ -19,6 +19,9 @@ Design document: `SPEC-ATOMIC-SWAP-DESK.md` in
 
 ## Status
 
+The profile is **v1.1**: leg A's offer carries a fee field (`feeBps`), and it is zero on every
+deployment we run — see `docs/FEES.md`.
+
 **Alpha, Phase 0, keyless.** Nothing here moves value. There is no FLOP testnet RPC yet; the
 FLOP leg is bound through tclk PR #171's mock chain only. The only rail with a read path today
 is tclk's `paper` rail (`vendor/tclk/src/paper-rail.ts`) — a rehearsal surface that holds no
@@ -70,9 +73,10 @@ node examples/audit-export.mjs --root fixtures/rehearsal-2026-09-18 \
 
 ## What this is not
 
-No AMM, no pool, no fee, no custody, no relayer (yellow paper R10.4's allowlisted relayer is
+No AMM, no pool, no custody, no relayer (yellow paper R10.4's allowlisted relayer is
 not used: each party redeems its own leg), no point/adaptor locks (tclk's adaptor path is
-unaudited reference crypto), no mainnet value.
+unaudited reference crypto), no mainnet value. The profile carries a fee field (`docs/FEES.md`),
+but every deployment we operate sets it to zero; no deployment here charges anything.
 
 ## License
 
