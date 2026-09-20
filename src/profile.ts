@@ -11,6 +11,8 @@ import type { OfferFrame } from "@flop-labs/tclk";
 import { normalizeRailId } from "@flop-labs/tclk";
 
 import {
+  FEE_BPS_MAX,
+  FEE_BPS_PATTERN,
   FLOP_ASSET,
   FLOP_RAIL,
   SWAP_ID_DOMAIN,
@@ -38,12 +40,23 @@ export function isSwapId(value: unknown): value is string {
   return typeof value === "string" && HEX32.test(value);
 }
 
-/** Encode leg A's context: what the Buyer wants for the counter-asset it pays. */
-export function legAContext(want: Omit<LegAContext, "leg">): string {
+/**
+ * Encode leg A's context: what the Buyer wants for the counter-asset it pays, plus the
+ * declared fee (profile v1.1, SPEC §3.7). `feeBps` defaults to `0` (every deployment we
+ * operate) when omitted; throws on a non-integer or out-of-range value — same fail-closed
+ * treatment as a bad asset or amount, since this string ends up inside a signed offer.
+ */
+export function legAContext(
+  want: Omit<LegAContext, "leg" | "feeBps"> & { feeBps?: number },
+): string {
   if (!ASSET.test(want.wantAsset)) throw new Error("swap: wantAsset is not a tclk asset id");
   if (!AMOUNT.test(want.wantAmount)) throw new Error("swap: wantAmount must be a decimal integer");
   const rail = normalizeRailId(want.wantRail);
-  return `a|${want.wantAsset}|${want.wantAmount}|${rail}`;
+  const feeBps = want.feeBps ?? 0;
+  if (!Number.isInteger(feeBps) || feeBps < 0 || feeBps > FEE_BPS_MAX) {
+    throw new Error(`swap: feeBps must be an integer 0..${FEE_BPS_MAX}`);
+  }
+  return `a|${want.wantAsset}|${want.wantAmount}|${rail}|${feeBps}`;
 }
 
 /** Encode leg B's context: the leg A offer this FLOP leg answers. */
@@ -52,12 +65,25 @@ export function legBContext(legAOfferId: string): string {
   return `b|${legAOfferId}`;
 }
 
-/** Parse a `job.context`. Null on anything that is not exactly one of the two grammars. */
+/**
+ * Parse a `job.context`. Null on anything that is not exactly one of the documented
+ * grammars. Leg A accepts both the v1.0 (4-segment) and v1.1 (5-segment, `<fee-bps>`)
+ * forms — a 4-segment leg A reads as `feeBps: 0`, so Phase 0 vectors and the
+ * 2026-09-18 rehearsal fixture stay valid. `f|…` is reserved for the Phase 3 fee leg
+ * (SPEC §3.7, F4: `"f|<leg-B offer id>|<fee-amount>"`) — not implemented until F4, so it
+ * always parses to `null` here.
+ */
 export function parseSwapContext(context: unknown): SwapContext | null {
   if (typeof context !== "string") return null;
   const parts = context.split("|");
-  if (parts[0] === "a" && parts.length === 4) {
-    const [, wantAsset, wantAmount, wantRail] = parts as [string, string, string, string];
+  if (parts[0] === "a" && (parts.length === 4 || parts.length === 5)) {
+    const [, wantAsset, wantAmount, wantRail, feeBpsRaw] = parts as [
+      string,
+      string,
+      string,
+      string,
+      string | undefined,
+    ];
     if (!ASSET.test(wantAsset) || !AMOUNT.test(wantAmount)) return null;
     let rail: string;
     try {
@@ -66,12 +92,21 @@ export function parseSwapContext(context: unknown): SwapContext | null {
       return null;
     }
     if (rail !== wantRail) return null; // must already be canonical on the wire
-    return { leg: "a", wantAsset, wantAmount, wantRail: rail };
+    let feeBps = 0;
+    if (parts.length === 5) {
+      if (feeBpsRaw === undefined || !FEE_BPS_PATTERN.test(feeBpsRaw)) return null;
+      feeBps = Number(feeBpsRaw);
+    }
+    return { leg: "a", wantAsset, wantAmount, wantRail: rail, feeBps };
   }
   if (parts[0] === "b" && parts.length === 2) {
     const legAOfferId = parts[1] as string;
     if (!HEX32.test(legAOfferId)) return null;
     return { leg: "b", legAOfferId };
+  }
+  if (parts[0] === "f") {
+    // Reserved for the Phase 3 fee leg (SPEC §3.7, F4) — inert until then.
+    return null;
   }
   return null;
 }
