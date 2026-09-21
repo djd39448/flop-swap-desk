@@ -85,4 +85,5 @@ but every deployment we operate sets it to zero; no deployment here charges anyt
 
 ## License
 
-MIT. `vendor/tclk` is Apache-2.0, © FLOP Labs contributors.
+MIT for this repo's own code. Vendored and derived files keep their upstream license — see
+`PROVENANCE.md` for the full file-by-file list, sources and hashes.

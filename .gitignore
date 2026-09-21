@@ -4,3 +4,5 @@ vendor/tclk/dist/
 vendor/tclk/node_modules/
 *.log
 .state/
+out/
+cache/
