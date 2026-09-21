@@ -12,6 +12,12 @@ hash time-locked escrows, one shared secret, and no one in the middle holding an
   audit trail. It holds no keys and cannot post, lock, claim, or refund.
 - **Deadline checker** (`src/deadlines.ts`): the timelock rules that make the two legs atomic,
   including yellow paper R10.2 timelock symmetry in the orientation this profile fixes.
+- **EVM escrow contracts** (`contracts/`, tested by `test/*.t.sol` under `lib/forge-std`):
+  `EvmHashRail.sol`, vendored byte-identical, and `EvmHashRailFee.sol`, the fee-bearing
+  variant derived from it (`docs/FEES.md`, `PROVENANCE.md`). Solidity only — no adapter wires
+  them to the desk yet, and neither is deployed anywhere.
+- **Vendored viem binding** (`src/vendor/evm-hash-rail.ts`): tclk's own binding of
+  `EvmHashRail.sol` onto `viem`, vendored from an open upstream PR (`PROVENANCE.md`).
 - **Client** (not yet built): the party-side agent that holds *your* keys and drives the rails.
 
 Design document: `SPEC-ATOMIC-SWAP-DESK.md` in
@@ -56,6 +62,11 @@ npm test
 `@flop-labs/tclk` is vendored as a git submodule (`vendor/tclk`) pinned to upstream `main`
 commit `5cc4ab9`, because the npm release `0.1.0` predates the transcript fold this desk
 depends on. `npm test` builds it first. Clone with `--recurse-submodules`.
+
+`npm test` covers the TypeScript surface only and does not need Foundry. The Solidity gate is
+separate: `forge test`, run from the repo root, exercises `contracts/*.sol` against
+`test/*.t.sol` and the `lib/forge-std` submodule (pinned in `foundry.lock`). Foundry
+(`forge`/`anvil`) is not a dependency of `npm test` and is not installed by it.
 
 ## Audit replay
 

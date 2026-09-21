@@ -16,6 +16,10 @@ The fee is **zero on every deployment we operate**. Leg A's offer declares `feeB
 
 ## The mechanism (how a fee would work, if one were ever nonzero)
 
+The fee-bearing contract now exists, as `contracts/EvmHashRailFee.sol` (with its Foundry
+tests, `test/EvmHashRailFee.t.sol`), but it is **not deployed anywhere** — this section
+describes what it does, not something live.
+
 - **Declared, signed, fixed.** Leg A's `job.context` optionally carries a fifth segment,
   `<fee-bps>` — a decimal integer 0…10000 (basis points of leg A's `amount`, the counter-asset
   the Buyer pays), defaulting to `0` when omitted (`docs/PROFILE.md` §3.1). The Buyer signs it in
