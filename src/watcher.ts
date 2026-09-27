@@ -19,7 +19,13 @@ import {
   type TranscriptRecord,
 } from "@flop-labs/tclk";
 
-import { findSwapLegCandidates, foldCaptured, hasAuthenticatedPaperLock, type CapturedNote } from "./replay.js";
+import {
+  findSwapLegCandidates,
+  foldCaptured,
+  hasAuthenticatedPaperLock,
+  type CapturedNote,
+  type SwapLegCandidate,
+} from "./replay.js";
 import type { Board, BoardInput, SwapStatus } from "./types.js";
 
 // SPEC §4 order; "reaches paired or later" = rank ≥ `paired`, never the two failure states
@@ -123,6 +129,70 @@ async function writeFileAtomic(path: string, data: string | Uint8Array): Promise
   const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
   await writeFile(tmp, data);
   await rename(tmp, path);
+}
+
+// H2 (tclk#181): the offers room is a byte ring that only holds "tens of minutes" of
+// traffic, so a swap's offer/accept lines can roll off before a later sweep would otherwise
+// see them again. `job.id` (swapId) is attacker-controlled free text (tclk's own
+// `validateJob` only requires it be a non-empty string) — `underRoot` below already refuses
+// any segment that would escape `root`, but this also refuses to archive under anything that
+// is not the sha256 hex shape `swapId` is supposed to be, so a stray "/" or ".." in a hostile
+// job.id produces one unarchived leg, never a surprising directory.
+const SWAP_ID_SHAPE = /^0x[0-9a-f]{64}$/;
+
+/** Every offer-room export line, indexed by its own `seq`, read straight off the untouched
+ *  wire bytes (before `quoteBigNonces`) so a later archive write is the exact original text,
+ *  not a reconstruction. Only `seq` is read here (always a small, safe venue-assigned
+ *  integer); a big transport nonce elsewhere on the same line cannot corrupt it. Tolerant,
+ *  like every other read of anonymous export bytes in this module: an unparseable line is
+ *  simply not indexed. */
+function rawLinesBySeq(exportBody: string): Map<number, string> {
+  const bySeq = new Map<number, string>();
+  for (const line of exportBody.split("\n")) {
+    if (line.trim() === "") continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (value === null || typeof value !== "object") continue;
+    const seq = (value as { seq?: unknown }).seq;
+    if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0) bySeq.set(seq, line);
+  }
+  return bySeq;
+}
+
+/**
+ * Archive one swap-leg candidate's exact offer-room lines (its offer and its accept) under
+ * `raw/swaps/<swapId>/offer-room/<seq>.line`, the first sweep that has both on hand — every
+ * later sweep is a no-op per line once written, since an offer or accept never changes once
+ * posted. `examples/audit-export.mjs` folds these back in when the ring's own union no
+ * longer has a seq.
+ */
+async function archiveSwapOfferLines(
+  root: string,
+  candidate: SwapLegCandidate,
+  rawLineBySeq: ReadonlyMap<number, string>,
+): Promise<void> {
+  if (!SWAP_ID_SHAPE.test(candidate.swapId)) return;
+  for (const seq of [candidate.offerSeq, candidate.acceptSeq]) {
+    const path = underRoot(root, "raw", "swaps", candidate.swapId, "offer-room", `${seq}.line`);
+    if (existsSync(path)) continue; // already archived from an earlier sweep
+    const line = rawLineBySeq.get(seq);
+    if (line === undefined) continue; // not on this sweep's own export: nothing to archive yet
+    await writeFileAtomic(path, line.endsWith("\n") ? line : `${line}\n`);
+  }
+}
+
+/** Archive a swap's deal-room body under `raw/swaps/<swapId>/deal-rooms/<room>.json`,
+ *  byte-exact, alongside the timestamped `raw/<room>/<iso>.json` capture (H2, tclk#181).
+ *  Unlike the offer-room lines, this is overwritten every sweep: a deal room accumulates
+ *  frames over the swap's life (lock, reveal, receipt, …), so only the latest capture has
+ *  everything a replay needs. */
+async function archiveSwapDealRoom(root: string, swapId: string, room: string, body: string): Promise<void> {
+  if (!SWAP_ID_SHAPE.test(swapId)) return;
+  await writeFileAtomic(underRoot(root, "raw", "swaps", swapId, "deal-rooms", `${room}.json`), body);
 }
 
 async function fetchWithTimeout(
@@ -271,6 +341,7 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
     return report;
   }
   report.offerRecords = offerRoomRecords.length;
+  const rawLineBySeq = rawLinesBySeq(exportBody);
 
   // Step 2: which contracts' deal rooms are worth polling, and fetch them.
   const { candidates, swapLegOffers } = findSwapLegCandidates(offerRoomRecords);
@@ -280,6 +351,11 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   const roomByContract = new Map<string, string>();
 
   for (const candidate of cappedCandidates) {
+    // H2 (tclk#181): archive this leg's exact offer-room lines now, independent of whether
+    // the deal-room fetch below succeeds — the ring may already have rolled past them by the
+    // time a later sweep runs.
+    await archiveSwapOfferLines(root, candidate, rawLineBySeq);
+
     let room: string;
     try {
       room = dealRoom(candidate.contract);
@@ -319,6 +395,7 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
     }
 
     await writeFileAtomic(underRoot(root, "raw", room, `${sweepIso}.json`), body);
+    await archiveSwapDealRoom(root, candidate.swapId, room, body);
     const { records, skippedCount } = normalizeDealRoomBody(room, body);
     dealRooms.set(room, records);
     roomByContract.set(candidate.contract, room);

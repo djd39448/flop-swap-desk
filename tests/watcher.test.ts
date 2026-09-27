@@ -484,6 +484,90 @@ describe("runSweep", () => {
     expect(existsSync(join(root, "board.json"))).toBe(true);
   });
 
+  describe("swap archive (H2, tclk#181)", () => {
+    it("archives each leg's offer-room lines the first sweep that sees them, byte-exact, surviving a later sweep whose ring has already dropped the earlier lines", async () => {
+      const swap = buildSwap("ffff0001", 1, NOW - 200_000);
+      const legARows = swap.rows.slice(0, 2); // offerA, acceptA
+      const legBRows = swap.rows.slice(2, 4); // offerB, acceptB
+
+      // Sweep 1: only leg A is on the (synthetic) ring -- leg B hasn't been posted yet.
+      const export1 = ndjson(legARows);
+      const fetch1 = makeFetch((url) => {
+        if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: export1 };
+        return { status: 200, body: dealRoomBody([]) };
+      }, []);
+      const report1 = await runSweep({ ...baseOptions(), fetch: fetch1 });
+      expect(report1.ok).toBe(true);
+
+      const legAOfferPath = join(root, "raw", "swaps", swap.swapId, "offer-room", `${legARows[0]!.seq}.line`);
+      const legAAcceptPath = join(root, "raw", "swaps", swap.swapId, "offer-room", `${legARows[1]!.seq}.line`);
+      expect(existsSync(legAOfferPath)).toBe(true);
+      expect(existsSync(legAAcceptPath)).toBe(true);
+      expect((await readFile(legAOfferPath, "utf8")).trim()).toBe(JSON.stringify(legARows[0]));
+      expect((await readFile(legAAcceptPath, "utf8")).trim()).toBe(JSON.stringify(legARows[1]));
+
+      // Sweep 2: the ring has rolled -- leg A's lines are gone from this sweep's export,
+      // only leg B is now visible (leg B was just posted).
+      const export2 = ndjson(legBRows);
+      const fetch2 = makeFetch((url) => {
+        if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: export2 };
+        return { status: 200, body: dealRoomBody([]) };
+      }, []);
+      const report2 = await runSweep({ ...baseOptions({ nowMs: () => NOW - 100_000 }), fetch: fetch2 });
+      expect(report2.ok).toBe(true);
+
+      // Leg A's archive is untouched (idempotent) even though sweep 2 never saw it again.
+      expect(existsSync(legAOfferPath)).toBe(true);
+      expect((await readFile(legAOfferPath, "utf8")).trim()).toBe(JSON.stringify(legARows[0]));
+
+      const legBOfferPath = join(root, "raw", "swaps", swap.swapId, "offer-room", `${legBRows[0]!.seq}.line`);
+      const legBAcceptPath = join(root, "raw", "swaps", swap.swapId, "offer-room", `${legBRows[1]!.seq}.line`);
+      expect(existsSync(legBOfferPath)).toBe(true);
+      expect(existsSync(legBAcceptPath)).toBe(true);
+      expect((await readFile(legBOfferPath, "utf8")).trim()).toBe(JSON.stringify(legBRows[0]));
+      expect((await readFile(legBAcceptPath, "utf8")).trim()).toBe(JSON.stringify(legBRows[1]));
+    });
+
+    it("archives a swap's deal-room capture under raw/swaps/<swapId>/deal-rooms/, refreshed every sweep", async () => {
+      const swap = buildSwap("ffff0002", 1, NOW - 200_000);
+      const exportBody = ndjson(swap.rows);
+      const room = dealRoom(swap.legBAccept.contract);
+
+      const fetch1 = makeFetch((url) => {
+        if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+        if (url.includes(room)) return { status: 200, body: dealRoomBody([]) };
+        return { status: 404, body: "" };
+      }, []);
+      const report1 = await runSweep({ ...baseOptions(), fetch: fetch1 });
+      expect(report1.ok).toBe(true);
+
+      const archivePath = join(root, "raw", "swaps", swap.swapId, "deal-rooms", `${room}.json`);
+      expect(existsSync(archivePath)).toBe(true);
+      expect(await readFile(archivePath, "utf8")).toBe(dealRoomBody([]));
+
+      const lockFrame = {
+        type: "lock" as const,
+        from: seller.did,
+        contract: swap.legBAccept.contract,
+        rail: "flop-htlc",
+        ref: "flop-escrow-1",
+      };
+      const lockRow = rowFromRecord(record(room, 1, NOW - 90_000, seller, encodeFrame(lockFrame)));
+      const fetch2 = makeFetch((url) => {
+        if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+        if (url.includes(room)) return { status: 200, body: dealRoomBody([lockRow]) };
+        return { status: 404, body: "" };
+      }, []);
+      const report2 = await runSweep({ ...baseOptions({ nowMs: () => NOW - 80_000 }), fetch: fetch2 });
+      expect(report2.ok).toBe(true);
+
+      // Overwritten with the freshest body: a deal room accumulates frames over the swap's
+      // life (lock, reveal, receipt, …), so only the latest capture has everything a replay
+      // needs -- unlike the immutable offer-room lines above.
+      expect(await readFile(archivePath, "utf8")).toBe(dealRoomBody([lockRow]));
+    });
+  });
+
   describe("paper-rail note evidence (P0.5)", () => {
     async function soleFile(...dir: string[]): Promise<string> {
       const entries = await readdir(join(root, ...dir));

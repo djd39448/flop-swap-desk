@@ -46,6 +46,10 @@ interface SwapLegOffer { seq: number; swapId: string; leg: SwapLeg; offer: Offer
 export interface SwapLegCandidate {
   contract: string;
   offerSeq: number;
+  /** The accept's own offer-room seq (H2, tclk#181) — alongside `offerSeq`, the pair a
+   *  caller needs to archive this leg's exact offer-room lines byte-for-byte before the
+   *  venue's ring rolls past them. */
+  acceptSeq: number;
   swapId: string;
   leg: SwapLeg;
   offer: OfferFrame;
@@ -102,6 +106,7 @@ export function findSwapLegCandidates(offerRoomRecords: readonly TranscriptRecor
         byContract.set(frame.contract, {
           contract: frame.contract,
           offerSeq: legOffer.seq,
+          acceptSeq: record.seq,
           swapId: legOffer.swapId,
           leg: legOffer.leg,
           offer: legOffer.offer,

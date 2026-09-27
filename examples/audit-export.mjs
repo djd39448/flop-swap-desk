@@ -187,6 +187,76 @@ function loadDealRooms(root) {
   return dealRooms;
 }
 
+/**
+ * H2 (tclk#181): every `raw/swaps/<swapId>/offer-room/*.line` file the watcher archived —
+ * one exact offer-room export line each, captured the first sweep that saw it, byte-exact
+ * (see `archiveSwapOfferLines` in `src/watcher.ts`). The offers room is a byte ring that only
+ * holds "tens of minutes" of traffic, so `loadOffers`'s own union of `raw/tclk-offers/*.jsonl`
+ * exports can be missing a seq an old sweep saw once and a newer sweep's export no longer
+ * carries; this fills exactly those gaps, never overriding a seq the ring union already has.
+ */
+function loadArchivedOfferLines(root) {
+  const swapsDir = join(root, "raw", "swaps");
+  const records = [];
+  let entries;
+  try {
+    entries = readdirSync(swapsDir, { withFileTypes: true });
+  } catch {
+    return records;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(swapsDir, entry.name, "offer-room");
+    for (const name of listFiles(dir)) {
+      const text = readFileSync(join(dir, name), "utf8");
+      for (const line of quoteBigNonces(text).split("\n")) {
+        if (line.trim() === "") continue;
+        let value;
+        try {
+          value = JSON.parse(line);
+        } catch {
+          continue; // a corrupted archive line is skipped, not fatal
+        }
+        try {
+          records.push(transcriptRecord(OFFER_ROOM, value));
+        } catch {
+          continue;
+        }
+      }
+    }
+  }
+  return records;
+}
+
+/**
+ * H2 (tclk#181): every `raw/swaps/<swapId>/deal-rooms/<room>.json` the watcher archived —
+ * the swap's own deal room(s), always the latest capture (`archiveSwapDealRoom`). Used only
+ * to fill in a room `loadDealRooms` did not find under `raw/<room>/` (e.g. its timestamped
+ * captures were pruned for disk space); the primary path wins when both exist.
+ */
+function loadDealRoomsFromSwapArchive(root) {
+  const swapsDir = join(root, "raw", "swaps");
+  const dealRooms = new Map();
+  let entries;
+  try {
+    entries = readdirSync(swapsDir, { withFileTypes: true });
+  } catch {
+    return dealRooms;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(swapsDir, entry.name, "deal-rooms");
+    for (const name of listFiles(dir)) {
+      if (!name.endsWith(".json")) continue;
+      const room = name.slice(0, -".json".length);
+      if (dealRooms.has(room)) continue; // first (only) archived capture wins per room here
+      const body = readFileSync(join(dir, name), "utf8");
+      dealRooms.set(room, normalizeDealRoomBody(room, body));
+    }
+  }
+  return dealRooms;
+}
+
 /** Every swap-leg candidate's paper note (`raw/kv/<ns>/<key>/*.txt`, latest capture), keyed
  *  by contract — exactly the shape `foldCaptured` wants. A candidate with no captured note
  *  directory just gets no evidence for that leg (same as a live 404). */
@@ -265,17 +335,41 @@ function main() {
     return 3;
   }
 
-  const { records: offers, malformedLines } = loadOffers(args.root);
+  const { records: ringOffers, malformedLines } = loadOffers(args.root);
+  // H2 (tclk#181): fill in any seq the ring's own export union no longer has from the
+  // per-swap archive, so a swap still replays after the offers room has rolled past it.
+  const offersBySeq = new Map(ringOffers.map((r) => [r.seq, r]));
+  let archivedOfferLines = 0;
+  for (const archived of loadArchivedOfferLines(args.root)) {
+    if (offersBySeq.has(archived.seq)) continue;
+    offersBySeq.set(archived.seq, archived);
+    archivedOfferLines += 1;
+  }
+  const offers = [...offersBySeq.values()].sort((a, b) => a.seq - b.seq);
+
   const dealRooms = loadDealRooms(args.root);
+  for (const [room, records] of loadDealRoomsFromSwapArchive(args.root)) {
+    if (!dealRooms.has(room)) dealRooms.set(room, records);
+  }
+
   const notes = loadNotes(args.root, offers);
   const board = foldCaptured({ offers, dealRooms, notes, nowMs: Date.now() });
   const swaps = board.swaps.map(describeSwap);
 
   if (args.json) {
-    process.stdout.write(`${JSON.stringify({ swaps, unpaired: board.unpaired, malformedOfferLines: malformedLines }, null, 2)}\n`);
+    process.stdout.write(
+      `${JSON.stringify(
+        { swaps, unpaired: board.unpaired, malformedOfferLines: malformedLines, archivedOfferLines },
+        null,
+        2,
+      )}\n`,
+    );
   } else {
     if (malformedLines > 0) {
       process.stdout.write(`offers: skipped ${malformedLines} malformed line(s) across raw/${OFFER_ROOM}/*.jsonl\n`);
+    }
+    if (archivedOfferLines > 0) {
+      process.stdout.write(`offers: recovered ${archivedOfferLines} line(s) from raw/swaps/*/offer-room/ (ring rolled)\n`);
     }
     printReport(swaps, board.unpaired);
   }
@@ -296,7 +390,15 @@ function main() {
 // Only run as a CLI when invoked directly (`node examples/audit-export.mjs ...`); importing
 // this module (e.g. from a test, to exercise `loadOffers` directly) must not have the side
 // effect of running the whole program.
-export { loadOffers, loadDealRooms, loadNotes, describeSwap, parseArgs };
+export {
+  loadOffers,
+  loadDealRooms,
+  loadNotes,
+  loadArchivedOfferLines,
+  loadDealRoomsFromSwapArchive,
+  describeSwap,
+  parseArgs,
+};
 if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
   process.exitCode = main();
 }
