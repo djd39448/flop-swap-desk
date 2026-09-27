@@ -123,6 +123,17 @@ export interface SwapEvidence {
   bRail?: RailObservation;
 }
 
+/**
+ * H3: money state per leg, derived only from rail evidence (paper notes today; a chain read
+ * once P2 lands) — never from tclk frames alone, so a signed `reveal` frame is never read as
+ * `claimed`. Vocabulary pinned to `flop-labs/tclk` PR #173 at commit `0f94269` (see
+ * PROVENANCE.md; nothing from that PR is vendored, this is a naming citation only). `unfunded`
+ * is not reachable from the paper rail today (a paper record only exists once a leg locks —
+ * there is no "checked and confirmed empty" state to report) but is part of the vocabulary for
+ * when a chain rail can report it.
+ */
+export type SettlementView = "none" | "unverified" | "unfunded" | "funded" | "claimed" | "refunded";
+
 /** The desk's view of one swap. Every field is derived; `reasons` says why, fail-closed. */
 export interface SwapView {
   swapId: string | null;
@@ -138,6 +149,8 @@ export interface SwapView {
   legA: TranscriptFoldResult | null;
   legB: TranscriptFoldResult | null;
   evidence: SwapEvidence;
+  /** H3: per-leg settlement view, from rail evidence alone — see `SettlementView`. */
+  settlementView: { a: SettlementView; b: SettlementView };
   reasons: string[];
   /** The revealed preimage once leg A's reveal verified (world-readable by design). */
   secret?: string;

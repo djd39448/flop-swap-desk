@@ -19,7 +19,7 @@ import {
 
 import { PAPER_RAIL_ID } from "./paper-evidence.js";
 import { checkOrientation, classifySwapOffer } from "./profile.js";
-import type { LockEvidence, SwapFoldInput, SwapView } from "./types.js";
+import type { LockEvidence, RailObservation, SettlementView, SwapFoldInput, SwapView } from "./types.js";
 
 /** Pushed once, on every status (including `settled`), when either leg's lock evidence
  *  came from tclk's `paper` rail — a rehearsal record, never a payment (see
@@ -104,6 +104,34 @@ function evaluateLock(
   return { corroborated: true };
 }
 
+/** `RailObservation.status` (this repo's internal, paper-rail-shaped vocabulary) to the H3
+ *  settlement view (tclk PR #173's vocabulary, pinned above). A `RailObservation` only ever
+ *  exists once a rail's record decodes and its terms match the contract's own (see
+ *  `paper-evidence.ts`'s `paperEvidence`), so its presence is itself trustworthy rail
+ *  evidence — independent of `LockEvidence.railVerified`, which answers a narrower question
+ *  ("is it currently locked", tclk#180) than "what do we know about this leg's money".
+ */
+const RAIL_STATUS_TO_SETTLEMENT_VIEW: Readonly<Record<RailObservation["status"], SettlementView>> = {
+  locked: "funded",
+  claimed: "claimed",
+  refunded: "refunded",
+};
+
+/**
+ * H3: a leg's settlement view from rail evidence alone, never from tclk frames — a signed
+ * `reveal` frame proves the choreography advanced, not that a rail moved anything. `none`
+ * when there is nothing to go on at all (no evidence, or evidence whose `railVerified` is
+ * `null` — nothing existed to check, e.g. no paper note posted yet); `unverified` when a rail
+ * record was found but does not corroborate the expected terms (tclk#180 mismatch, unreadable
+ * record, or a claimed record whose secret does not open the statement); otherwise the
+ * `RailObservation`'s own status, mapped above.
+ */
+function settlementViewForLeg(evidence: LockEvidence | undefined, rail: RailObservation | undefined): SettlementView {
+  if (rail !== undefined) return RAIL_STATUS_TO_SETTLEMENT_VIEW[rail.status];
+  if (evidence === undefined || evidence.railVerified === null) return "none";
+  return "unverified";
+}
+
 function foldLeg(records: readonly TranscriptRecord[]): TranscriptFoldResult | null {
   return records.length === 0 ? null : foldTranscript(records);
 }
@@ -178,6 +206,12 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     legA: legAFold,
     legB: legBFold,
     evidence,
+    // H3: rail-evidence-only, computed once here so it is set on every return path below,
+    // independent of how far (or whether) the frame-derived choreography status advances.
+    settlementView: {
+      a: settlementViewForLeg(evidence.a, evidence.aRail),
+      b: settlementViewForLeg(evidence.b, evidence.bRail),
+    },
     reasons,
   };
 

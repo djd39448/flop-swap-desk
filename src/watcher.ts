@@ -479,6 +479,8 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
           sweptAtMs: nowMs,
           swapId: swap.swapId,
           status: swap.status,
+          // H3: money state per leg, from rail evidence alone (tclk PR #173 vocabulary).
+          settlementView: swap.settlementView,
           legAOfferId: swap.legAOfferId,
           legBOfferId: swap.legBOfferId,
           buyerDid: swap.buyerDid,

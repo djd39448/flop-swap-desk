@@ -431,6 +431,9 @@ describe("runSweep", () => {
     expect(jsonlLines.length).toBe(2);
     expect(JSON.parse(jsonlLines[0]!).status).toBe("paired");
     expect(JSON.parse(jsonlLines[1]!).status).toBe("b-locked");
+    // H3: settlementView rides beside status on every swaps.jsonl line.
+    expect(JSON.parse(jsonlLines[0]!).settlementView).toEqual({ a: "none", b: "none" });
+    expect(JSON.parse(jsonlLines[1]!).settlementView).toEqual({ a: "none", b: "none" });
 
     const hitContent = await readFile(join(root, "HIT"), "utf8");
     expect(hitContent.trim().split("\n").length).toBe(1);
@@ -578,7 +581,12 @@ describe("runSweep", () => {
     function findSwap(board: { swaps: Array<{ swapId: string | null }> }, swapId: string) {
       const found = board.swaps.find((s) => s.swapId === swapId);
       expect(found).toBeDefined();
-      return found as { swapId: string; status: string; reasons: string[] };
+      return found as {
+        swapId: string;
+        status: string;
+        reasons: string[];
+        settlementView: { a: string; b: string };
+      };
     }
 
     it("fetches both legs' paper notes, persists them byte-exact, and folds a full rehearsal to settled with the rehearsal reason", async () => {
@@ -629,6 +637,8 @@ describe("runSweep", () => {
       const view = findSwap(board, swap.swapId);
       expect(view.status).toBe("settled");
       expect(view.reasons).toContain("paper rail: rehearsal only, no value");
+      // H3: both notes were claimed, so the rail evidence alone settles both legs' views.
+      expect(view.settlementView).toEqual({ a: "claimed", b: "claimed" });
     });
 
     it("a 404 note leaves the swap at revealed/awaiting finality", async () => {

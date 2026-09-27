@@ -293,6 +293,8 @@ function describeSwap(view) {
   return {
     swapId: view.swapId,
     status: view.status,
+    // H3: money state per leg, from rail evidence alone (tclk PR #173 vocabulary).
+    settlementView: view.settlementView,
     reasons: view.reasons,
     buyerDid: view.buyerDid,
     sellerDid: view.sellerDid,
@@ -306,6 +308,7 @@ function describeSwap(view) {
 function printReport(swaps, unpaired) {
   for (const swap of swaps) {
     process.stdout.write(`swap ${swap.swapId ?? "(unpaired)"} -> ${swap.status}\n`);
+    process.stdout.write(`  settlementView: a=${swap.settlementView.a} b=${swap.settlementView.b}\n`);
     process.stdout.write(`  buyer=${swap.buyerDid ?? "?"} seller=${swap.sellerDid ?? "?"} feeBps=${swap.feeBps ?? "?"}\n`);
     process.stdout.write(`  offer-room seqs: ${swap.offerRoomSeqs.join(", ") || "(none)"}\n`);
     process.stdout.write(`  deal-room seqs:  ${swap.dealRoomSeqs.join(", ") || "(none)"}\n`);

@@ -452,6 +452,99 @@ describe("foldSwap — nine-field lock check (tclk#180)", () => {
   });
 });
 
+describe("foldSwap — settlementView (H3, tclk PR #173 vocabulary)", () => {
+  // Rail evidence only, never tclk frames: computed once and present on every status,
+  // including the earliest ones, where no lock has even been attempted yet.
+  const s = build();
+
+  it("both legs 'none' with no evidence at all, even at 'bid'", () => {
+    const view = foldSwap({ legA: [s.records.offerA], legB: [], nowMs: T0 + 1 });
+    expect(view.status).toBe("bid");
+    expect(view.settlementView).toEqual({ a: "none", b: "none" });
+  });
+
+  it("'none' when the evidence's own railVerified is null (nothing to check, e.g. no paper note yet)", () => {
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB],
+      evidence: {
+        b: { rail: "paper", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: null, checkedAtMs: T0 },
+      },
+      nowMs: T0 + 4 * MIN,
+    });
+    expect(view.settlementView.b).toBe("none");
+  });
+
+  it("'unverified' when a rail record was found but its terms mismatch (tclk#180) — no RailObservation", () => {
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB],
+      evidence: {
+        b: { rail: "paper", ref: "flop-escrow-1", terms: { ...s.legBTerms, amount: "1" }, railVerified: true, checkedAtMs: T0 },
+      },
+      nowMs: T0 + 4 * MIN,
+    });
+    // railVerified:true is what the rail itself claims; the terms mismatch overrides it —
+    // evaluateLock treats the leg as uncorroborated either way, and there is still no
+    // RailObservation for settlementView to read a status from.
+    expect(view.settlementView.b).toBe("unverified");
+  });
+
+  it("'funded' when the RailObservation reports 'locked'", () => {
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: {
+        b: { rail: "paper", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 },
+        bRail: { status: "locked", final: true, checkedAtMs: T0 },
+      },
+      nowMs: T0 + 5 * MIN,
+    });
+    expect(view.settlementView.b).toBe("funded");
+  });
+
+  it("'claimed' when the RailObservation reports 'claimed', independent of frame-derived status", () => {
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: {
+        bRail: { status: "claimed", final: true, checkedAtMs: T0 },
+      },
+      nowMs: T0 + 5 * MIN,
+    });
+    // Leg B's tclk frames never reveal here (no reveal frame at all) -- the frame-derived
+    // composite status cannot be "settled"/"revealed" from this alone, yet the rail already
+    // says claimed: proof settlementView never reads frames, only rail evidence.
+    expect(view.status).not.toBe("revealed");
+    expect(view.status).not.toBe("settled");
+    expect(view.settlementView.b).toBe("claimed");
+  });
+
+  it("'refunded' when the RailObservation reports 'refunded'", () => {
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: {
+        bRail: { status: "refunded", final: true, checkedAtMs: T0 },
+      },
+      nowMs: T0 + 5 * MIN,
+    });
+    expect(view.settlementView.b).toBe("refunded");
+  });
+
+  it("each leg's settlementView is independent (A funded, B none)", () => {
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
+      legB: [s.records.offerB, s.records.acceptB],
+      evidence: {
+        aRail: { status: "locked", final: true, checkedAtMs: T0 },
+      },
+      nowMs: T0 + 5 * MIN,
+    });
+    expect(view.settlementView).toEqual({ a: "funded", b: "none" });
+  });
+});
+
 describe("foldSwap — unpaired (≥4 distinct causes)", () => {
   it("unpaired when leg A has no records at all", () => {
     const view = foldSwap({ legA: [], legB: [], nowMs: T0 });

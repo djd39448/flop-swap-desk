@@ -63,6 +63,9 @@ export function fakeBuildBoard({ offers, dealRooms }: BoardInput): Board {
       legA: null,
       legB: null,
       evidence: {},
+      // This fake never sets up rail evidence, so both legs are always "none" (H3) --
+      // matches src/swap.ts's own settlementViewForLeg for the no-evidence case.
+      settlementView: { a: "none", b: "none" },
       reasons: [],
     });
   }
