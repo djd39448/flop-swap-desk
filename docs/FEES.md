@@ -16,10 +16,11 @@ The fee is **zero on every deployment we operate**. Leg A's offer declares `feeB
 
 ## The mechanism (how a fee would work, if one were ever nonzero)
 
-- **Declared, signed, fixed.** Leg A's `job.context` carries `<fee-bps>` — a decimal integer
-  0…10000 (basis points of leg A's `amount`, the counter-asset the Buyer pays). The Buyer signs
-  it in the offer; the Seller signs it by accepting. It cannot be changed after the fact by
-  either party or by us.
+- **Declared, signed, fixed.** Leg A's `job.context` optionally carries a fifth segment,
+  `<fee-bps>` — a decimal integer 0…10000 (basis points of leg A's `amount`, the counter-asset
+  the Buyer pays), defaulting to `0` when omitted (`docs/PROFILE.md` §3.1). The Buyer signs it in
+  the offer; the Seller signs it by accepting. It cannot be changed after the fact by either party
+  or by us.
 - **Enforced only by an immutable contract, paid only on success.** The counter-asset leg's
   escrow contract holds `feeBps` and `feeRecipient` as immutables set at deployment. A
   successful `claim` pays `amount − floor(amount · feeBps / 10000)` to the payee and the
@@ -60,7 +61,6 @@ should be read as one.
 
 ## See also
 
-- `PROFILE.md` §3.3 — the profile-level specification of `<fee-bps>` and the well-formed-pair
+- `PROFILE.md` §3.1, §3.3 — the profile-level grammar for `<fee-bps>` and the well-formed-pair
   rule it participates in.
 - `flop-contrib/SPEC-ATOMIC-SWAP-DESK.md` §3.7 — the design source (decisions D-12…D-17).
-- `flop-contrib/handoff/FEES-PLAN-2026-09-19.md` — the plan this page and PROFILE.md §3.3 implement.

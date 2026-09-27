@@ -1,7 +1,7 @@
 # The swap profile (`job.proto = "swap"`)
 
-Version: profile v1.1 (adds leg A's `<fee-bps>` segment, §3.3; the v1.0 4-segment grammar
-still reads, as `feeBps: 0`).
+Version: profile v1.1 (leg A's context takes an optional fifth `<fee-bps>` segment, §3.1/§3.3,
+defaulting to zero when omitted).
 
 Status: draft, Phase 0 (keyless, no posts). Design source: `flop-contrib/SPEC-ATOMIC-SWAP-DESK.md`
 §3 (this document rewrites that section for an outside `tclk/1` implementer who has never seen
@@ -86,10 +86,10 @@ Both legs carry `job.proto = "swap"` and the same `job.id = swapId`. `swapId` is
 can never collide with a `tclk/1` offer or contract id.
 
 ```
-leg A (v1.1)  job.context = "a|<want-asset>|<want-amount>|<want-rail>|<fee-bps>"
-leg A (v1.0)  job.context = "a|<want-asset>|<want-amount>|<want-rail>"        → reads as feeBps 0
-leg B         job.context = "b|<leg-A offer id>"                              (unchanged)
-reserved      job.context = "f|<leg-B offer id>|<fee-amount>"                (fee leg, Phase 3/F4; parses to null until then)
+leg A (base)  job.context = "a|<want-asset>|<want-amount>|<want-rail>"
+leg A (+fee)  job.context = "a|<want-asset>|<want-amount>|<want-rail>|<fee-bps>"  optional fifth segment, defaults to 0
+leg B         job.context = "b|<leg-A offer id>"                                  (unchanged)
+reserved      job.context = "f|<leg-B offer id>|<fee-amount>"                    (fee leg, Phase 3/F4; parses to null until then)
 ```
 
 - Leg A's context states what the Buyer wants for the counter-asset it pays: the FLOP amount (in
@@ -99,11 +99,14 @@ reserved      job.context = "f|<leg-B offer id>|<fee-amount>"                (fe
   `flop-htlc.` is rejected, not silently normalized, because the context is inside the
   Ed25519-signed offer and normalizing it after the fact would let two implementations disagree
   about what was signed.
-- **`<fee-bps>` (v1.1, §3.3):** a fifth segment, `^(0|[1-9][0-9]{0,3}|10000)$` — a decimal integer
-  0…10000, no leading zeros, no sign, no decimals, basis points of leg A's `amount`. A 4-segment
-  leg A (the v1.0 grammar) is still read, as `feeBps: 0`, so Phase 0 vectors and the
-  2026-09-18 rehearsal fixture stay valid. `legAContext()` (`src/profile.ts`) emits the 5-segment
-  form, defaulting `feeBps` to `0` when the caller omits it.
+- **`<fee-bps>` — an optional fifth segment** (§3.3): `^(0|[1-9][0-9]{0,3}|10000)$` — a decimal
+  integer 0…10000, no leading zeros, no sign, no decimals, basis points of leg A's `amount`.
+  Omitted, it reads as `feeBps: 0` — the four-segment form above is the common case, since every
+  deployment we operate charges nothing; the fifth segment exists so that if a fee is ever
+  charged, it is declared and signed inside the same offer rather than added out of band.
+  `legAContext()` (`src/profile.ts`) emits the five-segment form, defaulting `feeBps` to `0` when
+  the caller omits it, so Phase 0 vectors and the 2026-09-18 rehearsal fixture stay valid either
+  way.
 - Leg B's context names leg A's **offer id** (not the `swapId`) so a fold can pair the two legs
   without trusting `swapId` alone — the offer id is itself a hash committing to leg A's full
   content, so leg B is provably answering that specific offer and no other. Leg B carries no fee
@@ -138,17 +141,18 @@ board's job (`SPEC-ATOMIC-SWAP-DESK.md` §4 P0.2), not this document's — this 
 the predicate, not the code that walks live transcripts to evaluate it. Anything that fails any
 rule is `unpaired` and never advances a swap's composite state.
 
-### 3.3 Fees (profile v1.1; design source SPEC §3.7, decisions D-12…D-17; plan in `flop-contrib/handoff/FEES-PLAN-2026-09-19.md`)
+### 3.3 Fees (profile v1.1; design source SPEC §3.7, decisions D-12…D-17)
 
 The profile carries a fee field. Every deployment we operate sets it to zero. A fee, if ever
 charged, is a fixed number in an immutable contract, paid only on a completed swap, published in
-advance, and the same for everyone.
+advance, and the same for everyone. `docs/FEES.md` is the one page this wording points to for
+what the fee field is, how it would be enforced, and what is true about it today — including the
+recipient policy and the Phase 5 gate on ever naming one; this section does not restate them.
 
-- **Declared, signed, fixed.** Leg A's context carries `<fee-bps>` (§3.1): a decimal integer
-  `^(0|[1-9][0-9]{0,3}|10000)$`, basis points of leg A's `amount` (the counter-asset the Buyer
-  pays). The Buyer signs it in the offer; the Seller signs it by accepting. The 4-segment v1.0
-  grammar is still read (`feeBps: 0`), so Phase 0 vectors and the 2026-09-18 rehearsal fixture
-  stay valid.
+- **Declared, signed, fixed.** Leg A's context carries the optional `<fee-bps>` segment (§3.1): a
+  decimal integer `^(0|[1-9][0-9]{0,3}|10000)$`, basis points of leg A's `amount` (the
+  counter-asset the Buyer pays). The Buyer signs it in the offer; the Seller signs it by
+  accepting. Omitted, it reads as `feeBps: 0` — the only value any deployment we operate produces.
 - **Enforced only by an immutable contract, paid only on success.** On the counter-asset leg the
   escrow contract (`EvmHashRailFee.sol`, derived from the vendored `EvmHashRail.sol`) holds
   `feeBps` and `feeRecipient` as immutables: a successful `claim` pays
@@ -161,16 +165,40 @@ advance, and the same for everyone.
   one; it refuses bids or accepts above a policy maximum (default 100 bps = 1%) without an
   explicit override. The board shows `feeBps` and the escrow address for every swap; nothing
   about fees is hidden or discretionary.
-- **Recipient is receive-only.** The fee address per chain is one the desk operator controls; its key never
-  touches this machine. G1 (trading keys) does not gate the recipient (D-14).
 - **FLOP-side fee is Phase 3 (F4), not v1.1.** FLOP has no contract layer, so a fee on the FLOP
   leg can only be a third `tclk/1` contract to the desk under the same shared statement `H`
   (`job.context = "f|<leg-B offer id>|<fee-amount>"`, `claimBy ≥ B.claimBy`) — it needs a
   claiming agent with FLOP keys online, so it is designed and decided in Phase 3. v1.1 only
   reserves the prefix: `parseSwapContext` returns `null` for it (§3.1).
-- **Every deployment we operate sets the fee to zero until Phase 5**, when the mainnet number,
-  the recipient and its legal owner are decided after the counsel read decision D-17 requires.
-  No promises are made here about future fees, tokens, or airdrops — see `docs/FEES.md`.
+
+### 3.4 What a fold must check
+
+§3.2's well-formed-pair predicate is necessary but not sufficient — this month's findings against
+the choreography (tclk#180, #181, #172/#173, #175) add four more things a conforming fold must do
+before it reports anything about a leg's money:
+
+- **All nine `LockTerms` fields, not whatever a rail's own `verifyLock` happens to cover.** A
+  rail's lock-verification result is corroboration, never sufficient alone —
+  `PaperRail.verifyLock` compares four of the nine (`contract, lock, statement, amount, asset,
+  payer, payee, claimByMs, refundAfterMs`) — so a fold checks the rest itself against the accepted
+  offer's own terms before a leg counts as locked, and names the mismatched field when it does not
+  (tclk#180).
+- **A byte-exact archive of the folded pair.** The offers room is a byte ring holding only tens of
+  minutes of traffic (tclk#181); a fold that wants to stay replayable keeps the exact offer-room
+  lines and deal-room frames it folded, not just a reference into a room that will move on.
+- **A settlement view from rail evidence alone.** Money state (`none | unverified | unfunded |
+  funded | claimed | refunded`, tclk PR #173 at `0f94269`) is reported only from what a rail
+  says — a paper note today, a chain read later — never from `tclk/1` frames alone, so a signed
+  `reveal` is never read as a completed payment.
+- **Coordination-only labeling.** Any verdict that rests on an unsigned venue timestamp (to order
+  two records against each other) or on the export's row order (to break a tie among several
+  candidates) is labeled as such, distinct from a verdict the venue's own signatures cover
+  (tclk#175).
+
+`flop-swap-desk`'s implementation: the per-leg lock check and the settlement view are
+`src/swap.ts`; the accept-choice labeling is `src/board.ts`; the per-swap archive is
+`src/watcher.ts` and `examples/audit-export.mjs`. This subsection states the policy; that code is
+the fold §3.2 calls "the board's job."
 
 ## 4. Sequence
 
@@ -328,3 +356,7 @@ the file is a checked-in golden, not build output.
 - `flop-labs/tclk#171` (`FlopHtlcRail`, `timelockSymmetryMinimum`, `blocksUntil`) — the rail-side
   re-derivation of R10.2 this profile's deadline checker cross-checks against, independently
   verified by bdunn77 (2026-09-18).
+- `flop-labs/tclk#180` (`PaperRail.verifyLock` compares four of nine `LockTerms` fields), `#181`
+  (the offers room is a byte ring, frames survive tens of minutes), `#172`/`#173` at `0f94269`
+  (the settlement-view vocabulary), `#175` (verdicts depending on unsigned venue `ts` or export
+  row order) — this month's findings §3.4 answers.

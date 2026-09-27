@@ -27,10 +27,15 @@ FLOP leg is bound through tclk PR #171's mock chain only. The only rail with a r
 is tclk's `paper` rail (`vendor/tclk/src/paper-rail.ts`) — a rehearsal surface that holds no
 value and whose records anyone can overwrite; the board can fold a fully-rehearsed swap all the
 way to `settled` on paper evidence, but every reason trail it produces says so
-(`"paper rail: rehearsal only, no value"`). Chain rails (`evm-htlc`, `flop-htlc`, …) still have
-no read path, so a swap settling for real cannot advance past `paired` today — by design, not by
-accident (fail closed). Every end-to-end atomicity claim remains PENDING until yellow paper open
-item E.48 closes, and this repository does not present one.
+(`"paper rail: rehearsal only, no value"`). **The Phase 0 verdict is choreography only (`PaperRail`
+verifies 4 of 9 `LockTerms` fields, tclk#180):** the fold independently checks all nine before a
+leg counts as locked (`src/swap.ts`, §3.4 of `docs/PROFILE.md`), but the paper rail's own record
+can only ever attest to `status`/`lock`/`statement`/`refundAfterMs` — so a `settled` paper
+rehearsal proves the choreography and the pairing rules, never amount or payee integrity. Chain
+rails (`evm-htlc`, `flop-htlc`, …) still have no read path, so a swap settling for real cannot
+advance past `paired` today — by design, not by accident (fail closed). Every end-to-end
+atomicity claim remains PENDING until yellow paper open item E.48 closes, and this repository
+does not present one.
 
 ## The one rule that makes it work
 
