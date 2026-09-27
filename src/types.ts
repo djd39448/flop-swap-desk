@@ -4,7 +4,9 @@
 // tclk/1 transcripts plus rail observations; nothing here is an authority over money.
 // Design: flop-contrib/SPEC-ATOMIC-SWAP-DESK.md (draft 0.1, 2026-09-18), §3–§4.
 
-import type { OfferFrame, TranscriptFoldResult, TranscriptRecord } from "@flop-labs/tclk";
+import type { LockTerms, OfferFrame, TranscriptFoldResult, TranscriptRecord } from "@flop-labs/tclk";
+
+export type { LockTerms };
 
 /** `offer.job.proto` value that marks a tclk/1 offer as one leg of a swap. */
 export const SWAP_PROTO = "swap";
@@ -76,15 +78,27 @@ export const SWAP_TERMINAL_STATUSES: ReadonlySet<SwapStatus> = new Set<SwapStatu
 ]);
 
 /**
- * What a rail read path reported about an announced lock. `verified` is the rail's
- * fail-closed `verifyLock` answer at the *finalized* view; `finalizedRef` names the
+ * What a rail read path reported about an announced lock. `finalizedRef` names the
  * block/height/finality id it was checked against so anyone can re-check. Absent evidence
  * is "unknown", never "verified".
+ *
+ * `terms` is the lock's own claimed `LockTerms` — all nine fields (contract, lock,
+ * statement, amount, asset, payer, payee, claimByMs, refundAfterMs) the evidence was
+ * checked against. `src/swap.ts`'s fold compares every one of them against the accepted
+ * offer's own `lockTerms()` before a leg counts as locked; a rail's own check may cover
+ * fewer (tclk#180: `PaperRail.verifyLock` compares four of the nine), so this field lets the
+ * fold verify the rest itself instead of trusting whatever subset the rail bothered to check.
+ *
+ * `railVerified` is the rail's own fail-closed `verifyLock`-equivalent verdict at the
+ * *finalized* view: `true`/`false` when the rail's own (possibly partial) check ran,
+ * `null` when there was nothing to check against at all (e.g. no paper note posted yet).
+ * Recorded as corroboration only — never sufficient alone to mark a leg locked (tclk#180).
  */
 export interface LockEvidence {
   rail: string;
   ref: string;
-  verified: boolean;
+  terms: LockTerms;
+  railVerified: boolean | null;
   checkedAtMs: number;
   finalizedRef?: string;
   endpoint?: string;

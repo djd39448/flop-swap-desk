@@ -22,6 +22,7 @@ import {
 import { buildBoard as defaultBuildBoard } from "./board.js";
 import { paperEvidence, stripNoteBanner, PAPER_RAIL_ID } from "./paper-evidence.js";
 import { classifySwapOffer } from "./profile.js";
+import { offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, SwapEvidence, SwapLeg } from "./types.js";
 
 // An offer/accept authenticated for the signed lane in tclk-offers (the same checks as
@@ -176,13 +177,10 @@ export function foldCaptured(input: FoldCapturedInput): Board {
     if (captured === undefined) continue; // not fetched/not found: evidence absent
 
     const noteValue = stripNoteBanner(captured.body);
+    // Full nine-field LockTerms (H1, tclk#180), from the authenticated offer/accept pair
+    // itself — never from the deal room or the note, which is world-writable.
     const result = paperEvidence(
-      {
-        contract: candidate.contract,
-        lock: candidate.offer.lock,
-        statement: candidate.accept.statement,
-        refundAfterMs: candidate.offer.refundAfterMs,
-      },
+      offerAcceptLockTerms(candidate.offer, candidate.accept),
       noteValue,
       input.nowMs,
       captured.endpoint,

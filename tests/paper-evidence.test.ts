@@ -16,11 +16,23 @@ const ENDPOINT = "https://technocore.example/kv/tclk-paper-ab/cdef0123456789";
 const lock = generateHashLock();
 const CONTRACT = `0x${"ab".repeat(32)}`;
 
+const BUYER_DID = "did:key:z6Mktest0000000000000000000000000000000000buyer";
+const SELLER_DID = "did:key:z6Mktest0000000000000000000000000000000seller";
+
+// PaperLegTerms is the full nine-field LockTerms (H1, tclk#180); the paper record itself can
+// only ever confirm lock/statement/refundAfterMs (plus its own status) — see termsMatch in
+// src/paper-evidence.ts — so the other five are here only to satisfy the type and are never
+// exercised by these branch tests.
 function terms(overrides: Partial<PaperLegTerms> = {}): PaperLegTerms {
   return {
     contract: CONTRACT,
     lock: "hash",
     statement: lock.hash,
+    amount: "1000",
+    asset: "USDC",
+    payer: BUYER_DID,
+    payee: SELLER_DID,
+    claimByMs: T0 + 2_700_000,
     refundAfterMs: T0 + 3_600_000,
     ...overrides,
   };
@@ -52,20 +64,21 @@ describe("stripNoteBanner", () => {
 });
 
 describe("paperEvidence", () => {
-  it("noteValue null: verified false, reason 'no paper record', no rail", () => {
+  it("noteValue null: railVerified null (unknown), reason 'no paper record', no rail", () => {
     const result = paperEvidence(terms(), null, T0, ENDPOINT);
     expect(result.rail).toBeUndefined();
     expect(result.lock.rail).toBe(PAPER_RAIL_ID);
     expect(result.lock.ref).toBe(CONTRACT);
     expect(result.lock.endpoint).toBe(ENDPOINT);
-    expect(result.lock.verified).toBe(false);
+    expect(result.lock.terms).toEqual(terms());
+    expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toBe(`no paper record${WARNING_SUFFIX}`);
   });
 
-  it("unreadable note value: verified false, reason 'unreadable paper record', no rail", () => {
+  it("unreadable note value: railVerified null (unknown), reason 'unreadable paper record', no rail", () => {
     const result = paperEvidence(terms(), "not a paper record at all", T0, ENDPOINT);
     expect(result.rail).toBeUndefined();
-    expect(result.lock.verified).toBe(false);
+    expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toBe(`unreadable paper record${WARNING_SUFFIX}`);
   });
 
@@ -75,7 +88,7 @@ describe("paperEvidence", () => {
     const value = note({ status: "locked", lock: "point", statement: point.statement, refundAfterMs: terms().refundAfterMs });
     const result = paperEvidence(terms(), value, T0, ENDPOINT);
     expect(result.rail).toBeUndefined();
-    expect(result.lock.verified).toBe(false);
+    expect(result.lock.railVerified).toBe(false);
     expect(result.lock.reason).toBe(`paper record terms differ from the contract${WARNING_SUFFIX}`);
   });
 
@@ -84,7 +97,7 @@ describe("paperEvidence", () => {
     const value = note({ status: "locked", lock: "hash", statement: other.hash, refundAfterMs: terms().refundAfterMs });
     const result = paperEvidence(terms(), value, T0, ENDPOINT);
     expect(result.rail).toBeUndefined();
-    expect(result.lock.verified).toBe(false);
+    expect(result.lock.railVerified).toBe(false);
     expect(result.lock.reason).toBe(`paper record terms differ from the contract${WARNING_SUFFIX}`);
   });
 
@@ -92,7 +105,7 @@ describe("paperEvidence", () => {
     const value = note({ status: "locked", lock: "hash", statement: lock.hash, refundAfterMs: terms().refundAfterMs + 1 });
     const result = paperEvidence(terms(), value, T0, ENDPOINT);
     expect(result.rail).toBeUndefined();
-    expect(result.lock.verified).toBe(false);
+    expect(result.lock.railVerified).toBe(false);
     expect(result.lock.reason).toBe(`paper record terms differ from the contract${WARNING_SUFFIX}`);
   });
 
@@ -107,14 +120,15 @@ describe("paperEvidence", () => {
     });
     const result = paperEvidence(terms(), value, T0, ENDPOINT);
     expect(result.rail).toBeUndefined();
-    expect(result.lock.verified).toBe(false);
+    expect(result.lock.railVerified).toBe(false);
     expect(result.lock.reason).toBe(`claimed record's secret does not open the statement${WARNING_SUFFIX}`);
   });
 
-  it("matching locked record: verified true, rail present, final true", () => {
+  it("matching locked record: railVerified true, rail present, final true", () => {
     const value = note({ status: "locked", lock: "hash", statement: lock.hash, refundAfterMs: terms().refundAfterMs });
     const result = paperEvidence(terms(), value, T0, ENDPOINT);
-    expect(result.lock.verified).toBe(true);
+    expect(result.lock.railVerified).toBe(true);
+    expect(result.lock.terms).toEqual(terms());
     expect(result.lock.reason).toBe(`paper record is locked${WARNING_SUFFIX}`);
     expect(result.rail).toEqual({
       status: "locked",
@@ -124,7 +138,7 @@ describe("paperEvidence", () => {
     });
   });
 
-  it("matching claimed record with a secret that opens the statement: verified false, rail present", () => {
+  it("matching claimed record with a secret that opens the statement: railVerified false, rail present", () => {
     const value = note({
       status: "claimed",
       lock: "hash",
@@ -133,16 +147,16 @@ describe("paperEvidence", () => {
       secret: lock.preimage,
     });
     const result = paperEvidence(terms(), value, T0, ENDPOINT);
-    expect(result.lock.verified).toBe(false);
+    expect(result.lock.railVerified).toBe(false);
     expect(result.lock.reason).toBe(`paper record is claimed${WARNING_SUFFIX}`);
     expect(result.rail?.status).toBe("claimed");
     expect(result.rail?.final).toBe(true);
   });
 
-  it("matching refunded record: verified false, rail present", () => {
+  it("matching refunded record: railVerified false, rail present", () => {
     const value = note({ status: "refunded", lock: "hash", statement: lock.hash, refundAfterMs: terms().refundAfterMs });
     const result = paperEvidence(terms(), value, T0, ENDPOINT);
-    expect(result.lock.verified).toBe(false);
+    expect(result.lock.railVerified).toBe(false);
     expect(result.lock.reason).toBe(`paper record is refunded${WARNING_SUFFIX}`);
     expect(result.rail?.status).toBe("refunded");
     expect(result.rail?.final).toBe(true);
@@ -177,7 +191,7 @@ describe("paperEvidence", () => {
 
     it("decodes and verifies as a matching, claimed (settled-rehearsal) record", () => {
       const result = paperEvidence(
-        { contract, lock: "hash", statement, refundAfterMs },
+        terms({ contract, statement, refundAfterMs }),
         noteValue,
         T0,
         endpoint,
@@ -185,7 +199,7 @@ describe("paperEvidence", () => {
       expect(result.lock.rail).toBe(PAPER_RAIL_ID);
       expect(result.lock.ref).toBe(contract);
       expect(result.lock.endpoint).toBe(endpoint);
-      expect(result.lock.verified).toBe(false); // claimed, not locked: no longer open
+      expect(result.lock.railVerified).toBe(false); // claimed, not locked: no longer open
       expect(result.lock.reason).toBe(`paper record is claimed${WARNING_SUFFIX}`);
       expect(result.rail).toEqual({
         status: "claimed",

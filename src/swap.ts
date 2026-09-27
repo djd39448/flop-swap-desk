@@ -7,16 +7,102 @@
 // here reads a clock or a network.
 // Design: flop-contrib/SPEC-ATOMIC-SWAP-DESK.md (draft 0.1, 2026-09-18), §4.
 
-import { foldTranscript, type TranscriptFoldResult, type TranscriptRecord } from "@flop-labs/tclk";
+import {
+  foldTranscript,
+  lockTerms,
+  type AcceptFrame,
+  type LockTerms,
+  type OfferFrame,
+  type TranscriptFoldResult,
+  type TranscriptRecord,
+} from "@flop-labs/tclk";
 
 import { PAPER_RAIL_ID } from "./paper-evidence.js";
 import { checkOrientation, classifySwapOffer } from "./profile.js";
-import type { SwapFoldInput, SwapView } from "./types.js";
+import type { LockEvidence, SwapFoldInput, SwapView } from "./types.js";
 
 /** Pushed once, on every status (including `settled`), when either leg's lock evidence
  *  came from tclk's `paper` rail — a rehearsal record, never a payment (see
  *  vendor/tclk/src/paper-rail.ts's own warning). */
 export const PAPER_REHEARSAL_REASON = "paper rail: rehearsal only, no value";
+
+/**
+ * The full nine-field `LockTerms` an accepted offer/accept pair commits to, computed the
+ * same way tclk's own `lockTerms(state)` would once the contract is accepted
+ * (`vendor/tclk/src/machine.ts`'s role-based payer/payee assignment: the offerer is payer
+ * when `offer.role === "payer"`, else the acceptor is). Reproduced here (rather than
+ * requiring a full fold) because a caller that has only the authenticated offer/accept pair
+ * — `src/replay.ts`'s candidate discovery, before any leg is folded — already has everything
+ * this needs and nothing else.
+ */
+export function offerAcceptLockTerms(offer: OfferFrame, accept: AcceptFrame): LockTerms {
+  const offerIsPayer = offer.role === "payer";
+  return {
+    contract: accept.contract,
+    lock: offer.lock,
+    statement: accept.statement,
+    amount: offer.amount,
+    asset: offer.asset,
+    payer: offerIsPayer ? offer.from : accept.from,
+    payee: offerIsPayer ? accept.from : offer.from,
+    claimByMs: offer.claimByMs,
+    refundAfterMs: offer.refundAfterMs,
+  };
+}
+
+/** tclk#180: `PaperRail.verifyLock` (and a rail's own check in general) may compare fewer
+ *  than all nine `LockTerms` fields — this is the full field list, in the order H1-SPEC and
+ *  D-03 name them, that the fold itself always checks before a leg counts as locked. */
+const LOCK_TERMS_FIELDS: ReadonlyArray<keyof LockTerms> = [
+  "contract",
+  "lock",
+  "statement",
+  "amount",
+  "asset",
+  "payer",
+  "payee",
+  "claimByMs",
+  "refundAfterMs",
+];
+
+/** The name of the first `LockTerms` field where `actual` differs from `expected`, or `null`
+ *  when all nine match. */
+function lockTermsMismatch(expected: LockTerms, actual: LockTerms): keyof LockTerms | null {
+  for (const field of LOCK_TERMS_FIELDS) {
+    if (expected[field] !== actual[field]) return field;
+  }
+  return null;
+}
+
+interface LockEvaluation {
+  corroborated: boolean;
+  reason?: string;
+}
+
+/**
+ * A leg counts as locked only when its evidence's claimed `LockTerms` equal the accepted
+ * offer's own terms in all nine fields *and* the rail corroborates the lock (`railVerified
+ * === true`) — a rail's own verifyLock is corroboration, never sufficient alone (tclk#180).
+ * Absent evidence, or evidence whose terms mismatch, or a rail that says `false`/`null`, all
+ * leave the leg uncorroborated; a terms mismatch gets a reason naming the field, everything
+ * else falls back to the caller's generic "lock unverified" reason.
+ */
+function evaluateLock(
+  evidence: LockEvidence | undefined,
+  expected: LockTerms,
+  leg: "A" | "B",
+): LockEvaluation {
+  if (evidence === undefined) return { corroborated: false };
+  const mismatch = lockTermsMismatch(expected, evidence.terms);
+  if (mismatch !== null) {
+    return {
+      corroborated: false,
+      reason: `leg ${leg} lock terms differ from the accepted offer: ${mismatch} mismatch`,
+    };
+  }
+  if (evidence.railVerified !== true) return { corroborated: false };
+  return { corroborated: true };
+}
 
 function foldLeg(records: readonly TranscriptRecord[]): TranscriptFoldResult | null {
   return records.length === 0 ? null : foldTranscript(records);
@@ -272,7 +358,6 @@ export function foldSwap(input: SwapFoldInput): SwapView {
   }
 
   const bLocked = legBState.status === "locked";
-  const bLockedVerified = bLocked && evidence.b?.verified === true;
 
   if (!bLocked) {
     if (nowMs >= legAOffer.expiresMs) {
@@ -284,8 +369,12 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     return view;
   }
 
-  if (!bLockedVerified) {
-    reasons.push("leg B lock unverified");
+  // H1 (tclk#180): a leg counts as locked only once its evidence's LockTerms equal the
+  // accepted offer's own terms in all nine fields; a rail's own verifyLock (`railVerified`)
+  // is corroboration on top of that, never sufficient alone.
+  const legBEvaluation = evaluateLock(evidence.b, lockTerms(legBState), "B");
+  if (!legBEvaluation.corroborated) {
+    reasons.push(legBEvaluation.reason ?? "leg B lock unverified");
     view.status = "paired";
     return view;
   }
@@ -302,8 +391,9 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     return view;
   }
 
-  if (evidence.a?.verified !== true) {
-    reasons.push("leg A lock unverified");
+  const legAEvaluation = evaluateLock(evidence.a, lockTerms(legAState), "A");
+  if (!legAEvaluation.corroborated) {
+    reasons.push(legAEvaluation.reason ?? "leg A lock unverified");
     view.status = "b-locked";
     return view;
   }

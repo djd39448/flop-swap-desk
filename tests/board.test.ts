@@ -94,7 +94,12 @@ describe("buildBoard", () => {
     const dealRooms = new Map<string, readonly TranscriptRecord[]>([
       [s1.dealRoomB, [s1.records.lockB]],
     ]);
-    const evidence = new Map([[s1.swapId, { b: { rail: "flop-htlc", ref: "flop-escrow-1", verified: true, checkedAtMs: T0 + 5 * MIN } }]]);
+    const evidence = new Map([
+      [
+        s1.swapId,
+        { b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s1.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN } },
+      ],
+    ]);
 
     const board = buildBoard({ offers, dealRooms, evidence, nowMs: T0 + 6 * MIN });
 

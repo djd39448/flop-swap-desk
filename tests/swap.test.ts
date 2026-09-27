@@ -10,6 +10,7 @@ import {
   makeAccept,
   makeOffer,
   OFFER_ROOM,
+  type LockTerms,
 } from "@flop-labs/tclk";
 import { describe, expect, it } from "vitest";
 
@@ -124,7 +125,8 @@ describe("foldSwap — SPEC §4 states", () => {
         b: {
           rail: "flop-htlc",
           ref: "flop-escrow-1",
-          verified: false,
+          terms: s.legBTerms,
+          railVerified: false,
           checkedAtMs: T0 + 5 * MIN,
           reason: "rpc says not found",
         },
@@ -141,7 +143,7 @@ describe("foldSwap — SPEC §4 states", () => {
       legA: [s.records.offerA, s.records.acceptA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
       evidence: {
-        b: { rail: "flop-htlc", ref: "flop-escrow-1", verified: true, checkedAtMs: T0 + 5 * MIN },
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN },
       },
       nowMs: T0 + 5 * MIN,
     });
@@ -154,7 +156,7 @@ describe("foldSwap — SPEC §4 states", () => {
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
       evidence: {
-        b: { rail: "flop-htlc", ref: "flop-escrow-1", verified: true, checkedAtMs: T0 + 5 * MIN },
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN },
       },
       nowMs: T0 + 6 * MIN,
     });
@@ -168,8 +170,8 @@ describe("foldSwap — SPEC §4 states", () => {
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
       evidence: {
-        a: { rail: "evm-htlc", ref: "evm-escrow-1", verified: true, checkedAtMs: T0 + 6 * MIN },
-        b: { rail: "flop-htlc", ref: "flop-escrow-1", verified: true, checkedAtMs: T0 + 5 * MIN },
+        a: { rail: "evm-htlc", ref: "evm-escrow-1", terms: s.legATerms, railVerified: true, checkedAtMs: T0 + 6 * MIN },
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN },
       },
       nowMs: T0 + 6 * MIN,
     });
@@ -195,7 +197,7 @@ describe("foldSwap — SPEC §4 states", () => {
     const view = foldSwap({
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.revealB],
-      evidence: { b: { rail: "flop-htlc", ref: s.frames.lockB.ref, verified: true, checkedAtMs: T0 } },
+      evidence: { b: { rail: "flop-htlc", ref: s.frames.lockB.ref, terms: s.legBTerms, railVerified: true, checkedAtMs: T0 } },
       nowMs: T0 + 7 * MIN,
     });
     expect(view.status).toBe("revealed");
@@ -234,8 +236,8 @@ describe("foldSwap — SPEC §4 states", () => {
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.revealA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.revealB],
       evidence: {
-        a: { rail: "paper", ref: s.frames.lockA.contract, verified: false, checkedAtMs: T0 + 9 * MIN, reason: "paper record is claimed; paper rail holds no value and a stranger can overwrite it" },
-        b: { rail: "paper", ref: s.frames.lockB.contract, verified: false, checkedAtMs: T0 + 9 * MIN, reason: "paper record is claimed; paper rail holds no value and a stranger can overwrite it" },
+        a: { rail: "paper", ref: s.frames.lockA.contract, terms: s.legATerms, railVerified: false, checkedAtMs: T0 + 9 * MIN, reason: "paper record is claimed; paper rail holds no value and a stranger can overwrite it" },
+        b: { rail: "paper", ref: s.frames.lockB.contract, terms: s.legBTerms, railVerified: false, checkedAtMs: T0 + 9 * MIN, reason: "paper record is claimed; paper rail holds no value and a stranger can overwrite it" },
         aRail: { status: "claimed", final: true, checkedAtMs: T0 + 9 * MIN },
         bRail: { status: "claimed", final: true, checkedAtMs: T0 + 9 * MIN },
       },
@@ -302,7 +304,7 @@ describe("foldSwap — SPEC §4 states", () => {
       legA: [s.records.offerA, s.records.acceptA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
       evidence: {
-        b: { rail: "flop-htlc", ref: "flop-escrow-1", verified: true, checkedAtMs: T0 + 5 * MIN },
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN },
       },
       nowMs: s.frames.offerA.claimByMs + 1_000,
     });
@@ -336,12 +338,117 @@ describe("foldSwap — SPEC §4 states", () => {
       legA: [s.records.offerA, s.records.acceptA, earlyLockA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
       evidence: {
-        b: { rail: "flop-htlc", ref: "flop-escrow-1", verified: true, checkedAtMs: T0 + 4 * MIN },
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 + 4 * MIN },
       },
       nowMs: T0 + 6 * MIN,
     });
     expect(view.reasons).toContain("lock order violated: A before B");
     expect(view.status).toBe("b-locked");
+  });
+});
+
+describe("foldSwap — nine-field lock check (tclk#180)", () => {
+  // tclk#180: PaperRail.verifyLock (and a rail's own check in general) compares only
+  // status/lock/statement/refundAfterMs — four of the nine LockTerms fields. The fold must
+  // never rely on a rail's `railVerified` alone: it independently checks all nine fields on
+  // the evidence's own `terms` against the accepted offer's terms before a leg counts as
+  // locked, and names the mismatched field when they differ.
+  const s = build();
+
+  const fieldMismatches: Array<{ field: keyof LockTerms; corrupt: (terms: LockTerms) => LockTerms }> = [
+    { field: "contract", corrupt: (t) => ({ ...t, contract: `0x${"99".repeat(32)}` }) },
+    { field: "lock", corrupt: (t) => ({ ...t, lock: t.lock === "hash" ? "point" : "hash" }) },
+    { field: "statement", corrupt: (t) => ({ ...t, statement: `0x${"88".repeat(32)}` }) },
+    { field: "amount", corrupt: (t) => ({ ...t, amount: "1" }) },
+    { field: "asset", corrupt: (t) => ({ ...t, asset: "WRONG-ASSET" }) },
+    { field: "payer", corrupt: (t) => ({ ...t, payer: stranger.did }) },
+    { field: "payee", corrupt: (t) => ({ ...t, payee: stranger.did }) },
+    { field: "claimByMs", corrupt: (t) => ({ ...t, claimByMs: t.claimByMs + 1 }) },
+    { field: "refundAfterMs", corrupt: (t) => ({ ...t, refundAfterMs: t.refundAfterMs + 1 }) },
+  ];
+
+  it.each(fieldMismatches)(
+    "leg B stays unlocked (not b-locked) when evidence.terms.$field differs from the accepted offer",
+    ({ field, corrupt }) => {
+      const view = foldSwap({
+        legA: [s.records.offerA, s.records.acceptA],
+        legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+        evidence: {
+          b: {
+            rail: "flop-htlc",
+            ref: "flop-escrow-1",
+            terms: corrupt(s.legBTerms),
+            railVerified: true,
+            checkedAtMs: T0 + 5 * MIN,
+          },
+        },
+        nowMs: T0 + 5 * MIN,
+      });
+      expect(view.status).toBe("paired");
+      expect(view.reasons.some((r) => r.includes(`${field} mismatch`))).toBe(true);
+    },
+  );
+
+  it("leg A stays unlocked (b-locked, not a-locked) when its evidence terms differ from the accepted offer", () => {
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: {
+        a: {
+          rail: "evm-htlc",
+          ref: "evm-escrow-1",
+          terms: { ...s.legATerms, amount: "1" },
+          railVerified: true,
+          checkedAtMs: T0 + 6 * MIN,
+        },
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN },
+      },
+      nowMs: T0 + 6 * MIN,
+    });
+    expect(view.status).toBe("b-locked");
+    expect(view.reasons.some((r) => r.includes("leg A lock terms differ from the accepted offer: amount mismatch"))).toBe(
+      true,
+    );
+  });
+
+  it("a rail's railVerified:true is not sufficient alone when terms otherwise match but the field check would matter", () => {
+    // Same terms as the accepted offer (all nine fields correct) and railVerified:true:
+    // corroborated, reaches b-locked. This is the control for the mismatch cases above.
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: {
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN },
+      },
+      nowMs: T0 + 5 * MIN,
+    });
+    expect(view.status).toBe("b-locked");
+  });
+
+  it("leg B stays unlocked when the rail's own railVerified is false even though terms match exactly", () => {
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: {
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: false, checkedAtMs: T0 + 5 * MIN },
+      },
+      nowMs: T0 + 5 * MIN,
+    });
+    expect(view.status).toBe("paired");
+    expect(view.reasons).toContain("leg B lock unverified");
+  });
+
+  it("leg B stays unlocked when the rail's own railVerified is null (no evidence to check) even with correct terms", () => {
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: {
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: null, checkedAtMs: T0 + 5 * MIN },
+      },
+      nowMs: T0 + 5 * MIN,
+    });
+    expect(view.status).toBe("paired");
+    expect(view.reasons).toContain("leg B lock unverified");
   });
 });
 
@@ -636,7 +743,7 @@ describe("foldSwap — SPEC §6 forgeries are rejected without advancing state",
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA, wrongRevealRecord],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
       evidence: {
-        b: { rail: "flop-htlc", ref: "flop-escrow-1", verified: true, checkedAtMs: T0 + 5 * MIN },
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN },
       },
       nowMs: T0 + 6 * MIN,
     });

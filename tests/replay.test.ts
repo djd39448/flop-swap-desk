@@ -111,7 +111,7 @@ describe("foldCaptured", () => {
     const view = board.swaps.find((sw) => sw.swapId === s.swapId);
     expect(view).toBeDefined();
     expect(view!.evidence.b?.rail).toBe("paper");
-    expect(view!.evidence.b?.verified).toBe(true);
+    expect(view!.evidence.b?.railVerified).toBe(true);
     expect(view!.evidence.bRail?.status).toBe("locked");
     expect(view!.reasons).toContain("paper rail: rehearsal only, no value");
   });

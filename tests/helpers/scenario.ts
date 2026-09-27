@@ -18,6 +18,7 @@ import {
   type CancelFrame,
   type HashLock,
   type LockFrame,
+  type LockTerms,
   type OfferFrame,
   type RefundFrame,
   type RevealFrame,
@@ -25,6 +26,7 @@ import {
 } from "@flop-labs/tclk";
 
 import { legAContext, legBContext, swapId as computeSwapId } from "../../src/profile.js";
+import { offerAcceptLockTerms } from "../../src/swap.js";
 import { type Identity, record } from "./identity.js";
 
 const MINUTE_MS = 60_000;
@@ -85,6 +87,10 @@ export interface Scenario {
   /** The mainline happy path, in venue order: bid → accepted → paired → b-locked →
    *  a-locked → revealed → settled. Slice it for any earlier state. */
   mainline: TranscriptRecord[];
+  /** The nine-field `LockTerms` each leg's accepted offer/accept commits to (H1, tclk#180) —
+   *  what a leg's evidence `.terms` must equal for the fold to count it as corroborated. */
+  legATerms: LockTerms;
+  legBTerms: LockTerms;
 }
 
 export function scenario(options: ScenarioOptions): Scenario {
@@ -246,5 +252,7 @@ export function scenario(options: ScenarioOptions): Scenario {
     },
     records,
     mainline,
+    legATerms: offerAcceptLockTerms(offerA, acceptA),
+    legBTerms: offerAcceptLockTerms(offerB, acceptB),
   };
 }
