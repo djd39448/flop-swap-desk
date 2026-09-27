@@ -66,6 +66,8 @@ export function fakeBuildBoard({ offers, dealRooms }: BoardInput): Board {
       // This fake never sets up rail evidence, so both legs are always "none" (H3) --
       // matches src/swap.ts's own settlementViewForLeg for the no-evidence case.
       settlementView: { a: "none", b: "none" },
+      // This fake never disambiguates accepts by counterparty at all (H4) -- nothing here.
+      coordinationOnly: [],
       reasons: [],
     });
   }

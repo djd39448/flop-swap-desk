@@ -134,6 +134,19 @@ export interface SwapEvidence {
  */
 export type SettlementView = "none" | "unverified" | "unfunded" | "funded" | "claimed" | "refunded";
 
+/**
+ * H4: a verdict this desk drew that rests on data the venue's signatures do not cover — an
+ * unsigned venue `ts` (used to order two records against each other) or the export's row
+ * order (used to break a tie among several candidates). Neither is forgeable into a fake
+ * *frame*, but a venue (or a MITM of an unauthenticated read) could still misreport them, so
+ * anything derived from them is labeled, never silently trusted the same as a signed field
+ * (tclk#175, and the reordering/timestamp concerns in tclk#93/#96).
+ */
+export interface CoordinationOnlyFlag {
+  basis: "coordination-only";
+  reason: string;
+}
+
 /** The desk's view of one swap. Every field is derived; `reasons` says why, fail-closed. */
 export interface SwapView {
   swapId: string | null;
@@ -151,6 +164,9 @@ export interface SwapView {
   evidence: SwapEvidence;
   /** H3: per-leg settlement view, from rail evidence alone — see `SettlementView`. */
   settlementView: { a: SettlementView; b: SettlementView };
+  /** H4: every verdict folded into this view that rests on unsigned venue `ts` or export row
+   *  order — see `CoordinationOnlyFlag`. Empty when nothing here depended on either. */
+  coordinationOnly: CoordinationOnlyFlag[];
   reasons: string[];
   /** The revealed preimage once leg A's reveal verified (world-readable by design). */
   secret?: string;

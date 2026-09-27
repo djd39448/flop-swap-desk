@@ -212,6 +212,9 @@ export function foldSwap(input: SwapFoldInput): SwapView {
       a: settlementViewForLeg(evidence.a, evidence.aRail),
       b: settlementViewForLeg(evidence.b, evidence.bRail),
     },
+    // H4: board.ts appends its own entries here too (an accept chosen by export row order),
+    // for verdicts this function has no visibility into.
+    coordinationOnly: [],
     reasons,
   };
 
@@ -339,7 +342,12 @@ export function foldSwap(input: SwapFoldInput): SwapView {
   view.sellerDid = legAState.payeeDid;
 
   if (lockOrderViolated(input.legA, legAFold, input.legB, legBFold)) {
-    reasons.push("lock order violated: A before B");
+    const reason = "lock order violated: A before B";
+    reasons.push(reason);
+    // H4: this verdict compares two records' unsigned venue `timestampMs` against each
+    // other (tclk#175/#93/#96) — the venue's own metadata, not covered by either sender's
+    // signature.
+    view.coordinationOnly.push({ basis: "coordination-only", reason: `${reason} (depends on unsigned venue ts)` });
   }
 
   if (legAState.status === "cancelled" || legBState.status === "cancelled") {

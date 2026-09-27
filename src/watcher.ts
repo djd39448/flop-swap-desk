@@ -325,7 +325,16 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   const exportUrl = `${baseUrl}/r/${OFFER_ROOM}/export`;
   let exportBody: string;
   try {
-    exportBody = (await fetchWithTimeout(fetchImpl, exportUrl, timeoutMs, userAgent)).body;
+    const response = await fetchWithTimeout(fetchImpl, exportUrl, timeoutMs, userAgent);
+    // H4: a non-2xx export response (a 502/503 gateway page, say) is a transport failure,
+    // not something to hand to parseTranscriptExport and misreport as a parse error — the
+    // status code lands in report.transport.error, which bin/watch.mjs prints on the sweep
+    // line. Nothing is persisted under raw/tclk-offers/ for a response that isn't the export.
+    if (response.status < 200 || response.status >= 300) {
+      report.transport = { url: exportUrl, error: `http ${response.status}` };
+      return report;
+    }
+    exportBody = response.body;
   } catch (error) {
     report.transport = { url: exportUrl, error: error instanceof Error ? error.message : String(error) };
     return report;

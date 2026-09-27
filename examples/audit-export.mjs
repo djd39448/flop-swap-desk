@@ -295,6 +295,8 @@ function describeSwap(view) {
     status: view.status,
     // H3: money state per leg, from rail evidence alone (tclk PR #173 vocabulary).
     settlementView: view.settlementView,
+    // H4: verdicts here that rest on unsigned venue ts or export row order (tclk#175).
+    coordinationOnly: view.coordinationOnly,
     reasons: view.reasons,
     buyerDid: view.buyerDid,
     sellerDid: view.sellerDid,
@@ -313,6 +315,7 @@ function printReport(swaps, unpaired) {
     process.stdout.write(`  offer-room seqs: ${swap.offerRoomSeqs.join(", ") || "(none)"}\n`);
     process.stdout.write(`  deal-room seqs:  ${swap.dealRoomSeqs.join(", ") || "(none)"}\n`);
     for (const ref of swap.finalizedRefs) process.stdout.write(`  finalizedRef: ${ref}\n`);
+    for (const flag of swap.coordinationOnly) process.stdout.write(`  coordination-only: ${flag.reason}\n`);
     for (const reason of swap.reasons) process.stdout.write(`  reason: ${reason}\n`);
   }
   if (unpaired.length > 0) {

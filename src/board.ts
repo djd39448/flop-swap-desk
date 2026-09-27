@@ -71,17 +71,26 @@ function buildLegRecords(
   return records;
 }
 
+interface ChosenAccept {
+  accept: AuthenticatedFrame | undefined;
+  /** H4: true iff picking `accept` depended on the offers-room export's row order rather
+   *  than a matching counterparty — only possible when there was more than one candidate to
+   *  choose among (with exactly one, no reordering of the input could have changed the
+   *  answer, so it is not order-*dependent*, just order-*only* input). tclk#175. */
+  coordinationOnly: boolean;
+}
+
 /** The accept from `counterparty` if one exists, else the earliest; undefined when none. */
 function chooseAccept(
   accepts: readonly AuthenticatedFrame[] | undefined,
   counterparty: string | undefined,
-): AuthenticatedFrame | undefined {
-  if (accepts === undefined || accepts.length === 0) return undefined;
+): ChosenAccept {
+  if (accepts === undefined || accepts.length === 0) return { accept: undefined, coordinationOnly: false };
   if (counterparty !== undefined) {
     const own = accepts.find((candidate) => candidate.frame.from === counterparty);
-    if (own !== undefined) return own;
+    if (own !== undefined) return { accept: own, coordinationOnly: false };
   }
-  return accepts[0];
+  return { accept: accepts[0], coordinationOnly: accepts.length > 1 };
 }
 
 /** Fold every offer in `input.offers` (all of `tclk-offers`, venue order) into a board. */
@@ -155,19 +164,34 @@ export function buildBoard(input: BoardInput): Board {
   const swaps: SwapView[] = [];
   for (const [legAOfferId, legA] of legAByOfferId) {
     const legB = legBByLegAOfferId.get(legAOfferId);
-    const acceptA = chooseAccept(acceptsByRef.get(legAOfferId), legB?.offer.from);
-    const legARecords = buildLegRecords(legA.record, acceptA, input.dealRooms);
-    const legBRecords = legB
-      ? buildLegRecords(legB.record, chooseAccept(acceptsByRef.get(legB.offer.id), legA.offer.from), input.dealRooms)
-      : [];
+    const acceptAChoice = chooseAccept(acceptsByRef.get(legAOfferId), legB?.offer.from);
+    const legARecords = buildLegRecords(legA.record, acceptAChoice.accept, input.dealRooms);
+    const acceptBChoice = legB
+      ? chooseAccept(acceptsByRef.get(legB.offer.id), legA.offer.from)
+      : { accept: undefined, coordinationOnly: false };
+    const legBRecords = legB ? buildLegRecords(legB.record, acceptBChoice.accept, input.dealRooms) : [];
     const evidence = input.evidence?.get(legA.swapId);
-    swaps.push(
-      foldSwap(
-        evidence === undefined
-          ? { legA: legARecords, legB: legBRecords, nowMs: input.nowMs }
-          : { legA: legARecords, legB: legBRecords, evidence, nowMs: input.nowMs },
-      ),
+    const view = foldSwap(
+      evidence === undefined
+        ? { legA: legARecords, legB: legBRecords, nowMs: input.nowMs }
+        : { legA: legARecords, legB: legBRecords, evidence, nowMs: input.nowMs },
     );
+    // H4: foldSwap has no visibility into how an accept was chosen among several candidates
+    // for the same offer id — that choice happens here, before folding — so it is appended
+    // after the fact rather than threaded through as another input (tclk#175).
+    if (acceptAChoice.coordinationOnly && acceptAChoice.accept !== undefined) {
+      view.coordinationOnly.push({
+        basis: "coordination-only",
+        reason: "leg A's accept chosen by export row order among several candidates, not a matching counterparty",
+      });
+    }
+    if (acceptBChoice.coordinationOnly && acceptBChoice.accept !== undefined) {
+      view.coordinationOnly.push({
+        basis: "coordination-only",
+        reason: "leg B's accept chosen by export row order among several candidates, not a matching counterparty",
+      });
+    }
+    swaps.push(view);
   }
 
   return { swaps, unpaired };

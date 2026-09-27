@@ -320,6 +320,36 @@ describe("runSweep", () => {
     expect(await readFile(join(root, "raw", "tclk-offers", isoDir[0]!), "utf8")).toBe(badBody);
   });
 
+  it("classifies a non-2xx export response (a 502 gateway page) as a transport error, not a parse error, and says the status code (H4)", async () => {
+    const gatewayPage = "<html><body>502 Bad Gateway</body></html>";
+    const fetchImpl = makeFetch((url) => {
+      if (url.endsWith("/r/tclk-offers/export")) return { status: 502, body: gatewayPage };
+      return { status: 404, body: "" };
+    }, []);
+
+    const report = await runSweep({ ...baseOptions(), fetch: fetchImpl });
+    expect(report.ok).toBe(false);
+    expect(report.offerParseError).toBeUndefined();
+    expect(report.transport).toBeDefined();
+    expect(report.transport?.error).toBe("http 502");
+    expect(existsSync(join(root, "board.json"))).toBe(false);
+
+    // A gateway error page is not the export: nothing was written under raw/tclk-offers/.
+    expect(existsSync(join(root, "raw", "tclk-offers"))).toBe(false);
+  });
+
+  it("classifies a 503 export response the same way, with its own status code", async () => {
+    const fetchImpl = makeFetch((url) => {
+      if (url.endsWith("/r/tclk-offers/export")) return { status: 503, body: "Service Unavailable" };
+      return { status: 404, body: "" };
+    }, []);
+
+    const report = await runSweep({ ...baseOptions(), fetch: fetchImpl });
+    expect(report.ok).toBe(false);
+    expect(report.offerParseError).toBeUndefined();
+    expect(report.transport?.error).toBe("http 503");
+  });
+
   it("only fetches deal rooms for swap-leg contracts, capped at maxDealRooms (earliest first)", async () => {
     const swapA = buildSwap("aaaa0001", 1, NOW - 10_000);
     const swapB = buildSwap("aaaa0002", 10, NOW - 9_000);

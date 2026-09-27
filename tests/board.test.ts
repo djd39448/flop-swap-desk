@@ -137,11 +137,21 @@ describe("buildBoard", () => {
     expect(board.swaps[0]?.status).toBe("paired");
     expect(board.swaps[0]?.sellerDid).toBe(seller.did);
     expect(board.unpaired).toEqual([]);
+    // H4: the counterparty match found leg B's own opener, so nothing here was picked by
+    // export row order.
+    expect(board.swaps[0]?.coordinationOnly).toEqual([]);
 
-    // With no leg B at all, the earliest accept stands in (an ordinary accepted bid).
+    // With no leg B at all, the earliest accept stands in (an ordinary accepted bid) --
+    // and, with two candidate accepts (stranger + seller) and no leg B yet to disambiguate
+    // them, that choice is exactly the row-order-dependent one H4 flags (tclk#175): it is
+    // also, in this slice, the *wrong* identity (the stranger's), which is the point.
     const lone = buildBoard({ offers: offers.slice(0, 3), dealRooms: new Map(), nowMs: T0 + 4 * MIN });
     expect(lone.swaps[0]?.status).toBe("accepted");
     expect(lone.swaps[0]?.sellerDid).toBe(stranger.did);
+    expect(lone.swaps[0]?.coordinationOnly).toContainEqual({
+      basis: "coordination-only",
+      reason: "leg A's accept chosen by export row order among several candidates, not a matching counterparty",
+    });
   });
 
   it("reports a competing second leg B as unpaired, loses the earliest-seq tie-break", () => {
@@ -286,5 +296,18 @@ describe("buildBoard", () => {
     expect(board.swaps).toHaveLength(1);
     expect(board.swaps[0]?.status).toBe("paired");
     expect(board.swaps[0]?.feeBps).toBe(0);
+  });
+
+  it("does not flag coordination-only when leg A has exactly one accept and no leg B yet (no ambiguity for row order to resolve)", () => {
+    const s1 = scenario({ buyer, seller, t0: T0, swapNonce: "8888888888888888" });
+    const seq = seqCounter();
+    const offers: TranscriptRecord[] = [seq(s1.records.offerA), seq(s1.records.acceptA)];
+    const board = buildBoard({ offers, dealRooms: new Map(), nowMs: T0 + 2 * MIN });
+    expect(board.swaps).toHaveLength(1);
+    expect(board.swaps[0]?.status).toBe("accepted");
+    expect(board.swaps[0]?.sellerDid).toBe(seller.did);
+    // H4: a single candidate is not "chosen by row order" -- no reordering of the input
+    // could have produced a different answer, so this is not the tclk#175 risk.
+    expect(board.swaps[0]?.coordinationOnly).toEqual([]);
   });
 });

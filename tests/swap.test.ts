@@ -344,6 +344,26 @@ describe("foldSwap — SPEC §4 states", () => {
     });
     expect(view.reasons).toContain("lock order violated: A before B");
     expect(view.status).toBe("b-locked");
+    // H4 (tclk#175): this verdict compares two records' unsigned venue timestamps.
+    expect(view.coordinationOnly).toContainEqual({
+      basis: "coordination-only",
+      reason: "lock order violated: A before B (depends on unsigned venue ts)",
+    });
+  });
+
+  it("no coordination-only flags on the ordinary happy path (no lock-order issue)", () => {
+    const s = build();
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: {
+        a: { rail: "evm-htlc", ref: "evm-escrow-1", terms: s.legATerms, railVerified: true, checkedAtMs: T0 + 6 * MIN },
+        b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN },
+      },
+      nowMs: T0 + 6 * MIN,
+    });
+    expect(view.status).toBe("a-locked");
+    expect(view.coordinationOnly).toEqual([]);
   });
 });
 
