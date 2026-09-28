@@ -112,16 +112,20 @@ function buildBtcFixture() {
     record(OFFER_ROOM, 4, T0 + 3 * MIN, buyer, encodeFrame(legBAccept)),
   ];
 
+  // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame, matching the real client flows
+  // (P4-BTC-SPEC.md §7 — both parties post their pubkey line, THEN the Buyer funds and posts the
+  // lock frame) and `replay.ts`'s own `beforeSeq: accepted.seq` rule, which now ignores anything
+  // at or after the accepted lock's own seq.
   const dealRoomA = dealRoom(legAAccept.contract);
   const dealRoomARows = [
-    record(dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame({
-      type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "btc-htlc", ref: REF,
-    })),
-    record(dealRoomA, 2, T0 + 4.5 * MIN, seller, formatPubkeyLine({
+    record(dealRoomA, 1, T0 + 4 * MIN, seller, formatPubkeyLine({
       railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYEE_PUBKEY,
     })),
-    record(dealRoomA, 3, T0 + 4.5 * MIN + 1, buyer, formatPubkeyLine({
+    record(dealRoomA, 2, T0 + 4 * MIN + 1, buyer, formatPubkeyLine({
       railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYER_PUBKEY,
+    })),
+    record(dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame({
+      type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "btc-htlc", ref: REF,
     })),
   ];
 
@@ -336,6 +340,61 @@ describe("examples/audit-export.mjs — btc-htlc leg end to end", () => {
     const result = run(["--root", root]);
     expect(result.status).toBe(2);
     expect(result.stderr).toMatch(/btc rail config is invalid.*not on the allow list/);
+  });
+
+  it("R2-3: a conflicting pubkey line posted AFTER the accepted lock frame leaves leg A funded (never re-resolved)", async () => {
+    const fixture = buildBtcFixture();
+    // A second, conflicting pubkey line for the Seller (payee), posted after the lock frame the
+    // tclk machine actually accepted (seq 3) — per G1's own rule (now applied on replay too,
+    // R2-3), this must neither add to nor conflict with what already resolved before the lock.
+    fixture.dealRoomARows.push(
+      record(fixture.dealRoomA, 4, T0 + 5 * MIN, seller, formatPubkeyLine({
+        railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: `03${"ee".repeat(32)}`,
+      })),
+    );
+    await writeWatchRoot(root, fixture, { rails: { btc: BTC_CONFIG } });
+
+    const result = run(["--root", root, "--json"]);
+    expect(result.status).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    const swap = parsed.swaps.find((s: { swapId: string }) => s.swapId === fixture.swapId);
+    expect(swap).toBeDefined();
+    expect(swap.settlementView.a).toBe("funded");
+  });
+
+  it("R2-5: a genuine response from a DIFFERENT capture (the donor's own nonce id) leaves leg A without chain evidence, naming the capture binding", async () => {
+    const fixture = buildBtcFixture();
+    await writeWatchRoot(root, fixture, { rails: { btc: BTC_CONFIG } });
+
+    // H8's own splice defence, exercised through the real CLI: a donor exchange that is itself
+    // genuine and self-consistent (its own request id equals its own response's embedded id) but
+    // minted under a DIFFERENT capture (a different nonce) — so only `idBoundToCapture` can catch
+    // it, never a bare id-mismatch check.
+    const donorNonce = "dddddddddddddddd";
+    const donorId = `${REF}:${fixture.index.checkedAtMs}:${donorNonce}:1`;
+    const donorBody = jsonRpcResult(donorId, { chain: "regtest", blocks: TIP_HEIGHT });
+    const donorSha = sha256Hex(donorBody);
+    await writeFile(join(root, "raw", "rpc", `${donorSha}.json`), donorBody);
+
+    const splicedIndex = {
+      ...fixture.index,
+      exchanges: fixture.index.exchanges.map((exchange, i) =>
+        i === 0
+          ? { ...exchange, requestBody: JSON.stringify({ jsonrpc: "2.0", id: donorId, method: "getblockchaininfo", params: [] }), responseSha256: donorSha }
+          : exchange,
+      ),
+    };
+    await writeFile(join(root, "raw", "btc", `${FUND_TXID}-${FUND_VOUT}`, "only.json"), JSON.stringify(splicedIndex, null, 2));
+
+    const result = run(["--root", root, "--json"]);
+    expect(result.status).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    const swap = parsed.swaps.find((s: { swapId: string }) => s.swapId === fixture.swapId);
+    expect(swap).toBeDefined();
+    expect(swap.settlementView.a).toBe("none");
+    expect(swap.finalizedRefs).toEqual([]);
+    expect(swap.evidence.a.railVerified).toBeNull();
+    expect(swap.evidence.a.reason).toMatch(/not bound to this capture/);
   });
 
   it("prints a note, still replays, and fails the leg closed when the newest capture index is corrupted", async () => {

@@ -1011,8 +1011,10 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
-      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
+      // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
+      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -1045,8 +1047,10 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const revealB: RevealFrame = { type: "reveal", from: buyer.did, contract: s.legBAccept.contract, ref: s.legBAccept.contract, secret: s.lock.preimage };
 
     const dealRoomsA = [
-      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
+      // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
+      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
       record(s.dealRoomA, 4, T0 + 5 * MIN, seller, encodeFrame(revealA)),
     ];
     const dealRoomsB = [
@@ -1089,8 +1093,10 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
-      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
+      // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
+      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -1126,8 +1132,10 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
-      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
+      // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
+      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -1158,8 +1166,10 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
-      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
+      // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
+      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -1201,8 +1211,8 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const forgedLockA: LockFrame = { type: "lock", from: seller.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
-      record(s.dealRoomA, 1, T0 + 4 * MIN, seller, encodeFrame(forgedLockA)),
-      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      record(s.dealRoomA, 3, T0 + 4.5 * MIN, seller, encodeFrame(forgedLockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -1229,8 +1239,10 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
-      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
+      // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
+      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 

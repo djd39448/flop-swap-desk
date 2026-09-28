@@ -1293,10 +1293,12 @@ describe("runSweep", () => {
       function dealRowsA(baseDealMs: number) {
         const sellerLine = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYEE_PUBKEY });
         const buyerLine = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYER_PUBKEY });
+        // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
+        // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
         return [
-          rowFromRecord(record(dealRoomA, 1, baseDealMs, buyer, encodeFrame(lockA))),
-          rowFromRecord(record(dealRoomA, 2, baseDealMs + 1, seller, sellerLine)),
-          rowFromRecord(record(dealRoomA, 3, baseDealMs + 2, buyer, buyerLine)),
+          rowFromRecord(record(dealRoomA, 1, baseDealMs, seller, sellerLine)),
+          rowFromRecord(record(dealRoomA, 2, baseDealMs + 1, buyer, buyerLine)),
+          rowFromRecord(record(dealRoomA, 3, baseDealMs + 2, buyer, encodeFrame(lockA))),
         ];
       }
 
