@@ -87,8 +87,15 @@ function toBtcHtlcTerms(terms: LockTerms, accounts: RailAccounts): BtcHtlcTerms 
   return { hashLock: terms.statement, amountSats: terms.amount, refundAfterMs: terms.refundAfterMs, payeePubkey, payerPubkey };
 }
 
-function toWriteEvidence(evidence: { ref: string; txid: string; blockHeight: number | null; blockHash: string | null; raw: string[] }): RailWriteEvidence {
-  return { ref: evidence.ref, txid: evidence.txid, blockHeight: evidence.blockHeight, blockHash: evidence.blockHash, raw: evidence.raw };
+function toWriteEvidence(evidence: { ref: string; txid: string; blockHeight: number | null; blockHash: string | null; raw: string[]; rawTx?: string }): RailWriteEvidence {
+  return {
+    ref: evidence.ref,
+    txid: evidence.txid,
+    blockHeight: evidence.blockHeight,
+    blockHash: evidence.blockHash,
+    raw: evidence.raw,
+    ...(evidence.rawTx === undefined ? {} : { rawTx: evidence.rawTx }),
+  };
 }
 
 class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
@@ -153,6 +160,20 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
     const btcTerms = toBtcHtlcTerms(this.terms, this.accounts);
     const evidence = await this.btcRail.refund(ref, btcTerms, this.ownWallet(), this.options.destinationAddress);
     return toWriteEvidence(evidence);
+  }
+
+  /** P4-BTC-FIXES-R2.md R2-1: re-check the chain and re-send `priorEvidence`'s own recorded
+   *  bytes (`priorEvidence.rawTx`/`priorEvidence.txid`) if they have dropped — see
+   *  `BtcHtlcRail.resendRefundIfDropped`'s own doc for the exact conditions. `priorEvidence`
+   *  unchanged (never a new write, never a thrown "cannot resend") when there is nothing to
+   *  resend from at all — unreachable via `BuyerFlow`, which always records `refund()`'s own
+   *  `rawTx` before this could ever be called, kept defensive rather than assumed. */
+  async resendRefundIfDropped(ref: string, priorEvidence: RailWriteEvidence): Promise<RailWriteEvidence> {
+    if (priorEvidence.rawTx === undefined || priorEvidence.txid === undefined) {
+      return priorEvidence;
+    }
+    const result = await this.btcRail.resendRefundIfDropped(ref, priorEvidence.txid, priorEvidence.rawTx);
+    return result.resent ? { ...priorEvidence, txid: result.txid, raw: result.raw } : priorEvidence;
   }
 
   /** D-11: capture live, then decide (`src/rails/btc-evidence.ts`) — never throws for a

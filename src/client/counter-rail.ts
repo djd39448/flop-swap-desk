@@ -73,6 +73,12 @@ export interface RailWriteEvidence {
   /** Bitcoin only — `null` immediately after broadcast (a regtest node never auto-mines); the
    *  evidence reader, not this write, is what later confirms a height. */
   blockHeight?: number | null;
+  /** P4-BTC-FIXES-R2.md R2-1: a Bitcoin REFUND's own exact signed transaction bytes (hex) —
+   *  `src/rails/btc-htlc.ts`'s `WriteEvidence.rawTx` — kept so a later retry can re-send the
+   *  IDENTICAL bytes if they drop out of the mempool without confirming
+   *  (`ConnectedCounterAssetRail.resendRefundIfDropped`), never rebuilding or re-signing. Absent
+   *  for every other write (fund/claim never need a retry-resend path; EVM has no such concept). */
+  rawTx?: string;
 }
 
 /** D-11's "capture live, then decide" contract (mirrors `src/rails/evm-evidence.ts`'s
@@ -131,6 +137,15 @@ export interface ConnectedCounterAssetRail {
    *  rail's own adapter wraps unchanged. */
   claim(ref: string, secret: string, notAfterMs: number): Promise<RailWriteEvidence>;
   refund(ref: string): Promise<RailWriteEvidence>;
+  /** P4-BTC-FIXES-R2.md R2-1: on a refund retry (this connected handle's own `refund()` already
+   *  broadcast once), re-check the chain and re-send `priorEvidence`'s own EXACT bytes
+   *  (`priorEvidence.rawTx`) if they have genuinely dropped (not in the mempool, not confirmed)
+   *  while the escrow remains unspent by anyone — idempotent (identical bytes reproduce the
+   *  identical txid), and never rebuilds or re-signs. Optional: a rail with no such concept
+   *  (today: `evm-htlc` — no behaviour change for EVM) simply omits it; `BuyerFlow.refundLegA`
+   *  only calls this when the connected handle actually implements it, and otherwise treats
+   *  `priorEvidence` as still the live truth. */
+  resendRefundIfDropped?(ref: string, priorEvidence: RailWriteEvidence): Promise<RailWriteEvidence>;
   /** D-11: capture live, then decide — never throws for a chain-state reason, only a genuine
    *  transport failure. */
   verifyLockFinal(terms: LockTerms, ref: string, accounts: RailAccounts): Promise<RailEvidenceResult>;

@@ -31,7 +31,7 @@ import {
   scriptPubKeyForAddress,
   type FundingUtxo,
 } from "./btc-script.js";
-import type { CapturingRpc } from "./rpc-capture.js";
+import { RpcCaptureError, type CapturingRpc } from "./rpc-capture.js";
 
 export type BtcNetworkName = "regtest" | "signet";
 
@@ -238,6 +238,16 @@ function validateTerms(terms: BtcHtlcTerms): void {
   }
 }
 
+/** P4-BTC-FIXES-R2.md R2-2: Core's own "No such mempool or blockchain transaction"/"Transaction
+ *  not in mempool" answer (code -5) is the ONLY legitimate negative result for a lookup by txid
+ *  — any other error (a transport failure, a malformed response, a rejected auth header) must
+ *  propagate rather than be swallowed into the same "never reached the network" verdict a caller
+ *  would otherwise treat as safe to act on (R2-1's own `resendRefundIfDropped` is exactly such a
+ *  caller: it must never treat "the node timed out" as "safe to resend"). */
+function isRpcNotFound(error: unknown): boolean {
+  return error instanceof RpcCaptureError && error.code === -5;
+}
+
 function parseOutpointRef(ref: string): { txid: string; vout: number } {
   if (!REF_SHAPE.test(ref)) {
     throw new Error(`btc-htlc: ref must look like "<64-hex txid>:<vout>", got "${ref}"`);
@@ -364,6 +374,11 @@ export interface WriteEvidence {
    *  A10's rule, reused here: a snapshot-at-start slice, never a `drain()` that could also sweep
    *  up an earlier, un-drained read). */
   raw: string[];
+  /** P4-BTC-FIXES-R2.md R2-1: `refund()`'s own exact signed transaction bytes (hex), kept so a
+   *  caller can re-send the IDENTICAL bytes later (`resendRefundIfDropped`) if they drop out of
+   *  the mempool without confirming, rather than building (and therefore signing) a new refund.
+   *  Absent from `fund()`/`claim()` — neither needs a retry-resend path today. */
+  rawTx?: string;
 }
 
 export interface BtcHtlcRailOptions {
@@ -474,9 +489,9 @@ export class BtcHtlcRail {
     return await this.request<string>("sendrawtransaction", [rawHex]);
   }
 
-  private finishWriteEvidence(ref: string, txid: string, before: number): WriteEvidence {
+  private finishWriteEvidence(ref: string, txid: string, before: number, rawTx?: string): WriteEvidence {
     const raw = this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256);
-    return { ref, txid, blockHeight: null, blockHash: null, raw };
+    return { ref, txid, blockHeight: null, blockHash: null, raw, ...(rawTx === undefined ? {} : { rawTx }) };
   }
 
   /** The chain's tip block time, in ms. One of the two chain-time helpers spec §4 asks for. */
@@ -578,18 +593,80 @@ export class BtcHtlcRail {
    * (the harness runs `-txindex=1`, so this answers for a mempool-only tx too, not only a mined
    * one); a "no such transaction" answer means "never reached the network" (`broadcast: false`),
    * never a thrown exception.
+   *
+   * P4-BTC-FIXES-R2.md R2-2: ONLY an `RpcCaptureError` carrying Core's own "No such mempool or
+   * blockchain transaction" code (-5) may return `broadcast: false` — every other error (a
+   * transport failure, a malformed response, an unexpected JSON-RPC error code) throws. Before
+   * this fix, ANY error here — including one that says nothing about whether the transaction was
+   * ever broadcast — was silently folded into "never reached the network", which is unsound: a
+   * caller acting on that verdict (R2-1's own `resendRefundIfDropped`) could then re-send a
+   * refund that was, in fact, already confirmed or still safely pending, on nothing more than a
+   * blip the node happened to answer with a different error shape.
    */
   async recoverFunding(txid: string): Promise<RecoveredFunding> {
     await this.assertPinnedChain();
     let result: { confirmations?: unknown; blockhash?: unknown };
     try {
       result = await this.request<{ confirmations?: unknown; blockhash?: unknown }>("getrawtransaction", [txid, true]);
-    } catch {
-      return { broadcast: false, blockHash: null, confirmations: null };
+    } catch (error) {
+      if (isRpcNotFound(error)) return { broadcast: false, blockHash: null, confirmations: null };
+      throw error;
     }
     const confirmations = typeof result.confirmations === "number" && Number.isInteger(result.confirmations) ? result.confirmations : 0;
     const blockHash = typeof result.blockhash === "string" ? result.blockhash : null;
     return { broadcast: true, blockHash, confirmations };
+  }
+
+  /**
+   * P4-BTC-FIXES-R2.md R2-1: idempotent resend of a previously-broadcast refund whose bytes are
+   * already recorded (`refundRawTx`, `refund()`'s own `WriteEvidence.rawTx`) — NEVER rebuilds or
+   * re-signs anything; resending identical bytes always reproduces the identical `refundTxid` (a
+   * hash of those exact bytes), so this can only ever confirm the same write is back in the
+   * mempool, never create a new one. Only actually re-sends when ALL of:
+   *
+   *  1. `refundTxid` is not currently sitting in the mempool (`getmempoolentry` answers "not
+   *     found" — R2-2's own code-(-5)-only rule applies here too);
+   *  2. it is not confirmed either (`recoverFunding`: fewer than 1 confirmation, or never seen at
+   *     all); and
+   *  3. the funding outpoint remains unspent by ANYONE, considering the mempool too
+   *     (`gettxout(..., true)`) — so a claim that has already reached the mempool (not yet mined)
+   *     is never raced by a blind resend; the caller's own evidence read is what discovers that.
+   *
+   * Never throws for a chain-state reason; a genuine transport failure from any of its own reads
+   * propagates (the same R2-2 discipline).
+   */
+  async resendRefundIfDropped(ref: string, refundTxid: string, refundRawTx: string): Promise<{ resent: boolean; txid: string; raw: string[] }> {
+    const { txid: fundTxid, vout: fundVout } = parseOutpointRef(ref);
+    await this.assertPinnedChain();
+    const before = this.rpc.exchanges().length;
+    const done = (resent: boolean, txid: string) => ({ resent, txid, raw: this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256) });
+
+    try {
+      await this.request("getmempoolentry", [refundTxid]);
+      return done(false, refundTxid); // still pending in the mempool — nothing dropped
+    } catch (error) {
+      if (!isRpcNotFound(error)) throw error;
+    }
+
+    const recovered = await this.recoverFunding(refundTxid);
+    if (recovered.confirmations !== null && recovered.confirmations >= 1) {
+      return done(false, refundTxid); // already confirmed
+    }
+
+    const txout = await this.request<Record<string, unknown> | null>("gettxout", [fundTxid, fundVout, true]);
+    if (txout === null) {
+      // Spent by something else (most likely a claim, not yet or already confirmed) — never
+      // resend blind; the caller's own evidence read (verifyLockFinal) discovers and reports this.
+      return done(false, refundTxid);
+    }
+
+    const sentTxid = await this.broadcastOrThrow(refundRawTx);
+    if (sentTxid !== refundTxid) {
+      // Unreachable given identical bytes hash deterministically to the identical txid — kept as
+      // a loud sanity check rather than silently returning a mismatched ref/txid pair.
+      throw new Error("btc-htlc: resending the recorded refund produced a different txid than recorded (unexpected)");
+    }
+    return done(true, sentTxid);
   }
 
   /**
@@ -731,7 +808,9 @@ export class BtcHtlcRail {
     }
 
     const txid = await this.broadcastOrThrow(processed.hex);
-    return this.finishWriteEvidence(ref, txid, before);
+    // R2-1: record the exact signed bytes broadcast, so a later retry can re-send the IDENTICAL
+    // transaction if it drops out of the mempool without confirming (`resendRefundIfDropped`).
+    return this.finishWriteEvidence(ref, txid, before, processed.hex);
   }
 
   /**

@@ -580,15 +580,24 @@ export class BuyerFlow {
    * room (a pubkey/account line posted after funding can neither block nor help this call, and
    * this method depends on nothing the venue could have changed since).
    *
-   * G7: broadcasts at most once (a retry that finds the refund not yet confirmed must only ever
-   * re-check, never resend — this build's fixed fee carries no bump to retry with anyway, and
-   * Core 28+'s own full-RBF-by-default policy means it is the mempool's call, not this flow's,
-   * whether a second identical broadcast would do anything), and reports success — posting the
-   * refund/receipt frames, at most once — only once the evidence reader itself shows the refund
-   * confirmed. A broadcast the mempool accepted is not by itself evidence of what will actually
-   * end up spending the outpoint: after `T` the claim and the refund race (no on-chain claim
-   * deadline, README "Bitcoin leg"), so this checks the real outcome rather than assume the
-   * refund it just sent is the one that won.
+   * G7: builds and signs at most one refund transaction ever (this build's fixed fee carries no
+   * bump to retry with anyway, and Core 28+'s own full-RBF-by-default policy means it is the
+   * mempool's call, not this flow's, whether a second identical broadcast would do anything), and
+   * reports success — posting the refund/receipt frames, at most once — only once the evidence
+   * reader itself shows the refund confirmed. A broadcast the mempool accepted is not by itself
+   * evidence of what will actually end up spending the outpoint: after `T` the claim and the
+   * refund race (no on-chain claim deadline, README "Bitcoin leg"), so this checks the real
+   * outcome rather than assume the refund it just sent is the one that won.
+   *
+   * P4-BTC-FIXES-R2.md R2-1: a retry (this method called again after an earlier call found the
+   * refund not yet confirmed) never rebuilds or re-signs anything — but it is no longer a bare
+   * re-check either. The already-broadcast refund can drop out of the mempool (expiry, an RBF
+   * eviction by an unrelated transaction) without ever confirming, and while it stays dropped the
+   * HTLC output remains unspent and claimable by the Seller. So every retry re-checks the chain
+   * and, on a rail that implements it (`resendRefundIfDropped`), re-sends the SAME recorded bytes
+   * when they have genuinely dropped and the escrow is still unspent — idempotent (the identical
+   * bytes reproduce the identical txid), never a new write. If the outpoint was instead claimed,
+   * the read below still routes to `learnSecret`/`claimLegB`, exactly as before.
    */
   async refundLegA(): Promise<RailWriteEvidence> {
     const { offerA, acceptA } = this.requirePaired();
@@ -610,6 +619,13 @@ export class BuyerFlow {
     if (this.legARefundEvidence === undefined) {
       const before = connected.exchanges.length;
       this.legARefundEvidence = await connected.refund(railRef);
+      this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+    } else if (connected.resendRefundIfDropped !== undefined) {
+      // R2-1: a retry — the earlier broadcast may simply still be pending, or it may have
+      // genuinely dropped out of the mempool while the HTLC stays unspent. Never re-builds or
+      // re-signs; a rail with no such concept (evm-htlc) leaves `legARefundEvidence` untouched.
+      const before = connected.exchanges.length;
+      this.legARefundEvidence = await connected.resendRefundIfDropped(railRef, this.legARefundEvidence);
       this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
     }
 
