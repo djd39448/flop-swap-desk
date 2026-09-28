@@ -17,6 +17,7 @@
     "build": "npm run build:vendor && tsc -p tsconfig.json",
     "test": "npm run build && vitest run",
     "test:anvil": "npm run build && forge build && vitest run --config vitest.anvil.config.ts",
+    "test:regtest": "npm run build && vitest run --config vitest.regtest.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "watch": "node bin/watch.mjs"
   },
