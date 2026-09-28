@@ -310,13 +310,22 @@ party or reveal the secret without payment.
   only broadcast, not yet mined: `learnSecret` (via `findClaimedPreimage`) checks the mempool
   first (`gettxspendingprevout`, then the spender's own witness), never only the bounded block scan
   (P4-BTC-FIXES-R3.md K1). `BuyerFlow.refundLegA` reads the outpoint's own state — a pending or
-  already-mined claim included — *before* ever building a refund, and routes to
+  already-mined claim included — on every call, retries included, *before* building or re-sending
+  a refund, and routes to
   `learnSecret()`/`claimLegB()` with a clear reason the moment one is found, rather than racing a
   doomed broadcast (K2); once it does build one, it reports a refund only once it confirms, and
   re-sends the same recorded refund if it dropped out of the mempool. `claimByMs` itself is
   enforced only by the Seller's own client, and none of this removes the underlying race after
   `T` — it only ensures each side's own client sees the same chain/mempool state the other one
   does, as early as its own next read.
+- **Two lost-reply cases end with the money right but the frames missing.** (1) If the Seller's
+  claim broadcast reply is lost and the claim is mined before the retry, `claimLegA` refuses on the
+  retry (the lock now reads `claimed`), so the Seller's reveal and receipt frames are never posted;
+  the Seller already has the BTC and the Buyer still learns the secret from the chain. (2) If the
+  Buyer's refund broadcast reply is lost and the refund is mined (and its output spent) before the
+  retry, `refundLegA` fails with the node's raw rejection instead of posting its refund frames; the
+  Buyer already has its BTC back. In both cases the watcher's evidence still shows the leg's real
+  state from the chain.
 - **The refund waits for median time past, which lags wall clock.** `T = refundAfterMs / 1000` is
   checked against the chain's median time of its last 11 blocks (BIP113), not the tip block's own
   timestamp or wall-clock "now" — so a refund's real, chain-observable availability lags
