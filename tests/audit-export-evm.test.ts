@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { encodeFunctionResult, type Address } from "viem";
+import { encodeFunctionData, encodeFunctionResult, type Address } from "viem";
 import { dealRoom, encodeFrame, generateHashLock, makeAccept, makeOffer, OFFER_ROOM } from "@flop-labs/tclk";
 
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
@@ -116,7 +116,14 @@ function buildEvmFixture(contractAddress: Address) {
   const chainIdBody = jsonRpcResult(1, `0x${ANVIL_LOCAL_PIN.chainId.toString(16)}`);
   const blockBody = jsonRpcResult(2, { number: "0x5", hash: BLOCK_HASH });
   const callBody = jsonRpcResult(3, callResult);
+  const callParams = [
+    { to: EVM_CONFIG.contract, data: encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [lock.hash as `0x${string}`] }) },
+    { blockHash: BLOCK_HASH },
+  ];
 
+  // P22-P24-EVM-FIXES.md A1: each exchange's own `requestBody` must actually ask for its
+  // declared `method`/`params` — these three are what a real `CapturingRpc` would have sent,
+  // never a placeholder, since `evmEvidence` now binds every read to its own request.
   const index = {
     v: 1,
     rail: "evm-htlc",
@@ -128,10 +135,29 @@ function buildEvmFixture(contractAddress: Address) {
     hashLock: lock.hash,
     checkedAtMs: T0 + 5 * MIN,
     finality: { mode: "tag", tag: "finalized" },
+    config: EVM_CONFIG,
     exchanges: [
-      { method: "eth_chainId", params: [], requestBody: "{}", responseSha256: sha256Hex(chainIdBody), atMs: T0 },
-      { method: "eth_getBlockByNumber", params: ["finalized", false], requestBody: "{}", responseSha256: sha256Hex(blockBody), atMs: T0 },
-      { method: "eth_call", params: [{ to: EVM_CONFIG.contract, data: "0xdeadbeef" }, { blockHash: BLOCK_HASH }], requestBody: "{}", responseSha256: sha256Hex(callBody), atMs: T0 },
+      {
+        method: "eth_chainId",
+        params: [],
+        requestBody: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
+        responseSha256: sha256Hex(chainIdBody),
+        atMs: T0,
+      },
+      {
+        method: "eth_getBlockByNumber",
+        params: ["finalized", false],
+        requestBody: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_getBlockByNumber", params: ["finalized", false] }),
+        responseSha256: sha256Hex(blockBody),
+        atMs: T0,
+      },
+      {
+        method: "eth_call",
+        params: callParams,
+        requestBody: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "eth_call", params: callParams }),
+        responseSha256: sha256Hex(callBody),
+        atMs: T0,
+      },
     ],
   };
 
@@ -197,24 +223,24 @@ describe("loadRails", () => {
 });
 
 describe("loadEvmCaptures", () => {
-  it("returns an empty map when raw/evm does not exist", () => {
-    expect(loadEvmCaptures(root).size).toBe(0);
+  it("returns an empty map when raw/evm does not exist", async () => {
+    expect((await loadEvmCaptures(root)).size).toBe(0);
   });
 
-  it("loads the latest index per hashLock, and load() re-verifies raw/rpc bytes", async () => {
+  it("loads the latest index per hashLock, with pre-verified raw/rpc bytes (P22-P24-EVM-FIXES.md A11)", async () => {
     const fixture = buildEvmFixture(RAIL_CONTRACT);
     await writeWatchRoot(root, fixture);
 
-    const chain = loadEvmCaptures(root);
+    const chain = await loadEvmCaptures(root);
     expect(chain.size).toBe(1);
     const capture = chain.get(fixture.lock.hash);
     expect(capture).toBeDefined();
     expect(capture.index.hashLock).toBe(fixture.lock.hash);
 
     const goodSha = fixture.index.exchanges[0]!.responseSha256;
-    await expect(capture.load(goodSha)).resolves.toBe(fixture.chainIdBody);
+    expect(new TextDecoder().decode(capture.bytes.get(goodSha))).toBe(fixture.chainIdBody);
     // A sha256 that was never written (or a tampered one) is "missing", never thrown.
-    await expect(capture.load("0".repeat(64))).resolves.toBeNull();
+    expect(capture.bytes.get("0".repeat(64)) ?? null).toBeNull();
   });
 });
 

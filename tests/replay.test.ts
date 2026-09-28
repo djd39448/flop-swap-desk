@@ -17,7 +17,7 @@ import {
 } from "@flop-labs/tclk";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { encodeFunctionResult, type Address, type Hex } from "viem";
+import { encodeFunctionData, encodeFunctionResult, type Address, type Hex } from "viem";
 import { describe, expect, it } from "vitest";
 
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
@@ -110,7 +110,7 @@ describe("foldCaptured", () => {
       statement: s.lock.hash,
       refundAfterMs: s.legBOffer.refundAfterMs,
     });
-    const board = await foldCaptured({
+    const board = foldCaptured({
       offers: s.offers,
       dealRooms: new Map([[s.dealRoomB, s.dealRoomsB]]),
       notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteValue}\n`, endpoint: "kv:test" }]]),
@@ -126,7 +126,7 @@ describe("foldCaptured", () => {
 
   it("a candidate with a paper lock but no captured note gets no evidence for that leg", async () => {
     const s = buildPaperSwap();
-    const board = await foldCaptured({
+    const board = foldCaptured({
       offers: s.offers,
       dealRooms: new Map([[s.dealRoomB, s.dealRoomsB]]),
       notes: new Map(), // nothing captured — mirrors a 404 or an uncaptured replay
@@ -201,10 +201,10 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
   interface ExchangeSpec { method: string; params: unknown; body: string }
 
   function buildCapture(hashLock: string, exchanges: ExchangeSpec[]): EvmCapture {
-    const bySha = new Map<string, string>();
+    const bySha = new Map<string, Uint8Array>();
     const indexExchanges = exchanges.map((spec, i) => {
       const sha = sha256Hex(spec.body);
-      bySha.set(sha, spec.body);
+      bySha.set(sha, new TextEncoder().encode(spec.body));
       return {
         method: spec.method,
         params: spec.params,
@@ -224,16 +224,17 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       hashLock,
       checkedAtMs: T0,
       finality: { mode: "tag", tag: "finalized" },
+      config: EVM_CONFIG,
       exchanges: indexExchanges,
     };
-    return { index, load: (sha) => bySha.get(sha) ?? null };
+    return { index, bytes: bySha };
   }
 
   /** The standard chainId/finalized-block/eth_call sequence, all synthetic. `chainId`
    *  overrides what the (also synthetic) `eth_chainId` RPC response itself reports — this is
    *  what `evmEvidence` actually decodes against the pin, never the capture index's own
    *  `chainId` metadata field. */
-  function standardExchanges(callResult: Hex, chainId = ANVIL_LOCAL_PIN.chainId): ExchangeSpec[] {
+  function standardExchanges(hashLock: Hex, callResult: Hex, chainId = ANVIL_LOCAL_PIN.chainId): ExchangeSpec[] {
     return [
       { method: "eth_chainId", params: [], body: jsonRpcResult(1, `0x${chainId.toString(16)}`) },
       {
@@ -243,7 +244,10 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       },
       {
         method: "eth_call",
-        params: [{ to: EVM_CONFIG.contract, data: "0xdeadbeef" }, { blockHash: BLOCK_HASH }],
+        params: [
+          { to: EVM_CONFIG.contract, data: encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [hashLock] }) },
+          { blockHash: BLOCK_HASH },
+        ],
         body: jsonRpcResult(3, callResult),
       },
     ];
@@ -328,9 +332,9 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
     const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
-    const capture = buildCapture(s.lock.hash, standardExchanges(encodeLocksResult({ status: Status.Locked })));
+    const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
 
-    const board = await foldCaptured({
+    const board = foldCaptured({
       offers: s.offers,
       dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
       notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
@@ -343,7 +347,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     expect(view).toBeDefined();
     expect(view!.evidence.a?.rail).toBe("evm-htlc");
     expect(view!.evidence.a?.railVerified).toBe(true);
-    expect(view!.evidence.aRail).toEqual({ status: "locked", final: true, checkedAtMs: T0 + 6 * MIN, finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
+    expect(view!.evidence.aRail).toEqual({ status: "locked", final: true, checkedAtMs: T0, finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
     expect(view!.status).toBe("a-locked");
   });
 
@@ -371,9 +375,9 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       refundAfterMs: s.legBOffer.refundAfterMs,
       secret: s.lock.preimage,
     });
-    const capture = buildCapture(s.lock.hash, standardExchanges(encodeLocksResult({ status: Status.Claimed })));
+    const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Claimed })));
 
-    const board = await foldCaptured({
+    const board = foldCaptured({
       offers: s.offers,
       dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
       notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
@@ -400,9 +404,9 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
-    const capture = buildCapture(s.lock.hash, standardExchanges(encodeLocksResult({ status: Status.Refunded })));
+    const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Refunded })));
 
-    const board = await foldCaptured({
+    const board = foldCaptured({
       offers: s.offers,
       dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
       notes: new Map(), // leg B's note was never captured: irrelevant to this leg-A case
@@ -413,7 +417,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
 
     const view = board.swaps.find((sw) => sw.swapId === s.swapId);
     expect(view).toBeDefined();
-    expect(view!.evidence.aRail).toEqual({ status: "refunded", final: true, checkedAtMs: T0 + 6 * MIN, finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
+    expect(view!.evidence.aRail).toEqual({ status: "refunded", final: true, checkedAtMs: T0, finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
     expect(view!.status).toBe("refunded-a");
   });
 
@@ -428,10 +432,10 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
     const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
-    const capture = buildCapture(s.lock.hash, standardExchanges(encodeLocksResult({ status: Status.Locked })));
-    const tamperedCapture: EvmCapture = { index: capture.index, load: () => null }; // every read now "missing"
+    const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
+    const tamperedCapture: EvmCapture = { index: capture.index, bytes: new Map() }; // every read now "missing"
 
-    const board = await foldCaptured({
+    const board = foldCaptured({
       offers: s.offers,
       dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
       notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
@@ -460,9 +464,9 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
 
     const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
     // The RPC itself reports Base Sepolia's chain id, but rails.evm below still pins anvil-local.
-    const capture = buildCapture(s.lock.hash, standardExchanges(encodeLocksResult({ status: Status.Locked }), 84532));
+    const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Locked }), 84532));
 
-    const board = await foldCaptured({
+    const board = foldCaptured({
       offers: s.offers,
       dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
       notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
@@ -490,9 +494,9 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
-    const capture = buildCapture(s.lock.hash, standardExchanges(encodeLocksResult({ status: Status.Locked })));
+    const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
 
-    const board = await foldCaptured({
+    const board = foldCaptured({
       offers: s.offers,
       dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
       notes: new Map(),
@@ -518,10 +522,10 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
     const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
-    const capture = buildCapture(s.lock.hash, standardExchanges(encodeLocksResult({ status: Status.Locked })));
+    const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
 
     // No `rails` field at all — same as every call in this file before §5 existed.
-    const board = await foldCaptured({
+    const board = foldCaptured({
       offers: s.offers,
       dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
       notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),

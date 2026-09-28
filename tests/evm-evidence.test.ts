@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { encodeFunctionResult, type Address, type Hex } from "viem";
+import { encodeFunctionData, encodeFunctionResult, type Address, type Hex } from "viem";
 import type { LockTerms } from "@flop-labs/tclk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -114,17 +114,29 @@ interface ExchangeSpec {
   body: string;
 }
 
+/** The real `locks(hashLock)` calldata — P22-P24-EVM-FIXES.md A1 now requires a captured
+ *  `eth_call`'s own request to actually carry this (not a placeholder), or the exchange fails
+ *  to bind. */
+function locksCallData(hashLock: string): Hex {
+  return encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [hashLock as Hex] });
+}
+
+/** Also builds each exchange's request/response bytes so A1's binding (requestBody parses to
+ *  exactly the declared method/params; the response's own `id` matches) holds by default —
+ *  every `it.each`/override in this file that wants a *tampered* exchange does so explicitly,
+ *  never by accident of a sloppy fixture. */
 function buildCapture(opts: {
   hashLock?: string;
   contract?: Address;
   chainId?: number;
   finality?: EvmCaptureIndex["finality"];
+  config?: EvmRailConfig;
   exchanges: ExchangeSpec[];
 }): EvmCapture {
-  const bySha = new Map<string, string>();
+  const bySha = new Map<string, Uint8Array>();
   const exchanges: EvmCaptureIndexExchange[] = opts.exchanges.map((spec, i) => {
     const sha = sha256Hex(spec.body);
-    bySha.set(sha, spec.body);
+    bySha.set(sha, new TextEncoder().encode(spec.body));
     return {
       method: spec.method,
       params: spec.params,
@@ -144,9 +156,10 @@ function buildCapture(opts: {
     hashLock: opts.hashLock ?? HASH_LOCK,
     checkedAtMs: CHECKED_AT_MS,
     finality: opts.finality ?? { mode: "tag", tag: "finalized" },
+    config: opts.config ?? CONFIG,
     exchanges,
   };
-  return { index, load: (sha256Hex_) => bySha.get(sha256Hex_) ?? null };
+  return { index, bytes: bySha };
 }
 
 /** The standard three-exchange sequence (chainId, finalized tag, eth_call) for a status/field
@@ -182,7 +195,7 @@ function standardExchanges(opts: {
   if (!opts.omitCall) {
     specs.push({
       method: "eth_call",
-      params: [{ to: CONFIG.contract, data: "0xdeadbeef" }, { blockHash: opts.blockHash ?? BLOCK_HASH }],
+      params: [{ to: CONFIG.contract, data: locksCallData(HASH_LOCK) }, { blockHash: opts.blockHash ?? BLOCK_HASH }],
       body: opts.callError ? jsonRpcError(3, -32000, "execution reverted") : jsonRpcResult(3, opts.callResult ?? "0x"),
     });
   }
@@ -196,7 +209,7 @@ describe("evmEvidence — happy path", () => {
     const capture = buildCapture({
       exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }),
     });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
 
     expect(result.lock.railVerified).toBe(true);
     expect(result.rail).toEqual({ status: "locked", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
@@ -215,7 +228,6 @@ describe("evmEvidence — happy path", () => {
       config: CONFIG,
       accounts: { payee: PAYEE },
       capture,
-      checkedAtMs: CHECKED_AT_MS,
     });
     expect(result.lock.railVerified).toBe(true);
     expect(result.lock.reason).toMatch(/payer unbound/);
@@ -228,7 +240,7 @@ describe("evmEvidence — ref/lock gate", () => {
       hashLock: "0x" + "99".repeat(32),
       exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }),
     });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(false);
     expect(result.rail).toBeUndefined();
   });
@@ -236,7 +248,7 @@ describe("evmEvidence — ref/lock gate", () => {
   it("terms.lock !== 'hash' -> railVerified false, no rail", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
     const pointTerms: LockTerms = { ...TERMS, lock: "point" };
-    const result = await evmEvidence({ terms: pointTerms, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: pointTerms, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(false);
     expect(result.rail).toBeUndefined();
   });
@@ -245,14 +257,14 @@ describe("evmEvidence — ref/lock gate", () => {
 describe("evmEvidence — chain id and contract checks", () => {
   it("captured chain id differs from the pin -> railVerified null", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ chainId: 84532, callResult: encodeLocksResult({ status: Status.Locked }) }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/does not match pin/);
   });
 
   it("eth_chainId exchange itself is an rpc error -> railVerified null", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ chainIdError: true, callResult: encodeLocksResult({ status: Status.Locked }) }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/rpc rejected eth_chainId/);
   });
@@ -262,13 +274,52 @@ describe("evmEvidence — chain id and contract checks", () => {
       contract: addr("a-different-contract"),
       exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }),
     });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/contract does not match/);
+  });
+
+  // P22-P24-EVM-FIXES.md A2: every hex value is validated before hexToNumber — never a thrown
+  // exception on captured data.
+  it("eth_chainId result is null (not a hex string at all) -> railVerified null, never throws", async () => {
+    const capture = buildCapture({
+      exchanges: [
+        { method: "eth_chainId", params: [], body: jsonRpcResult(1, null) },
+        ...standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }).slice(1),
+      ],
+    });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/malformed eth_chainId result/);
+  });
+
+  it("eth_chainId result is a non-hex string -> railVerified null, never throws", async () => {
+    const capture = buildCapture({
+      exchanges: [
+        { method: "eth_chainId", params: [], body: jsonRpcResult(1, "not-hex-at-all") },
+        ...standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }).slice(1),
+      ],
+    });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/malformed eth_chainId result/);
   });
 });
 
 describe("evmEvidence — finalized-view resolution", () => {
+  // P22-P24-EVM-FIXES.md A2: the finalized block's own `.number` is a hex value read from
+  // captured (untrusted) data — never handed to hexToNumber unchecked.
+  it("finalized tag's block has a non-hex number field -> railVerified null, never throws", async () => {
+    const capture = buildCapture({
+      exchanges: [
+        { method: "eth_chainId", params: [], body: jsonRpcResult(1, "0x7a69") },
+        { method: "eth_getBlockByNumber", params: ["finalized", false], body: jsonRpcResult(2, { number: "not-hex", hash: BLOCK_HASH }) },
+      ],
+    });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+  });
+
   it("rpc lacks the finalized tag and no fallbackConfirmations is configured -> fail closed", async () => {
     const capture = buildCapture({
       exchanges: [
@@ -276,7 +327,7 @@ describe("evmEvidence — finalized-view resolution", () => {
         { method: "eth_getBlockByNumber", params: ["finalized", false], body: jsonRpcError(2, -32601, "unsupported") },
       ],
     });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toBe("rpc lacks the finalized tag and no fallbackConfirmations is configured");
     expect(result.rail).toBeUndefined();
@@ -289,7 +340,7 @@ describe("evmEvidence — finalized-view resolution", () => {
         { method: "eth_getBlockByNumber", params: ["finalized", false], body: jsonRpcResult(2, null) },
       ],
     });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/rpc lacks the finalized tag/);
   });
@@ -301,7 +352,7 @@ describe("evmEvidence — finalized-view resolution", () => {
         { method: "eth_getBlockByNumber", params: ["finalized", false], body: jsonRpcResult(2, { number: "0x5", hash: null }) },
       ],
     });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
   });
 
@@ -311,6 +362,7 @@ describe("evmEvidence — finalized-view resolution", () => {
       pin: { ...PIN, finality: { mode: "tag", tag: "finalized", fallbackConfirmations: 2 } },
     };
     const capture = buildCapture({
+      config: configWithFallback, // A4: replay decodes per the config this was captured under
       finality: { mode: "tag", tag: "finalized" },
       exchanges: [
         { method: "eth_chainId", params: [], body: jsonRpcResult(1, "0x7a69") },
@@ -323,12 +375,12 @@ describe("evmEvidence — finalized-view resolution", () => {
         },
         {
           method: "eth_call",
-          params: [{ to: CONFIG.contract, data: "0xdeadbeef" }, { blockHash: FALLBACK_BLOCK_HASH }],
+          params: [{ to: CONFIG.contract, data: locksCallData(HASH_LOCK) }, { blockHash: FALLBACK_BLOCK_HASH }],
           body: jsonRpcResult(5, encodeLocksResult({ status: Status.Locked })),
         },
       ],
     });
-    const result = await evmEvidence({ terms: TERMS, config: configWithFallback, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: configWithFallback, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(true);
     expect(result.lock.finalizedRef).toBe(`anvil-local:confirmations-2:7:${FALLBACK_BLOCK_HASH}`);
   });
@@ -336,6 +388,7 @@ describe("evmEvidence — finalized-view resolution", () => {
   it("mode 'confirmations' always uses latest-N, regardless of any tag", async () => {
     const confirmationsConfig: EvmRailConfig = { ...CONFIG, pin: { ...PIN, finality: { mode: "confirmations", confirmations: 3 } } };
     const capture = buildCapture({
+      config: confirmationsConfig, // A4: replay decodes per the config this was captured under
       finality: { mode: "confirmations", confirmations: 3 },
       exchanges: [
         { method: "eth_chainId", params: [], body: jsonRpcResult(1, "0x7a69") },
@@ -347,12 +400,12 @@ describe("evmEvidence — finalized-view resolution", () => {
         },
         {
           method: "eth_call",
-          params: [{ to: CONFIG.contract, data: "0xdeadbeef" }, { blockHash: FALLBACK_BLOCK_HASH }],
+          params: [{ to: CONFIG.contract, data: locksCallData(HASH_LOCK) }, { blockHash: FALLBACK_BLOCK_HASH }],
           body: jsonRpcResult(4, encodeLocksResult({ status: Status.Locked })),
         },
       ],
     });
-    const result = await evmEvidence({ terms: TERMS, config: confirmationsConfig, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: confirmationsConfig, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(true);
     expect(result.lock.finalizedRef).toBe(`anvil-local:confirmations-3:7:${FALLBACK_BLOCK_HASH}`);
   });
@@ -361,29 +414,29 @@ describe("evmEvidence — finalized-view resolution", () => {
 describe("evmEvidence — the eth_call read itself", () => {
   it("missing/tampered capture (no eth_call exchange at all) -> railVerified null", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ omitCall: true }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/missing\/tampered capture/);
   });
 
-  it("capture.load returns null for the eth_call exchange (tampered file) -> railVerified null", async () => {
+  it("every capture byte is missing (tampered/never written) -> railVerified null", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
-    const tampered: EvmCapture = { index: capture.index, load: async () => null };
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: tampered, checkedAtMs: CHECKED_AT_MS });
+    const tampered: EvmCapture = { index: capture.index, bytes: new Map() };
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: tampered });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/missing\/tampered capture/);
   });
 
   it("eth_call rpc error -> railVerified null", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callError: true }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/rpc rejected eth_call/);
   });
 
   it("malformed locks() result (not valid ABI-encoded output) -> railVerified null", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: "0x1234" as Hex }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toBe("malformed locks() result");
   });
@@ -392,7 +445,7 @@ describe("evmEvidence — the eth_call read itself", () => {
 describe("evmEvidence — on-chain status", () => {
   it("status None -> railVerified null, 'no lock at the finalized view', no rail", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.None }) }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toBe("no lock at the finalized view");
     expect(result.rail).toBeUndefined();
@@ -400,23 +453,33 @@ describe("evmEvidence — on-chain status", () => {
 
   it("status Claimed -> railVerified false, rail observation claimed/final", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Claimed }) }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(false);
     expect(result.rail).toEqual({ status: "claimed", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
   });
 
   it("status Refunded -> railVerified false, rail observation refunded/final", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Refunded }) }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(false);
     expect(result.rail).toEqual({ status: "refunded", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+  });
+
+  // P22-P24-EVM-FIXES.md A2: an on-chain status outside 0..3 (the contract's own declared
+  // range) must never be silently treated as Locked — it decodes to "malformed", not a guess.
+  it("status 7 (outside the contract's declared range) -> railVerified null, 'unknown status', no rail", async () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: 7 }) }) });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toBe("malformed locks() result (unknown status)");
+    expect(result.rail).toBeUndefined();
   });
 });
 
 describe("evmEvidence — Locked branch field-by-field compare", () => {
   it("payee has no account line -> railVerified null, rail still reported", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: { payer: PAYER }, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: { payer: PAYER }, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toBe("payee has no account line");
     expect(result.rail?.status).toBe("locked");
@@ -425,7 +488,7 @@ describe("evmEvidence — Locked branch field-by-field compare", () => {
   it("asset has no configured token address -> railVerified null, rail still reported", async () => {
     const noAssetConfig: EvmRailConfig = { ...CONFIG, assets: {} };
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
-    const result = await evmEvidence({ terms: TERMS, config: noAssetConfig, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: noAssetConfig, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/has no configured token address/);
     expect(result.rail?.status).toBe("locked");
@@ -440,7 +503,7 @@ describe("evmEvidence — Locked branch field-by-field compare", () => {
     ["payer", { payer: OTHER }, /payer differs/],
   ] as const)("%s mismatch -> railVerified false, rail still reported", async (_label, overrides, pattern) => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked, ...overrides }) }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(false);
     expect(result.lock.reason).toMatch(pattern);
     expect(result.rail?.status).toBe("locked");
@@ -450,7 +513,7 @@ describe("evmEvidence — Locked branch field-by-field compare", () => {
     const capture = buildCapture({
       exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked, payer: OTHER }) }),
     });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: { payee: PAYEE }, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: { payee: PAYEE }, capture });
     expect(result.lock.railVerified).toBe(true);
     expect(result.lock.reason).toMatch(/payer unbound/);
   });
@@ -458,7 +521,7 @@ describe("evmEvidence — Locked branch field-by-field compare", () => {
   it("addresses compare case-insensitively (isAddressEqual)", async () => {
     const upper = PAYEE.toUpperCase().replace("0X", "0x") as Address;
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked, payee: upper }) }) });
-    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture, checkedAtMs: CHECKED_AT_MS });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(true);
   });
 });
@@ -495,15 +558,138 @@ describe("captureEvmLeg + evmEvidence — live vs replay equivalence", () => {
 
     const liveCapture: EvmCapture = {
       index,
-      load: (sha) => exchanges.find((e) => e.responseSha256 === sha)?.responseBody ?? null,
+      bytes: new Map(exchanges.map((e) => [e.responseSha256, new TextEncoder().encode(e.responseBody)])),
     };
-    const liveResult = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: liveCapture, checkedAtMs: CHECKED_AT_MS });
+    const liveResult = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: liveCapture });
     expect(liveResult.lock.railVerified).toBe(true);
 
     await writeCapture(root, exchanges);
-    const replayCapture: EvmCapture = { index, load: (sha) => readCapture(root, sha) };
-    const replayResult = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: replayCapture, checkedAtMs: CHECKED_AT_MS });
+    const replayBytes = new Map(
+      await Promise.all(
+        index.exchanges.map(async (e): Promise<[string, Uint8Array | null]> => {
+          const body = await readCapture(root, e.responseSha256);
+          return [e.responseSha256, body === null ? null : new TextEncoder().encode(body)];
+        }),
+      ),
+    );
+    const replayCapture: EvmCapture = { index, bytes: replayBytes };
+    const replayResult = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: replayCapture });
 
     expect(replayResult).toEqual(liveResult);
+  });
+});
+
+// P22-P24-EVM-FIXES.md A1: every exchange this decodes from must be bound to what it actually
+// claims to be — never merely trusted because a candidate exchange's own (editable) `.method`/
+// `.params` metadata said so. Each test below tampers exactly one thing a real attacker could
+// edit in the index file and confirms the leg comes back unverified, never thrown.
+describe("evmEvidence — A1: bind every exchange to its request", () => {
+  it("a genuine response from a different exchange spliced in as the eth_call's own -> unverified (id mismatch)", () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    const blockSha = capture.index.exchanges[1]!.responseSha256;
+    const spliced: EvmCaptureIndex = {
+      ...capture.index,
+      exchanges: capture.index.exchanges.map((exchange, i) => (i === 2 ? { ...exchange, responseSha256: blockSha } : exchange)),
+    };
+    const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: { index: spliced, bytes: capture.bytes } });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/missing\/tampered capture/);
+  });
+
+  it("the finalized-tag exchange's own requestBody was rewritten to ask for latest instead -> unverified", () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    const tamperedExchanges = capture.index.exchanges.map((exchange, i) =>
+      i === 1
+        ? { ...exchange, requestBody: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_getBlockByNumber", params: ["latest", false] }) }
+        : exchange,
+    );
+    const tampered: EvmCaptureIndex = { ...capture.index, exchanges: tamperedExchanges };
+    const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: { index: tampered, bytes: capture.bytes } });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/missing\/tampered capture/);
+  });
+
+  it("the eth_call request targets a different contract than config.contract -> unverified", () => {
+    const wrongTo = addr("a-sneaky-contract");
+    const exchanges = standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }).map((spec) =>
+      spec.method === "eth_call" ? { ...spec, params: [{ to: wrongTo, data: locksCallData(HASH_LOCK) }, { blockHash: BLOCK_HASH }] } : spec,
+    );
+    const capture = buildCapture({ exchanges });
+    const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/does not target this deployment's contract/);
+  });
+
+  it("the eth_call request encodes a different hashLock's calldata -> unverified", () => {
+    const wrongHashLock = "0x" + "77".repeat(32);
+    const exchanges = standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }).map((spec) =>
+      spec.method === "eth_call" ? { ...spec, params: [{ to: CONFIG.contract, data: locksCallData(wrongHashLock) }, { blockHash: BLOCK_HASH }] } : spec,
+    );
+    const capture = buildCapture({ exchanges });
+    const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/does not encode locks\(hashLock\)/);
+  });
+
+  it("the eth_call request is pinned to a different block hash than the finalized view -> unverified", () => {
+    const wrongHash = ("0x" + "99".repeat(32)) as Hex;
+    const exchanges = standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }).map((spec) =>
+      spec.method === "eth_call" ? { ...spec, params: [{ to: CONFIG.contract, data: locksCallData(HASH_LOCK) }, { blockHash: wrongHash }] } : spec,
+    );
+    const capture = buildCapture({ exchanges });
+    const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/not pinned to the finalized block/);
+  });
+});
+
+// P22-P24-EVM-FIXES.md A4: a capture's own config (frozen at capture time) must agree with the
+// auditor's supplied config on chain id, contract and this leg's asset — otherwise a later
+// rails.json edit could silently change how an old capture replays.
+describe("evmEvidence — A4: the capture's own config must match the auditor's", () => {
+  it("captured config's pin.chainId differs from the auditor's -> railVerified null", () => {
+    const capturedConfig: EvmRailConfig = { ...CONFIG, pin: { ...PIN, chainId: 84532 } };
+    const capture = buildCapture({ config: capturedConfig, exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/capture was taken under a different rail config/);
+  });
+
+  it("captured config's contract differs from the auditor's -> railVerified null", () => {
+    const capturedConfig: EvmRailConfig = { ...CONFIG, contract: addr("a-different-contract") };
+    const capture = buildCapture({ config: capturedConfig, exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/capture was taken under a different rail config/);
+  });
+
+  it("captured config's asset token address differs from the auditor's -> railVerified null", () => {
+    const capturedConfig: EvmRailConfig = { ...CONFIG, assets: { USDC: addr("a-different-usdc") } };
+    const capture = buildCapture({ config: capturedConfig, exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/capture was taken under a different rail config/);
+  });
+
+  it("a pre-A4 capture with no config field at all -> railVerified null, never trusted implicitly", () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    const noConfigIndex = { ...capture.index } as Partial<EvmCaptureIndex>;
+    delete noConfigIndex.config;
+    const result = evmEvidence({
+      terms: TERMS,
+      config: CONFIG,
+      accounts: ACCOUNTS,
+      capture: { index: noConfigIndex as EvmCaptureIndex, bytes: capture.bytes },
+    });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/no usable config/);
+  });
+
+  it("captured config's finality is malformed (confirmations <= 0) -> railVerified null", () => {
+    const capturedConfig: EvmRailConfig = { ...CONFIG, pin: { ...PIN, finality: { mode: "confirmations", confirmations: 0 } } };
+    const capture = buildCapture({ config: capturedConfig, exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/finality config is malformed/);
   });
 });

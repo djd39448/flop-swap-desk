@@ -27,7 +27,7 @@ import { OFFER_ROOM, paperNote, transcriptRecord } from "@flop-labs/tclk";
 
 import { quoteBigNonces } from "../dist/watcher.js";
 import { findSwapLegCandidates, foldCaptured } from "../dist/replay.js";
-import { readCapture } from "../dist/rails/rpc-capture.js";
+import { loadEvmCapture } from "../dist/rails/evm-evidence.js";
 
 const USAGE = `Usage: node examples/audit-export.mjs --root DIR [--expect <swapId>=<status>] [--rails FILE] [--json]
 
@@ -294,11 +294,13 @@ function loadNotes(root, offers) {
 }
 
 /** Every `raw/evm/<hashLock>/*.json` capture index (P22-P24-EVM-SPEC.md §4/§5), latest per
- *  hashLock (ISO-stamped names sort chronologically) — paired with a `load` that re-verifies
- *  its raw bytes from `raw/rpc/<sha256>.json` through `readCapture` on every read, so a
- *  tampered or missing response file fails only that hashLock's evidence, never the replay
- *  itself. No network: every byte `readCapture` returns comes from `--root`. */
-function loadEvmCaptures(root) {
+ *  hashLock — `loadEvmCapture` (src/rails/evm-evidence.ts, P22-P24-EVM-FIXES.md A11) does the
+ *  actual file I/O: picks the latest index, and pre-loads + re-verifies its raw bytes from
+ *  `raw/rpc/<sha256>.json` through `readCapture`, so a tampered or missing response file fails
+ *  only that hashLock's evidence, never the replay itself. No network: every byte comes from
+ *  `--root`. Async only for this file-reading step — `foldCaptured` itself stays synchronous
+ *  (A11). */
+async function loadEvmCaptures(root) {
   const evmDir = join(root, "raw", "evm");
   const chain = new Map();
   let entries;
@@ -310,11 +312,8 @@ function loadEvmCaptures(root) {
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const hashLock = entry.name;
-    const files = listFiles(join(evmDir, hashLock));
-    if (files.length === 0) continue;
-    const latest = files[files.length - 1];
-    const index = JSON.parse(readFileSync(join(evmDir, hashLock, latest), "utf8"));
-    chain.set(hashLock, { index, load: (sha256Hex) => readCapture(root, sha256Hex) });
+    const capture = await loadEvmCapture(root, hashLock);
+    if (capture !== null) chain.set(hashLock, capture);
   }
   return chain;
 }
@@ -436,8 +435,8 @@ async function main() {
   // P22-P24-EVM-SPEC.md §5: chain-read captures and their pinned config, both optional and
   // both absent from a watch root that never configured a chain rail — foldCaptured then
   // folds exactly as it always did. Still no network: readCapture only ever reads --root.
-  const chain = loadEvmCaptures(args.root);
-  const board = await foldCaptured({ offers, dealRooms, notes, chain, rails, nowMs: Date.now() });
+  const chain = await loadEvmCaptures(args.root);
+  const board = foldCaptured({ offers, dealRooms, notes, chain, rails, nowMs: Date.now() });
   const swaps = board.swaps.map(describeSwap);
 
   if (args.json) {

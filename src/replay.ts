@@ -218,7 +218,7 @@ export interface FoldCapturedInput {
  * in; anything else (an unrecognised rail, or a rail/ref combination this build has no reader
  * for) gets no evidence, exactly like an absent lock frame does today.
  */
-export async function foldCaptured(input: FoldCapturedInput): Promise<Board> {
+export function foldCaptured(input: FoldCapturedInput): Board {
   const buildBoardFn = input.board ?? defaultBuildBoard;
   const { candidates } = findSwapLegCandidates(input.offers);
   const evidenceBySwap = new Map<string, SwapEvidence>();
@@ -251,7 +251,7 @@ export async function foldCaptured(input: FoldCapturedInput): Promise<Board> {
         rail: EVM_RAIL_ID,
         caip2: evmConfig.pin.caip2,
       });
-      result = await evmEvidence({ terms, config: evmConfig, accounts, capture, checkedAtMs: input.nowMs });
+      result = evmEvidence({ terms, config: evmConfig, accounts, capture });
     } else {
       continue; // an unrecognised rail, or a rail this build has no evidence reader for
     }

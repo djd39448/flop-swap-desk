@@ -385,13 +385,12 @@ export class EvmHtlcRail {
   async verifyLockFinal(terms: LockTerms, ref: string, accounts: EvmAccounts): Promise<EvmEvidenceResult> {
     const checkedAtMs = this.clock();
     const { index, exchanges } = await captureEvmLeg(this.rpc, this.config, ref, checkedAtMs);
-    const bodyBySha256 = new Map(exchanges.map((exchange) => [exchange.responseSha256, exchange.responseBody]));
+    const bytes = new Map(exchanges.map((exchange) => [exchange.responseSha256, new TextEncoder().encode(exchange.responseBody)]));
     return evmEvidence({
       terms,
       config: this.config,
       accounts,
-      capture: { index, load: (sha256Hex) => bodyBySha256.get(sha256Hex) ?? null },
-      checkedAtMs,
+      capture: { index, bytes },
     });
   }
 

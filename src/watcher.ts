@@ -523,8 +523,8 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
           underRoot(root, "raw", "evm", hashLock, `${sweepIso}.json`),
           `${JSON.stringify(index, null, 2)}\n`,
         );
-        const bodyBySha256 = new Map(exchanges.map((exchange) => [exchange.responseSha256, exchange.responseBody]));
-        chainCaptures.set(hashLock, { index, load: (sha256Hex) => bodyBySha256.get(sha256Hex) ?? null });
+        const bytes = new Map(exchanges.map((exchange) => [exchange.responseSha256, new TextEncoder().encode(exchange.responseBody)]));
+        chainCaptures.set(hashLock, { index, bytes });
         report.chainReads += 1;
       } catch (error) {
         report.chainReadsSkipped.push({
@@ -536,7 +536,7 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   }
 
   // Step 3: fold the board — the same code path an offline replay uses.
-  const board = await foldCaptured({
+  const board = foldCaptured({
     offers: offerRoomRecords,
     dealRooms,
     notes: capturedNotes,
