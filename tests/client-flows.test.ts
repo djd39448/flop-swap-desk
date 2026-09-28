@@ -702,6 +702,28 @@ describe("BuyerFlow.lockLegA — E3 (records its lock before sending it)", () =>
           result: [buildRefundedLog(capturedHashLock, { blockNumber: "0x9", blockHash: BLOCK_HASH, txHash: TX_HASH, logIndex: "0x0" })],
         };
       },
+      // G7: `refundLegA` now checks the evidence reader itself before ever reporting success —
+      // `verifyLockFinal`'s own capture needs a finalized-tag block and a `locks()` read showing
+      // Refunded (status 3) with every field matching this swap's own terms.
+      eth_getBlockByNumber: (params) => {
+        if (params[0] === "finalized") return { result: { number: "0x6", hash: BLOCK_HASH } };
+        throw new Error(`test setup: unexpected eth_getBlockByNumber(${String(params[0])})`);
+      },
+      eth_call: () => ({
+        result: encodeFunctionResult({
+          abi: EVM_HASH_RAIL_ABI,
+          functionName: "locks",
+          result: [
+            BUYER_ACCOUNT,
+            SELLER_ACCOUNT,
+            TOKEN,
+            1_000_000n,
+            BigInt(legADeadlines(T0).claimByMs),
+            BigInt(legADeadlines(T0).refundAfterMs),
+            3, // Refunded
+          ],
+        }),
+      }),
     });
     const h = harness(82, 83, { buyerRpc: rpc });
     await pairLockBAndAccountLines(h, "00000001");
@@ -714,7 +736,8 @@ describe("BuyerFlow.lockLegA — E3 (records its lock before sending it)", () =>
 
     // E3: despite the throw, this flow's own state must already know leg A is locked — refund
     // must work off the chain (which it now can, via a genuine on-chain Refunded log), not off
-    // whether `lockLegA` itself ever returned successfully.
+    // whether `lockLegA` itself ever returned successfully. G7: refundLegA also confirms the
+    // refund (via the mocked `locks()` read above showing Refunded) before ever reporting it.
     h.clockRef.ms = legADeadlines(T0).refundAfterMs;
     await expect(h.buyerFlow.refundLegA()).resolves.toBeDefined();
   });
