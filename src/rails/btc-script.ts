@@ -29,10 +29,13 @@ import type { BTC_NETWORK } from "@scure/btc-signer/utils.js";
  *  checkable against the signed terms byte for byte. */
 export const BIP65_THRESHOLD = 500_000_000;
 
-/** P4-BTC-FIXES.md H7: `nLockTime`/CLTV is a 32-bit unsigned consensus field — a value above this
- *  can never be encoded on chain at all, so both the locktime deriver and the script builder
- *  refuse it up front rather than let it silently truncate or fail deep inside a PSBT encoder. */
-export const MAX_LOCKTIME = 0xffffffff;
+/** P4-BTC-FIXES.md H7, tightened by the main-loop review 2026-09-28: the cap is miniscript's
+ *  `after(n)` range, `1 <= n < 2^31`, not the 32-bit `nLockTime` field. The refund is signed by
+ *  the Buyer's wallet through `walletprocesspsbt`, which satisfies the script only after parsing
+ *  it as miniscript; a `T` of 2^31 or more (unix time in 2038 or later) would build and fund a
+ *  valid P2WSH whose refund branch the wallet cannot sign, leaving the escrow claimable only by
+ *  the Seller. Both the locktime deriver and the script builder refuse it up front. */
+export const MAX_LOCKTIME = 0x7fffffff;
 
 /** `@scure/btc-signer` ships only mainnet (`bc`) and testnet (`tb`) bech32 HRPs (its own
  *  `NETWORK`/`TEST_NETWORK`) — regtest needs its own network params defined by hand. Probe
@@ -77,7 +80,7 @@ export function locktimeFromRefundAfterMs(refundAfterMs: number): number {
     );
   }
   if (t > MAX_LOCKTIME) {
-    throw new Error(`btc-script: locktime ${t} exceeds the maximum 32-bit nLockTime value (${MAX_LOCKTIME})`);
+    throw new Error(`btc-script: locktime ${t} exceeds miniscript's after() maximum (${MAX_LOCKTIME}); the wallet could not sign the refund`);
   }
   return t;
 }

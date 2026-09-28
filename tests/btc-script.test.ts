@@ -76,13 +76,14 @@ describe("buildHtlcScript", () => {
     ).toThrow(/BIP65/);
   });
 
-  it("H7: refuses a locktime above the maximum 32-bit nLockTime value", () => {
+  it("H7: refuses a locktime above miniscript's after() maximum (2^31 - 1), including 2^31 itself", () => {
     expect(() =>
       buildHtlcScript({ hashLock: hexToBytes(H_HEX), payeePubkey: hexToBytes(PAYEE_HEX), payerPubkey: hexToBytes(PAYER_HEX), locktime: MAX_LOCKTIME + 1 }),
-    ).toThrow(/at most|32-bit/);
+    ).toThrow(/at most/);
+    expect(MAX_LOCKTIME + 1).toBe(0x80000000);
   });
 
-  it("H7: accepts the maximum 32-bit nLockTime value itself", () => {
+  it("H7: accepts miniscript's after() maximum (2^31 - 1) itself", () => {
     expect(() =>
       buildHtlcScript({ hashLock: hexToBytes(H_HEX), payeePubkey: hexToBytes(PAYEE_HEX), payerPubkey: hexToBytes(PAYER_HEX), locktime: MAX_LOCKTIME }),
     ).not.toThrow();
@@ -112,11 +113,12 @@ describe("locktimeFromRefundAfterMs", () => {
     expect(() => locktimeFromRefundAfterMs(1000)).toThrow(/BIP65/);
   });
 
-  it("H7: refuses a value above the maximum 32-bit nLockTime value", () => {
-    expect(() => locktimeFromRefundAfterMs((MAX_LOCKTIME + 1) * 1000)).toThrow(/32-bit/);
+  it("H7: refuses a value above miniscript's after() maximum (2^31 - 1)", () => {
+    expect(() => locktimeFromRefundAfterMs(0x80000000 * 1000)).toThrow(/after\(\) maximum/);
+    expect(() => locktimeFromRefundAfterMs(0xffffffff * 1000)).toThrow(/after\(\) maximum/);
   });
 
-  it("H7: accepts the maximum 32-bit nLockTime value itself", () => {
+  it("H7: accepts miniscript's after() maximum (2^31 - 1) itself", () => {
     expect(locktimeFromRefundAfterMs(MAX_LOCKTIME * 1000)).toBe(MAX_LOCKTIME);
   });
 
