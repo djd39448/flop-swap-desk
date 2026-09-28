@@ -16,6 +16,7 @@
     "build:vendor": "tsc -p vendor/tclk/tsconfig.json",
     "build": "npm run build:vendor && tsc -p tsconfig.json",
     "test": "npm run build && vitest run",
+    "test:anvil": "npm run build && forge build && vitest run --config vitest.anvil.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "watch": "node bin/watch.mjs"
   },
