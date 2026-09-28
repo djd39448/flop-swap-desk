@@ -147,6 +147,10 @@ export interface StartBitcoindOptions {
   /** Blocks mined to the buyer's own address at startup so `buyer.sendtoaddress` has spendable
    *  funds immediately (coinbase needs 100 confirmations to mature). Default 101. */
   fundingBlocks?: number;
+  /** P4-BTC-FIXES-R2.md R2-1: extra `bitcoind` command-line flags appended after this helper's
+   *  own fixed set (e.g. `["-mempoolexpiry=1"]` for a test that needs a real mempool eviction) —
+   *  never used for anything key-related (P4-BTC-SPEC.md §1 still applies in full). */
+  extraArgs?: string[];
 }
 
 /**
@@ -171,6 +175,7 @@ export async function startBitcoind(options: StartBitcoindOptions = {}): Promise
     `-rpcport=${rpcPort}`,
     "-rpcbind=127.0.0.1",
     "-rpcallowip=127.0.0.1",
+    ...(options.extraArgs ?? []),
   ];
 
   let child: ChildProcess;

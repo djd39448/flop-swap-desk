@@ -111,7 +111,11 @@ function mockBitcoind(handlers: Handlers): { fetch: typeof fetch; calls: RpcCall
       try {
         envelope = { jsonrpc: "2.0", id: parsedBody.id, result: handler(parsedBody.params, path) };
       } catch (error) {
-        envelope = { jsonrpc: "2.0", id: parsedBody.id, error: { code: -1, message: error instanceof Error ? error.message : String(error) } };
+        // R2-2: a handler can throw a plain Error (code -1, the historical default here) or an
+        // object carrying its own `.code` (e.g. `Object.assign(new Error(...), { code: -5 })`)
+        // when a test needs to distinguish Core's own "not found" answer from any other failure.
+        const code = typeof (error as { code?: unknown } | undefined)?.code === "number" ? (error as { code: number }).code : -1;
+        envelope = { jsonrpc: "2.0", id: parsedBody.id, error: { code, message: error instanceof Error ? error.message : String(error) } };
       }
     }
     const bytes = new TextEncoder().encode(JSON.stringify(envelope));
@@ -355,16 +359,99 @@ describe("BtcHtlcRail.recoverFunding", () => {
     expect(recovered).toEqual({ broadcast: true, blockHash: null, confirmations: 0 });
   });
 
-  it("H2: reports broadcast:false when the node has never seen this txid, never throws", async () => {
+  it("H2/R2-2: reports broadcast:false when the node has never seen this txid (code -5), never throws", async () => {
     const { rail } = await connectRail(
       baseHandlers({
         getrawtransaction: () => {
-          throw new Error("No such mempool or blockchain transaction");
+          throw Object.assign(new Error("No such mempool or blockchain transaction"), { code: -5 });
         },
       }),
     );
     const recovered = await rail.recoverFunding(FUNDING_TXID);
     expect(recovered).toEqual({ broadcast: false, blockHash: null, confirmations: null });
+  });
+
+  it("R2-2: propagates any error that is NOT code -5 — a transport/other RPC failure is never treated as \"never broadcast\"", async () => {
+    const { rail } = await connectRail(
+      baseHandlers({
+        getrawtransaction: () => {
+          throw new Error("connection reset"); // mockBitcoind defaults an un-coded throw to -1
+        },
+      }),
+    );
+    await expect(rail.recoverFunding(FUNDING_TXID)).rejects.toThrow(/connection reset/);
+  });
+});
+
+// ── resendRefundIfDropped (R2-1) ────────────────────────────────────────────────────────────────
+
+describe("BtcHtlcRail.resendRefundIfDropped", () => {
+  const REFUND_TXID = "cc".repeat(32);
+  const REFUND_RAW_TX = "deadbeef";
+
+  function resendHandlers(overrides: Partial<Handlers> = {}): Handlers {
+    return baseHandlers({
+      getmempoolentry: () => {
+        throw Object.assign(new Error("Transaction not in mempool"), { code: -5 });
+      },
+      getrawtransaction: () => {
+        throw Object.assign(new Error("No such mempool or blockchain transaction"), { code: -5 });
+      },
+      gettxout: () => ({ confirmations: 0, value: 0.01, scriptPubKey: { hex: bytesToHex(SCRIPT.scriptPubKey) } }),
+      sendrawtransaction: () => REFUND_TXID, // identical bytes -> identical (mocked) txid
+      ...overrides,
+    });
+  }
+
+  it("does nothing when the refund is still sitting in the mempool", async () => {
+    const { rail, calls } = await connectRail(resendHandlers({ getmempoolentry: () => ({ txid: REFUND_TXID }) }));
+    const result = await rail.resendRefundIfDropped(REF, REFUND_TXID, REFUND_RAW_TX);
+    expect(result).toEqual({ resent: false, txid: REFUND_TXID, raw: expect.any(Array) });
+    expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
+  });
+
+  it("does nothing when the refund is already confirmed", async () => {
+    const { rail, calls } = await connectRail(
+      resendHandlers({ getrawtransaction: () => ({ confirmations: 2, blockhash: "bb".repeat(32) }) }),
+    );
+    const result = await rail.resendRefundIfDropped(REF, REFUND_TXID, REFUND_RAW_TX);
+    expect(result.resent).toBe(false);
+    expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
+  });
+
+  it("does nothing when the funding outpoint was spent by something else (e.g. a claim)", async () => {
+    const { rail, calls } = await connectRail(resendHandlers({ gettxout: () => null }));
+    const result = await rail.resendRefundIfDropped(REF, REFUND_TXID, REFUND_RAW_TX);
+    expect(result.resent).toBe(false);
+    expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
+  });
+
+  it("R2-1: re-sends the SAME bytes (via testmempoolaccept then sendrawtransaction) once genuinely dropped while the outpoint remains unspent", async () => {
+    const { rail, calls } = await connectRail(resendHandlers());
+    const result = await rail.resendRefundIfDropped(REF, REFUND_TXID, REFUND_RAW_TX);
+    expect(result).toEqual({ resent: true, txid: REFUND_TXID, raw: expect.any(Array) });
+    const acceptCall = calls.find((c) => c.method === "testmempoolaccept");
+    const sendCall = calls.find((c) => c.method === "sendrawtransaction");
+    expect(acceptCall?.params[0]).toEqual([REFUND_RAW_TX]);
+    expect(sendCall?.params[0]).toBe(REFUND_RAW_TX);
+  });
+
+  it("checks gettxout with include_mempool: true against the funding outpoint, not the confirmed-only set", async () => {
+    const { rail, calls } = await connectRail(resendHandlers());
+    await rail.resendRefundIfDropped(REF, REFUND_TXID, REFUND_RAW_TX);
+    const txoutCall = calls.find((c) => c.method === "gettxout");
+    expect(txoutCall?.params).toEqual([FUND_TXID, 1, true]);
+  });
+
+  it("propagates a transport failure from getmempoolentry rather than treating it as \"not in the mempool\"", async () => {
+    const { rail } = await connectRail(
+      resendHandlers({
+        getmempoolentry: () => {
+          throw new Error("connection reset"); // not code -5
+        },
+      }),
+    );
+    await expect(rail.resendRefundIfDropped(REF, REFUND_TXID, REFUND_RAW_TX)).rejects.toThrow(/connection reset/);
   });
 });
 

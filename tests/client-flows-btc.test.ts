@@ -67,6 +67,12 @@ interface FakeRailScript {
   commitLock?: () => Promise<RailWriteEvidence>;
   claim?: () => Promise<RailWriteEvidence>;
   refund?: () => Promise<RailWriteEvidence>;
+  /** R2-1: only set on a fake that wants to stand in for a rail implementing the OPTIONAL
+   *  `resendRefundIfDropped` — a script that omits this leaves the field entirely absent on the
+   *  connected handle (never merely `undefined` via `unimplemented`), exactly like `evm-rail.ts`'s
+   *  real adapter, so `BuyerFlow.refundLegA`'s own `connected.resendRefundIfDropped !== undefined`
+   *  check sees the same thing it would against real EVM/Bitcoin adapters. */
+  resendRefundIfDropped?: () => Promise<RailWriteEvidence>;
   verifyLockFinal?: () => Promise<RailEvidenceResult>;
   findClaimedPreimage?: () => Promise<string | null>;
   chainTimeMs?: () => Promise<number>;
@@ -75,7 +81,13 @@ interface FakeRailScript {
 
 class FakeConnectedRail implements ConnectedCounterAssetRail {
   readonly exchanges: readonly Exchange[] = [];
-  constructor(private readonly script: FakeRailScript) {}
+  readonly resendRefundIfDropped?: (ref: string, priorEvidence: RailWriteEvidence) => Promise<RailWriteEvidence>;
+  constructor(private readonly script: FakeRailScript) {
+    if (script.resendRefundIfDropped !== undefined) {
+      const resend = script.resendRefundIfDropped;
+      this.resendRefundIfDropped = async () => resend();
+    }
+  }
   async prepareLock(): Promise<PreparedLock> {
     return (this.script.prepareLock ?? (() => unimplemented("prepareLock")))();
   }
@@ -396,6 +408,75 @@ describe("G7 — a refund counts only when confirmed", () => {
 
     await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/claimed instead/);
     await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/learnSecret\(\) then claimLegB\(\)/);
+  });
+
+  it("R2-1: a retry checks resendRefundIfDropped (never re-broadcasts through refund() itself) and can recover a dropped refund", async () => {
+    let refundCalls = 0;
+    let resendCalls = 0;
+    let verifyCalls = 0;
+    const { h, rail } = await lockedFlow();
+    (rail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
+      new FakeConnectedRail({
+        refund: async () => {
+          refundCalls += 1;
+          return { ref: REF, raw: [], txid: "cc".repeat(32), rawTx: "deadbeef" };
+        },
+        resendRefundIfDropped: async () => {
+          resendCalls += 1;
+          return { ref: REF, raw: [], txid: "cc".repeat(32), rawTx: "deadbeef" };
+        },
+        verifyLockFinal: async () => {
+          verifyCalls += 1;
+          return verifyCalls < 3
+            ? { lock: { rail: "btc-htlc", ref: REF, terms: {} as never, railVerified: null, checkedAtMs: 0 } }
+            : {
+                lock: { rail: "btc-htlc", ref: REF, terms: {} as never, railVerified: true, checkedAtMs: 0 },
+                rail: { status: "refunded", final: true, checkedAtMs: 0 },
+              };
+        },
+      });
+
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/not yet confirmed/); // 1st: broadcasts
+    expect(refundCalls).toBe(1);
+    expect(resendCalls).toBe(0);
+
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/not yet confirmed/); // 2nd: retry — may have dropped
+    expect(refundCalls).toBe(1); // never re-broadcasts through refund() itself
+    expect(resendCalls).toBe(1); // but does check (and, per the script above, "resend") every retry
+
+    const refundA = await h.buyerFlow.refundLegA(); // 3rd: now confirmed
+    expect(refundA.ref).toBe(REF);
+    expect(refundCalls).toBe(1);
+    expect(resendCalls).toBe(2);
+  });
+
+  it("a rail with no resendRefundIfDropped concept (evm-htlc-shaped) never has it called, matching pre-R2-1 behaviour", async () => {
+    let refundCalls = 0;
+    let verifyCalls = 0;
+    const { h, rail } = await lockedFlow();
+    (rail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
+      new FakeConnectedRail({
+        // No `resendRefundIfDropped` in this script at all — the connected handle's own field
+        // stays absent (see FakeConnectedRail's constructor), exactly like evm-rail.ts's real
+        // adapter, so BuyerFlow must never even attempt to call it.
+        refund: async () => {
+          refundCalls += 1;
+          return { ref: REF, raw: [] };
+        },
+        verifyLockFinal: async () => {
+          verifyCalls += 1;
+          return verifyCalls === 1
+            ? { lock: { rail: "btc-htlc", ref: REF, terms: {} as never, railVerified: null, checkedAtMs: 0 } }
+            : {
+                lock: { rail: "btc-htlc", ref: REF, terms: {} as never, railVerified: true, checkedAtMs: 0 },
+                rail: { status: "refunded", final: true, checkedAtMs: 0 },
+              };
+        },
+      });
+
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/not yet confirmed/);
+    await h.buyerFlow.refundLegA();
+    expect(refundCalls).toBe(1);
   });
 
   it("posts the refund/receipt frames only once even across a retried call", async () => {

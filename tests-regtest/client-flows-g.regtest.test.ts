@@ -318,3 +318,80 @@ describe("Group G — Bitcoin client-flow fixes that need a real bitcoind wallet
     }, 120_000);
   });
 });
+
+// P4-BTC-FIXES-R2.md R2-1: a real mempool eviction needs its own node (`-mempoolexpiry=1`), so
+// this gets a separate top-level describe with its own bitcoind rather than sharing Group G's.
+describe("R2-1 — a refund that drops out of the mempool is re-sent, unchanged, on retry", () => {
+  let node: BitcoindHandle;
+  let config: BtcRailConfig;
+
+  beforeAll(async () => {
+    // A 1-hour mempool expiry — short enough to force a real eviction inside one test, rather
+    // than waiting anywhere near Core's own 336-hour default.
+    node = await startBitcoind({ extraArgs: ["-mempoolexpiry=1"] });
+    config = { pin: { ...BTC_REGTEST_PIN, finality: { confirmations: 2 } }, endpoint: node.endpoint };
+  }, 120_000);
+
+  afterAll(async () => {
+    await node?.stop();
+  });
+
+  function freshParty(id: Identity): Party {
+    return { identity: id, rpc: node.createCapturingRpc() };
+  }
+  function ident(tag: number): Identity {
+    return identity(tag.toString(16).padStart(2, "0").repeat(32));
+  }
+
+  it("re-broadcasts the SAME recorded refund bytes once they expire from the mempool, and the leg still refunds after mining", async () => {
+    const buyer = ident(201);
+    const seller = ident(202);
+    const t0 = await currentMediantimeMs(node);
+    const h = setupSwap(node, config, freshParty(buyer), freshParty(seller), t0);
+
+    const { offerA } = await pairAndVerify("00000201", buyer, h, t0, node);
+    const lockA = await h.buyerFlow.lockLegA();
+    await h.mineBlocks(2);
+
+    const refundAtMs = offerA.refundAfterMs + 5 * 60_000;
+    await h.warpTo(refundAtMs); // sets mocktime + mines 11 so median-time-past itself passes T
+
+    // 1st call: broadcasts the refund (a regtest node never auto-mines, so it stays unconfirmed).
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/not yet confirmed/);
+
+    const mempoolAfterBroadcast = await node.rpcCall<string[]>("getrawmempool", []);
+    expect(mempoolAfterBroadcast).toHaveLength(1);
+    const refundTxid = mempoolAfterBroadcast[0];
+    expect(refundTxid).toMatch(/^[0-9a-f]{64}$/);
+
+    // Advance real (mocked) time 2h past the refund's own entry time — past the node's 1-hour
+    // mempoolexpiry — then submit one unrelated transaction: bitcoind sweeps expired mempool
+    // entries opportunistically when accepting a new one, which is what actually evicts the
+    // refund (mining would instead CONFIRM it, defeating the point of this test).
+    const entryTimeSec = Math.floor(refundAtMs / 1000) + 1; // mirrors warpTo's own mocktime formula
+    await node.setMockTime(entryTimeSec + 2 * 60 * 60);
+    await node.rpcCall("sendtoaddress", [node.seller.address, 0.0001], `/wallet/${node.buyer.wallet}`);
+
+    const mempoolAfterEvict = await node.rpcCall<string[]>("getrawmempool", []);
+    expect(mempoolAfterEvict).not.toContain(refundTxid); // the premise this test is checking
+
+    const [fundTxid, fundVoutStr] = lockA.writeEvidence.ref.split(":");
+    const stillUnspent = await node.rpcCall<{ value: number } | null>("gettxout", [fundTxid, Number(fundVoutStr), true]);
+    expect(stillUnspent).not.toBeNull(); // the HTLC output is still there, claimable by the Seller
+
+    // 2nd call (retry): R2-1's own resend path re-checks the chain, finds the refund genuinely
+    // dropped while the escrow remains unspent, and re-sends the IDENTICAL recorded bytes — still
+    // unconfirmed (nothing mined since), so this still reports "not yet confirmed", exactly as a
+    // retry that found the refund merely still pending would.
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/not yet confirmed/);
+
+    const mempoolAfterResend = await node.rpcCall<string[]>("getrawmempool", []);
+    expect(mempoolAfterResend).toContain(refundTxid); // back in the mempool — same txid, same bytes
+
+    // 3rd call: now confirmed — reports success, using the SAME txid throughout (never a new,
+    // separately-signed refund transaction).
+    await h.mineBlocks(2);
+    const refundA = await h.buyerFlow.refundLegA();
+    expect(refundA.txid).toBe(refundTxid);
+  }, 120_000);
+});
