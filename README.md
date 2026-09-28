@@ -105,6 +105,19 @@ This builds `dist/` and the contracts, then spawns a real `anvil` node (found vi
 the on-chain `Claimed` log alone when the Seller never posts a reveal frame). `npm test` never
 spawns `anvil` — a missing binary fails `test:anvil` loudly instead.
 
+**Fixture capture is opt-in.** Every client-flow scenario writes its watch-root bundle to a
+fresh `mkdtemp` directory by default, so an ordinary `npm run test:anvil` never touches the three
+committed fixtures below. Regenerating them (after a change to the capture index format, the
+evidence bundle shape, or the client flows themselves) is a deliberate, separate step:
+
+```bash
+CAPTURE_EVM_FIXTURES=1 npm run test:anvil
+```
+
+which overwrites `fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b}/` in place. Commit
+the result and then confirm both that `tests/evm-anvil-fixtures.test.ts` (hermetic, `npm test`)
+replays it and that a plain `npm run test:anvil` afterward leaves `git status` clean.
+
 **Keyless throughout (D-10):** no private key, mnemonic, or seed for any EVM account exists
 anywhere in this build — writes go out as JSON-RPC accounts (`eth_sendTransaction` from one of
 anvil's own unlocked addresses) via a plain-address viem `WalletClient`. tclk's Ed25519 test

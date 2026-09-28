@@ -7,9 +7,16 @@
 // timers, no polling): the happy path to `settled`, both refund paths, the claim-before-
 // finality refusal, and the Buyer learning the secret from the on-chain `Claimed` log alone.
 // `npm run test:anvil` only — `npm test` never spawns anvil (tests-anvil/helpers/anvil.ts).
+//
+// P22-P24-EVM-FIXES.md B4: every scenario writes its bundle to a fresh `mkdtemp` directory by
+// default — the committed fixtures under `fixtures/evm-anvil-2026-09-28/` are only ever
+// (re)written when `CAPTURE_EVM_FIXTURES=1` is set (README "EVM leg (local, keyless)"). Before
+// this fix, an ordinary `npm run test:anvil` run silently rewrote those three committed
+// directories every time.
 
 import { execFile } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -23,15 +30,29 @@ import { SellerFlow } from "../src/client/seller.js";
 import { MemoryVenue } from "../src/client/venue.js";
 import { writeBundle, type BundleEvidenceSummary } from "../src/client/bundle.js";
 import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
-import { CapturingRpc } from "../src/rails/rpc-capture.js";
+import { CapturingRpc, type Exchange } from "../src/rails/rpc-capture.js";
 import { swapId as computeSwapId } from "../src/profile.js";
-import type { DeadlinePolicy } from "../src/types.js";
 import { identity, type Identity } from "../tests/helpers/identity.js";
 import { deployRailContracts, startAnvil, type AnvilHandle } from "./helpers/anvil.js";
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const FIXTURES_ROOT = join(REPO_ROOT, "fixtures", "evm-anvil-2026-09-28");
+
+/** B4: `CAPTURE_EVM_FIXTURES=1 npm run test:anvil` (re)writes the three committed fixtures in
+ *  place; any other run (including a bare `npm run test:anvil`) writes to a fresh `mkdtemp`
+ *  directory that nothing ever reads back, so the committed fixtures never move. */
+const CAPTURE_FIXTURES = process.env.CAPTURE_EVM_FIXTURES === "1";
+
+async function scenarioRoot(scenario: string): Promise<string> {
+  if (CAPTURE_FIXTURES) {
+    const dir = join(FIXTURES_ROOT, scenario);
+    await rm(dir, { recursive: true, force: true });
+    await mkdir(dir, { recursive: true });
+    return dir;
+  }
+  return mkdtemp(join(tmpdir(), `flop-evm-anvil-${scenario}-`));
+}
 
 const MOCK_ERC20_MINT_ABI = [
   {
@@ -69,26 +90,21 @@ async function mint(anvil: AnvilHandle, token: Address, to: Address, amount: big
 const GENESIS_SECONDS = 1_700_000_000;
 const GENESIS_MS = GENESIS_SECONDS * 1_000;
 
-/** P22-P24-EVM-SPEC.md §6: the EVM deadline policy for the local run — `minRevealWindowMs` 45
- *  min, `finalityAMs` 20 min; the R10.2 knobs are the existing FLOP constants
- *  (`src/deadlines.ts`'s `DEFAULT_POLICY_EXAMPLE`), unchanged. */
-const POLICY: DeadlinePolicy = {
-  minRevealWindowMs: 45 * 60_000,
-  finalityAMs: 20 * 60_000,
-  flopMarginPercent: 20,
-  flopMaxFinalityStallBlocks: 3_600,
-  flopFinalityLagBlocks: 0,
-  flopBlockMs: 1_000,
-};
+/** P22-P24-EVM-FIXES.md B3: the EVM deadline policy is now pinned in the client itself
+ *  (`EVM_LOCAL_POLICY`) rather than taken from this runner — this file uses the same constant
+ *  both flows check against, so its own sizing comments below stay accurate. */
 
-/** Leg A: `refundAfterMs = t0 + 90 min` (SPEC §6); `claimByMs` comfortably inside that. */
+/** Leg A: `refundAfterMs = t0 + 90 min` (SPEC §6); `claimByMs` comfortably inside that (B2: the
+ *  90 min - 60 min = 30 min claim/refund gap comfortably clears `EVM_LOCAL_POLICY`'s 5 min
+ *  claim-inclusion margin). */
 function legADeadlines(t0: number) {
   return { claimByMs: t0 + 60 * 60_000, refundAfterMs: t0 + 90 * 60_000, expiresMs: t0 + 30 * 60_000 };
 }
 
-/** Leg B: sized so `checkSwapDeadlines(offerA, offerB, t0, POLICY)` holds — verified by hand
- *  against `POLICY` and `legADeadlines` above (rule 2 needs >= t0+110min, rule 3 needs
- *  >= t0+150min); `buyer.acceptLegB` re-checks it live regardless. */
+/** Leg B: sized so `checkSwapDeadlines(offerA, offerB, t0, EVM_LOCAL_POLICY)` holds — verified
+ *  by hand against `EVM_LOCAL_POLICY` and `legADeadlines` above (rule 2 needs >= t0+110min,
+ *  rule 3 needs >= t0+150min); both `sellerFlow.acceptLegA` and `buyerFlow.acceptLegB` re-check
+ *  it live regardless. */
 function legBDeadlines(t0: number) {
   return { claimByMs: t0 + 120 * 60_000, refundAfterMs: t0 + 180 * 60_000, expiresMs: t0 + 40 * 60_000 };
 }
@@ -219,9 +235,9 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
       ...legADeadlines(t0),
     });
 
-    const { acceptA, offerB } = await sellerFlow.acceptLegA(offerA, legBDeadlines(t0));
-    const acceptB = await buyerFlow.acceptLegB(offerB, acceptA, POLICY, t0);
-    await sellerFlow.lockLegB(acceptB);
+    const { acceptA, acceptARecord, offerB } = await sellerFlow.acceptLegA(offerA, legBDeadlines(t0), t0);
+    const { acceptB, acceptBRecord } = await buyerFlow.acceptLegB(offerB, acceptARecord, t0);
+    await sellerFlow.lockLegB(acceptBRecord);
     await buyerFlow.verifyLegBLocked();
     await sellerFlow.postAccountLineA(sellerAccount);
     await buyerFlow.postAccountLineA(buyerAccount);
@@ -229,11 +245,13 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
     return { swapId, offerA, offerB, acceptA, acceptB };
   }
 
-  /** Writes a watch-root bundle for `swapId` and replays it through `examples/audit-export.mjs`
-   *  (as a real child process, `npm run build` having already produced `dist/` before
-   *  `test:anvil` runs vitest) — asserting the exit code the spec calls for. */
+  /** Writes a watch-root bundle for `swapId` (to a fresh `mkdtemp` directory, or — only under
+   *  `CAPTURE_EVM_FIXTURES=1` — the named committed fixture directory, B4) and replays it
+   *  through `examples/audit-export.mjs` (as a real child process, `npm run build` having
+   *  already produced `dist/` before `test:anvil` runs vitest) — asserting the exit code the
+   *  spec calls for. */
   async function writeAndReplay(args: {
-    root: string;
+    scenario: string;
     swapId: string;
     status: string;
     venue: MemoryVenue;
@@ -243,9 +261,11 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
     evm?: { hashLock: Hex };
     nowMs: number;
     writes: BundleEvidenceSummary["writes"];
-  }): Promise<void> {
-    await rm(args.root, { recursive: true, force: true });
-    await mkdir(args.root, { recursive: true });
+    /** B5: every EVM write both flows made this scenario — `[...buyerFlow.exchanges,
+     *  ...sellerFlow.exchanges]` — so `writeBundle` can persist them into `raw/rpc/`. */
+    writeExchanges: readonly Exchange[];
+  }): Promise<string> {
+    const root = await scenarioRoot(args.scenario);
 
     const dealRoomA = dealRoom(args.acceptAContract);
     const dealRoomB = dealRoom(args.acceptBContract);
@@ -257,15 +277,13 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
       legA: { contract: args.acceptAContract, rail: "evm-htlc" },
       legB: { contract: args.acceptBContract, rail: "paper" },
       feeBps: 0,
-      status: args.status,
       writes: args.writes,
-      finalizedRefs: [],
       startedAtMs: GENESIS_MS,
       finishedAtMs: args.nowMs,
     };
 
     await writeBundle({
-      root: args.root,
+      root,
       nowMs: args.nowMs,
       offerRoomRecords: await args.venue.read(OFFER_ROOM),
       dealRooms: new Map([
@@ -273,15 +291,17 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
         [dealRoomB, await args.venue.read(dealRoomB)],
       ]),
       paperNotes: rawNote === undefined ? new Map() : new Map([[args.acceptBContract, rawNote]]),
+      writeExchanges: args.writeExchanges,
       ...(args.evm === undefined
         ? {}
         : { evm: { config, rpc: new CapturingRpc({ endpoint: anvil.endpoint }), hashLock: args.evm.hashLock } }),
       evidence: summary,
     });
 
-    const result = await runAuditExport(args.root, `${args.swapId}=${args.status}`);
+    const result = await runAuditExport(root, `${args.swapId}=${args.status}`);
     expect(result.stderr).toBe("");
     expect(result.code).toBe(0);
+    return root;
   }
 
   it("scenario 1: happy path -> settled", async () => {
@@ -311,7 +331,7 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
     await buyerFlow.claimLegB(secret);
 
     await writeAndReplay({
-      root: join(FIXTURES_ROOT, "settled"),
+      scenario: "settled",
       swapId,
       status: "settled",
       venue,
@@ -324,6 +344,7 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
         { leg: "a", step: "lock", rail: "evm-htlc", evidence: lockA.writeEvidence },
         { leg: "a", step: "claim", rail: "evm-htlc", evidence: claimed.evidence },
       ],
+      writeExchanges: [...buyerFlow.exchanges, ...sellerFlow.exchanges],
     });
   }, 30_000);
 
@@ -363,7 +384,7 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
     await mineBlocks(2);
 
     await writeAndReplay({
-      root: join(FIXTURES_ROOT, "refunded"),
+      scenario: "refunded",
       swapId,
       status: "refunded",
       venue,
@@ -376,6 +397,7 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
         { leg: "a", step: "lock", rail: "evm-htlc", evidence: lockA.writeEvidence },
         { leg: "a", step: "refund", rail: "evm-htlc", evidence: refundA },
       ],
+      writeExchanges: [...buyerFlow.exchanges, ...sellerFlow.exchanges],
     });
   }, 30_000);
 
@@ -406,7 +428,7 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
     expect(refundB.refund).toBeDefined();
 
     await writeAndReplay({
-      root: join(FIXTURES_ROOT, "refunded-b"),
+      scenario: "refunded-b",
       swapId,
       status: "refunded-b",
       venue,
@@ -415,6 +437,7 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
       noteStore,
       nowMs: clock(),
       writes: [{ leg: "b", step: "refund", rail: "paper", evidence: {} }],
+      writeExchanges: [...buyerFlow.exchanges, ...sellerFlow.exchanges],
     });
   }, 30_000);
 
