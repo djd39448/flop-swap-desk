@@ -48,7 +48,6 @@ import { SellerFlow } from "../src/client/seller.js";
 import { MemoryVenue } from "../src/client/venue.js";
 import { writeBundle, type BundleEvidenceSummary } from "../src/client/bundle.js";
 import type { CounterAssetRail } from "../src/client/counter-rail.js";
-import { BTC_LOCAL_POLICY } from "../src/client/policy.js";
 import type { BtcAccounts } from "../src/rails/btc-evidence.js";
 import { BTC_REGTEST_PIN, BtcHtlcRail, keyFromAddressInfo, type BtcHtlcTerms, type BtcRailConfig, type BtcSignerKey } from "../src/rails/btc-htlc.js";
 import { CapturingRpc, type Exchange } from "../src/rails/rpc-capture.js";
@@ -111,11 +110,12 @@ function legADeadlines(t0: number) {
 }
 
 /** Leg B: sized so `checkSwapDeadlines(offerA, offerB, t0, BTC_LOCAL_POLICY)` holds — rule 2
- *  needs `legB.claimByMs >= legA.refundAfterMs (t0+5h) + finalityAMs (2h)` = `t0+7h`; rule 3
- *  (R10.2, 1 s FLOP blocks) needs `legB.refundAfterMs >= t0 + ~6h` at `lockTimeMs = t0`. Both
- *  flows re-check live regardless. */
+ *  needs `legB.claimByMs >= legA.refundAfterMs (t0+5h) + finalityAMs (P4-BTC-FIXES.md G5: raised
+ *  to 3h)` = `t0+8h`; `claimByMs` below is `t0+9h`, a full hour of margin rather than sitting
+ *  exactly on the boundary. Rule 3 (R10.2, 1 s FLOP blocks) needs `legB.refundAfterMs >= t0 +
+ *  ~6h` at `lockTimeMs = t0`. Both flows re-check live regardless. */
 function legBDeadlines(t0: number) {
-  return { claimByMs: t0 + 8 * 60 * 60_000, refundAfterMs: t0 + 20 * 60 * 60_000, expiresMs: t0 + 40 * 60_000 };
+  return { claimByMs: t0 + 9 * 60 * 60_000, refundAfterMs: t0 + 20 * 60 * 60_000, expiresMs: t0 + 40 * 60_000 };
 }
 
 interface Party {
@@ -146,12 +146,14 @@ function setupSwap(node: BitcoindHandle, config: BtcRailConfig, buyer: Party, se
     clock,
   });
 
+  // P4-BTC-FIXES.md G5: the policy comes from the rail itself now (`buyerRail.policy` /
+  // `sellerRail.policy`, both `BTC_LOCAL_POLICY` — `BtcCounterRail`'s own frozen constant) —
+  // there is no longer a constructor option to pass one through.
   const buyerFlow = new BuyerFlow({
     identity: buyer.identity,
     venue,
     paperRail: new PaperRail(noteStore, clock),
     rail: buyerRail,
-    policy: BTC_LOCAL_POLICY,
     clock,
   });
   const sellerFlow = new SellerFlow({
@@ -159,7 +161,6 @@ function setupSwap(node: BitcoindHandle, config: BtcRailConfig, buyer: Party, se
     venue,
     paperRail: new PaperRail(noteStore, clock),
     rail: sellerRail,
-    policy: BTC_LOCAL_POLICY,
     clock,
   });
 
@@ -359,9 +360,14 @@ describe("Seller/Buyer client flows against a real bitcoind -regtest node", () =
     // The Seller never claims/reveals. Push median time past legA.refundAfterMs, then each
     // party refunds its own leg.
     await h.warpTo(offerA.refundAfterMs + 5 * 60_000);
+    // P4-BTC-FIXES.md G7: refundLegA now broadcasts, then reports success only once the refund
+    // itself is confirmed (this file's own config requires 2 confirmations) — the first call
+    // broadcasts and finds it unconfirmed (a regtest node never auto-mines); mining enough blocks,
+    // then calling again (a no-op re-check, never a second broadcast), lets it report success.
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/not yet confirmed/);
+    await h.mineBlocks(2);
     const refundA = await h.buyerFlow.refundLegA();
     expect(refundA.txid).toMatch(/^[0-9a-f]{64}$/);
-    await h.mineBlocks(1);
 
     await h.warpTo(offerB.refundAfterMs + 60_000);
     const refundB = await h.sellerFlow.refundLegB();

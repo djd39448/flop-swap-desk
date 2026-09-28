@@ -387,6 +387,13 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
 
     // The Seller never claims/reveals. Both refund windows pass; each party refunds its own leg.
     await warpTo(offerA.refundAfterMs + 60_000);
+    // P4-BTC-FIXES.md G7: refundLegA now broadcasts, then reports success only once the refund
+    // itself is confirmed (`--slots-in-an-epoch 1`: `finalized = latest - 2`, so the refund's own
+    // just-mined block is not yet finalized the instant it lands) — the first call broadcasts
+    // and finds it not yet confirmed; mining 2 more blocks, then calling again (a no-op re-check,
+    // never a second broadcast), lets it report success.
+    await expect(buyerFlow.refundLegA()).rejects.toThrow(/not yet confirmed/);
+    await mineBlocks(2);
     const refundA = await buyerFlow.refundLegA();
     expect(refundA.event).toBe("Refunded");
 
