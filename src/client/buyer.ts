@@ -66,8 +66,7 @@ import { checkSwapDeadlines } from "../deadlines.js";
 import { checkLegBMatchesWant, checkOrientation, classifySwapOffer, legAContext } from "../profile.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "../swap.js";
-import type { CounterAssetRail, RailBlockMarker, RailWriteEvidence } from "./counter-rail.js";
-import { EVM_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
+import { belowMinLockable, type CounterAssetRail, type RailAccounts, type RailBlockMarker, type RailWriteEvidence } from "./counter-rail.js";
 import type { Signer, Venue } from "./venue.js";
 
 export interface BuyerFlowOptions {
@@ -80,11 +79,6 @@ export interface BuyerFlowOptions {
    *  (`src/client/evm-rail.ts`'s `createEvmCounterRail`), `btc-htlc` via
    *  `src/client/btc-rail.ts`'s `createBtcCounterRail`. Only this Buyer ever locks leg A. */
   rail: CounterAssetRail;
-  /** The deadline policy every `checkSwapDeadlines`/margin guard in this flow checks against —
-   *  `EVM_LOCAL_POLICY` when omitted (P4-BTC-SPEC.md §7a: this field did not exist before the
-   *  Bitcoin leg, so every pre-existing caller that never passed one keeps its exact prior
-   *  behaviour unchanged); a `btc-htlc` rail is paired with `BTC_LOCAL_POLICY`. */
-  policy?: RailLocalPolicy;
   clock: () => number;
 }
 
@@ -110,7 +104,6 @@ export class BuyerFlow {
   private readonly venue: Venue;
   private readonly paperRail: PaperRail;
   private readonly rail: CounterAssetRail;
-  private readonly policy: RailLocalPolicy;
   private readonly clock: () => number;
 
   private offerA?: OfferFrame;
@@ -123,15 +116,39 @@ export class BuyerFlow {
    *  second leg-B offer for the same leg A) can never both pair this flow to a leg B. */
   private legBPairingPending = false;
   private legBVerified = false;
+  /** P4-BTC-FIXES.md G2: set synchronously, before `lockLegA`'s first statement — the same
+   *  re-entry pattern `legBPairingPending` uses above, so two `lockLegA` calls issued back to
+   *  back can never both reach a write. */
+  private legALockPending = false;
+  /** G2: set once, right before `lockLegA` ever risks a broadcast, and NEVER cleared again —
+   *  even if that attempt throws. The only way past it is `reconcileLockA()`; `lockLegA` itself
+   *  never retries a funding it cannot be sure did not already reach the network. */
+  private legALockAttempted = false;
   private lockedHashLock?: string;
   /** P4-BTC-SPEC.md §7a: the leg-A rail's own write ref for this flow's lock — `hashLock` for
    *  `evm-htlc` (`WriteEvidence.ref === terms.statement`), the funding outpoint
    *  (`"<txid>:<vout>"`) for `btc-htlc`. `refundLegA`/`learnSecret` must use THIS, never
    *  `lockedHashLock`, wherever the rail's own interface asks for a `ref` — the two happen to be
    *  the same value for `evm-htlc` today, which is exactly why this distinction was invisible
-   *  before a second, outpoint-keyed rail existed. */
+   *  before a second, outpoint-keyed rail existed. P4-BTC-FIXES.md G3: recorded from
+   *  `prepareLock`'s own return, BEFORE `commitLock` ever broadcasts — so a failure anywhere
+   *  after that point (a flaky read on the broadcast's own response) still leaves this flow able
+   *  to recover the exact outpoint that was (or will be) created. */
   private lockedRailRef?: string;
   private lockedFromBlock?: RailBlockMarker;
+  /** P4-BTC-FIXES.md G1: this leg's resolved payer/payee identities, frozen the moment
+   *  `lockLegA` resolves them — BEFORE funding — and reused by every later step
+   *  (`refundLegA`, `learnSecret`) instead of ever re-reading the deal room. A pubkey/account
+   *  line posted after funding can therefore neither add to nor conflict with what this flow
+   *  already committed to acting on. */
+  private lockedAccounts?: RailAccounts;
+  /** G7: the refund's own write evidence, recorded the first time `refundLegA` actually
+   *  broadcasts — a later call (made because the first one found the refund not yet confirmed)
+   *  must never re-broadcast; it just re-checks. */
+  private legARefundEvidence?: RailWriteEvidence;
+  /** G7: `refundLegA`'s own refund/receipt frames are posted at most once — set only once the
+   *  evidence reader itself confirms the refund. */
+  private legARefundFramesPosted = false;
   /** B5: every leg-A write this flow has made so far (`lockLegA`'s lock, `refundLegA`'s
    *  refund), in call order — see the identical field on `SellerFlow`. */
   private readonly writeExchanges: Exchange[] = [];
@@ -141,7 +158,6 @@ export class BuyerFlow {
     this.venue = options.venue;
     this.paperRail = options.paperRail;
     this.rail = options.rail;
-    this.policy = options.policy ?? EVM_LOCAL_POLICY;
     this.clock = options.clock;
   }
 
@@ -161,6 +177,14 @@ export class BuyerFlow {
    *  with `rails: ["evm-htlc"]` and `feeBps` 0 (every deployment we operate). */
   async bid(params: BidParams): Promise<OfferFrame> {
     if (this.offerA !== undefined) throw new Error("buyer: already bid for this flow");
+    // G6: refuse an amount this rail could never actually lock (below the fixed spend fee plus
+    // the worst-case dust limit, with margin) before ever posting a public offer for it.
+    if (belowMinLockable(this.rail, params.amount)) {
+      throw new Error(
+        `buyer: refusing to bid ${params.amount} ${params.asset} — below this rail's minimum lockable amount ` +
+          `${this.rail.minLockableAmount} (G6)`,
+      );
+    }
     const offerA = makeOffer({
       from: this.identity.did,
       role: "payer",
@@ -291,7 +315,7 @@ export class BuyerFlow {
     if (!pairCheck.ok) {
       throw new Error(`buyer: refusing to accept leg B — ${pairCheck.reason} (C2)`);
     }
-    const deadlineCheck = checkSwapDeadlines(this.offerA, offerB, lockTimeMs, this.policy);
+    const deadlineCheck = checkSwapDeadlines(this.offerA, offerB, lockTimeMs, this.rail.policy);
     if (!deadlineCheck.ok) {
       throw new Error(`buyer: refusing to accept leg B — unsafe deadlines: ${deadlineCheck.violations.join("; ")}`);
     }
@@ -344,15 +368,42 @@ export class BuyerFlow {
    * deadline arithmetic, for leg B's own lock state instead.
    */
   async lockLegA(): Promise<{ hashLock: string; writeEvidence: RailWriteEvidence }> {
+    // P4-BTC-FIXES.md G2: refuse outright when this leg's lock has already been attempted
+    // (whether or not it is known to have succeeded), or another call is already in flight —
+    // checked, and the in-flight flag set, before anything else runs (including before this
+    // method's first `await`), the same re-entry pattern `acceptLegB`/`SellerFlow.lockLegB` use
+    // for their own latches. `reconcileLockA()` is the only way past a set `legALockAttempted`.
+    if (this.legALockAttempted || this.legALockPending) {
+      throw new Error("buyer: refusing to lock leg A — already attempted, or a lock is already in flight (G2)");
+    }
+    this.legALockPending = true;
+    try {
+      return await this.lockLegAUnlatched();
+    } finally {
+      this.legALockPending = false;
+    }
+  }
+
+  private async lockLegAUnlatched(): Promise<{ hashLock: string; writeEvidence: RailWriteEvidence }> {
     if (!this.legBVerified) {
       throw new Error("buyer: refusing to lock leg A before leg B verifies");
     }
     const { offerA, offerB, acceptA, acceptB } = this.requirePaired();
 
-    const deadlineCheck = checkSwapDeadlines(offerA, offerB, this.clock(), this.policy);
+    const deadlineCheck = checkSwapDeadlines(offerA, offerB, this.clock(), this.rail.policy);
     if (!deadlineCheck.ok) {
       throw new Error(
         `buyer: refusing to lock leg A — deadlines are no longer safe at lock time (B3): ${deadlineCheck.violations.join("; ")}`,
+      );
+    }
+
+    // G6: re-check the amount floor at lock time too — defense in depth, since `offerA.amount`
+    // cannot have changed since `bid()` already checked it, but spending real value is exactly
+    // the place to check "should never" rather than assume it.
+    if (belowMinLockable(this.rail, offerA.amount)) {
+      throw new Error(
+        `buyer: refusing to lock leg A — ${offerA.amount} ${offerA.asset} is below this rail's minimum lockable amount ` +
+          `${this.rail.minLockableAmount} (G6)`,
       );
     }
 
@@ -391,24 +442,34 @@ export class BuyerFlow {
 
     const fromBlock = await connected.currentBlockMarker();
 
-    // P22-P24-EVM-FIXES-R3.md E3: record this flow's own lock state from what it already knows
-    // — `termsA.statement` is the hash lock the Seller committed to in `acceptA`, known before
-    // this flow ever touches the chain — BEFORE the lock write ever runs, not after.
-    // `refundLegA` and `learnSecret` then read the chain itself as the truth; a failed evidence
-    // capture or a failed lock-frame post below must never leave this flow believing leg A was
-    // "never locked" when the on-chain write may already have succeeded.
+    // G3 (client half of H2): build (and, for a rail that needs one, sign) the lock transaction
+    // WITHOUT broadcasting it yet — `prepared.ref` is already fully determined at this point (a
+    // Bitcoin outpoint hashes the prepared transaction's own bytes; an EVM ref is simply the
+    // hashLock, already known regardless).
+    const prepared = await connected.prepareLock(termsA, 0);
+
+    // P22-P24-EVM-FIXES-R3.md E3 + P4-BTC-FIXES.md G1/G3: record everything `refundLegA`/
+    // `learnSecret` will ever need BEFORE this flow ever risks a broadcast — the hash lock
+    // (always known in advance), the resolved accounts (G1: frozen here, permanently, so a
+    // pubkey/account line posted after this point can neither add to nor conflict with what this
+    // flow already committed to acting on), and the rail's own write ref (G3: already known from
+    // `prepared`, not from whatever `commitLock` eventually returns — a failed evidence capture
+    // or a failed lock-frame post, or even a flaky read on the broadcast's own response, must
+    // never leave this flow believing leg A was "never locked" when the write may already have
+    // reached the network).
     const hashLock = termsA.statement;
     this.lockedHashLock = hashLock;
     this.lockedFromBlock = fromBlock;
+    this.lockedAccounts = accounts;
+    this.lockedRailRef = prepared.ref;
+
+    // G2: from this point on this flow can no longer be sure a retry would not double-fund —
+    // latch it permanently, right before the one call that might actually reach the network.
+    this.legALockAttempted = true;
 
     const before = connected.exchanges.length;
-    const writeEvidence = await connected.lock(termsA, 0);
+    const writeEvidence = await connected.commitLock();
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
-
-    // P4-BTC-SPEC.md §7a: the rail's own write ref (an outpoint for btc-htlc, the hashLock for
-    // evm-htlc) — recorded before the lock frame that announces it is ever posted, so a failed
-    // post still leaves this flow able to recover it from `writeEvidence` alone.
-    this.lockedRailRef = writeEvidence.ref;
 
     await this.venue.post(
       dealRoom(acceptA.contract),
@@ -417,6 +478,28 @@ export class BuyerFlow {
     );
 
     return { hashLock, writeEvidence };
+  }
+
+  /**
+   * P4-BTC-FIXES.md G2: the only way forward after a `lockLegA` call that threw once a lock has
+   * already been attempted — recovers the truth about that ONE attempt from the chain itself
+   * (via the recorded `lockedRailRef`), rather than ever funding a second time. `{ locked: false
+   * }` when this flow never even got as far as recording a prepared ref (nothing to check yet);
+   * a genuine `verifyLockFinal` observation (locked, claimed or refunded) at any point after that
+   * reports `{ locked: true }`.
+   */
+  async reconcileLockA(): Promise<{ locked: boolean }> {
+    if (!this.legALockAttempted) {
+      throw new Error("buyer: nothing to reconcile — leg A lock was never attempted (G2)");
+    }
+    if (this.lockedRailRef === undefined || this.lockedAccounts === undefined) {
+      return { locked: false };
+    }
+    const { offerA, acceptA } = this.requirePaired();
+    const termsA = offerAcceptLockTerms(offerA, acceptA);
+    const connected = await this.rail.connect(termsA, this.lockedAccounts);
+    const evidence = await connected.verifyLockFinal(termsA, this.lockedRailRef, this.lockedAccounts);
+    return { locked: evidence.rail !== undefined };
   }
 
   /** Learn the secret from the Seller's signed `reveal` frame when it posted one, or (SPEC
@@ -432,10 +515,9 @@ export class BuyerFlow {
     // real on-chain effect landed but BEFORE it returned a `writeEvidence` (e.g. its bounded
     // event-log lookup found nothing), `lockedRailRef` was never set — fall back to the hashLock
     // recorded before the write ever ran, which IS a valid `evm-htlc` ref (the two coincide by
-    // construction, `src/rails/evm-htlc.ts`'s own `lock()`). For `btc-htlc`, where the two are
-    // never the same value, this fallback cannot recover the real outpoint — a documented limit
-    // of a rail whose own write ref does not exist until the write itself returns (README
-    // "Bitcoin leg" known limits).
+    // construction, `src/rails/evm-htlc.ts`'s own `lock()`). P4-BTC-FIXES.md G3 means this
+    // fallback is no longer needed for `btc-htlc` either (the outpoint is recorded from
+    // `prepareLock` before `commitLock` ever runs), but it is kept as a last resort.
     const railRef = this.lockedRailRef ?? hashLock;
 
     const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
@@ -444,22 +526,23 @@ export class BuyerFlow {
       const frame = tryDecodeFrame(record.line);
       if (frame === null || frame.type !== "reveal" || frame.from !== record.sender) continue;
       if (frame.contract !== acceptA.contract) continue;
-      if (frame.ref !== undefined && frame.ref !== hashLock) continue;
+      // P4-BTC-FIXES.md G4: the reveal's own `ref` names the leg's RECORDED RAIL REF — the
+      // funding outpoint for `btc-htlc`, the hashLock for `evm-htlc` (the two happen to coincide
+      // there, which is exactly why comparing against `hashLock` alone was invisible before
+      // `btc-htlc` existed: `SellerFlow.claimLegA` posts `ref: railRef`, never `ref:
+      // hashLockHex`, so a Bitcoin reveal's `ref` is always an outpoint and could never match
+      // `hashLock`'s own `0x`-hex shape).
+      if (frame.ref !== undefined && frame.ref !== railRef) continue;
       if (verifySecret("hash", hashLock, frame.secret)) return frame.secret;
     }
 
+    // P4-BTC-FIXES.md G1: use the accounts frozen at lock time — never re-read/re-resolve the
+    // room here (a line posted after funding must neither help nor hinder this read).
+    if (this.lockedAccounts === undefined) {
+      throw new Error("buyer: refusing to guess the secret — leg A accounts were never resolved (G1)");
+    }
     const termsA = offerAcceptLockTerms(offerA, acceptA);
-    // P4-BTC-SPEC.md §6/§7a: a btc-htlc leg's `findClaimedPreimage` needs no resolved account of
-    // its own (it only scans a bounded block window for a witness item that opens the hashLock
-    // `connect()` already bound `termsA` with), but `connect()` itself is shared with the leg's
-    // other writes — resolving accounts here costs nothing for evm-htlc (never used) and is
-    // harmless for btc-htlc even though this particular call never needs them.
-    const accounts = this.rail.resolveAccounts(dealRoomARecords, {
-      contract: acceptA.contract,
-      payerDid: termsA.payer,
-      payeeDid: termsA.payee,
-    });
-    const connected = await this.rail.connect(termsA, accounts);
+    const connected = await this.rail.connect(termsA, this.lockedAccounts);
     const preimage = await connected.findClaimedPreimage(railRef, this.lockedFromBlock);
     if (preimage === null) {
       throw new Error("buyer: refusing to guess the secret — no reveal frame and no Claimed log yet");
@@ -489,8 +572,24 @@ export class BuyerFlow {
     return { reveal, receipt };
   }
 
-  /** Refund leg A only at/after `A.refundAfterMs` — the leg-A rail's own `refund` also enforces
-   *  this on-chain; this check exists so a caller sees this class's own reason. */
+  /**
+   * Refund leg A only at/after `A.refundAfterMs` — the leg-A rail's own `refund` also enforces
+   * this on-chain; this check exists so a caller sees this class's own reason.
+   *
+   * P4-BTC-FIXES.md G1: uses `lockedAccounts`, frozen at lock time — never re-reads the deal
+   * room (a pubkey/account line posted after funding can neither block nor help this call, and
+   * this method depends on nothing the venue could have changed since).
+   *
+   * G7: broadcasts at most once (a retry that finds the refund not yet confirmed must only ever
+   * re-check, never resend — this build's fixed fee carries no bump to retry with anyway, and
+   * Core 28+'s own full-RBF-by-default policy means it is the mempool's call, not this flow's,
+   * whether a second identical broadcast would do anything), and reports success — posting the
+   * refund/receipt frames, at most once — only once the evidence reader itself shows the refund
+   * confirmed. A broadcast the mempool accepted is not by itself evidence of what will actually
+   * end up spending the outpoint: after `T` the claim and the refund race (no on-chain claim
+   * deadline, README "Bitcoin leg"), so this checks the real outcome rather than assume the
+   * refund it just sent is the one that won.
+   */
   async refundLegA(): Promise<RailWriteEvidence> {
     const { offerA, acceptA } = this.requirePaired();
     if (this.lockedHashLock === undefined) throw new Error("buyer: leg A was never locked, nothing to refund");
@@ -499,36 +598,48 @@ export class BuyerFlow {
     }
     // E3's own recovery path (see the identical comment on `learnSecret`): fall back to the
     // pre-recorded hashLock when the write itself never returned a `writeEvidence` — valid for
-    // `evm-htlc`, a documented limit for `btc-htlc`.
+    // `evm-htlc`, and no longer needed for `btc-htlc` since G3 records the outpoint before
+    // `commitLock` ever runs.
     const railRef = this.lockedRailRef ?? this.lockedHashLock;
+    if (this.lockedAccounts === undefined) {
+      throw new Error("buyer: refusing to refund leg A — leg A accounts were never resolved (G1)");
+    }
     const termsA = offerAcceptLockTerms(offerA, acceptA);
-    // P4-BTC-SPEC.md §6: unlike evm-htlc (whose `refund` needs no resolved account at all), a
-    // btc-htlc refund needs BOTH parties' pubkeys to rebuild its own witnessScript — resolve
-    // them from the deal room the same way `lockLegA`/`claimLegA` already do, rather than
-    // connecting with an empty `RailAccounts` and letting the rail discover the gap itself.
-    const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
-    const accounts = this.rail.resolveAccounts(dealRoomARecords, {
-      contract: acceptA.contract,
-      payerDid: termsA.payer,
-      payeeDid: termsA.payee,
-    });
-    const connected = await this.rail.connect(termsA, accounts);
-    const before = connected.exchanges.length;
-    const writeEvidence = await connected.refund(railRef);
-    this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
-    // tclk's own machine requires a refund/receipt frame's `ref`, when present, to equal the
-    // contract's own accepted `railRef` (vendor/tclk/src/machine.ts) — the rail's own write ref,
-    // never `lockedHashLock` (only ever true by coincidence for evm-htlc).
-    await this.venue.post(
-      dealRoom(acceptA.contract),
-      encodeFrame({ type: "refund", from: this.identity.did, contract: acceptA.contract, ref: railRef }),
-      this.identity,
-    );
-    await this.venue.post(
-      dealRoom(acceptA.contract),
-      encodeFrame({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "refunded", rail: this.rail.railId, ref: railRef }),
-      this.identity,
-    );
-    return writeEvidence;
+    const connected = await this.rail.connect(termsA, this.lockedAccounts);
+
+    if (this.legARefundEvidence === undefined) {
+      const before = connected.exchanges.length;
+      this.legARefundEvidence = await connected.refund(railRef);
+      this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+    }
+
+    const evidence = await connected.verifyLockFinal(termsA, railRef, this.lockedAccounts);
+    if (evidence.rail?.status === "claimed") {
+      throw new Error(
+        "buyer: refusing to report leg A refunded — the lock was claimed instead (the refund lost the race to a claim); " +
+          "call learnSecret() then claimLegB() instead of refundLegA() (G7)",
+      );
+    }
+    if (evidence.rail === undefined || evidence.rail.status !== "refunded" || !evidence.rail.final) {
+      throw new Error("buyer: refund broadcast but not yet confirmed; call refundLegA() again once it confirms (G7)");
+    }
+
+    if (!this.legARefundFramesPosted) {
+      // tclk's own machine requires a refund/receipt frame's `ref`, when present, to equal the
+      // contract's own accepted `railRef` (vendor/tclk/src/machine.ts) — the rail's own write
+      // ref, never `lockedHashLock` (only ever true by coincidence for evm-htlc).
+      await this.venue.post(
+        dealRoom(acceptA.contract),
+        encodeFrame({ type: "refund", from: this.identity.did, contract: acceptA.contract, ref: railRef }),
+        this.identity,
+      );
+      await this.venue.post(
+        dealRoom(acceptA.contract),
+        encodeFrame({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "refunded", rail: this.rail.railId, ref: railRef }),
+        this.identity,
+      );
+      this.legARefundFramesPosted = true;
+    }
+    return this.legARefundEvidence;
   }
 }
