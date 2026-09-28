@@ -338,7 +338,25 @@ export function foldCaptured(input: FoldCapturedInput): Board {
           rail: EVM_RAIL_ID,
           caip2: evmConfigCheck.config.pin.caip2,
         });
-        result = evmEvidence({ terms, config: evmConfigCheck.config, accounts, capture });
+        // D4 (P22-P24-EVM-FIXES-R2.md): a backstop, not the primary defense — `evmEvidence`
+        // validates every address-shaped field it reads off captured data before it can ever
+        // throw over one, but this call sits inside a loop that folds *every* candidate in one
+        // pass, so an unanticipated throw here (a bug neither of us found yet) must still fail
+        // only this one leg closed, never the whole replay and every other swap in it.
+        try {
+          result = evmEvidence({ terms, config: evmConfigCheck.config, accounts, capture });
+        } catch (error) {
+          result = {
+            lock: {
+              rail: EVM_RAIL_ID,
+              ref: accepted.railRef,
+              terms,
+              railVerified: null,
+              checkedAtMs: input.nowMs,
+              reason: `evm-htlc: evidence check threw unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          };
+        }
       }
     } else {
       continue; // an unrecognised rail, or a rail this build has no evidence reader for

@@ -32,7 +32,7 @@ import { verifyHashPreimage } from "@flop-labs/tclk";
 
 import { EVM_HASH_RAIL_ABI, EvmHashRail, type AddressBook, type AssetBook } from "../vendor/evm-hash-rail.js";
 import { captureEvmLeg, evmEvidence, EVM_RAIL_ID, hashLockRefMismatch, type EvmAccounts, type EvmEvidenceResult } from "./evm-evidence.js";
-import type { CapturingRpc } from "./rpc-capture.js";
+import { verifiedExchangeBytes, type CapturingRpc } from "./rpc-capture.js";
 
 /** §2.2 point 1. Only `"finalized"` is a defined tag today; the union leaves room for a
  *  future one without widening every caller to a bare string. */
@@ -430,12 +430,22 @@ export class EvmHtlcRail {
     // exchanges — never `drain()`, which would also sweep up anything an earlier, un-drained
     // read (a `verifyLockFinal` a caller chose not to drain) left sitting in the log.
     const before = this.rpc.exchanges().length;
-    const hash = await this.walletClient.writeContract({
-      address: token,
-      abi: ERC20_APPROVE_ABI,
-      functionName: "approve",
-      args: [this.config.contract, BigInt(amount)],
-    });
+    // P22-P24-EVM-FIXES-R2.md D1: "a comparably unique id for write-path captures" — this
+    // `rpc` instance is long-lived across a whole swap's worth of writes, so its ids must not
+    // collide across two different `approve` calls the way two different `CapturingRpc`
+    // instances' plain sequences could (see `CapturingRpc.setIdNamespace`).
+    this.rpc.setIdNamespace(`write-approve:${asset}:${this.clock()}`);
+    let hash: Hex;
+    try {
+      hash = await this.walletClient.writeContract({
+        address: token,
+        abi: ERC20_APPROVE_ABI,
+        functionName: "approve",
+        args: [this.config.contract, BigInt(amount)],
+      });
+    } finally {
+      this.rpc.setIdNamespace(undefined);
+    }
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") {
       throw new Error(`evm-htlc: approve transaction mined but reverted on-chain (hash: ${hash})`);
@@ -455,9 +465,15 @@ export class EvmHtlcRail {
     }
     await this.assertPinnedChainId();
     const before = this.rpc.exchanges().length;
-    const fromBlock = await this.publicClient.getBlockNumber();
-    await this.rail.lock(terms);
-    return this.captureWriteEvidence("Locked", terms.statement as Hex, fromBlock, before);
+    // D1: see the identical comment on `approve` above.
+    this.rpc.setIdNamespace(`write-lock:${terms.statement}:${this.clock()}`);
+    try {
+      const fromBlock = await this.publicClient.getBlockNumber();
+      await this.rail.lock(terms);
+      return await this.captureWriteEvidence("Locked", terms.statement as Hex, fromBlock, before);
+    } finally {
+      this.rpc.setIdNamespace(undefined);
+    }
   }
 
   /**
@@ -472,9 +488,15 @@ export class EvmHtlcRail {
     await this.assertPinnedChainId();
     await this.simulateClaimOrThrow(hashLock, secret);
     const before = this.rpc.exchanges().length;
-    const fromBlock = await this.publicClient.getBlockNumber();
-    await this.rail.claim(hashLock, secret);
-    return this.captureWriteEvidence("Claimed", hashLock, fromBlock, before);
+    // D1: see the identical comment on `approve` above.
+    this.rpc.setIdNamespace(`write-claim:${hashLock}:${this.clock()}`);
+    try {
+      const fromBlock = await this.publicClient.getBlockNumber();
+      await this.rail.claim(hashLock, secret);
+      return await this.captureWriteEvidence("Claimed", hashLock, fromBlock, before);
+    } finally {
+      this.rpc.setIdNamespace(undefined);
+    }
   }
 
   /** B2: `eth_call` the vendored contract's own `claim(hashLock, preimage)` at `latest` through
@@ -511,9 +533,15 @@ export class EvmHtlcRail {
   async refund(hashLock: Hex): Promise<WriteEvidence> {
     await this.assertPinnedChainId();
     const before = this.rpc.exchanges().length;
-    const fromBlock = await this.publicClient.getBlockNumber();
-    await this.rail.refund(hashLock);
-    return this.captureWriteEvidence("Refunded", hashLock, fromBlock, before);
+    // D1: see the identical comment on `approve` above.
+    this.rpc.setIdNamespace(`write-refund:${hashLock}:${this.clock()}`);
+    try {
+      const fromBlock = await this.publicClient.getBlockNumber();
+      await this.rail.refund(hashLock);
+      return await this.captureWriteEvidence("Refunded", hashLock, fromBlock, before);
+    } finally {
+      this.rpc.setIdNamespace(undefined);
+    }
   }
 
   /** Records `eth_blockNumber` before the write, then looks the matching event up with a
@@ -583,7 +611,7 @@ export class EvmHtlcRail {
     }
     const checkedAtMs = this.clock();
     const { index, exchanges } = await captureEvmLeg(this.rpc, this.config, ref, checkedAtMs);
-    const bytes = new Map(exchanges.map((exchange) => [exchange.responseSha256, new TextEncoder().encode(exchange.responseBody)]));
+    const bytes = verifiedExchangeBytes(exchanges);
     const result = evmEvidence({
       terms,
       config: this.config,

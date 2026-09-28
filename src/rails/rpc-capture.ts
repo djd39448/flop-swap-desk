@@ -20,13 +20,25 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 
 /** One request/response round trip, byte-exact. `atMs` is the injected clock's reading taken
  *  when the request was issued — never `Date.now()` directly (house rule: no clock in a
- *  function that isn't explicitly given one). */
+ *  function that isn't explicitly given one).
+ *
+ *  P22-P24-EVM-FIXES-R2.md D2: `responseBytes` is the exact wire bytes (what `responseSha256`
+ *  is a hash of, what `writeCapture` writes, what `readCapture` re-derives) — the source of
+ *  truth for every write/hash/equality operation from here on. `responseBody` is kept only as
+ *  a convenience UTF-8 decode of those same bytes (lossy — `TextDecoder`'s replacement
+ *  characters — for whatever isn't valid UTF-8) for a caller that wants a readable string (an
+ *  error message, a quick `.includes()`); nothing that decides a verdict may compare or hash
+ *  it, since a response with a UTF-8 BOM or a genuinely invalid byte would otherwise decode
+ *  losslessly live but not survive a disk round trip through a JS string the same way (the
+ *  live and replayed verdicts must never be able to diverge over exactly this). */
 export interface Exchange {
   method: string;
   params: unknown;
   requestBody: string;
   responseBody: string;
-  /** Lowercase hex sha256 of `responseBody`'s exact bytes — the name `writeCapture` gives the
+  /** The exact response bytes — see the interface doc above. */
+  responseBytes: Uint8Array;
+  /** Lowercase hex sha256 of `responseBytes`'s exact bytes — the name `writeCapture` gives the
    *  file it writes, and the value `readCapture` re-derives to catch tampering. */
   responseSha256: string;
   atMs: number;
@@ -86,6 +98,8 @@ export class CapturingRpc implements CaptureSink {
   private readonly timeoutMs: number | undefined;
   private readonly log: Exchange[] = [];
   private nextId = 1;
+  private idNamespace: string | undefined;
+  private namespaceCounter = 0;
 
   constructor(options: CapturingRpcOptions) {
     this.endpoint = options.endpoint;
@@ -94,39 +108,73 @@ export class CapturingRpc implements CaptureSink {
     this.timeoutMs = options.timeoutMs;
   }
 
+  /**
+   * P22-P24-EVM-FIXES-R2.md D1: from now until the next call, every id this instance mints is
+   * `${namespace}:${n}` (`n` restarting at 1) instead of the bare auto-incrementing integer
+   * `nextId` mints by default. A plain integer id is unique only *within one `CapturingRpc`
+   * instance's own lifetime* — a fresh instance always restarts at 1 — so a genuine response
+   * captured under one capture session (one hashLock/checkedAtMs, or a totally different
+   * instance/process) could otherwise be spliced into a different capture's index and still
+   * satisfy `evm-evidence.ts`'s `bindExchange` ("response id equals request id"), since two
+   * unrelated captures can easily mint the exact same small integer. Binding every id to
+   * something the *verifier* independently trusts (an evidence capture's own hashLock +
+   * checkedAtMs — see `captureEvmLeg`) closes that gap: `bindExchange` additionally requires a
+   * captured id to start with the capture it claims to belong to. Pass `undefined` to go back
+   * to the bare integer sequence — every caller that never calls this (every test, and any
+   * write that has no natural per-capture identity of its own) keeps today's behaviour exactly.
+   */
+  setIdNamespace(namespace: string | undefined): void {
+    this.idNamespace = namespace;
+    this.namespaceCounter = 0;
+  }
+
+  private mintId(): string | number {
+    if (this.idNamespace === undefined) {
+      const id = this.nextId;
+      this.nextId += 1;
+      return id;
+    }
+    this.namespaceCounter += 1;
+    return `${this.idNamespace}:${this.namespaceCounter}`;
+  }
+
   async request({ method, params }: { method: string; params?: unknown }): Promise<unknown> {
-    const id = this.nextId;
-    this.nextId += 1;
+    const id = this.mintId();
     const requestBody = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? [] });
     const atMs = this.clock();
 
-    // A9: a stalled/unreachable endpoint must not be able to hang a sweep forever — abort
+    // A9/D6: a stalled/unreachable endpoint must not be able to hang a sweep forever — abort
     // after `timeoutMs` (when the caller configured one) exactly like `src/watcher.ts`'s own
-    // `fetchWithTimeout` does for its technocore reads.
+    // `fetchWithTimeout` does for its technocore reads. D6: the timer covers the BODY too, not
+    // only the initial connection — `fetch()` commonly resolves once response *headers* arrive,
+    // while the body keeps streaming, so clearing the timer right after `fetchImpl` resolves
+    // (the original bug) would leave a server that stalls mid-body free to hang the subsequent
+    // `arrayBuffer()` read forever. Both steps happen inside the same try, so the same abort
+    // (and the same `finally`) covers whichever one is still in flight when `timeoutMs` elapses.
     const controller = new AbortController();
     const timer = this.timeoutMs === undefined ? undefined : setTimeout(() => controller.abort(), this.timeoutMs);
-    let response: Response;
+    let responseBytes: Uint8Array;
     try {
-      response = await this.fetchImpl(this.endpoint, {
+      const response = await this.fetchImpl(this.endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: requestBody,
         signal: controller.signal,
       });
+      // A9: hash and store the exact wire bytes (`arrayBuffer()`), never a UTF-8 decode/re-encode
+      // round trip through `.text()` — a response containing bytes that are not valid UTF-8
+      // would decode with lossy replacement characters, so hashing the *decoded* string could
+      // never reproduce the sha256 of what the server actually sent.
+      responseBytes = new Uint8Array(await response.arrayBuffer());
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
 
-    // A9: hash and store the exact wire bytes (`arrayBuffer()`), never a UTF-8 decode/re-encode
-    // round trip through `.text()` — a response containing bytes that are not valid UTF-8
-    // would decode with lossy replacement characters, so hashing the *decoded* string could
-    // never reproduce the sha256 of what the server actually sent. `responseBody` (used for
-    // JSON parsing below and for whatever a caller does with the exchange afterward) is
-    // decoded from that same byte buffer, once, as a separate copy.
-    const responseBytes = new Uint8Array(await response.arrayBuffer());
+    // `responseBody` (used for JSON parsing below and for whatever a caller does with the
+    // exchange afterward) is decoded from that same byte buffer, once, as a separate copy.
     const responseSha256 = bytesToHex(sha256(responseBytes));
     const responseBody = new TextDecoder("utf-8").decode(responseBytes);
-    this.log.push({ method, params: params ?? [], requestBody, responseBody, responseSha256, atMs });
+    this.log.push({ method, params: params ?? [], requestBody, responseBody, responseBytes, responseSha256, atMs });
 
     let parsed: unknown;
     try {
@@ -155,11 +203,22 @@ export class CapturingRpc implements CaptureSink {
   }
 }
 
-async function writeFileAtomic(path: string, data: string): Promise<void> {
+async function writeFileAtomic(path: string, data: string | Uint8Array): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
   await writeFile(tmp, data);
   await rename(tmp, path);
+}
+
+/** D2: exact byte-for-byte equality — never `TextDecoder`/`TextEncoder` round-tripped, so a
+ *  response with a UTF-8 BOM or a genuinely invalid byte compares the same way live and
+ *  replayed. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 /** Where `writeCapture`/`readCapture` keep one exchange's response bytes under a watch root. */
@@ -170,42 +229,81 @@ function rawRpcPath(root: string, sha256Hex: string): string {
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 /**
- * Write each exchange's `responseBody` byte-exact to `raw/rpc/<responseSha256>.json`. The name
- * is the content's own hash, so two callers writing the same exchange twice (or the same
- * exchange re-captured on a later sweep) produce the identical file — idempotent by
- * construction. Skips a path that is already on disk rather than re-writing it, since its
- * content is fully determined by its own name.
+ * Write each exchange's `responseBytes` byte-exact to `raw/rpc/<responseSha256>.json` — never
+ * `responseBody` (P22-P24-EVM-FIXES-R2.md D2: a `TextDecoder`/`TextEncoder` round trip through
+ * a JS string is lossy for a response containing a byte that isn't valid UTF-8, which would
+ * otherwise write different bytes than the ones `responseSha256` actually names). The name is
+ * the content's own hash, so two callers writing the same exchange twice (or the same exchange
+ * re-captured on a later sweep) produce the identical file — idempotent by construction. Skips
+ * a path that is already on disk with the identical bytes rather than re-writing it; a path
+ * that exists with *different* bytes (corruption, or a hostile edit) is overwritten with the
+ * genuine bytes this capture just produced, self-healing rather than trusting whatever was
+ * there first.
  */
 export async function writeCapture(root: string, exchanges: readonly Exchange[]): Promise<void> {
   for (const exchange of exchanges) {
     const path = rawRpcPath(root, exchange.responseSha256);
-    let alreadyThere: string | null;
+    let alreadyThere: Uint8Array | null;
     try {
-      alreadyThere = await readFile(path, "utf8");
+      alreadyThere = await readFile(path);
     } catch {
       alreadyThere = null;
     }
-    if (alreadyThere === exchange.responseBody) continue;
-    await writeFileAtomic(path, exchange.responseBody);
+    if (alreadyThere !== null && bytesEqual(alreadyThere, exchange.responseBytes)) continue;
+    await writeFileAtomic(path, exchange.responseBytes);
   }
 }
 
 /**
- * Read `raw/rpc/<sha256>.json` and re-hash it. `null` on a missing file OR a hash mismatch
- * (tampering, truncation, a caller passing a hash that never came from `writeCapture`) — the
- * caller (`src/rails/evm-evidence.ts`'s `evmEvidence`) turns either into fail-closed evidence,
- * never a thrown exception; this file is anonymous input from disk, same trust level as a
- * `/kv` note. A malformed `sha256Hex` (not 64 lowercase hex chars) is refused before touching
- * the filesystem at all, so a hostile or corrupted index can never walk this out of `root`.
+ * Read `raw/rpc/<sha256>.json`'s raw bytes and re-hash them directly — never decoded to a
+ * string and re-encoded first (P22-P24-EVM-FIXES-R2.md D2: that round trip is lossy for a byte
+ * that isn't valid UTF-8, so a genuine capture of such a response could otherwise re-hash to a
+ * *different* value on replay than it did live, even though nothing was tampered — the live and
+ * replayed verdicts must never be able to diverge over exactly this). `null` on a missing file
+ * OR a hash mismatch (tampering, truncation, a caller passing a hash that never came from
+ * `writeCapture`) — the caller (`src/rails/evm-evidence.ts`'s `evmEvidence`) turns either into
+ * fail-closed evidence, never a thrown exception; this file is anonymous input from disk, same
+ * trust level as a `/kv` note. A malformed `sha256Hex` (not 64 lowercase hex chars) is refused
+ * before touching the filesystem at all, so a hostile or corrupted index can never walk this
+ * out of `root`.
  */
-export async function readCapture(root: string, sha256Hex: string): Promise<string | null> {
+export async function readCapture(root: string, sha256Hex: string): Promise<Uint8Array | null> {
   if (!SHA256_HEX.test(sha256Hex)) return null;
-  let body: string;
+  let raw: Buffer;
   try {
-    body = await readFile(rawRpcPath(root, sha256Hex), "utf8");
+    raw = await readFile(rawRpcPath(root, sha256Hex));
   } catch {
     return null;
   }
-  const actual = bytesToHex(sha256(new TextEncoder().encode(body)));
+  // A plain `Uint8Array` copy, not the `Buffer` subclass `readFile` returns — the same concrete
+  // type every other byte array in this module is (`Exchange.responseBytes`, `writeCapture`'s
+  // own input), so a caller's `toEqual`/structural comparison never has to know or care that
+  // these bytes happened to come from a file.
+  const body = new Uint8Array(raw);
+  const actual = bytesToHex(sha256(body));
   return actual === sha256Hex ? body : null;
+}
+
+/**
+ * P22-P24-EVM-FIXES-R2.md D2: builds an `EvmCapture.bytes`-shaped map straight from a live
+ * capture's own `Exchange[]`, re-hashing each one's `responseBytes` against its own
+ * `responseSha256` — the same re-hash `readCapture` performs on a replayed file, so a live
+ * capture and a replayed one are trusted identically instead of a live one blindly reusing
+ * whatever bytes happen to already be sitting in memory. Used by every caller that builds an
+ * in-memory `EvmCapture` straight from a live capture (`src/rails/evm-htlc.ts`'s
+ * `verifyLockFinal`, `src/watcher.ts`'s sweep, `src/client/bundle.ts`'s evidence writer) —
+ * never `new TextEncoder().encode(exchange.responseBody)`, which is lossy for a response
+ * containing a byte that isn't valid UTF-8 (the live and replayed verdicts must never be able
+ * to diverge over exactly this). A mismatch (should never happen if `CapturingRpc` behaved,
+ * but this is the same untrusted-input boundary as everywhere else in this file) maps to
+ * `null`, exactly like a `readCapture` tamper/miss.
+ */
+export function verifiedExchangeBytes(exchanges: readonly Exchange[]): Map<string, Uint8Array | null> {
+  const bytes = new Map<string, Uint8Array | null>();
+  for (const exchange of exchanges) {
+    if (bytes.has(exchange.responseSha256)) continue;
+    const actual = bytesToHex(sha256(exchange.responseBytes));
+    bytes.set(exchange.responseSha256, actual === exchange.responseSha256 ? exchange.responseBytes : null);
+  }
+  return bytes;
 }

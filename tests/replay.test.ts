@@ -146,8 +146,13 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
   function sha256Hex(text: string): string {
     return bytesToHex(sha256(new TextEncoder().encode(text)));
   }
-  function jsonRpcResult(id: number, result: unknown): string {
+  function jsonRpcResult(id: number | string, result: unknown): string {
     return JSON.stringify({ jsonrpc: "2.0", id, result });
+  }
+  /** P22-P24-EVM-FIXES-R2.md D1: the capture-bound id format every real capture now uses —
+   *  every fixture in this block builds its capture at `T0`, so this always binds. */
+  function evmId(hashLock: string, n: number): string {
+    return `${hashLock}:${T0}:${n}`;
   }
   function addr(tag: string): Address {
     const hex = Buffer.from(tag, "utf8").toString("hex").padEnd(40, "0").slice(0, 40);
@@ -208,7 +213,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       return {
         method: spec.method,
         params: spec.params,
-        requestBody: JSON.stringify({ jsonrpc: "2.0", id: i + 1, method: spec.method, params: spec.params }),
+        requestBody: JSON.stringify({ jsonrpc: "2.0", id: evmId(hashLock, i + 1), method: spec.method, params: spec.params }),
         responseSha256: sha,
         atMs: T0,
       };
@@ -236,11 +241,11 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
    *  `chainId` metadata field. */
   function standardExchanges(hashLock: Hex, callResult: Hex, chainId = ANVIL_LOCAL_PIN.chainId): ExchangeSpec[] {
     return [
-      { method: "eth_chainId", params: [], body: jsonRpcResult(1, `0x${chainId.toString(16)}`) },
+      { method: "eth_chainId", params: [], body: jsonRpcResult(evmId(hashLock, 1), `0x${chainId.toString(16)}`) },
       {
         method: "eth_getBlockByNumber",
         params: ["finalized", false],
-        body: jsonRpcResult(2, { number: "0x5", hash: BLOCK_HASH }),
+        body: jsonRpcResult(evmId(hashLock, 2), { number: "0x5", hash: BLOCK_HASH }),
       },
       {
         method: "eth_call",
@@ -248,7 +253,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
           { to: EVM_CONFIG.contract, data: encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [hashLock] }) },
           { blockHash: BLOCK_HASH },
         ],
-        body: jsonRpcResult(3, callResult),
+        body: jsonRpcResult(evmId(hashLock, 3), callResult),
       },
     ];
   }
@@ -482,6 +487,69 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     expect(view!.status).toBe("b-locked");
   });
 
+  // P22-P24-EVM-FIXES-R2.md D4: "'nope' as a captured contract address fails that leg closed
+  // and every other swap still reports" — one swap's malformed captured contract must never
+  // crash the whole fold (`isAddressEqual` throws on anything that isn't address-shaped); every
+  // other swap in the same batch keeps getting its own evidence, folded normally.
+  it("D4: a captured contract of 'nope' fails only that leg; every other swap in the same fold still reports", async () => {
+    const bad = buildMixedSwapBase("d004d004d004d004");
+    const good = buildMixedSwapBase("d005d005d005d005");
+
+    function evmLegAFixture(s: ReturnType<typeof buildMixedSwapBase>) {
+      const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: s.lock.hash };
+      const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+      const dealRoomsA = [
+        record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
+        ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      ];
+      const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+      return { dealRoomsA, dealRoomsB };
+    }
+
+    const badRooms = evmLegAFixture(bad);
+    const goodRooms = evmLegAFixture(good);
+
+    const badCapture = buildCapture(bad.lock.hash, standardExchanges(bad.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
+    // The reviewer's edit: the manifest's own top-level `contract` field set to a bare string
+    // that isn't shaped like an address at all — distinct from `capturedConfig.contract`.
+    const badTamperedCapture: EvmCapture = { index: { ...badCapture.index, contract: "nope" as Address }, bytes: badCapture.bytes };
+    const goodCapture = buildCapture(good.lock.hash, standardExchanges(good.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
+    const goodNoteBValue = encodePaperRecord({
+      status: "locked",
+      lock: "hash",
+      statement: good.lock.hash,
+      refundAfterMs: good.legBOffer.refundAfterMs,
+    });
+
+    const board = foldCaptured({
+      offers: [...bad.offers, ...good.offers],
+      dealRooms: new Map([
+        [bad.dealRoomA, badRooms.dealRoomsA],
+        [bad.dealRoomB, badRooms.dealRoomsB],
+        [good.dealRoomA, goodRooms.dealRoomsA],
+        [good.dealRoomB, goodRooms.dealRoomsB],
+      ]),
+      notes: new Map([[good.legBAccept.contract, { body: `!! rehearsal\n\n${goodNoteBValue}\n`, endpoint: "kv:test" }]]),
+      chain: new Map([
+        [bad.lock.hash, badTamperedCapture],
+        [good.lock.hash, goodCapture],
+      ]),
+      rails: { evm: EVM_CONFIG },
+      nowMs: T0 + 6 * MIN,
+    });
+
+    const badView = board.swaps.find((sw) => sw.swapId === bad.swapId);
+    expect(badView).toBeDefined();
+    expect(badView!.evidence.a?.railVerified).toBeNull();
+    expect(badView!.evidence.a?.reason).toMatch(/not a valid address|threw unexpectedly/);
+
+    const goodView = board.swaps.find((sw) => sw.swapId === good.swapId);
+    expect(goodView).toBeDefined();
+    expect(goodView!.evidence.a?.rail).toBe("evm-htlc");
+    expect(goodView!.evidence.a?.railVerified).toBe(true);
+    expect(goodView!.status).toBe("a-locked");
+  });
+
   it("a lock frame signed by anyone other than the leg's own payer is ignored entirely", async () => {
     const s = buildMixedSwapBase("f006f006f006f006");
     // Signed by the seller (leg A's payee, not its payer) — verifyTranscriptRecord accepts
@@ -586,7 +654,12 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       expect(view!.status).toBe("a-locked");
     });
 
-    it("a payer's earlier malformed frame (posted after the refund window had already opened) does not shadow the later accepted lock", async () => {
+    // P22-P24-EVM-FIXES-R2.md D7: renamed from "...earlier malformed frame..." — the frame
+    // itself is perfectly well-formed; what rejects it is tclk's own deadline check (the
+    // refund window was already open by the time it was posted), not anything wrong with its
+    // shape. "Malformed" mis-described the fixture; this pins the same behaviour under its
+    // actual name.
+    it("a payer's earlier lock frame rejected by deadline (posted after the refund window had already opened) does not shadow the later accepted lock", async () => {
       const s = buildMixedSwapBase("a002a002a002a002");
       const wrongRef = "0x" + "88".repeat(32);
       // tclk's machine rejects this one on its own timestamp ("refund window is already
@@ -595,11 +668,11 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       // have picked this up as "the" lock frame for leg A (and, since its ref does not equal
       // terms.statement, reported no evm-htlc evidence for leg A at all — never even reaching
       // the frame the payer actually meant).
-      const malformedLockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: wrongRef };
+      const rejectedByDeadlineLockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: wrongRef };
       const acceptedLockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: s.lock.hash };
       const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
       const dealRoomsA = [
-        record(s.dealRoomA, 1, T0 + 65 * MIN /* after legAOffer.refundAfterMs (60 min) */, buyer, encodeFrame(malformedLockA)),
+        record(s.dealRoomA, 1, T0 + 65 * MIN /* after legAOffer.refundAfterMs (60 min) */, buyer, encodeFrame(rejectedByDeadlineLockA)),
         record(s.dealRoomA, 2, T0 + 4 * MIN, buyer, encodeFrame(acceptedLockA)),
         ...accountLineRecords(s.dealRoomA, 3, T0 + 4.5 * MIN),
       ];
@@ -623,6 +696,44 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       expect(view!.evidence.a?.ref).toBe(s.lock.hash);
       expect(view!.evidence.a?.railVerified).toBe(true);
       expect(view!.status).toBe("a-locked");
+    });
+
+    // D7: the companion case — an earlier frame that tclk *does* accept (it is on time; only
+    // its ref is wrong) is a genuinely different scenario from the deadline case above. tclk's
+    // own step machine locks a contract at most once, so once this wrong-ref frame is accepted
+    // as leg A's lock, the payer's later, correctly-ref'd frame is rejected as a duplicate lock
+    // attempt — `foldAcceptedLock` keeps reporting the *wrong* ref forever. Dispatch requires
+    // `accepted.railRef === terms.statement` before it will even look for a captured read, so
+    // this leg gets no evidence at all: fails closed, never a crash and never the wrong verdict.
+    it("D7: a well-timed but wrong-ref frame accepted first leaves the leg with no evidence at all (fails closed)", async () => {
+      const s = buildMixedSwapBase("a007a007a007a007");
+      const wrongRef = "0x" + "99".repeat(32);
+      const wrongRefLockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: wrongRef };
+      const laterCorrectLockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: s.lock.hash };
+      const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+      const dealRoomsA = [
+        record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(wrongRefLockA)), // on time, wrong ref: tclk accepts it
+        record(s.dealRoomA, 2, T0 + 4.2 * MIN, buyer, encodeFrame(laterCorrectLockA)), // on time, right ref: too late, already locked
+        ...accountLineRecords(s.dealRoomA, 3, T0 + 4.5 * MIN),
+      ];
+      const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+
+      const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+      const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
+
+      const board = foldCaptured({
+        offers: s.offers,
+        dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+        notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
+        chain: new Map([[s.lock.hash, capture]]),
+        rails: { evm: EVM_CONFIG },
+        nowMs: T0 + 6 * MIN,
+      });
+
+      const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+      expect(view).toBeDefined();
+      expect(view!.evidence.a).toBeUndefined();
+      expect(view!.evidence.aRail).toBeUndefined();
     });
   });
 

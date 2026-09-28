@@ -39,7 +39,7 @@ import { OFFER_ROOM, paperNote, type TranscriptRecord } from "@flop-labs/tclk";
 import { foldCaptured, type CapturedNote } from "../replay.js";
 import { captureEvmLeg, captureFinalizedRef, type EvmCapture } from "../rails/evm-evidence.js";
 import type { EvmRailConfig } from "../rails/evm-htlc.js";
-import { writeCapture, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
+import { verifiedExchangeBytes, writeCapture, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 
 /** The exact banner text `stripNoteBanner` (src/paper-evidence.ts) strips before decoding a
  *  paper note's last non-empty line — copied verbatim from the real
@@ -208,7 +208,7 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
     await writeCapture(input.root, exchanges);
     await writeFileAtomic(join(input.root, "raw", "evm", hashLock, `${stamp}.json`), `${JSON.stringify(index, null, 2)}\n`);
 
-    const bytes = new Map(exchanges.map((exchange) => [exchange.responseSha256, new TextEncoder().encode(exchange.responseBody)]));
+    const bytes = verifiedExchangeBytes(exchanges);
     const capture: EvmCapture = { index, bytes };
     chainForFold.set(hashLock, capture);
     const evmRef = captureFinalizedRef(config, capture);

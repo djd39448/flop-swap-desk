@@ -29,7 +29,7 @@ import {
 } from "./replay.js";
 import { captureEvmLeg, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
 import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
-import { CapturingRpc, writeCapture } from "./rails/rpc-capture.js";
+import { CapturingRpc, verifiedExchangeBytes, writeCapture } from "./rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, SwapStatus } from "./types.js";
 
@@ -547,7 +547,7 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
           underRoot(root, "raw", "evm", hashLock, `${sweepIso}.json`),
           `${JSON.stringify(index, null, 2)}\n`,
         );
-        const bytes = new Map(exchanges.map((exchange) => [exchange.responseSha256, new TextEncoder().encode(exchange.responseBody)]));
+        const bytes = verifiedExchangeBytes(exchanges);
         chainCaptures.set(hashLock, { index, bytes });
         report.chainReads += 1;
       } catch (error) {

@@ -56,8 +56,12 @@ const EVM_CONFIG: EvmRailConfig = {
 function sha256Hex(text: string): string {
   return bytesToHex(sha256(new TextEncoder().encode(text)));
 }
-function jsonRpcResult(id: number, result: unknown): string {
+function jsonRpcResult(id: number | string, result: unknown): string {
   return JSON.stringify({ jsonrpc: "2.0", id, result });
+}
+/** P22-P24-EVM-FIXES-R2.md D1: the capture-bound id format every real capture now uses. */
+function evmId(hashLock: string, checkedAtMs: number, n: number): string {
+  return `${hashLock}:${checkedAtMs}:${n}`;
 }
 function wireRow(rec: ReturnType<typeof record>) {
   return JSON.stringify({ seq: rec.seq, ts: new Date(rec.timestampMs).toISOString(), from: rec.sender, nonce: rec.nonce, sig: rec.signature, text: rec.line });
@@ -113,9 +117,10 @@ function buildEvmFixture(contractAddress: Address) {
     functionName: "locks",
     result: [BUYER_ADDR, SELLER_ADDR, TOKEN, BigInt(legATerms.amount), BigInt(legATerms.claimByMs), BigInt(legATerms.refundAfterMs), 1 /* Locked */],
   });
-  const chainIdBody = jsonRpcResult(1, `0x${ANVIL_LOCAL_PIN.chainId.toString(16)}`);
-  const blockBody = jsonRpcResult(2, { number: "0x5", hash: BLOCK_HASH });
-  const callBody = jsonRpcResult(3, callResult);
+  const checkedAtMs = T0 + 5 * MIN;
+  const chainIdBody = jsonRpcResult(evmId(lock.hash, checkedAtMs, 1), `0x${ANVIL_LOCAL_PIN.chainId.toString(16)}`);
+  const blockBody = jsonRpcResult(evmId(lock.hash, checkedAtMs, 2), { number: "0x5", hash: BLOCK_HASH });
+  const callBody = jsonRpcResult(evmId(lock.hash, checkedAtMs, 3), callResult);
   const callParams = [
     { to: EVM_CONFIG.contract, data: encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [lock.hash as `0x${string}`] }) },
     { blockHash: BLOCK_HASH },
@@ -124,6 +129,8 @@ function buildEvmFixture(contractAddress: Address) {
   // P22-P24-EVM-FIXES.md A1: each exchange's own `requestBody` must actually ask for its
   // declared `method`/`params` — these three are what a real `CapturingRpc` would have sent,
   // never a placeholder, since `evmEvidence` now binds every read to its own request.
+  // P22-P24-EVM-FIXES-R2.md D1: their ids are bound to this capture's own hashLock/checkedAtMs
+  // (`CapturingRpc.setIdNamespace`), never a bare auto-incrementing integer.
   const index = {
     v: 1,
     rail: "evm-htlc",
@@ -133,28 +140,33 @@ function buildEvmFixture(contractAddress: Address) {
     endpoint: EVM_CONFIG.endpoint,
     contract: contractAddress,
     hashLock: lock.hash,
-    checkedAtMs: T0 + 5 * MIN,
+    checkedAtMs,
     finality: { mode: "tag", tag: "finalized" },
     config: EVM_CONFIG,
     exchanges: [
       {
         method: "eth_chainId",
         params: [],
-        requestBody: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
+        requestBody: JSON.stringify({ jsonrpc: "2.0", id: evmId(lock.hash, checkedAtMs, 1), method: "eth_chainId", params: [] }),
         responseSha256: sha256Hex(chainIdBody),
         atMs: T0,
       },
       {
         method: "eth_getBlockByNumber",
         params: ["finalized", false],
-        requestBody: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_getBlockByNumber", params: ["finalized", false] }),
+        requestBody: JSON.stringify({
+          jsonrpc: "2.0",
+          id: evmId(lock.hash, checkedAtMs, 2),
+          method: "eth_getBlockByNumber",
+          params: ["finalized", false],
+        }),
         responseSha256: sha256Hex(blockBody),
         atMs: T0,
       },
       {
         method: "eth_call",
         params: callParams,
-        requestBody: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "eth_call", params: callParams }),
+        requestBody: JSON.stringify({ jsonrpc: "2.0", id: evmId(lock.hash, checkedAtMs, 3), method: "eth_call", params: callParams }),
         responseSha256: sha256Hex(callBody),
         atMs: T0,
       },

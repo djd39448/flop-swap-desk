@@ -37,6 +37,7 @@ import {
   decodeFunctionResult,
   encodeFunctionData,
   hexToNumber,
+  isAddress,
   isAddressEqual,
   numberToHex,
   type Address,
@@ -46,7 +47,14 @@ import type { LockTerms } from "@flop-labs/tclk";
 
 import { EVM_HASH_RAIL_ABI } from "../vendor/evm-hash-rail.js";
 import { readCapture, type CapturingRpc, type Exchange } from "./rpc-capture.js";
-import type { EvmFinality, EvmRailConfig } from "./evm-htlc.js";
+// D3 (P22-P24-EVM-FIXES-R2.md): a captured config is validated with the exact same
+// allow-list/D-09/shape rule every other rail-config entry point runs (A3) — `checkEvmRailConfig`
+// is a runtime import (not `import type`), which makes this a genuine circular import with
+// evm-htlc.ts (it imports several runtime values back from this module). That is safe here:
+// neither module calls anything it imports from the other at module-top-level, only from
+// inside a function body called well after both modules have finished loading (ESM resolves
+// circular imports via live bindings, not eager evaluation order).
+import { checkEvmRailConfig, type EvmFinality, type EvmRailConfig } from "./evm-htlc.js";
 import type { LockEvidence, RailObservation } from "../types.js";
 
 export const EVM_RAIL_ID = "evm-htlc";
@@ -71,6 +79,21 @@ const HEX_VALUE = /^0x[0-9a-fA-F]+$/;
  *  P22-P24-EVM-FIXES.md A8). */
 export function hashLockRefMismatch(terms: LockTerms, ref: string): boolean {
   return terms.lock !== "hash" || !HASH_LOCK_SHAPE.test(ref) || ref !== terms.statement;
+}
+
+/**
+ * P22-P24-EVM-FIXES-R2.md D4: whether `value` is even shaped like a 20-byte address —
+ * `isAddress(value, { strict: false })`, the same non-strict check `isAddressEqual` runs
+ * internally before it will compare two addresses (and *throws* `InvalidAddressError` for
+ * anything that fails it). Every address-shaped field this module reads off captured/untrusted
+ * data is checked with this *first*, so a malformed one (the reviewer's `"nope"` as a captured
+ * contract address; an eth_call request's `to` of the wrong length) fails closed with a normal
+ * `railVerified: null` reason instead of throwing out of `evmEvidence` — and, unguarded, out of
+ * a whole `foldCaptured` replay covering every other swap too (see `src/replay.ts`'s own
+ * try/catch backstop around its `evmEvidence` call for the belt-and-suspenders half of this).
+ */
+function isValidAddressShape(value: unknown): value is Address {
+  return typeof value === "string" && isAddress(value, { strict: false });
 }
 
 /** One captured exchange as it sits in the index file — `responseBody` itself is not here;
@@ -158,17 +181,22 @@ function looksLikeEvmRailConfig(value: unknown): value is EvmRailConfig {
   return typeof v.contract === "string" && v.assets !== null && typeof v.assets === "object";
 }
 
-/** Whether a captured config's own finality knobs are even well-formed (positive integer
- *  confirmations, if any) — a corrupted/hostile index that turns this to nonsense fails
- *  closed instead of ever reaching a bare integer arithmetic path with garbage. */
-function finalityLooksValid(finality: EvmFinality): boolean {
-  if (finality.mode === "confirmations") {
-    return Number.isInteger(finality.confirmations) && finality.confirmations > 0;
+/**
+ * D3 (P22-P24-EVM-FIXES-R2.md): whether a captured config's own finality knob is at least as
+ * strong as the auditor's — never weaker, since `resolveFinalizedBlock` decodes the finalized
+ * view according to *this* (captured) knob, not the auditor's. Both "confirmations" -> the
+ * captured count may only be *higher* (more confirmations = a stronger notion of final); any
+ * other combination (a different mode, a different tag, a different fallback) must match the
+ * auditor's exactly. This is what stops an index edited to claim its own tag is `"latest"` (or
+ * a confirmations count lowered to 1) from treating a barely-confirmed, reorg-prone block as
+ * though it were genuinely finalized — the well-formedness of the knob itself (a positive
+ * integer confirmations count, if any) is already covered by `checkEvmRailConfig`.
+ */
+function finalityAtLeastAsStrong(captured: EvmFinality, auditor: EvmFinality): boolean {
+  if (auditor.mode === "confirmations") {
+    return captured.mode === "confirmations" && captured.confirmations >= auditor.confirmations;
   }
-  return (
-    finality.fallbackConfirmations === undefined ||
-    (Number.isInteger(finality.fallbackConfirmations) && finality.fallbackConfirmations > 0)
-  );
+  return captured.mode === "tag" && captured.tag === auditor.tag && captured.fallbackConfirmations === auditor.fallbackConfirmations;
 }
 
 function findByMethod(exchanges: readonly EvmCaptureIndexExchange[], method: string): EvmCaptureIndexExchange | null {
@@ -202,14 +230,15 @@ function blockResultNumber(value: unknown): number | null {
 type EnvelopeOutcome = { kind: "result"; value: unknown } | { kind: "error" };
 
 interface ParsedRequest {
-  id: number;
+  id: number | string;
   method: string;
   params: unknown;
 }
 
 /** A1: parse one exchange's own `requestBody` — the literal bytes that were sent — never the
  *  index's separate (attacker-editable) `.method`/`.params` metadata fields. `null` for
- *  anything that isn't a JSON-RPC request object with a numeric `id` and string `method`. */
+ *  anything that isn't a JSON-RPC request object with a numeric or string `id` (D1: an evidence
+ *  capture's id is `"<hashLock>:<checkedAtMs>:<n>"`, not a bare integer) and string `method`. */
 function parseRequestBody(exchange: EvmCaptureIndexExchange): ParsedRequest | null {
   let parsed: unknown;
   try {
@@ -219,8 +248,25 @@ function parseRequestBody(exchange: EvmCaptureIndexExchange): ParsedRequest | nu
   }
   if (parsed === null || typeof parsed !== "object") return null;
   const obj = parsed as { id?: unknown; method?: unknown; params?: unknown };
-  if (typeof obj.id !== "number" || typeof obj.method !== "string") return null;
+  if ((typeof obj.id !== "number" && typeof obj.id !== "string") || typeof obj.method !== "string") return null;
   return { id: obj.id, method: obj.method, params: obj.params };
+}
+
+/** D1 (P22-P24-EVM-FIXES-R2.md): whether `id` is bound to *this* capture — it must be the
+ *  string `"<capture.index.hashLock>:<capture.index.checkedAtMs>:<n>"` `captureEvmLeg` mints
+ *  via `CapturingRpc.setIdNamespace`. JSON-RPC ids restart at 1 (or at "n" for any fixed
+ *  namespace) per session, so without this check a genuine response — and its own genuine,
+ *  internally-consistent id — captured under a *different* hashLock/checkedAtMs (a different
+ *  swap's capture entirely, or the same swap re-checked at another time) could be spliced into
+ *  this capture's index, with a forged request whose `id` is simply copied from that borrowed
+ *  response, and would otherwise still "bind" (request.id === response.id, both attacker-
+ *  supplied metadata). `capture.index.hashLock` is already required (earlier in `evmEvidence`)
+ *  to equal the caller's own trusted `terms.statement` before any exchange is bound, so an
+ *  attacker cannot simply relabel this capture as the donor's hashLock to pass this check — the
+ *  donor's real response carries the donor's real hashLock baked into its own `id`, which can
+ *  never start with *this* capture's (different) hashLock. */
+function idBoundToCapture(capture: EvmCapture, id: number | string): boolean {
+  return typeof id === "string" && id.startsWith(`${capture.index.hashLock}:${capture.index.checkedAtMs}:`);
 }
 
 function sameJson(a: unknown, b: unknown): boolean {
@@ -274,6 +320,15 @@ function bindExchange(capture: EvmCapture, exchange: EvmCaptureIndexExchange | n
   const envelope = parsed as { id?: unknown; result?: unknown; error?: unknown };
   if (envelope.id !== request.id) {
     return { kind: "missing", reason: `missing/tampered capture: ${label} (response id does not match its request)` };
+  }
+  // D1: the id itself (now that request.id === envelope.id) must be bound to *this* capture —
+  // see `idBoundToCapture` for why this is what actually stops a genuine response from a
+  // different capture (a different hashLock/checkedAtMs) from being spliced in here.
+  if (!idBoundToCapture(capture, request.id)) {
+    return {
+      kind: "missing",
+      reason: `missing/tampered capture: ${label} (id is not bound to this capture's hashLock/checkedAtMs)`,
+    };
   }
   if (envelope.error !== undefined && envelope.error !== null) return { kind: "bound", request, outcome: { kind: "error" } };
   return { kind: "bound", request, outcome: { kind: "result", value: envelope.result } };
@@ -395,7 +450,9 @@ function validateLocksCallRequest(request: ParsedRequest, config: EvmRailConfig,
   }
   const to = (callObject as { to?: unknown }).to;
   const data = (callObject as { data?: unknown }).data;
-  if (typeof to !== "string" || !HEX_VALUE.test(to) || !isAddressEqual(to as Address, config.contract)) {
+  // D4: `isValidAddressShape` first — never the old generic (any-length) `HEX_VALUE` regex,
+  // which let a `to` of the wrong length reach `isAddressEqual` and throw.
+  if (!isValidAddressShape(to) || !isAddressEqual(to, config.contract)) {
     return "evm-htlc: eth_call request does not target this deployment's contract (tampered)";
   }
   const expectedData = encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [hashLock] });
@@ -472,63 +529,94 @@ export function evmEvidence(input: EvmEvidenceInput): EvmEvidenceResult {
     };
   }
 
-  // A4: this capture must carry a config, and it must agree with the auditor's own supplied
-  // config (the trust anchor for which deployment is ours) on chain id, contract and this
-  // leg's asset — a later edit to rails.json must never silently change how an old capture
-  // replays.
-  const capturedConfig = capture.index.config;
-  if (!looksLikeEvmRailConfig(capturedConfig)) {
-    return { lock: { ...base, railVerified: null, reason: "evm-htlc: capture index has no usable config (A4)" } };
+  // A4/D3 (P22-P24-EVM-FIXES-R2.md): this capture must carry a config, it must be valid on its
+  // own terms (the SAME allow-list/D-09/shape rule every other config entry point runs — A3),
+  // and it must agree with the auditor's own supplied config (the trust anchor for which
+  // deployment is ours) on chain id, contract, this leg's asset, and its finality — a later
+  // edit to rails.json must never silently change how an old capture replays, and an edited
+  // capture must never be able to *weaken* what it is checked against (D3: the reviewer's
+  // `tag: "latest"` edit — a captured finality that is anything other than the auditor's own,
+  // except a *higher* confirmations count, is refused before it can ever be used to treat a
+  // barely-confirmed, reorg-prone block as though it were genuinely finalized).
+  const capturedConfigCheck = checkEvmRailConfig(capture.index.config);
+  if (!capturedConfigCheck.ok) {
+    return { lock: { ...base, railVerified: null, reason: `evm-htlc: capture's own config is invalid (A4/D3): ${capturedConfigCheck.reason}` } };
   }
+  const capturedConfig = capturedConfigCheck.config;
   const capturedAssetToken = capturedConfig.assets[terms.asset];
+  if (capturedAssetToken === undefined) {
+    return {
+      lock: { ...base, railVerified: null, reason: `evm-htlc: capture's own config has no token address for asset "${terms.asset}" (D3)` },
+    };
+  }
   const configAssetToken = config.assets[terms.asset];
   if (
     capturedConfig.pin.chainId !== config.pin.chainId ||
     !isAddressEqual(capturedConfig.contract, config.contract) ||
-    (capturedAssetToken !== undefined && configAssetToken !== undefined && !isAddressEqual(capturedAssetToken, configAssetToken))
+    (configAssetToken !== undefined && !isAddressEqual(capturedAssetToken, configAssetToken))
   ) {
     return { lock: { ...base, railVerified: null, reason: "evm-htlc: capture was taken under a different rail config" } };
   }
-  if (!finalityLooksValid(capturedConfig.pin.finality)) {
-    return { lock: { ...base, railVerified: null, reason: "evm-htlc: capture's finality config is malformed" } };
+  if (!finalityAtLeastAsStrong(capturedConfig.pin.finality, config.pin.finality)) {
+    return {
+      lock: {
+        ...base,
+        railVerified: null,
+        reason: "evm-htlc: capture's own finality is weaker than the auditor's configured finality (D3)",
+      },
+    };
   }
+
+  // D3: from here on, every returned LockEvidence's own `endpoint` (and, once one is resolved,
+  // `finalizedRef`'s pin name) reports what THIS capture actually queried — its own frozen
+  // `capturedConfig` — never the auditor's possibly-since-changed `rails.json`/`--rails`
+  // endpoint or pin name, even though `capturedConfig` has already been cross-checked above to
+  // name the identical chain id, contract and asset the auditor expects.
+  const base2 = { ...base, endpoint: capturedConfig.endpoint };
 
   const chainIdBound = bindExchange(capture, findByMethod(capture.index.exchanges, "eth_chainId"), "eth_chainId");
   if (chainIdBound.kind === "missing") {
-    return { lock: { ...base, railVerified: null, reason: chainIdBound.reason } };
+    return { lock: { ...base2, railVerified: null, reason: chainIdBound.reason } };
   }
   if (chainIdBound.outcome.kind === "error") {
-    return { lock: { ...base, railVerified: null, reason: "rpc rejected eth_chainId" } };
+    return { lock: { ...base2, railVerified: null, reason: "rpc rejected eth_chainId" } };
   }
   const chainId = parseHexNumber(chainIdBound.outcome.value);
   if (chainId === null) {
-    return { lock: { ...base, railVerified: null, reason: "evm-htlc: malformed eth_chainId result (not hex)" } };
+    return { lock: { ...base2, railVerified: null, reason: "evm-htlc: malformed eth_chainId result (not hex)" } };
   }
   if (chainId !== config.pin.chainId) {
     return {
       lock: {
-        ...base,
+        ...base2,
         railVerified: null,
         reason: `captured chain id ${chainId} does not match pin "${config.pin.name}" (expected ${config.pin.chainId})`,
       },
     };
   }
 
+  // D4: the reviewer's demonstration — `capture.index.contract` (the manifest's own top-level
+  // field, distinct from `capturedConfig.contract`, which D3's `checkEvmRailConfig` already
+  // validates) is untrusted captured data with no prior shape check; a bare string like
+  // `"nope"` handed straight to `isAddressEqual` throws `InvalidAddressError` uncaught.
+  if (!isValidAddressShape(capture.index.contract)) {
+    return { lock: { ...base2, railVerified: null, reason: "evm-htlc: capture index contract is not a valid address" } };
+  }
   if (!isAddressEqual(capture.index.contract, config.contract)) {
-    return { lock: { ...base, railVerified: null, reason: "capture index contract does not match config.contract" } };
+    return { lock: { ...base2, railVerified: null, reason: "capture index contract does not match config.contract" } };
   }
 
   const finalized = resolveFinalizedBlock(capturedConfig, capture);
   if (!finalized.ok) {
-    return { lock: { ...base, railVerified: null, reason: finalized.reason } };
+    return { lock: { ...base2, railVerified: null, reason: finalized.reason } };
   }
 
   const callBound = bindExchange(capture, findByMethod(capture.index.exchanges, "eth_call"), "eth_call");
   if (callBound.kind === "missing") {
-    return { lock: { ...base, railVerified: null, reason: callBound.reason } };
+    return { lock: { ...base2, railVerified: null, reason: callBound.reason } };
   }
   if (callBound.outcome.kind === "error") {
-    return { lock: { ...base, railVerified: null, reason: "rpc rejected eth_call locks(hashLock)" } };
+    return { lock: { ...base2, railVerified: null, reason: "rpc rejected eth_call locks(hashLock)" } };
   }
 
   const callRequestReason = validateLocksCallRequest(
@@ -538,23 +626,24 @@ export function evmEvidence(input: EvmEvidenceInput): EvmEvidenceResult {
     finalized.hash,
   );
   if (callRequestReason !== null) {
-    return { lock: { ...base, railVerified: null, reason: callRequestReason } };
+    return { lock: { ...base2, railVerified: null, reason: callRequestReason } };
   }
 
   let decoded: unknown;
   try {
     decoded = decodeFunctionResult({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", data: callBound.outcome.value as Hex });
   } catch {
-    return { lock: { ...base, railVerified: null, reason: "malformed locks() result" } };
+    return { lock: { ...base2, railVerified: null, reason: "malformed locks() result" } };
   }
   const [onChainPayer, onChainPayee, onChainToken, onChainAmount, onChainClaimByMs, onChainRefundAfterMs, status] =
     decoded as readonly [Address, Address, Address, bigint, bigint, bigint, number];
 
-  const finalizedRef = `${config.pin.name}:${finalized.finalityLabel}:${finalized.number}:${finalized.hash}`;
-  // Every branch from here on did successfully resolve a finalized view, so `base` gains
+  // D3: the pin name in `finalizedRef` names the capture's own pin, not the auditor's.
+  const finalizedRef = `${capturedConfig.pin.name}:${finalized.finalityLabel}:${finalized.number}:${finalized.hash}`;
+  // Every branch from here on did successfully resolve a finalized view, so `base2` gains
   // `finalizedRef` for the rest of this function (LockEvidence carries the same finalizedRef
   // the RailObservation does, per §2.2 point 3).
-  const baseAtFinalizedView = { ...base, finalizedRef };
+  const baseAtFinalizedView = { ...base2, finalizedRef };
 
   // A2: an on-chain status outside the contract's own declared range never decodes to a
   // guessed branch (the pre-fix behaviour silently treated 4..255 as Locked).
@@ -565,16 +654,55 @@ export function evmEvidence(input: EvmEvidenceInput): EvmEvidenceResult {
   if (status === OnChainStatus.None) {
     return { lock: { ...baseAtFinalizedView, railVerified: null, reason: "no lock at the finalized view" } };
   }
-  if (status === OnChainStatus.Claimed) {
+  if (status === OnChainStatus.Claimed || status === OnChainStatus.Refunded) {
+    const label: "claimed" | "refunded" = status === OnChainStatus.Claimed ? "claimed" : "refunded";
+    const baseReason = `evm-htlc: locks(hashLock) is ${label} on-chain, not locked`;
+
+    // D1 (P22-P24-EVM-FIXES-R2.md): "the locks() tuple keeps [payee, token, amount, claimByMs,
+    // refundAfterMs, payer] after the status changes" — a genuine read of *this* hashLock's own
+    // claimed/refunded state must still show those fields matching `terms`/`accounts`, exactly
+    // as the Locked branch below requires. Without this check `rail.status` would be trusted at
+    // face value by `src/swap.ts`'s `settlementViewForLeg` (it reads `rail` ahead of
+    // `railVerified`), so an inconsistent or substituted read could report a leg claimed/
+    // refunded that never was for *this* swap — defense in depth on top of (not instead of) the
+    // id-binding fix above, which already defeats the specific cross-capture splice this guards
+    // against. Can't check (no payee account line, or no configured token) -> `null`, same as
+    // the Locked branch's own reasons for not asserting anything: no `rail` either.
+    if (accounts.payee === undefined) {
+      return { lock: { ...baseAtFinalizedView, railVerified: null, reason: `${baseReason} (payee has no account line to confirm it)` } };
+    }
+    const claimOrRefundToken = config.assets[terms.asset];
+    if (claimOrRefundToken === undefined) {
+      return {
+        lock: { ...baseAtFinalizedView, railVerified: null, reason: `asset "${terms.asset}" has no configured token address` },
+      };
+    }
+    const claimOrRefundMismatch = firstFieldMismatch({
+      onChainPayee,
+      onChainToken,
+      onChainAmount,
+      onChainClaimByMs,
+      onChainRefundAfterMs,
+      onChainPayer,
+      payee: accounts.payee,
+      ...(accounts.payer === undefined ? {} : { payer: accounts.payer }),
+      token: claimOrRefundToken,
+      terms,
+    });
+    if (claimOrRefundMismatch !== null) {
+      return {
+        lock: {
+          ...baseAtFinalizedView,
+          railVerified: null,
+          reason:
+            `evm-htlc: locks(hashLock) reports ${label}, but its other fields do not match this swap's terms/accounts ` +
+            `(${claimOrRefundMismatch}) — refusing to trust it as this swap's own lock`,
+        },
+      };
+    }
     return {
-      lock: { ...baseAtFinalizedView, railVerified: false, reason: "evm-htlc: locks(hashLock) is claimed on-chain, not locked" },
-      rail: { status: "claimed", final: true, checkedAtMs, finalizedRef },
-    };
-  }
-  if (status === OnChainStatus.Refunded) {
-    return {
-      lock: { ...baseAtFinalizedView, railVerified: false, reason: "evm-htlc: locks(hashLock) is refunded on-chain, not locked" },
-      rail: { status: "refunded", final: true, checkedAtMs, finalizedRef },
+      lock: { ...baseAtFinalizedView, railVerified: false, reason: baseReason },
+      rail: { status: label, final: true, checkedAtMs, finalizedRef },
     };
   }
 
@@ -615,11 +743,31 @@ export function evmEvidence(input: EvmEvidenceInput): EvmEvidenceResult {
   return { lock: { ...baseAtFinalizedView, railVerified: true, reason }, rail };
 }
 
+/**
+ * P22-P24-EVM-FIXES-R2.md D5: the live twin of `readNumberedBlock`'s replay-side parsing —
+ * `eth_blockNumber`'s own result is parsed with the same `parseHexNumber` guard the decoder
+ * uses on captured data, never handed straight to `hexToNumber` (which throws on anything that
+ * isn't well-formed hex). `null` (never a thrown exception) for a malformed `eth_blockNumber`
+ * result, for `latest < confirmations` (the chain hasn't produced enough blocks yet for this
+ * confirmations count — sending a *negative* block number would be nonsense, not merely
+ * "unconfirmed"), or for a transport-level failure on either call — `captureEvmLeg` turns any
+ * of these into "stop reading here", returning whatever was captured so far so it is still
+ * persisted and fails closed identically on replay.
+ */
 async function readLiveNumberedBlockHash(rpc: CapturingRpc, confirmations: number): Promise<Hex | null> {
-  const latestHex = (await rpc.request({ method: "eth_blockNumber", params: [] })) as Hex;
-  const latest = hexToNumber(latestHex);
+  // A genuine transport-level failure (the node unreachable, a rejected fetch) still propagates
+  // here, same as ever — there is nothing this function could paper over for that, and
+  // `captureEvmLeg`'s own caller (`src/watcher.ts`'s sweep) already treats it as a per-candidate
+  // skip. D5 is about a *value* the RPC actually answered with, not a call that never answered.
+  const latestRaw = await rpc.request({ method: "eth_blockNumber", params: [] });
+  const latest = parseHexNumber(latestRaw);
+  if (latest === null) return null;
   const n = latest - confirmations;
-  const result = (await rpc.request({ method: "eth_getBlockByNumber", params: [numberToHex(n), false] })) as unknown;
+  // D5: the chain hasn't produced enough blocks yet for this confirmations count — never send
+  // a *negative* block number (`numberToHex` throws on one); nothing to read yet, so there's no
+  // finalized view (fails closed, same as any other "not resolved" case).
+  if (n < 0) return null;
+  const result = await rpc.request({ method: "eth_getBlockByNumber", params: [numberToHex(n), false] });
   return blockResultHash(result);
 }
 
@@ -685,47 +833,71 @@ export async function captureEvmLeg(
     return { index: buildIndex(config, chainId, hashLock, nowMs, exchanges, finality), exchanges };
   };
 
-  const chainIdHex = (await rpc.request({ method: "eth_chainId", params: [] })) as Hex;
-  const chainId = hexToNumber(chainIdHex);
-  const finality = config.pin.finality;
-
-  let blockHash: Hex | null;
-  let finalityRecord: EvmCaptureIndex["finality"];
-
-  if (finality.mode === "confirmations") {
-    blockHash = await readLiveNumberedBlockHash(rpc, finality.confirmations);
-    finalityRecord = { mode: "confirmations", confirmations: finality.confirmations };
-  } else {
-    let tagHash: Hex | null = null;
-    try {
-      const result = await rpc.request({ method: "eth_getBlockByNumber", params: [finality.tag, false] });
-      tagHash = blockResultHash(result);
-    } catch {
-      tagHash = null;
-    }
-
-    if (tagHash !== null) {
-      blockHash = tagHash;
-      finalityRecord = { mode: "tag", tag: finality.tag };
-    } else if (finality.fallbackConfirmations !== undefined) {
-      blockHash = await readLiveNumberedBlockHash(rpc, finality.fallbackConfirmations);
-      finalityRecord = { mode: "confirmations", confirmations: finality.fallbackConfirmations };
-    } else {
-      return finish({ mode: "tag", tag: finality.tag }, chainId);
-    }
-  }
-
-  if (blockHash === null) return finish(finalityRecord, chainId);
-
-  const data = encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [hashLock as Hex] });
+  // D1 (P22-P24-EVM-FIXES-R2.md): every id this capture's own exchanges carry is bound to this
+  // exact hashLock/checkedAtMs pair (`idBoundToCapture`), not the bare auto-incrementing
+  // integer `rpc` would otherwise mint — closing the "a genuine response from a different
+  // capture binds" gap `bindExchange` now checks for. `rpc` may be a long-lived instance shared
+  // across many captures (`src/watcher.ts`'s per-sweep `rpc`, reused for every candidate) or
+  // across many writes (`EvmHtlcRail`'s own `this.rpc`), so the namespace is reset back to the
+  // plain sequence once this capture's own calls are done — never left set for whatever the
+  // caller does with `rpc` next.
+  rpc.setIdNamespace(`${hashLock}:${nowMs}`);
   try {
-    await rpc.request({ method: "eth_call", params: [{ to: config.contract, data }, { blockHash }] });
-  } catch {
-    // Recorded regardless (CapturingRpc records before throwing) — evmEvidence sees the
-    // error envelope on replay and fails closed; nothing more for this function to decide.
-  }
+    const finality = config.pin.finality;
+    const declaredFinalityRecord: EvmCaptureIndex["finality"] =
+      finality.mode === "confirmations" ? { mode: "confirmations", confirmations: finality.confirmations } : { mode: "tag", tag: finality.tag };
 
-  return finish(finalityRecord, chainId);
+    // D5 (P22-P24-EVM-FIXES-R2.md): never let a malformed `eth_chainId` result throw —
+    // `parseHexNumber`, the same guard the replay-side decoder uses on captured data, not the
+    // bare `hexToNumber` this used to call directly. A transport-level failure (the node
+    // unreachable, a rejected fetch) still propagates here, same as ever — `watcher.ts`'s sweep
+    // already treats that as a per-candidate skip; D5 is about a *value* the RPC actually
+    // answered with. A response that answers with garbage stops reading here, returning the one
+    // exchange captured so far so it is still persisted and fails closed identically on replay.
+    const chainIdRaw = await rpc.request({ method: "eth_chainId", params: [] });
+    const chainId = parseHexNumber(chainIdRaw);
+    if (chainId === null) return finish(declaredFinalityRecord, 0);
+
+    let blockHash: Hex | null;
+    let finalityRecord: EvmCaptureIndex["finality"] = declaredFinalityRecord;
+
+    if (finality.mode === "confirmations") {
+      blockHash = await readLiveNumberedBlockHash(rpc, finality.confirmations);
+      finalityRecord = { mode: "confirmations", confirmations: finality.confirmations };
+    } else {
+      let tagHash: Hex | null = null;
+      try {
+        const result = await rpc.request({ method: "eth_getBlockByNumber", params: [finality.tag, false] });
+        tagHash = blockResultHash(result);
+      } catch {
+        tagHash = null;
+      }
+
+      if (tagHash !== null) {
+        blockHash = tagHash;
+        finalityRecord = { mode: "tag", tag: finality.tag };
+      } else if (finality.fallbackConfirmations !== undefined) {
+        blockHash = await readLiveNumberedBlockHash(rpc, finality.fallbackConfirmations);
+        finalityRecord = { mode: "confirmations", confirmations: finality.fallbackConfirmations };
+      } else {
+        return finish(declaredFinalityRecord, chainId);
+      }
+    }
+
+    if (blockHash === null) return finish(finalityRecord, chainId);
+
+    const data = encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [hashLock as Hex] });
+    try {
+      await rpc.request({ method: "eth_call", params: [{ to: config.contract, data }, { blockHash }] });
+    } catch {
+      // Recorded regardless (CapturingRpc records before throwing) — evmEvidence sees the
+      // error envelope on replay and fails closed; nothing more for this function to decide.
+    }
+
+    return finish(finalityRecord, chainId);
+  } finally {
+    rpc.setIdNamespace(undefined);
+  }
 }
 
 /** P22-P24-EVM-FIXES.md B5: just the finalized-view identifier a capture resolves to — the
@@ -738,12 +910,19 @@ export async function captureEvmLeg(
  *  finalized tag with no fallback, …). */
 export function captureFinalizedRef(config: EvmRailConfig, capture: EvmCapture): string | null {
   const capturedConfig = looksLikeEvmRailConfig(capture.index.config) ? capture.index.config : config;
-  if (capturedConfig.pin.chainId !== config.pin.chainId || !isAddressEqual(capturedConfig.contract, config.contract)) {
+  // D4: `looksLikeEvmRailConfig` only checks `.contract` is a string, not that it is a valid
+  // address shape — validate before `isAddressEqual`, which throws on anything else.
+  if (
+    !isValidAddressShape(capturedConfig.contract) ||
+    capturedConfig.pin.chainId !== config.pin.chainId ||
+    !isAddressEqual(capturedConfig.contract, config.contract)
+  ) {
     return null;
   }
   const finalized = resolveFinalizedBlock(capturedConfig, capture);
   if (!finalized.ok) return null;
-  return `${config.pin.name}:${finalized.finalityLabel}:${finalized.number}:${finalized.hash}`;
+  // D3: the pin name names the capture's own pin, not the auditor's (see `evmEvidence`).
+  return `${capturedConfig.pin.name}:${finalized.finalityLabel}:${finalized.number}:${finalized.hash}`;
 }
 
 const SHA256_HEX_LOWER = /^[0-9a-f]{64}$/;
@@ -838,8 +1017,9 @@ export async function loadEvmCapture(root: string, hashLock: string): Promise<Lo
     const bytes = new Map<string, Uint8Array | null>();
     for (const exchange of index.exchanges) {
       if (bytes.has(exchange.responseSha256)) continue;
-      const body = await readCapture(root, exchange.responseSha256);
-      bytes.set(exchange.responseSha256, body === null ? null : new TextEncoder().encode(body));
+      // D2: `readCapture` now hands back the exact re-verified bytes directly — never a
+      // decoded string that would need (lossy) re-encoding here.
+      bytes.set(exchange.responseSha256, await readCapture(root, exchange.responseSha256));
     }
     return { capture: { index, bytes }, skipped };
   }

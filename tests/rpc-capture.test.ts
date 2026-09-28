@@ -144,6 +144,30 @@ describe("CapturingRpc.request", () => {
     await expect(rpc.request({ method: "eth_chainId", params: [] })).rejects.toThrow(/abort/i);
   });
 
+  // P22-P24-EVM-FIXES-R2.md D6: the timeout must cover the response BODY, not only the initial
+  // connection — `fetch()` commonly resolves once headers arrive while the body keeps
+  // streaming. Clearing the timer right after `fetchImpl` resolves (the pre-D6 bug) leaves
+  // `controller.abort()` never called at all, so a server that stalls mid-body would hang the
+  // subsequent `arrayBuffer()` read forever instead of ever rejecting.
+  it("D6: aborts a stalled response BODY after timeoutMs, even though the connection itself resolved promptly", async () => {
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      // The connection resolves immediately (as if headers arrived right away) — only the body
+      // read stalls, tied to the same AbortSignal a real fetch() Response would honor.
+      return {
+        text: async () => {
+          throw new Error("must not call text() to hash the response");
+        },
+        arrayBuffer: () =>
+          new Promise<ArrayBuffer>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+          }),
+      } as unknown as Response;
+    }) as typeof fetch;
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl, timeoutMs: 20 });
+
+    await expect(rpc.request({ method: "eth_chainId", params: [] })).rejects.toThrow(/abort/i);
+  });
+
   it("never aborts when timeoutMs is not configured (the default)", async () => {
     const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
       const body = '{"jsonrpc":"2.0","id":1,"result":"0x1"}';
@@ -184,10 +208,27 @@ describe("writeCapture / readCapture", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("writes each exchange's responseBody byte-exact to raw/rpc/<sha256>.json", async () => {
+  /** D2: builds a minimal well-formed `Exchange` for a given wire-bytes payload — every field
+   *  `writeCapture` might touch, `responseBytes` (the source of truth from here on) computed
+   *  from the same bytes `responseBody`/`responseSha256` describe, exactly like `CapturingRpc`
+   *  itself builds one. */
+  function exchangeFor(bytes: Uint8Array): { method: string; params: unknown; requestBody: string; responseBody: string; responseBytes: Uint8Array; responseSha256: string; atMs: number } {
+    return {
+      method: "m",
+      params: [],
+      requestBody: "{}",
+      responseBody: new TextDecoder("utf-8").decode(bytes),
+      responseBytes: bytes,
+      responseSha256: bytesToHex(sha256(bytes)),
+      atMs: 1,
+    };
+  }
+
+  it("writes each exchange's responseBytes byte-exact to raw/rpc/<sha256>.json", async () => {
     const body = '{"jsonrpc":"2.0","id":1,"result":"0x7a69"}';
+    const bytes = new TextEncoder().encode(body);
     const hash = sha256Hex(body);
-    await writeCapture(root, [{ method: "eth_chainId", params: [], requestBody: "{}", responseBody: body, responseSha256: hash, atMs: 1 }]);
+    await writeCapture(root, [exchangeFor(bytes)]);
 
     const onDisk = await readFile(join(root, "raw", "rpc", `${hash}.json`), "utf8");
     expect(onDisk).toBe(body);
@@ -195,20 +236,20 @@ describe("writeCapture / readCapture", () => {
 
   it("is idempotent: writing the same exchange twice does not throw and leaves the same bytes", async () => {
     const body = '{"jsonrpc":"2.0","id":1,"result":"0x1"}';
-    const hash = sha256Hex(body);
-    const exchange = { method: "m", params: [], requestBody: "{}", responseBody: body, responseSha256: hash, atMs: 1 };
+    const exchange = exchangeFor(new TextEncoder().encode(body));
     await writeCapture(root, [exchange]);
     await expect(writeCapture(root, [exchange])).resolves.toBeUndefined();
-    const onDisk = await readFile(join(root, "raw", "rpc", `${hash}.json`), "utf8");
+    const onDisk = await readFile(join(root, "raw", "rpc", `${exchange.responseSha256}.json`), "utf8");
     expect(onDisk).toBe(body);
   });
 
   it("readCapture returns the exact bytes when the hash matches", async () => {
     const body = '{"jsonrpc":"2.0","id":1,"result":"0x1"}';
+    const bytes = new TextEncoder().encode(body);
     const hash = sha256Hex(body);
-    await writeCapture(root, [{ method: "m", params: [], requestBody: "{}", responseBody: body, responseSha256: hash, atMs: 1 }]);
+    await writeCapture(root, [exchangeFor(bytes)]);
 
-    await expect(readCapture(root, hash)).resolves.toBe(body);
+    await expect(readCapture(root, hash)).resolves.toEqual(bytes);
   });
 
   it("readCapture returns null for a missing file", async () => {
@@ -218,13 +259,31 @@ describe("writeCapture / readCapture", () => {
   it("readCapture returns null when the on-disk bytes have been tampered with (hash no longer matches)", async () => {
     const original = '{"jsonrpc":"2.0","id":1,"result":"0x1"}';
     const hash = sha256Hex(original);
-    await writeCapture(root, [{ method: "m", params: [], requestBody: "{}", responseBody: original, responseSha256: hash, atMs: 1 }]);
+    await writeCapture(root, [exchangeFor(new TextEncoder().encode(original))]);
 
     // Tamper with the file in place — the name still claims `hash`, the content no longer
     // hashes to it.
     await writeFile(join(root, "raw", "rpc", `${hash}.json`), '{"jsonrpc":"2.0","id":1,"result":"0xTAMPERED"}');
 
     await expect(readCapture(root, hash)).resolves.toBeNull();
+  });
+
+  // P22-P24-EVM-FIXES-R2.md D2: "a response with a UTF-8 BOM or an invalid byte gives the same
+  // verdict live and in replay" — writeCapture/readCapture must round-trip the exact bytes, not
+  // a decoded-then-re-encoded string (which is lossy for a byte that isn't valid UTF-8 at all).
+  it("round-trips a response body that is not valid UTF-8 byte-for-byte (never a lossy string round trip)", async () => {
+    // A genuine UTF-8 BOM (EF BB BF) followed by a lone continuation byte (0x80), which on its
+    // own is not valid UTF-8 at any position — a non-fatal decode would replace it with U+FFFD,
+    // and re-encoding *that* would produce different bytes than these.
+    const bytes = new Uint8Array([0xef, 0xbb, 0xbf, 0x7b, 0x80, 0x7d]); // BOM + "{" + invalid + "}"
+    const hash = bytesToHex(sha256(bytes));
+    await writeCapture(root, [exchangeFor(bytes)]);
+
+    const onDiskBuffer = await readFile(join(root, "raw", "rpc", `${hash}.json`));
+    expect(new Uint8Array(onDiskBuffer)).toEqual(bytes);
+
+    const replayed = await readCapture(root, hash);
+    expect(replayed).toEqual(bytes);
   });
 
   it("readCapture refuses a malformed sha256 (never touches the filesystem for it)", async () => {
@@ -241,5 +300,54 @@ describe("RpcCaptureError", () => {
     expect(error.code).toBe(-32000);
     expect(error.message).toBe("boom");
     expect(error.name).toBe("RpcCaptureError");
+  });
+});
+
+// P22-P24-EVM-FIXES-R2.md D1: a plain auto-incrementing id is unique only within one
+// `CapturingRpc` instance's own lifetime — it always restarts at 1 for a fresh instance — so a
+// caller whose instance spans more than one logical "capture" (a swap's own hashLock, say) must
+// be able to bind every id it mints to that capture instead, so a genuine response minted under
+// a *different* namespace can never be mistaken for one of this capture's own exchanges by id
+// alone (see src/rails/evm-evidence.ts's `idBoundToCapture`/`bindExchange`).
+describe("CapturingRpc.setIdNamespace", () => {
+  it("mints `${namespace}:${n}` (n restarting at 1) once a namespace is set", async () => {
+    const { fetch: fetchImpl } = fakeFetch([
+      '{"jsonrpc":"2.0","id":"swap-a:1","result":"0x1"}',
+      '{"jsonrpc":"2.0","id":"swap-a:2","result":"0x2"}',
+    ]);
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl });
+    rpc.setIdNamespace("swap-a");
+    await rpc.request({ method: "eth_chainId", params: [] });
+    await rpc.request({ method: "eth_blockNumber", params: [] });
+    const ids = rpc.exchanges().map((exchange) => JSON.parse(exchange.requestBody).id);
+    expect(ids).toEqual(["swap-a:1", "swap-a:2"]);
+  });
+
+  it("two different namespaces never mint the same id, even at the same position", async () => {
+    const { fetch: fetchImpl } = fakeFetch([
+      '{"jsonrpc":"2.0","id":"swap-a:1","result":"0x1"}',
+      '{"jsonrpc":"2.0","id":"swap-b:1","result":"0x2"}',
+    ]);
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl });
+    rpc.setIdNamespace("swap-a");
+    await rpc.request({ method: "eth_chainId", params: [] });
+    rpc.setIdNamespace("swap-b");
+    await rpc.request({ method: "eth_chainId", params: [] });
+    const ids = rpc.exchanges().map((exchange) => JSON.parse(exchange.requestBody).id);
+    expect(ids).toEqual(["swap-a:1", "swap-b:1"]);
+  });
+
+  it("passing undefined restores the bare auto-incrementing integer sequence", async () => {
+    const { fetch: fetchImpl } = fakeFetch([
+      '{"jsonrpc":"2.0","id":"swap-a:1","result":"0x1"}',
+      '{"jsonrpc":"2.0","id":1,"result":"0x2"}',
+    ]);
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl });
+    rpc.setIdNamespace("swap-a");
+    await rpc.request({ method: "eth_chainId", params: [] });
+    rpc.setIdNamespace(undefined);
+    await rpc.request({ method: "eth_blockNumber", params: [] });
+    const ids = rpc.exchanges().map((exchange) => JSON.parse(exchange.requestBody).id);
+    expect(ids).toEqual(["swap-a:1", 1]);
   });
 });
