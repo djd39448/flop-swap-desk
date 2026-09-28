@@ -282,6 +282,12 @@ export class EvmHtlcRail {
       ...(options.clock === undefined ? {} : { clock: options.clock }),
     });
 
+    // P22-P24-EVM-FIXES.md A10: this check's own `eth_chainId` exchange has done its job (a
+    // mismatch already threw above) — drain it now so a rail instance that lives on to make
+    // writes never has it sitting in the log for the first write's own snapshot-at-start to
+    // see (a write's `WriteEvidence.raw` must hold only that write's own exchanges).
+    options.rpc.drain();
+
     return new EvmHtlcRail(options.config, options.rpc, publicClient, walletClient, rail, options.clock ?? Date.now);
   }
 
@@ -291,11 +297,32 @@ export class EvmHtlcRail {
     return address;
   }
 
+  /** P22-P24-EVM-FIXES.md A10: re-checked before every write (lock/claim/refund/approve), not
+   *  only once at `connect()` time — a long-lived rail instance drives an entire swap, and
+   *  refusing to sign anywhere but the pinned chain is cheap insurance against a reused RPC
+   *  endpoint having quietly started answering for a different chain since connect. */
+  private async assertPinnedChainId(): Promise<void> {
+    const chainIdHex = (await this.rpc.request({ method: "eth_chainId", params: [] })) as Hex;
+    const chainId = hexToNumber(chainIdHex);
+    if (chainId !== this.config.pin.chainId) {
+      throw new Error(
+        `evm-htlc: chain id ${chainId} no longer matches pin "${this.config.pin.name}" ` +
+          `(expected ${this.config.pin.chainId}); refusing to write`,
+      );
+    }
+  }
+
   /** ERC20 `approve` to the rail contract, receipt checked. Not itself a `lock`/`claim`/
    *  `refund`, so it returns just the tx hash plus the raw sha256s it produced, not a
    *  `WriteEvidence` (there is no rail event to bind it to). */
   async approve(asset: string, amount: string): Promise<{ txHash: Hex; raw: string[] }> {
     const token = this.resolveAsset(asset);
+    await this.assertPinnedChainId();
+    // A10: snapshot the exchange log length *before* this write (the same pattern
+    // `captureEvmLeg` uses), so `raw` below can be sliced to exactly this call's own
+    // exchanges — never `drain()`, which would also sweep up anything an earlier, un-drained
+    // read (a `verifyLockFinal` a caller chose not to drain) left sitting in the log.
+    const before = this.rpc.exchanges().length;
     const hash = await this.walletClient.writeContract({
       address: token,
       abi: ERC20_APPROVE_ABI,
@@ -306,7 +333,8 @@ export class EvmHtlcRail {
     if (receipt.status !== "success") {
       throw new Error(`evm-htlc: approve transaction mined but reverted on-chain (hash: ${hash})`);
     }
-    return { txHash: hash, raw: this.rpc.drain().map((exchange) => exchange.responseSha256) };
+    const raw = this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256);
+    return { txHash: hash, raw };
   }
 
   /** §2.2 point 2: hash-lock only, and this deployment's `EvmHashRail` has no fee (profile
@@ -318,28 +346,36 @@ export class EvmHtlcRail {
     if (feeBps !== 0) {
       throw new Error("evm-htlc: this deployment has no fee; declared feeBps must be 0");
     }
+    await this.assertPinnedChainId();
+    const before = this.rpc.exchanges().length;
     const fromBlock = await this.publicClient.getBlockNumber();
     await this.rail.lock(terms);
-    return this.captureWriteEvidence("Locked", terms.statement as Hex, fromBlock);
+    return this.captureWriteEvidence("Locked", terms.statement as Hex, fromBlock, before);
   }
 
   async claim(hashLock: Hex, secret: Hex): Promise<WriteEvidence> {
+    await this.assertPinnedChainId();
+    const before = this.rpc.exchanges().length;
     const fromBlock = await this.publicClient.getBlockNumber();
     await this.rail.claim(hashLock, secret);
-    return this.captureWriteEvidence("Claimed", hashLock, fromBlock);
+    return this.captureWriteEvidence("Claimed", hashLock, fromBlock, before);
   }
 
   async refund(hashLock: Hex): Promise<WriteEvidence> {
+    await this.assertPinnedChainId();
+    const before = this.rpc.exchanges().length;
     const fromBlock = await this.publicClient.getBlockNumber();
     await this.rail.refund(hashLock);
-    return this.captureWriteEvidence("Refunded", hashLock, fromBlock);
+    return this.captureWriteEvidence("Refunded", hashLock, fromBlock, before);
   }
 
   /** Records `eth_blockNumber` before the write, then looks the matching event up with a
    *  bounded `eth_getLogs` (`address` = the rail contract, `topics` = [event signature,
    *  hashLock], `fromBlock` = the recorded block, `toBlock` = "latest"). Exactly one matching
-   *  log is required — zero or several throws, never guesses which one. */
-  private async captureWriteEvidence(event: WriteEventName, hashLock: Hex, fromBlock: bigint): Promise<WriteEvidence> {
+   *  log is required — zero or several throws, never guesses which one. `before` (A10) is the
+   *  exchange log length this write's own caller (`lock`/`claim`/`refund`) snapshotted right
+   *  before it started, so `raw` below can be sliced to exactly this write's own exchanges. */
+  private async captureWriteEvidence(event: WriteEventName, hashLock: Hex, fromBlock: bigint, before: number): Promise<WriteEvidence> {
     const logs = await this.publicClient.getLogs({
       address: this.config.contract,
       event: WRITE_EVENT_ABI[event],
@@ -362,7 +398,7 @@ export class EvmHtlcRail {
     ) {
       throw new Error(`evm-htlc: ${event} log for ${hashLock} is missing block/tx identity`);
     }
-    const raw = this.rpc.drain().map((exchange) => exchange.responseSha256);
+    const raw = this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256);
     return {
       ref: hashLock,
       event,
@@ -401,12 +437,18 @@ export class EvmHtlcRail {
     const checkedAtMs = this.clock();
     const { index, exchanges } = await captureEvmLeg(this.rpc, this.config, ref, checkedAtMs);
     const bytes = new Map(exchanges.map((exchange) => [exchange.responseSha256, new TextEncoder().encode(exchange.responseBody)]));
-    return evmEvidence({
+    const result = evmEvidence({
       terms,
       config: this.config,
       accounts,
       capture: { index, bytes },
     });
+    // A10: `captureEvmLeg` only *peeks* the log (`rpc.exchanges().slice(before)`), and this
+    // call already holds everything it needs in `exchanges`/`result` above — drain it now
+    // rather than let a long-lived rail instance's exchange log grow forever across a whole
+    // swap's worth of polling, and so a later write's own snapshot-at-start starts clean.
+    this.rpc.drain();
+    return result;
   }
 
   /** §2.2 point 4: bounded `eth_getLogs` for `Claimed(hashLock, preimage)`; returns the

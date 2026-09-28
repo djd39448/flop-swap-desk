@@ -325,6 +325,79 @@ describe("EvmHtlcRail write path — bounded eth_getLogs -> WriteEvidence", () =
     const evidence = await rail.refund(TERMS.statement as Hex);
     expect(evidence.event).toBe("Refunded");
   });
+
+  // P22-P24-EVM-FIXES.md A10.
+  it("WriteEvidence.raw holds only this write's own exchanges, never anything already sitting in the shared rpc's log", async () => {
+    const log = buildLog(
+      LOCKED_EVENT,
+      {
+        hashLock: TERMS.statement,
+        payer: PAYER,
+        payee: PAYEE,
+        token: TOKEN,
+        amount: BigInt(TERMS.amount),
+        claimByMs: BigInt(TERMS.claimByMs),
+        refundAfterMs: BigInt(TERMS.refundAfterMs),
+      },
+      { blockNumber: "0x6", blockHash: BLOCK_HASH, txHash: TX_HASH, logIndex: "0x0" },
+    );
+    const config = configFor(ANVIL_LOCAL_PIN);
+    const { rpc } = mockCapturingRpc(lockHandlers([log]));
+    const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+
+    // Simulate something else having shared this `CapturingRpc` instance and left its own
+    // exchanges sitting in the log un-drained — exactly what `captureEvmLeg` does on purpose
+    // (it only ever peeks, `rpc.exchanges().slice(before)`, never drains): the old
+    // `drain()`-based implementation would have swept these into the *next* write's own
+    // `WriteEvidence.raw` too.
+    await rpc.request({ method: "eth_chainId", params: [] });
+    await rpc.request({ method: "eth_chainId", params: [] });
+    const priorHashes = new Set(rpc.exchanges().map((exchange) => exchange.responseSha256));
+    expect(priorHashes.size).toBe(2);
+
+    const evidence = await rail.lock(TERMS, 0);
+
+    expect(evidence.raw.length).toBeGreaterThan(0);
+    for (const hash of evidence.raw) expect(priorHashes.has(hash)).toBe(false);
+  });
+
+  it("connect()'s own eth_chainId exchange is drained, never sitting around for the first write's raw", async () => {
+    const config = configFor(ANVIL_LOCAL_PIN);
+    const { rpc } = mockCapturingRpc({ eth_chainId: () => ({ result: "0x7a69" }) });
+    await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+    expect(rpc.exchanges()).toHaveLength(0);
+  });
+
+  it("verifyLockFinal drains its own captured exchanges rather than leaving them in the log forever", async () => {
+    const config = configFor(ANVIL_LOCAL_PIN);
+    const { rpc } = mockCapturingRpc({
+      eth_chainId: () => ({ result: "0x7a69" }),
+      eth_getBlockByNumber: () => ({ result: { number: "0x5", hash: BLOCK_HASH } }),
+      eth_call: () => ({ result: encodeFunctionResult({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", result: [PAYER, PAYEE, TOKEN, BigInt(TERMS.amount), BigInt(TERMS.claimByMs), BigInt(TERMS.refundAfterMs), 1] }) }),
+    });
+    const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+    await rail.verifyLockFinal(TERMS, TERMS.statement, { payee: PAYEE, payer: PAYER });
+    expect(rpc.exchanges()).toHaveLength(0);
+  });
+
+  it("re-checks eth_chainId against the pin before every write, refusing if it no longer matches", async () => {
+    const config = configFor(ANVIL_LOCAL_PIN);
+    let chainIdCalls = 0;
+    const { rpc } = mockCapturingRpc({
+      // First call is connect()'s own; every call after that (the A10 recheck) answers with a
+      // different chain id, as if this long-lived rail's RPC endpoint got pointed elsewhere.
+      eth_chainId: () => {
+        chainIdCalls += 1;
+        return { result: chainIdCalls === 1 ? "0x7a69" : "0x2105" };
+      },
+    });
+    const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+
+    await expect(rail.lock(TERMS, 0)).rejects.toThrow(/chain id 8453 no longer matches pin "anvil-local"/);
+    await expect(rail.claim(TERMS.statement as Hex, ("0x" + "cd".repeat(32)) as Hex)).rejects.toThrow(/no longer matches pin/);
+    await expect(rail.refund(TERMS.statement as Hex)).rejects.toThrow(/no longer matches pin/);
+    await expect(rail.approve("USDC", "1")).rejects.toThrow(/no longer matches pin/);
+  });
 });
 
 describe("EvmHtlcRail.approve", () => {
