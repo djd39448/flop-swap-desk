@@ -18,8 +18,13 @@ import {
   type ReceiptFrame,
   type RevealFrame,
 } from "@flop-labs/tclk";
+import { encodeFunctionResult, type Address } from "viem";
 import { buildBoard } from "../src/board.js";
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
+import { formatAccountLine } from "../src/rails/account-line.js";
+import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
+import { offerAcceptLockTerms } from "../src/swap.js";
+import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { quoteBigNonces, runSweep, type RunSweepOptions } from "../src/watcher.js";
 import { identity, record } from "./helpers/identity.js";
 import { fakeBuildBoard } from "./helpers/fakeBoard.js";
@@ -743,6 +748,256 @@ describe("runSweep", () => {
       const view = findSwap(board, swap.swapId);
       expect(view.status).toBe("paired");
       expect(view.reasons).toContain("leg B lock unverified");
+    });
+  });
+
+  describe("chain evidence (evm-htlc rail, P22-P24-EVM-SPEC.md §5)", () => {
+    function addr(tag: string): Address {
+      const hex = Buffer.from(tag, "utf8").toString("hex").padEnd(40, "0").slice(0, 40);
+      return `0x${hex}` as Address;
+    }
+
+    const RAIL_CONTRACT = addr("evm-rail-contract");
+    const TOKEN = addr("usdc-token");
+    const BUYER_ADDR = addr("buyer-evm-addr");
+    const SELLER_ADDR = addr("seller-evm-addr");
+    const BLOCK_HASH = `0x${"cd".repeat(32)}`;
+
+    const EVM_CONFIG: EvmRailConfig = {
+      pin: ANVIL_LOCAL_PIN,
+      endpoint: "http://127.0.0.1:9999/rpc",
+      contract: RAIL_CONTRACT,
+      assets: { USDC: TOKEN },
+    };
+
+    /** Same shape as `buildSwap`, but leg A's own deal room also carries its `evm-htlc` lock
+     *  frame (posted by its payer, the Buyer) and both parties' D-08 account lines. */
+    function buildEvmSwap(nonceHex: string, baseSeq: number, baseMs: number) {
+      const swapId = makeSwapId(buyer.did, nonceHex);
+      const lock = generateHashLock();
+
+      const legAOffer = makeOffer({
+        from: buyer.did,
+        role: "payer",
+        amount: "1000",
+        asset: "USDC",
+        lock: "hash",
+        rails: ["evm-htlc"],
+        claimByMs: baseMs + 3_600_000,
+        refundAfterMs: baseMs + 7_200_000,
+        expiresMs: baseMs + 600_000,
+        job: { proto: "swap", id: swapId, context: legAContext({ wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc" }) },
+      });
+      const legAAccept = makeAccept(legAOffer, { from: seller.did, statement: lock.hash });
+
+      const legBOffer = makeOffer({
+        from: seller.did,
+        role: "payer",
+        amount: "52070000",
+        asset: "FLOP",
+        lock: "hash",
+        rails: ["flop-htlc"],
+        claimByMs: baseMs + 10_800_000,
+        refundAfterMs: baseMs + 14_400_000,
+        expiresMs: baseMs + 600_000,
+        job: { proto: "swap", id: swapId, context: legBContext(legAOffer.id) },
+      });
+      const legBAccept = makeAccept(legBOffer, { from: buyer.did, statement: lock.hash });
+
+      const offerRows = [
+        record(OFFER_ROOM, baseSeq, baseMs, buyer, encodeFrame(legAOffer)),
+        record(OFFER_ROOM, baseSeq + 1, baseMs + 1, seller, encodeFrame(legAAccept)),
+        record(OFFER_ROOM, baseSeq + 2, baseMs + 2, seller, encodeFrame(legBOffer)),
+        record(OFFER_ROOM, baseSeq + 3, baseMs + 3, buyer, encodeFrame(legBAccept)),
+      ].map(rowFromRecord);
+
+      const dealRoomA = dealRoom(legAAccept.contract);
+      const dealRoomB = dealRoom(legBAccept.contract);
+      const legATerms = offerAcceptLockTerms(legAOffer, legAAccept);
+      const lockA: LockFrame = { type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "evm-htlc", ref: lock.hash };
+
+      function dealRowsA(baseDealMs: number) {
+        const sellerLine = formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: SELLER_ADDR });
+        const buyerLine = formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: BUYER_ADDR });
+        return [
+          rowFromRecord(record(dealRoomA, 1, baseDealMs, buyer, encodeFrame(lockA))),
+          rowFromRecord(record(dealRoomA, 2, baseDealMs + 1, seller, sellerLine)),
+          rowFromRecord(record(dealRoomA, 3, baseDealMs + 2, buyer, buyerLine)),
+        ];
+      }
+
+      return { swapId, lock, legAOffer, legAAccept, legBOffer, legBAccept, offerRows, dealRoomA, dealRoomB, legATerms, dealRowsA };
+    }
+
+    /** A locked-status `locks()` ABI-encoding matching `terms`, for the synthetic `eth_call`. */
+    function encodeLockedResult(terms: { amount: string; claimByMs: number; refundAfterMs: number }): string {
+      return encodeFunctionResult({
+        abi: EVM_HASH_RAIL_ABI,
+        functionName: "locks",
+        result: [BUYER_ADDR, SELLER_ADDR, TOKEN, BigInt(terms.amount), BigInt(terms.claimByMs), BigInt(terms.refundAfterMs), 1 /* Locked */],
+      });
+    }
+
+    type RpcOutcome = { result: unknown } | { errorMessage: string } | "throw";
+
+    /** A combined fetch: technocore-style GET/POST responses (via `technocore`, same shape
+     *  `makeFetch`'s router returns) plus JSON-RPC POSTs to `rpcEndpoint`, routed by the
+     *  request body's own `method` field (through `rpcResult`). */
+    function makeEvmFetch(opts: {
+      technocore: (url: string) => FakeResponse;
+      rpcEndpoint: string;
+      rpcResult: (method: string, params: unknown) => RpcOutcome;
+      calls: Array<{ url: string; body?: string }>;
+    }): typeof fetch {
+      return (async (input: unknown, init?: unknown) => {
+        const url = String(input);
+        const body = (init as { body?: string } | undefined)?.body;
+        opts.calls.push({ url, body });
+        if (url === opts.rpcEndpoint && typeof body === "string") {
+          const parsed = JSON.parse(body) as { id: number; method: string; params: unknown };
+          const outcome = opts.rpcResult(parsed.method, parsed.params);
+          if (outcome === "throw") throw new TypeError(`rpc endpoint unreachable: ${parsed.method}`);
+          const envelope =
+            "errorMessage" in outcome
+              ? { jsonrpc: "2.0", id: parsed.id, error: { code: -32000, message: outcome.errorMessage } }
+              : { jsonrpc: "2.0", id: parsed.id, result: outcome.result };
+          return { status: 200, text: async () => JSON.stringify(envelope) } as Response;
+        }
+        const outcome = opts.technocore(url);
+        return { status: outcome.status, text: async () => outcome.body } as Response;
+      }) as typeof fetch;
+    }
+
+    function evmRpcResponder(callResult: string): (method: string, params: unknown) => RpcOutcome {
+      return (method) => {
+        if (method === "eth_chainId") return { result: `0x${ANVIL_LOCAL_PIN.chainId.toString(16)}` };
+        if (method === "eth_getBlockByNumber") return { result: { number: "0x5", hash: BLOCK_HASH } };
+        if (method === "eth_call") return { result: callResult };
+        return { errorMessage: `unexpected method ${method}` };
+      };
+    }
+
+    it("captures a locked evm-htlc leg live, writes raw/rpc + raw/evm + rails.json, and reports chainReads", async () => {
+      const swap = buildEvmSwap("aaaa1001", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+      const callResult = encodeLockedResult(swap.legATerms);
+
+      const calls: Array<{ url: string; body?: string }> = [];
+      const fetchImpl = makeEvmFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: EVM_CONFIG.endpoint,
+        rpcResult: evmRpcResponder(callResult),
+        calls,
+      });
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { evm: EVM_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.chainReads).toBe(1);
+      expect(report.chainReadsSkipped).toEqual([]);
+
+      const railsJson = JSON.parse(await readFile(join(root, "rails.json"), "utf8"));
+      expect(railsJson).toEqual({ evm: EVM_CONFIG });
+
+      const evmDir = join(root, "raw", "evm", swap.lock.hash);
+      const evmFiles = await readdir(evmDir);
+      expect(evmFiles.length).toBe(1);
+      const index = JSON.parse(await readFile(join(evmDir, evmFiles[0]!), "utf8"));
+      expect(index.hashLock).toBe(swap.lock.hash);
+      expect(index.exchanges).toHaveLength(3);
+
+      const rpcFiles = await readdir(join(root, "raw", "rpc"));
+      expect(rpcFiles.length).toBe(3);
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(view).toBeDefined();
+      expect(view.evidence.aRail).toMatchObject({ status: "locked", final: true });
+      expect(view.evidence.a.railVerified).toBe(true);
+    });
+
+    it("a second sweep with the same config does not rewrite rails.json", async () => {
+      const swap = buildEvmSwap("aaaa1002", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const fetchImpl = makeEvmFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          return { status: 200, body: dealRoomBody([]) };
+        },
+        rpcEndpoint: EVM_CONFIG.endpoint,
+        rpcResult: evmRpcResponder(encodeLockedResult(swap.legATerms)),
+        calls: [],
+      });
+
+      await runSweep({ ...baseOptions({ board: buildBoard, rails: { evm: EVM_CONFIG } }), fetch: fetchImpl });
+      const firstWrite = await readFile(join(root, "rails.json"), "utf8");
+      await runSweep({ ...baseOptions({ board: buildBoard, rails: { evm: EVM_CONFIG }, nowMs: () => NOW + 1000 }), fetch: fetchImpl });
+      const secondWrite = await readFile(join(root, "rails.json"), "utf8");
+      expect(secondWrite).toBe(firstWrite);
+    });
+
+    it("a transport failure on the chain read is recorded as a skip, not fatal to the sweep", async () => {
+      const swap = buildEvmSwap("aaaa1003", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+
+      const fetchImpl = makeEvmFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: EVM_CONFIG.endpoint,
+        rpcResult: () => "throw",
+        calls: [],
+      });
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { evm: EVM_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.chainReads).toBe(0);
+      expect(report.chainReadsSkipped).toHaveLength(1);
+      expect(report.chainReadsSkipped![0]!.contract).toBe(swap.legAAccept.contract);
+      expect(existsSync(join(root, "raw", "evm"))).toBe(false);
+    });
+
+    it("no rails configured: no RPC endpoint is ever touched, and the report carries no chain fields at all", async () => {
+      const swap = buildEvmSwap("aaaa1004", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+      const calls: Array<{ url: string; body?: string }> = [];
+
+      const fetchImpl = makeEvmFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: EVM_CONFIG.endpoint,
+        rpcResult: () => "throw", // would blow up the sweep if ever called
+        calls,
+      });
+
+      // No `options.rails` at all — the live watch's own default.
+      const report = await runSweep({ ...baseOptions({ board: buildBoard }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.chainReads).toBeUndefined();
+      expect(report.chainReadsSkipped).toBeUndefined();
+      expect(calls.some((c) => c.url === EVM_CONFIG.endpoint)).toBe(false);
+      expect(existsSync(join(root, "rails.json"))).toBe(false);
+      expect(existsSync(join(root, "raw", "evm"))).toBe(false);
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(view).toBeDefined();
+      expect(view.evidence.aRail).toBeUndefined();
+      expect(view.evidence.a).toBeUndefined();
     });
   });
 });

@@ -7,9 +7,11 @@
 // The continuous loop belongs to a scheduler (cron, a systemd timer, Task Scheduler), not
 // to this process — only `--once` is implemented; without it this prints usage and exits 2.
 
+import { readFileSync } from "node:fs";
+
 import { runSweep } from "../dist/watcher.js";
 
-const USAGE = `Usage: node bin/watch.mjs --root DIR [--base-url URL] [--max-deal-rooms N] [--timeout SEC] --once
+const USAGE = `Usage: node bin/watch.mjs --root DIR [--base-url URL] [--max-deal-rooms N] [--timeout SEC] [--rails FILE] --once
 
 Runs one read-only sweep of technocore.chat's tclk-offers export (and any deal rooms it
 implies) and writes the board under DIR. Never posts, signs, or writes outside DIR.
@@ -21,18 +23,22 @@ Options:
   --base-url URL        Venue base URL (default https://technocore.chat).
   --max-deal-rooms N     Cap on deal rooms fetched per sweep (default 50).
   --timeout SEC          Per-request timeout in seconds (default 45).
+  --rails FILE           P22-P24-EVM-SPEC.md §5: a JSON file shaped { "evm": EvmRailConfig }
+                          naming a chain rail to capture live evidence from. Absent (the
+                          default): no RPC endpoint is ever touched, unchanged from before
+                          this option existed.
   --once                 Run exactly one sweep and exit. Required — there is no built-in
                           loop; run this repeatedly from a scheduler instead.
   -h, --help              Show this message and exit 0.
 
 Exit codes:
   0  sweep completed
-  2  bad or missing arguments (nothing was run)
+  2  bad or missing arguments (nothing was run), or --rails did not name readable JSON
   3  the sweep hit a transport failure or could not parse the offers export
 `;
 
 function parseArgs(argv) {
-  const out = { root: null, baseUrl: null, maxDealRooms: null, timeoutSec: null, once: false };
+  const out = { root: null, baseUrl: null, maxDealRooms: null, timeoutSec: null, railsFile: null, once: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     switch (arg) {
@@ -47,6 +53,9 @@ function parseArgs(argv) {
         break;
       case "--timeout":
         out.timeoutSec = argv[++i];
+        break;
+      case "--rails":
+        out.railsFile = argv[++i];
         break;
       case "--once":
         out.once = true;
@@ -69,10 +78,14 @@ function summarize(report) {
         .map(([status, count]) => `${status}=${count}`)
         .join(",")
     : "none";
+  // chainReads only appears on a report at all when --rails was given (P22-P24-EVM-SPEC.md
+  // §5) — omitted here too, rather than printed as 0, so a sweep without it prints exactly
+  // what it always did.
+  const chainPart = report.chainReads !== undefined ? ` chainReads=${report.chainReads}` : "";
   return (
     `offers=${report.offerRecords} swapLegs=${report.swapLegOffers} ` +
     `dealRooms=${report.dealRoomsFetched} notes=${report.noteFetches} swaps[${statusPart}] ` +
-    `swapsWritten=${report.swapsWritten} hit=${report.hitCreated} ok=${report.ok}`
+    `swapsWritten=${report.swapsWritten} hit=${report.hitCreated} ok=${report.ok}${chainPart}`
   );
 }
 
@@ -109,6 +122,21 @@ async function main() {
       return 2;
     }
     options.timeoutMs = Math.round(s * 1000);
+  }
+  if (args.railsFile !== null) {
+    let raw;
+    try {
+      raw = readFileSync(args.railsFile, "utf8");
+    } catch (error) {
+      process.stderr.write(`watch.mjs: cannot read --rails file ${args.railsFile}: ${error.message}\n`);
+      return 2;
+    }
+    try {
+      options.rails = JSON.parse(raw);
+    } catch (error) {
+      process.stderr.write(`watch.mjs: --rails file ${args.railsFile} is not valid JSON: ${error.message}\n`);
+      return 2;
+    }
   }
 
   const report = await runSweep(options);

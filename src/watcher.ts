@@ -20,12 +20,17 @@ import {
 } from "@flop-labs/tclk";
 
 import {
+  findAuthenticatedLock,
   findSwapLegCandidates,
   foldCaptured,
   hasAuthenticatedPaperLock,
   type CapturedNote,
   type SwapLegCandidate,
 } from "./replay.js";
+import { captureEvmLeg, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
+import type { EvmRailConfig } from "./rails/evm-htlc.js";
+import { CapturingRpc, writeCapture } from "./rails/rpc-capture.js";
+import { offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, SwapStatus } from "./types.js";
 
 // SPEC §4 order; "reaches paired or later" = rank ≥ `paired`, never the two failure states
@@ -49,6 +54,7 @@ const STATUS_RANK: Record<SwapStatus, number> = {
 export interface SweepTransportError { url: string; error: string }
 export interface DealRoomSkip { room: string; contract: string; reason: string }
 export interface NoteFetchSkip { note: string; contract: string; reason: string }
+export interface ChainReadSkip { contract: string; reason: string }
 
 export interface SweepReport {
   ok: boolean;
@@ -61,6 +67,12 @@ export interface SweepReport {
   dealRoomsSkipped: DealRoomSkip[];
   noteFetches: number; // paper-rail /kv notes fetched (200) and folded into evidence
   noteFetchesSkipped: NoteFetchSkip[]; // non-404 note-fetch failures; 404 = absent, not a skip
+  /** P22-P24-EVM-SPEC.md §5: `evm-htlc` chain reads captured this sweep. Present only when
+   *  `options.rails.evm` is configured — absent entirely (not zero) otherwise, so a sweep
+   *  that never asked for a chain rail produces a report that is byte-for-byte what it always
+   *  was (the live watch never sets `options.rails`, so it never sees this field at all). */
+  chainReads?: number;
+  chainReadsSkipped?: ChainReadSkip[];
   swapsByStatus?: Record<string, number>; // board.swaps grouped by status
   swapsWritten: number; // lines appended to swaps.jsonl this sweep (status changes only)
   hitCreated: boolean;
@@ -77,6 +89,12 @@ export interface RunSweepOptions {
   timeoutMs?: number;
   userAgent?: string;
   board?: (input: BoardInput) => Board;
+  /** P22-P24-EVM-SPEC.md §5: the chain rails this sweep may capture live evidence from.
+   *  Absent (the default — and what the live watch passes): this sweep's network calls,
+   *  files and report are byte-for-byte what they are today — the RPC endpoint is never
+   *  touched, no `raw/evm/`/`raw/rpc/`/`rails.json` is written, and `chainReads`/
+   *  `chainReadsSkipped` never appear on the report. */
+  rails?: { evm?: EvmRailConfig };
 }
 
 const DEFAULT_BASE_URL = "https://technocore.chat";
@@ -123,6 +141,12 @@ function underRoot(root: string, ...segments: string[]): string {
   }
   return resolved;
 }
+
+// Defense in depth for the `raw/evm/<hashLock>/` path segment below — `hashLock` is already
+// constrained to equal `terms.statement`, itself hex-shape-checked by tclk's own frame
+// validation, but a path built from network-derived text gets its own belt-and-suspenders
+// check anyway (same convention as SWAP_ID_SHAPE below).
+const HASH_LOCK_SHAPE = /^0x[0-9a-f]{64}$/;
 
 async function writeFileAtomic(path: string, data: string | Uint8Array): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
@@ -456,8 +480,71 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
     capturedNotes.set(candidate.contract, { body: noteBody, endpoint: noteUrl });
   }
 
+  // Step 2.6 (P22-P24-EVM-SPEC.md §5): for every candidate whose (successfully fetched) deal
+  // room shows an authenticated `evm-htlc` lock from its own leg's payer, capture the chain
+  // read live. Nothing in this block runs unless the caller configured `options.rails.evm` —
+  // the live watch never does — which is what keeps a by-default sweep's network calls, files
+  // and report byte-for-byte what they were before this option existed.
+  const evmConfig = options.rails?.evm;
+  const chainCaptures = new Map<string, EvmCapture>();
+
+  if (evmConfig !== undefined) {
+    // The pinned config (endpoint included; nothing secret ever lives in an EvmRailConfig) —
+    // written once per sweep, atomically, and only rewritten when it actually changed.
+    const railsPath = underRoot(root, "rails.json");
+    const railsJson = `${JSON.stringify({ evm: evmConfig }, null, 2)}\n`;
+    const existingRailsJson = await readFile(railsPath, "utf8").catch(() => null);
+    if (existingRailsJson !== railsJson) await writeFileAtomic(railsPath, railsJson);
+
+    report.chainReads = 0;
+    report.chainReadsSkipped = [];
+    const rpc = new CapturingRpc({ endpoint: evmConfig.endpoint, fetch: fetchImpl, clock: () => nowMs });
+
+    for (const candidate of cappedCandidates) {
+      const room = roomByContract.get(candidate.contract);
+      if (room === undefined) continue; // deal room wasn't fetched this sweep (404/error)
+      const dealRoomRecords = dealRooms.get(room) ?? [];
+      const terms = offerAcceptLockTerms(candidate.offer, candidate.accept);
+      const lockFrame = findAuthenticatedLock(dealRoomRecords, candidate.contract, terms.payer);
+      if (
+        lockFrame === null ||
+        lockFrame.rail !== EVM_RAIL_ID ||
+        lockFrame.ref !== terms.statement ||
+        !HASH_LOCK_SHAPE.test(lockFrame.ref)
+      ) {
+        continue;
+      }
+      const hashLock = lockFrame.ref;
+
+      try {
+        const { index, exchanges } = await captureEvmLeg(rpc, evmConfig, hashLock, nowMs);
+        await writeCapture(root, exchanges);
+        await writeFileAtomic(
+          underRoot(root, "raw", "evm", hashLock, `${sweepIso}.json`),
+          `${JSON.stringify(index, null, 2)}\n`,
+        );
+        const bodyBySha256 = new Map(exchanges.map((exchange) => [exchange.responseSha256, exchange.responseBody]));
+        chainCaptures.set(hashLock, { index, load: (sha256Hex) => bodyBySha256.get(sha256Hex) ?? null });
+        report.chainReads += 1;
+      } catch (error) {
+        report.chainReadsSkipped.push({
+          contract: candidate.contract,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
   // Step 3: fold the board — the same code path an offline replay uses.
-  const board = foldCaptured({ offers: offerRoomRecords, dealRooms, notes: capturedNotes, nowMs, board: buildBoard });
+  const board = await foldCaptured({
+    offers: offerRoomRecords,
+    dealRooms,
+    notes: capturedNotes,
+    chain: chainCaptures,
+    nowMs,
+    board: buildBoard,
+    ...(evmConfig === undefined ? {} : { rails: { evm: evmConfig } }),
+  });
 
   const swapsByStatus: Record<string, number> = {};
   for (const swap of board.swaps) swapsByStatus[swap.status] = (swapsByStatus[swap.status] ?? 0) + 1;
