@@ -9,6 +9,6 @@
         "confirmations": 2
       }
     },
-    "endpoint": "http://127.0.0.1:61770"
+    "endpoint": "http://127.0.0.1:58181"
   }
 }

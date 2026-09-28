@@ -1,11 +1,11 @@
 {
   "swapId": "0x4096f1d32d53d44c63b4554ea849511ce01895e6de56d86ab3a257f4bc1fb80e",
   "legA": {
-    "contract": "0x01271a6eae0781b94309832ae5c2449008164efb1da3958ebd9224fb8806af21",
+    "contract": "0x200358922bdd38d25fb2dba63c66de93f32727440dd2d6806793ffd4fc286e8c",
     "rail": "btc-htlc"
   },
   "legB": {
-    "contract": "0xde5e660654daceb56dccab8b895161e34b144c42399ca5c4fe576f2a6b3652bc",
+    "contract": "0x2ee6d8860d0351fcbc01f7d465a1620544640da9ae19042fa59182bd9457cd84",
     "rail": "paper"
   },
   "feeBps": 0,
@@ -15,13 +15,13 @@
       "step": "lock",
       "rail": "btc-htlc",
       "evidence": {
-        "ref": "6fdf68711392822880061c2cf1403064bdd82f16463da0bef1625796561a8d1a:0",
-        "txid": "6fdf68711392822880061c2cf1403064bdd82f16463da0bef1625796561a8d1a",
+        "ref": "2d8b8b4b5911cdb20c3ba7d9e7e6d2efe29b429b2ba14c3d7d280bdff00edec8:1",
+        "txid": "2d8b8b4b5911cdb20c3ba7d9e7e6d2efe29b429b2ba14c3d7d280bdff00edec8",
         "blockHeight": null,
         "blockHash": null,
         "raw": [
-          "fc953cfdc24f26669417d63688f920f391fed331983a49b2bc8e26100705c299",
-          "03bf951ea3b279326fafe93febd623eb47c2cec12e42f57182b15cb1af229cac"
+          "5451e467b4ea840089c82b52323d1c33625dcfe42b3e113ca110cfb47ab56318",
+          "e7691bb508aafe34544eebe6e8cd1181aac97cb6cc53d5179f56b2f97b271256"
         ]
       }
     },
@@ -30,25 +30,25 @@
       "step": "claim",
       "rail": "btc-htlc",
       "evidence": {
-        "ref": "6fdf68711392822880061c2cf1403064bdd82f16463da0bef1625796561a8d1a:0",
-        "txid": "e35ff8644c046d46b3374d4cc326914797dcd19d6985ce99b12c72d35cfe7795",
+        "ref": "2d8b8b4b5911cdb20c3ba7d9e7e6d2efe29b429b2ba14c3d7d280bdff00edec8:1",
+        "txid": "2818f0745b1fcc3731a8d67fa6282d9635c8cdeec47be7b70fcbfc3171b36a01",
         "blockHeight": null,
         "blockHash": null,
         "raw": [
-          "f86317664a9dc5318e08f91f99130368e9a74905bf54b943ee5b14bbffe9e040",
-          "18d1c6f325a40cc4bdfa573d95829931dcb4a286d2d6db0314f885bb06f8093e",
-          "fca86ca6cce5497525357047cfaa059712f6bc01631b95b61dd40dee9959b186",
-          "6927be729f2f192b4d9df07fba3bdccf8e6760cf638c9a84198a7acfd61fd653",
-          "98c9f003f8bf40cecedbaf880fc945f5ffa940db1fa2c34780310c32a284e494"
+          "a74d7127d7429117b7dc432f89886e76444a3b7ba5a458721cd4c5d2e38a2cce",
+          "9c2fe564159c1135810180a7f97ae2ace7f2a596c5c6bf46548d490ce75e523f",
+          "4168178e90a7c0097d256cdeca99a1ac6c3871e2f0dc7e2e6d27d866aa1e273a",
+          "c73eb275d8510bd5563e0a2f39556c1c02c2c54b3b0f04a9ac644bcd8b365ad2",
+          "0b42a22eadb75d7459f57a9f0d078820cc21e8742da0219bfde5946aee09cffa"
         ]
       }
     }
   ],
-  "startedAtMs": 1790628730000,
-  "finishedAtMs": 1790628730000,
+  "startedAtMs": 1790631864000,
+  "finishedAtMs": 1790631864000,
   "status": "settled",
   "finalizedRefs": [
-    "paper:sha256:83c70e5e9a630c28ac4b09694c8eb44eb3d8b7624fc05953f77bcff8b89b03ff",
-    "btc-regtest:confirmations-2:104:51d5ce817713a53a9fc1aba95153b433c02483ace7abe1012cfc83f738049d77"
+    "paper:sha256:9d15a98c568c5705e9c40188b46b2e26de4353df711a3db75732928c51376099",
+    "btc-regtest:confirmations-2:104:119856ef1bc90a75f87283a18362209600439bfa85fdea48ca7c09a4e31cf1cd"
   ]
 }
