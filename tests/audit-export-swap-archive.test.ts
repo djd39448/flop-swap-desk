@@ -78,7 +78,7 @@ describe("loadArchivedOfferLines + loadOffers merge (mirrors examples/audit-expo
     expect(ringOffers.map((r: { seq: number }) => r.seq)).toEqual([3, 4]);
 
     // Without the archive, leg B's offer names a leg-A offer id nobody has ever seen: unpaired.
-    const ringOnlyBoard = foldCaptured({ offers: ringOffers, dealRooms: new Map(), notes: new Map(), nowMs: T0 + 4 * MIN });
+    const ringOnlyBoard = await foldCaptured({ offers: ringOffers, dealRooms: new Map(), notes: new Map(), nowMs: T0 + 4 * MIN });
     expect(ringOnlyBoard.swaps).toHaveLength(0);
     expect(ringOnlyBoard.unpaired).toEqual([{ offerId: offerB.id, reason: "leg B names an unknown leg A offer id" }]);
 
@@ -91,7 +91,7 @@ describe("loadArchivedOfferLines + loadOffers merge (mirrors examples/audit-expo
     const offers = [...bySeq.values()].sort((a: { seq: number }, b: { seq: number }) => a.seq - b.seq);
     expect(offers.map((r: { seq: number }) => r.seq)).toEqual([1, 2, 3, 4]);
 
-    const board = foldCaptured({ offers, dealRooms: new Map(), notes: new Map(), nowMs: T0 + 4 * MIN });
+    const board = await foldCaptured({ offers, dealRooms: new Map(), notes: new Map(), nowMs: T0 + 4 * MIN });
     const view = board.swaps.find((s) => s.swapId === swapId);
     expect(view).toBeDefined();
     expect(view!.status).toBe("paired");
