@@ -51,6 +51,20 @@ export interface BtcChainPin {
 export interface BtcRailConfig {
   pin: BtcChainPin;
   endpoint: string;
+  /** P4-BTC-FIXES.md H4: how many blocks past the funding height the evidence reader's spend
+   *  scan will walk before giving up and failing closed, instead of an unbounded walk to the
+   *  chain's own tip. Recorded verbatim in every capture's own `config` (A4) so a replay applies
+   *  the exact bound the live sweep used. Defaults to `DEFAULT_SCAN_WINDOW_BLOCKS` when omitted. */
+  scanWindowBlocks?: number;
+}
+
+/** P4-BTC-FIXES.md H4: ~2 weeks of mainnet blocks (10-minute spacing) — generous for regtest,
+ *  where a scan finding nothing within this many blocks past funding is exceptionally unlikely
+ *  to ever complete honestly, and unbounded is the actual defect being fixed. */
+export const DEFAULT_SCAN_WINDOW_BLOCKS = 2016;
+
+export function scanWindowFor(config: BtcRailConfig): number {
+  return config.scanWindowBlocks ?? DEFAULT_SCAN_WINDOW_BLOCKS;
 }
 
 /** Regtest genesis confirmed live against Core 31.1 (probe Q6, and this build's own regtest
@@ -86,6 +100,17 @@ export const BTC_SIGNET_PIN: BtcChainPin = {
  *  `"test"` or `"testnet4"` is refused by name, and so is anything nobody thought to name. */
 const ALLOWED_NETWORKS: ReadonlySet<string> = new Set(["regtest", "signet"]);
 const DENY_CHAIN_NAMES: ReadonlySet<string> = new Set(["main", "test", "testnet4"]);
+
+/** P4-BTC-FIXES.md H3: every config this build ever trusts must pin one of these two chains
+ *  exactly — a `(network, genesisHash)` pair that does not match either row here is not a config
+ *  for a chain this build knows how to be safe on, no matter what its own `pin.name` claims to
+ *  be. */
+const KNOWN_PINS: readonly BtcChainPin[] = [BTC_REGTEST_PIN, BTC_SIGNET_PIN];
+
+function knownPinFor(network: string, genesisHash: string): BtcChainPin | null {
+  const lowerGenesis = genesisHash.toLowerCase();
+  return KNOWN_PINS.find((pin) => pin.network === network && pin.genesisHash.toLowerCase() === lowerGenesis) ?? null;
+}
 
 const GENESIS_HASH_SHAPE = /^[0-9a-f]{64}$/;
 const CAIP2_BIP122_SHAPE = /^bip122:[0-9a-f]{32}$/;
@@ -126,6 +151,9 @@ export function btcRailConfigShapeReason(value: unknown): string | null {
   }
 
   if (typeof v.endpoint !== "string" || v.endpoint === "") return "btc rail config: endpoint must be a non-empty string";
+  if (v.scanWindowBlocks !== undefined && (typeof v.scanWindowBlocks !== "number" || !Number.isInteger(v.scanWindowBlocks) || v.scanWindowBlocks <= 0)) {
+    return "btc rail config: scanWindowBlocks must be a positive integer when present";
+  }
   return null;
 }
 
@@ -137,6 +165,18 @@ export function btcRailConfigShapeReason(value: unknown): string | null {
 export function validateBtcRailConfig(config: BtcRailConfig): void {
   if (!ALLOWED_NETWORKS.has(config.pin.network)) {
     throw new Error(`btc-htlc: network "${config.pin.network}" is not on the allow list (regtest, signet only)`);
+  }
+  // H3: pin names tied to their network — a config cannot rename a known (network, genesisHash)
+  // pair to a different `pin.name` (e.g. an index-only rename to "bitcoin-mainnet"), and cannot
+  // pin a (network, genesisHash) pair this build does not itself know about at all.
+  const known = knownPinFor(config.pin.network, config.pin.genesisHash);
+  if (known === null) {
+    throw new Error(
+      `btc-htlc: (network "${config.pin.network}", genesisHash ${config.pin.genesisHash}) does not match any known pin (btc-regtest, btc-signet-UNVERIFIED)`,
+    );
+  }
+  if (config.pin.name !== known.name) {
+    throw new Error(`btc-htlc: pin.name "${config.pin.name}" does not match the known pin's own name "${known.name}" for this (network, genesisHash)`);
   }
 }
 
@@ -257,6 +297,40 @@ export function keyFromAddressInfo(info: { pubkey: string; hdmasterfingerprint: 
  *  explicitly out of scope for this build (P4-BTC-SPEC.md §0 scope note: "Out of scope: …
  *  fees …"). */
 export const DEFAULT_FEE_SATS = 1000n;
+
+/** P4-BTC-FIXES.md H2: a funding transaction built and signed, but never yet broadcast — every
+ *  field a caller needs to record BEFORE broadcasting (so a crash between `prepareFunding` and
+ *  `broadcastFunding` leaves enough on disk to recover from, via `recoverFunding`, rather than
+ *  either double-funding or losing track of the outpoint). */
+export interface PreparedFunding {
+  /** The funding outpoint this transaction will create once broadcast ("txid:vout") — already
+   *  known here because `txid` is a hash of the transaction's own bytes, not of anything the
+   *  network assigns on broadcast. */
+  ref: string;
+  txid: string;
+  vout: number;
+  /** The complete, wallet-signed transaction, hex-encoded — exactly what `broadcastFunding` will
+   *  run `testmempoolaccept` then `sendrawtransaction` on. */
+  rawTx: string;
+  witnessScript: Uint8Array;
+  address: string;
+  terms: BtcHtlcTerms;
+}
+
+/** P4-BTC-FIXES.md H2: what `recoverFunding` can determine about a previously-prepared funding
+ *  txid without ever needing to have broadcast it itself — the node's own view is the source of
+ *  truth for "did this reach the network", not this process's own possibly-crashed memory of
+ *  whether `broadcastFunding` returned. */
+export interface RecoveredFunding {
+  /** True once the node's own view (mempool or chain) already contains this txid — a caller
+   *  recovering from an interruption between `broadcastFunding`'s own `testmempoolaccept` and its
+   *  return should treat this as "already sent" and never broadcast it again. */
+  broadcast: boolean;
+  /** Null until the transaction has been mined. */
+  blockHash: string | null;
+  /** Null when `broadcast` is false (nothing to report a confirmation count for). */
+  confirmations: number | null;
+}
 
 export interface WriteEvidence {
   /** The outpoint this write concerns: the newly created one for `fund`, or the one spent for
@@ -412,10 +486,102 @@ export class BtcHtlcRail {
     }
   }
 
+  /** Shared build logic for `prepareFunding`/`fund` — never touches `testmempoolaccept` or
+   *  `sendrawtransaction`; callers re-check the chain pin themselves before calling this, since
+   *  it has no re-check of its own (P4-BTC-FIXES.md H2). */
+  private async buildFundingPsbt(terms: BtcHtlcTerms, buyer: BtcWalletHandle): Promise<PreparedFunding> {
+    const locktime = locktimeFromRefundAfterMs(terms.refundAfterMs);
+    const hashLockBytes = hexToBytes(terms.hashLock.slice(2));
+    const payeePubkey = hexToBytes(terms.payeePubkey);
+    const payerPubkey = hexToBytes(terms.payerPubkey);
+    const { address, scriptPubKey, witnessScript } = buildHtlcScript({ hashLock: hashLockBytes, payeePubkey, payerPubkey, locktime }, this.networkParams);
+
+    const amountBtc = Decimal.encode(BigInt(terms.amountSats));
+    // H2: build via walletcreatefundedpsbt (an output to the HTLC address for exactly
+    // terms.amountSats, coin-selected and change-handled by the wallet's own keyless logic) +
+    // walletprocesspsbt (sign AND finalize in one call, exactly like claim/refund) — never
+    // sendtoaddress, which broadcasts on its own with no testmempoolaccept in between.
+    const created = await this.walletRequest<{ psbt: string }>(buyer.wallet, "walletcreatefundedpsbt", [[], [{ [address]: amountBtc }], 0, {}, true]);
+    const processed = await this.walletRequest<{ complete: boolean; hex?: string }>(buyer.wallet, "walletprocesspsbt", [created.psbt]);
+    if (!processed.complete || processed.hex === undefined) {
+      throw new Error("btc-htlc: walletprocesspsbt did not produce a complete, finalized funding transaction");
+    }
+
+    const decoded = Transaction.fromRaw(hexToBytes(processed.hex), { allowUnknownInputs: true, allowUnknownOutputs: true });
+    const scriptPubKeyHex = bytesToHex(scriptPubKey);
+    let vout = -1;
+    for (let i = 0; i < decoded.outputsLength; i += 1) {
+      const output = decoded.getOutput(i);
+      if (output.script !== undefined && bytesToHex(output.script) === scriptPubKeyHex) {
+        vout = i;
+        break;
+      }
+    }
+    if (vout === -1) {
+      throw new Error("btc-htlc: funding transaction has no output paying the HTLC address (unexpected)");
+    }
+    const txid = decoded.id;
+    return { ref: `${txid}:${vout}`, txid, vout, rawTx: processed.hex, witnessScript, address, terms };
+  }
+
   /**
-   * Sends exactly `terms.amountSats` satoshis to the HTLC's P2WSH address from `buyer`'s own
-   * wallet (keyless: `sendtoaddress` uses the wallet's own coin selection and signing) and
-   * returns the funding outpoint as `ref` ("txid:vout").
+   * H2: build and sign the funding transaction — via `walletcreatefundedpsbt` +
+   * `walletprocesspsbt`, exactly like `claim`/`refund` — and return it **before any broadcast**,
+   * so a caller can record `{ ref, rawTx, ... }` first (P4-BTC-SPEC.md §7a's "record before
+   * sending" rule) and only then call `broadcastFunding`. Re-checks the pinned chain itself,
+   * exactly like every other write.
+   */
+  async prepareFunding(terms: BtcHtlcTerms, buyer: BtcWalletHandle): Promise<PreparedFunding> {
+    validateTerms(terms);
+    if (buyer.key.pubkey.toLowerCase() !== terms.payerPubkey.toLowerCase()) {
+      throw new Error("btc-htlc: fund must be signed by the payer's own wallet (buyer.key.pubkey must equal terms.payerPubkey)");
+    }
+    await this.assertPinnedChain();
+    return this.buildFundingPsbt(terms, buyer);
+  }
+
+  /**
+   * H2: `testmempoolaccept` then `sendrawtransaction` on a transaction `prepareFunding` already
+   * built and signed — the only path by which a prepared funding transaction ever reaches the
+   * network. Re-checks the pinned chain itself (a caller may call this a while after
+   * `prepareFunding`, e.g. after recording it to disk first).
+   */
+  async broadcastFunding(prepared: PreparedFunding): Promise<WriteEvidence> {
+    await this.assertPinnedChain();
+    const before = this.rpc.exchanges().length;
+    const txid = await this.broadcastOrThrow(prepared.rawTx);
+    return this.finishWriteEvidence(prepared.ref, txid, before);
+  }
+
+  /**
+   * H2: recover a previously-prepared funding's own on-chain status by its txid alone — for a
+   * caller resuming after an interruption between `broadcastFunding`'s own `testmempoolaccept`
+   * and its return, which must never re-broadcast blindly without first checking whether the
+   * node's own view (mempool or chain) already has it. Reads `getrawtransaction(txid, true)`
+   * (the harness runs `-txindex=1`, so this answers for a mempool-only tx too, not only a mined
+   * one); a "no such transaction" answer means "never reached the network" (`broadcast: false`),
+   * never a thrown exception.
+   */
+  async recoverFunding(txid: string): Promise<RecoveredFunding> {
+    await this.assertPinnedChain();
+    let result: { confirmations?: unknown; blockhash?: unknown };
+    try {
+      result = await this.request<{ confirmations?: unknown; blockhash?: unknown }>("getrawtransaction", [txid, true]);
+    } catch {
+      return { broadcast: false, blockHash: null, confirmations: null };
+    }
+    const confirmations = typeof result.confirmations === "number" && Number.isInteger(result.confirmations) ? result.confirmations : 0;
+    const blockHash = typeof result.blockhash === "string" ? result.blockhash : null;
+    return { broadcast: true, blockHash, confirmations };
+  }
+
+  /**
+   * Back-compat convenience for existing callers (P4-BTC-FIXES.md H2: "keep the old fund()
+   * working"): `prepareFunding` immediately followed by `broadcastFunding`, with a single
+   * re-check of the pinned chain (not two), and `raw` covering every exchange both steps made —
+   * exactly one HTLC output funded, `testmempoolaccept` always run before `sendrawtransaction`.
+   * A caller that wants to record the prepared funding before it is broadcast (G3's own "record
+   * before sending" rule) calls `prepareFunding`/`broadcastFunding` directly instead.
    */
   async fund(terms: BtcHtlcTerms, buyer: BtcWalletHandle): Promise<WriteEvidence> {
     validateTerms(terms);
@@ -424,24 +590,9 @@ export class BtcHtlcRail {
     }
     await this.assertPinnedChain();
     const before = this.rpc.exchanges().length;
-
-    const locktime = locktimeFromRefundAfterMs(terms.refundAfterMs);
-    const hashLockBytes = hexToBytes(terms.hashLock.slice(2));
-    const payeePubkey = hexToBytes(terms.payeePubkey);
-    const payerPubkey = hexToBytes(terms.payerPubkey);
-    const { address, scriptPubKey } = buildHtlcScript({ hashLock: hashLockBytes, payeePubkey, payerPubkey, locktime }, this.networkParams);
-
-    const amountBtc = Decimal.encode(BigInt(terms.amountSats));
-    const txid = await this.walletRequest<string>(buyer.wallet, "sendtoaddress", [address, amountBtc]);
-
-    const scriptPubKeyHex = bytesToHex(scriptPubKey);
-    const info = await this.request<{ vout: Array<{ n: number; scriptPubKey: { hex: string } }> }>("getrawtransaction", [txid, true]);
-    const match = info.vout.find((output) => output.scriptPubKey.hex.toLowerCase() === scriptPubKeyHex);
-    if (match === undefined) {
-      throw new Error("btc-htlc: funding transaction has no output paying the HTLC address (unexpected)");
-    }
-
-    return this.finishWriteEvidence(`${txid}:${match.n}`, txid, before);
+    const prepared = await this.buildFundingPsbt(terms, buyer);
+    const txid = await this.broadcastOrThrow(prepared.rawTx);
+    return this.finishWriteEvidence(prepared.ref, txid, before);
   }
 
   /**

@@ -28,6 +28,7 @@ import {
   type BtcHtlcTerms,
   type BtcRailConfig,
   type BtcWalletHandle,
+  type PreparedFunding,
 } from "../src/rails/btc-htlc.js";
 
 // ── test fixtures ────────────────────────────────────────────────────────────────────────────
@@ -72,6 +73,15 @@ function fakeRawFundingTxHex(scriptPubKey: Uint8Array, amountSats: bigint): stri
   tx.addOutput({ script: scriptPubKey, amount: amountSats }); // vout 1: the HTLC output
   return bytesToHex(tx.unsignedTx);
 }
+
+// H2: prepareFunding/fund decode `walletprocesspsbt`'s own returned `hex` and derive the txid
+// from those exact bytes (`@scure/btc-signer`'s own `Transaction.id`) — never from any mock's
+// return value directly, exactly as production code cannot. So the funding transaction's own id
+// here is whatever those bytes hash to, not the arbitrary FUND_TXID fixture used elsewhere in
+// this file for a pre-existing outpoint passed INTO claim()/refund().
+const FUNDING_TX_HEX = fakeRawFundingTxHex(SCRIPT.scriptPubKey, 100_000_000n);
+const FUNDING_TXID = Transaction.fromRaw(hexToBytes(FUNDING_TX_HEX), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
+const FUNDING_VOUT = 1; // fakeRawFundingTxHex always places the HTLC output at vout 1
 
 interface RpcCallLog {
   method: string;
@@ -124,8 +134,13 @@ function baseHandlers(overrides: Partial<Handlers> = {}): Handlers {
     },
     testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: true }],
     sendrawtransaction: () => "bb".repeat(32),
-    sendtoaddress: () => FUND_TXID,
-    walletprocesspsbt: () => ({ complete: true, hex: "02" + "00".repeat(10) }),
+    // H2: fund()/prepareFunding go through walletcreatefundedpsbt + walletprocesspsbt now, never
+    // sendtoaddress — walletprocesspsbt's own returned `hex` must be a real, decodable funding
+    // transaction paying the HTLC address (FUNDING_TX_HEX), since prepareFunding decodes it to
+    // find the matching output and derive the txid; claim()/refund() never decode this value, so
+    // the same mocked bytes serve every write path this file exercises.
+    walletcreatefundedpsbt: () => ({ psbt: "cHNidP8A" }),
+    walletprocesspsbt: () => ({ complete: true, hex: FUNDING_TX_HEX }),
     ...overrides,
   };
 }
@@ -208,22 +223,39 @@ describe("re-check before every write", () => {
   });
 });
 
-// ── fund() ───────────────────────────────────────────────────────────────────────────────────
+// ── fund() / prepareFunding() / broadcastFunding() / recoverFunding() ──────────────────────────
 
 describe("BtcHtlcRail.fund", () => {
-  it("sends exactly terms.amountSats to the HTLC address and returns the funding ref", async () => {
+  it("builds via walletcreatefundedpsbt + walletprocesspsbt, testmempoolaccepts, then broadcasts, returning the funding ref", async () => {
     const { rail, calls } = await connectRail(baseHandlers());
     const evidence = await rail.fund(TERMS, BUYER);
 
-    expect(evidence.ref).toBe(`${FUND_TXID}:1`);
-    expect(evidence.txid).toBe(FUND_TXID);
+    expect(evidence.ref).toBe(`${FUNDING_TXID}:${FUNDING_VOUT}`);
+    expect(evidence.txid).toBe("bb".repeat(32)); // sendrawtransaction's own (mocked) return value
     expect(evidence.blockHeight).toBeNull();
     expect(evidence.blockHash).toBeNull();
 
-    const send = calls.find((c) => c.method === "sendtoaddress");
-    expect(send?.path).toBe("/wallet/buyer");
-    expect(send?.params[0]).toBe(SCRIPT.address);
-    expect(send?.params[1]).toBe("1"); // Decimal.encode(100_000_000n) === "1"
+    const created = calls.find((c) => c.method === "walletcreatefundedpsbt");
+    expect(created?.path).toBe("/wallet/buyer");
+    expect(created?.params[1]).toEqual([{ [SCRIPT.address]: "1" }]); // Decimal.encode(100_000_000n) === "1"
+    const sign = calls.find((c) => c.method === "walletprocesspsbt");
+    expect(sign?.path).toBe("/wallet/buyer");
+  });
+
+  it("H2: no write path broadcasts without testmempoolaccept first — accept then send, in order", async () => {
+    const { rail, calls } = await connectRail(baseHandlers());
+    await rail.fund(TERMS, BUYER);
+    const acceptIndex = calls.findIndex((c) => c.method === "testmempoolaccept");
+    const sendIndex = calls.findIndex((c) => c.method === "sendrawtransaction");
+    expect(acceptIndex).toBeGreaterThan(-1);
+    expect(sendIndex).toBeGreaterThan(acceptIndex);
+  });
+
+  it("H2: refuses when testmempoolaccept rejects it, and never calls sendrawtransaction", async () => {
+    const { rail, calls } = await connectRail(baseHandlers({ testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: false, "reject-reason": "mempool-script-verify-flag-failed" }] }));
+    calls.length = 0;
+    await expect(rail.fund(TERMS, BUYER)).rejects.toThrow(/mempool-script-verify-flag-failed/);
+    expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
   });
 
   it("raw lists only this write's own exchanges, not connect()'s or the re-check's", async () => {
@@ -231,8 +263,9 @@ describe("BtcHtlcRail.fund", () => {
     const evidence = await rail.fund(TERMS, BUYER);
     // The `before` snapshot is taken AFTER assertPinnedChain()'s own re-check calls (the same
     // place P22-P24-EVM-FIXES.md A10's `assertPinnedChainId()` sits relative to its own writes'
-    // `before` snapshots) — so raw is exactly sendtoaddress + getrawtransaction(verbose).
-    expect(evidence.raw.length).toBeGreaterThanOrEqual(2);
+    // `before` snapshots) — so raw is exactly walletcreatefundedpsbt + walletprocesspsbt +
+    // testmempoolaccept + sendrawtransaction.
+    expect(evidence.raw.length).toBeGreaterThanOrEqual(4);
     expect(new Set(evidence.raw).size).toBe(evidence.raw.length); // each exchange's own distinct response
   });
 
@@ -247,13 +280,91 @@ describe("BtcHtlcRail.fund", () => {
   });
 
   it("refuses when the funding transaction has no output paying the HTLC address", async () => {
-    const { rail } = await connectRail(baseHandlers({ getrawtransaction: (params) => (params[1] === true ? { vout: [] } : "00") }));
+    const { rail } = await connectRail(baseHandlers({ walletprocesspsbt: () => ({ complete: true, hex: fakeRawFundingTxHex(new Uint8Array([0x00, 0x14, ...new Array(20).fill(0)]), 100_000_000n) }) }));
     await expect(rail.fund(TERMS, BUYER)).rejects.toThrow(/no output paying the HTLC address/);
+  });
+
+  it("refuses when walletprocesspsbt does not return a complete, finalized transaction", async () => {
+    const { rail } = await connectRail(baseHandlers({ walletprocesspsbt: () => ({ complete: false }) }));
+    await expect(rail.fund(TERMS, BUYER)).rejects.toThrow(/complete, finalized/);
   });
 
   it("refuses malformed terms (bad hashLock shape)", async () => {
     const { rail } = await connectRail(baseHandlers());
     await expect(rail.fund({ ...TERMS, hashLock: "not-a-hash" }, BUYER)).rejects.toThrow(/hashLock/);
+  });
+});
+
+describe("BtcHtlcRail.prepareFunding / broadcastFunding", () => {
+  it("H2: prepareFunding builds and signs but never broadcasts — no testmempoolaccept, no sendrawtransaction", async () => {
+    const { rail, calls } = await connectRail(baseHandlers());
+    const prepared = await rail.prepareFunding(TERMS, BUYER);
+
+    expect(prepared.ref).toBe(`${FUNDING_TXID}:${FUNDING_VOUT}`);
+    expect(prepared.txid).toBe(FUNDING_TXID);
+    expect(prepared.vout).toBe(FUNDING_VOUT);
+    expect(prepared.rawTx).toBe(FUNDING_TX_HEX);
+    expect(prepared.address).toBe(SCRIPT.address);
+    expect(bytesToHex(prepared.witnessScript)).toBe(bytesToHex(SCRIPT.witnessScript));
+    expect(calls.some((c) => c.method === "testmempoolaccept")).toBe(false);
+    expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
+  });
+
+  it("H2: broadcastFunding runs testmempoolaccept then sendrawtransaction on exactly the prepared transaction", async () => {
+    const { rail, calls } = await connectRail(baseHandlers());
+    const prepared = await rail.prepareFunding(TERMS, BUYER);
+    calls.length = 0;
+    const evidence = await rail.broadcastFunding(prepared);
+
+    expect(evidence.ref).toBe(prepared.ref);
+    expect(evidence.txid).toBe("bb".repeat(32)); // sendrawtransaction's own (mocked) return value
+    const acceptIndex = calls.findIndex((c) => c.method === "testmempoolaccept");
+    const sendIndex = calls.findIndex((c) => c.method === "sendrawtransaction");
+    expect(acceptIndex).toBeGreaterThan(-1);
+    expect(sendIndex).toBeGreaterThan(acceptIndex);
+    expect(calls[acceptIndex]?.params[0]).toEqual([prepared.rawTx]);
+  });
+
+  it("H2: broadcastFunding refuses when testmempoolaccept rejects the prepared transaction, and never sends", async () => {
+    const { rail } = await connectRail(baseHandlers());
+    const prepared = await rail.prepareFunding(TERMS, BUYER);
+    const { rail: rejectingRail, calls } = await connectRail(baseHandlers({ testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: false, "reject-reason": "non-final" }] }));
+    calls.length = 0;
+    await expect(rejectingRail.broadcastFunding(prepared)).rejects.toThrow(/non-final/);
+    expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
+  });
+
+  it("re-checks the pinned chain before broadcasting even when prepared a while earlier", async () => {
+    const { rail, handlers: liveHandlers } = await connectRail(baseHandlers());
+    const prepared = await rail.prepareFunding(TERMS, BUYER);
+    liveHandlers.getblockchaininfo = () => ({ chain: "main", time: 0, mediantime: 0 });
+    await expect(rail.broadcastFunding(prepared)).rejects.toThrow(/refusing main by name/);
+  });
+});
+
+describe("BtcHtlcRail.recoverFunding", () => {
+  it("H2: reports broadcast:true with confirmations/blockhash once the node's own view has the txid", async () => {
+    const { rail } = await connectRail(baseHandlers({ getrawtransaction: () => ({ confirmations: 3, blockhash: "bb".repeat(32) }) }));
+    const recovered = await rail.recoverFunding(FUNDING_TXID);
+    expect(recovered).toEqual({ broadcast: true, blockHash: "bb".repeat(32), confirmations: 3 });
+  });
+
+  it("H2: reports broadcast:true, blockHash null, for a mempool-only (unconfirmed) txid", async () => {
+    const { rail } = await connectRail(baseHandlers({ getrawtransaction: () => ({}) }));
+    const recovered = await rail.recoverFunding(FUNDING_TXID);
+    expect(recovered).toEqual({ broadcast: true, blockHash: null, confirmations: 0 });
+  });
+
+  it("H2: reports broadcast:false when the node has never seen this txid, never throws", async () => {
+    const { rail } = await connectRail(
+      baseHandlers({
+        getrawtransaction: () => {
+          throw new Error("No such mempool or blockchain transaction");
+        },
+      }),
+    );
+    const recovered = await rail.recoverFunding(FUNDING_TXID);
+    expect(recovered).toEqual({ broadcast: false, blockHash: null, confirmations: null });
   });
 });
 
