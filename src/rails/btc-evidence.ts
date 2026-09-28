@@ -654,17 +654,24 @@ export async function captureBtcLeg(
   nowMs: number,
 ): Promise<{ index: BtcCaptureIndex; exchanges: Exchange[] }> {
   const nonce = randomNonce();
+  const scanWindow = scanWindowFor(config);
+  // P4-BTC-FIXES-R2.md R2-4: freeze the EFFECTIVE scan window into the capture's own recorded
+  // config — never leave it implicit (defaulting), so a later change to
+  // `DEFAULT_SCAN_WINDOW_BLOCKS` can never silently reinterpret an old capture under a different
+  // bound than the one the live sweep actually used. `btcEvidence`'s own narrower-than-the-
+  // auditor check (H4/D3) already reads this same field back via `scanWindowFor`, so recording it
+  // explicitly here is the only change a replay needs.
+  const effectiveConfig: BtcRailConfig = { ...config, scanWindowBlocks: scanWindow };
   const parsed = parseRef(ref);
   if (parsed === null) {
-    return { index: buildIndex(config, ref, nowMs, nonce, []), exchanges: [] };
+    return { index: buildIndex(effectiveConfig, ref, nowMs, nonce, []), exchanges: [] };
   }
   const { txid, vout } = parsed;
-  const scanWindow = scanWindowFor(config);
 
   const before = rpc.exchanges().length;
   const finish = (error?: string) => {
     const exchanges = rpc.exchanges().slice(before);
-    return { index: buildIndex(config, ref, nowMs, nonce, exchanges, error), exchanges };
+    return { index: buildIndex(effectiveConfig, ref, nowMs, nonce, exchanges, error), exchanges };
   };
 
   rpc.setIdNamespace(`${ref}:${nowMs}:${nonce}`);
