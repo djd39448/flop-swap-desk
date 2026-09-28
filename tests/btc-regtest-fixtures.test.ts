@@ -14,6 +14,8 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -133,23 +135,60 @@ describe("examples/audit-export.mjs — committed btc-regtest client-flow fixtur
     });
   }
 
-  it("no committed fixture holds anything resembling a private key, WIF, xprv, seed or mnemonic", async () => {
-    const { readdirSync, readFileSync, statSync } = await import("node:fs");
-    const suspicious = /-----BEGIN|PRIVATE KEY|mnemonic|seed phrase|\bxprv[0-9A-Za-z]{100,}|\bcprv[0-9A-Za-z]{100,}/i;
-    const walk = (dir: string): string[] =>
-      readdirSync(dir).flatMap((name) => {
-        const full = join(dir, name);
-        return statSync(full).isDirectory() ? walk(full) : [full];
-      });
-    for (const file of walk(fixturesRoot)) {
-      expect(suspicious.test(readFileSync(file, "utf8"))).toBe(false);
+  // H8: extended with tprv (Bitcoin's own testnet/regtest xprv prefix — the chain this build's
+  // fixtures are actually on), a testnet/regtest WIF (base58, 51-52 chars, starting `c`/`9`), and
+  // any captured request naming `dumpprivkey`, `dumpwallet`, or `listdescriptors` with `true` (the
+  // three RPCs P4-BTC-SPEC.md §1 forbids outright) — pinning what H1's own key-export ban claims.
+  const SUSPICIOUS_KEY_MATERIAL = /-----BEGIN|PRIVATE KEY|mnemonic|seed phrase|\bxprv[0-9A-Za-z]{100,}|\bcprv[0-9A-Za-z]{100,}|\btprv[0-9A-Za-z]{100,}|\b[c9][1-9A-HJ-NP-Za-km-z]{50,51}\b/i;
+  const SUSPICIOUS_RPC_METHOD = /dumpprivkey|dumpwallet|listdescriptors[\s\S]{0,80}true/i;
+
+  function walkFixtures(dir: string): string[] {
+    return readdirSync(dir).flatMap((name) => {
+      const full = join(dir, name);
+      return statSync(full).isDirectory() ? walkFixtures(full) : [full];
+    });
+  }
+
+  it("no committed fixture holds anything resembling a private key, WIF, xprv/tprv, seed or mnemonic", () => {
+    for (const file of walkFixtures(fixturesRoot)) {
+      expect(SUSPICIOUS_KEY_MATERIAL.test(readFileSync(file, "utf8"))).toBe(false);
+    }
+  });
+
+  it("H8: no committed fixture names dumpprivkey, dumpwallet, or listdescriptors with true", () => {
+    for (const file of walkFixtures(fixturesRoot)) {
+      expect(SUSPICIOUS_RPC_METHOD.test(readFileSync(file, "utf8"))).toBe(false);
+    }
+  });
+
+  // H8's own "pins what it claims": prove the extended patterns actually catch a planted leak —
+  // a scratch copy, never the committed fixtures themselves.
+  it("H8: the extended key/method scan actually flags a planted tprv, testnet WIF, and forbidden RPC method", () => {
+    const scratch = mkdtempSync(join(tmpdir(), "flop-btc-fixture-scan-"));
+    try {
+      mkdirSync(join(scratch, "raw", "rpc"), { recursive: true });
+      const tprvSample = `tprv${"A".repeat(107)}`;
+      const wifSample = `c${"1".repeat(51)}`;
+      writeFileSync(join(scratch, "planted-tprv.txt"), tprvSample);
+      writeFileSync(join(scratch, "planted-wif.txt"), wifSample);
+      writeFileSync(join(scratch, "raw", "rpc", "planted-method.json"), JSON.stringify({ method: "dumpprivkey", params: ["addr"] }));
+      writeFileSync(join(scratch, "raw", "rpc", "planted-listdescriptors.json"), JSON.stringify({ method: "listdescriptors", params: [true] }));
+
+      const files = walkFixtures(scratch);
+      const flaggedKeyMaterial = files.filter((f) => SUSPICIOUS_KEY_MATERIAL.test(readFileSync(f, "utf8")));
+      const flaggedMethods = files.filter((f) => SUSPICIOUS_RPC_METHOD.test(readFileSync(f, "utf8")));
+      expect(flaggedKeyMaterial.sort()).toEqual([join(scratch, "planted-tprv.txt"), join(scratch, "planted-wif.txt")].sort());
+      expect(flaggedMethods.sort()).toEqual(
+        [join(scratch, "raw", "rpc", "planted-listdescriptors.json"), join(scratch, "raw", "rpc", "planted-method.json")].sort(),
+      );
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
     }
   });
 
   // P4-BTC-SPEC.md §1: the node's RPC cookie (Basic auth) must never have been captured — every
   // exchange's own request bytes carry only the JSON-RPC body, never an HTTP header.
   it("no captured raw/rpc exchange contains an Authorization header or cookie value", async () => {
-    const { readdirSync, readFileSync, statSync } = await import("node:fs");
     const rpcDirs = CASES.map((c) => join(fixturesRoot, c.scenario, "raw", "rpc")).filter((dir) => {
       try {
         return statSync(dir).isDirectory();
