@@ -30,6 +30,7 @@
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §2.2 point 3, §4;
 // flop-contrib/handoff/P22-P24-EVM-FIXES.md A1, A2, A4, A7, A8, A11.
 
+import { randomBytes } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -126,6 +127,26 @@ export interface EvmCaptureIndex {
   checkedAtMs: number;
   finality: { mode: "tag"; tag: "finalized" } | { mode: "confirmations"; confirmations: number };
   config: EvmRailConfig;
+  /** P22-P24-EVM-FIXES-R2.md D1/P22-P24-EVM-FIXES-R3.md F2: a random value minted once per
+   *  `captureEvmLeg` call (never derived from anything an attacker could predict or replay),
+   *  required as part of every one of this capture's own request ids
+   *  (`<hashLock>:<checkedAtMs>:<nonce>:<n>`, `CapturingRpc.setIdNamespace`). Two genuine
+   *  captures that happen to share the same hashLock *and* the same `checkedAtMs` (a coincidence
+   *  no attacker needs to predict — a retried sweep, two calls under a mocked/coarse clock) used
+   *  to mint colliding ids before F2, which let a genuine response from one such capture splice
+   *  into the other and still satisfy `bindExchange`'s "id is bound to this capture" check
+   *  (F2's "same-timestamp splice"). Required, hex-shaped, non-empty — `looksLikeCaptureIndexFile`
+   *  refuses a captured index missing one. */
+  nonce: string;
+  /** P22-P24-EVM-FIXES-R3.md F1: set when this capture attempt did not run to completion — a
+   *  JSON-RPC error reply or a transport-level failure on one of `captureEvmLeg`'s own RPC calls
+   *  stopped it early. `exchanges` is then whatever was captured before the failure (often
+   *  none). Persisted and fed into the live fold exactly like a completed capture, so this
+   *  sweep's own (failed) attempt — never a stale earlier sweep's success — is what a later
+   *  replay's "latest capture" for this hashLock finds, and both the live board and the replay
+   *  fail this leg closed identically (`evmEvidence` below checks this first). Absent for a
+   *  capture that ran to completion, whether or not it found anything verifiable. */
+  error?: string;
   exchanges: EvmCaptureIndexExchange[];
 }
 
@@ -252,21 +273,26 @@ function parseRequestBody(exchange: EvmCaptureIndexExchange): ParsedRequest | nu
   return { id: obj.id, method: obj.method, params: obj.params };
 }
 
-/** D1 (P22-P24-EVM-FIXES-R2.md): whether `id` is bound to *this* capture — it must be the
- *  string `"<capture.index.hashLock>:<capture.index.checkedAtMs>:<n>"` `captureEvmLeg` mints
- *  via `CapturingRpc.setIdNamespace`. JSON-RPC ids restart at 1 (or at "n" for any fixed
- *  namespace) per session, so without this check a genuine response — and its own genuine,
- *  internally-consistent id — captured under a *different* hashLock/checkedAtMs (a different
- *  swap's capture entirely, or the same swap re-checked at another time) could be spliced into
- *  this capture's index, with a forged request whose `id` is simply copied from that borrowed
- *  response, and would otherwise still "bind" (request.id === response.id, both attacker-
- *  supplied metadata). `capture.index.hashLock` is already required (earlier in `evmEvidence`)
- *  to equal the caller's own trusted `terms.statement` before any exchange is bound, so an
- *  attacker cannot simply relabel this capture as the donor's hashLock to pass this check — the
- *  donor's real response carries the donor's real hashLock baked into its own `id`, which can
- *  never start with *this* capture's (different) hashLock. */
+/** D1 (P22-P24-EVM-FIXES-R2.md)/F2 (P22-P24-EVM-FIXES-R3.md): whether `id` is bound to *this*
+ *  capture — it must be the string
+ *  `"<capture.index.hashLock>:<capture.index.checkedAtMs>:<capture.index.nonce>:<n>"`
+ *  `captureEvmLeg` mints via `CapturingRpc.setIdNamespace`. JSON-RPC ids restart at 1 (or at "n"
+ *  for any fixed namespace) per session, so without this check a genuine response — and its own
+ *  genuine, internally-consistent id — captured under a *different* capture could be spliced
+ *  into this capture's index, with a forged request whose `id` is simply copied from that
+ *  borrowed response, and would otherwise still "bind" (request.id === response.id, both
+ *  attacker-supplied metadata). `capture.index.hashLock` is already required (earlier in
+ *  `evmEvidence`) to equal the caller's own trusted `terms.statement` before any exchange is
+ *  bound, so an attacker cannot simply relabel this capture as the donor's hashLock to pass this
+ *  check — the donor's real response carries the donor's real hashLock baked into its own `id`.
+ *  F2: the hashLock/checkedAtMs pair alone is not enough — two genuine captures can coincide on
+ *  both (no attacker prediction needed: a retried sweep, two calls under a mocked/coarse clock),
+ *  which used to let either one's genuine response splice into the other's capture and still
+ *  bind. Requiring the capture's own random `nonce` too (F2, never attacker-predictable) closes
+ *  that "same-timestamp splice": the donor's real id carries the donor's own (different) nonce,
+ *  which can never start with *this* capture's own. */
 function idBoundToCapture(capture: EvmCapture, id: number | string): boolean {
-  return typeof id === "string" && id.startsWith(`${capture.index.hashLock}:${capture.index.checkedAtMs}:`);
+  return typeof id === "string" && id.startsWith(`${capture.index.hashLock}:${capture.index.checkedAtMs}:${capture.index.nonce}:`);
 }
 
 function sameJson(a: unknown, b: unknown): boolean {
@@ -518,6 +544,15 @@ export function evmEvidence(input: EvmEvidenceInput): EvmEvidenceResult {
     endpoint: config.endpoint,
     raw,
   };
+
+  // F1 (P22-P24-EVM-FIXES-R3.md): this capture's own attempt did not run to completion (a
+  // JSON-RPC error reply or a transport failure stopped `captureEvmLeg` early) — checked first,
+  // before even the ref/lock gate, since a failed attempt's `hashLock` is still whatever the
+  // caller asked it to capture and would otherwise pass that check too. Never anything but
+  // `railVerified: null`: nothing here was actually checked against the chain.
+  if (capture.index.error !== undefined) {
+    return { lock: { ...base, railVerified: null, reason: `evm-htlc: chain read did not complete: ${capture.index.error}` } };
+  }
 
   if (hashLockRefMismatch(terms, capture.index.hashLock)) {
     return {
@@ -771,13 +806,24 @@ async function readLiveNumberedBlockHash(rpc: CapturingRpc, confirmations: numbe
   return blockResultHash(result);
 }
 
+/** F2: 8 random bytes (16 lowercase hex chars) — plenty to make a same-hashLock/same-
+ *  checkedAtMs id collision between two genuine captures astronomically unlikely, without
+ *  needing an injected randomness source: `captureEvmLeg` does real network I/O already (it is
+ *  not a pure function), so a real CSPRNG read here is no different a house-rule violation than
+ *  the RPC call itself. */
+function randomNonce(): string {
+  return randomBytes(8).toString("hex");
+}
+
 function buildIndex(
   config: EvmRailConfig,
   chainId: number,
   hashLock: string,
   checkedAtMs: number,
+  nonce: string,
   exchanges: readonly Exchange[],
   finality: EvmCaptureIndex["finality"],
+  error?: string,
 ): EvmCaptureIndex {
   return {
     v: 1,
@@ -791,6 +837,8 @@ function buildIndex(
     checkedAtMs,
     finality,
     config, // A4: freeze the exact config this capture was taken under.
+    nonce, // F2: this capture's own random id-namespace nonce.
+    ...(error === undefined ? {} : { error }), // F1: set only when this attempt did not finish.
     exchanges: exchanges.map(({ method, params, requestBody, responseSha256, atMs }) => ({
       method,
       params,
@@ -820,81 +868,105 @@ export async function captureEvmLeg(
   hashLock: string,
   nowMs: number,
 ): Promise<{ index: EvmCaptureIndex; exchanges: Exchange[] }> {
+  const nonce = randomNonce(); // F2: minted once per call, whether or not any RPC call is ever made.
+
   if (!HASH_LOCK_SHAPE.test(hashLock)) {
     const finality = config.pin.finality;
     const finalityRecord: EvmCaptureIndex["finality"] =
       finality.mode === "confirmations" ? { mode: "confirmations", confirmations: finality.confirmations } : { mode: "tag", tag: finality.tag };
-    return { index: buildIndex(config, 0, hashLock, nowMs, [], finalityRecord), exchanges: [] };
+    return { index: buildIndex(config, 0, hashLock, nowMs, nonce, [], finalityRecord), exchanges: [] };
   }
 
   const before = rpc.exchanges().length;
-  const finish = (finality: EvmCaptureIndex["finality"], chainId: number) => {
+  const finish = (finality: EvmCaptureIndex["finality"], chainId: number, error?: string) => {
     const exchanges = rpc.exchanges().slice(before);
-    return { index: buildIndex(config, chainId, hashLock, nowMs, exchanges, finality), exchanges };
+    return { index: buildIndex(config, chainId, hashLock, nowMs, nonce, exchanges, finality, error), exchanges };
   };
 
-  // D1 (P22-P24-EVM-FIXES-R2.md): every id this capture's own exchanges carry is bound to this
-  // exact hashLock/checkedAtMs pair (`idBoundToCapture`), not the bare auto-incrementing
-  // integer `rpc` would otherwise mint — closing the "a genuine response from a different
-  // capture binds" gap `bindExchange` now checks for. `rpc` may be a long-lived instance shared
-  // across many captures (`src/watcher.ts`'s per-sweep `rpc`, reused for every candidate) or
-  // across many writes (`EvmHtlcRail`'s own `this.rpc`), so the namespace is reset back to the
-  // plain sequence once this capture's own calls are done — never left set for whatever the
-  // caller does with `rpc` next.
-  rpc.setIdNamespace(`${hashLock}:${nowMs}`);
+  // D1 (P22-P24-EVM-FIXES-R2.md)/F2 (P22-P24-EVM-FIXES-R3.md): every id this capture's own
+  // exchanges carry is bound to this exact hashLock/checkedAtMs/nonce triple
+  // (`idBoundToCapture`), not the bare auto-incrementing integer `rpc` would otherwise mint —
+  // closing both the "a genuine response from a different capture binds" gap (D1) and the
+  // "same-timestamp splice" between two genuine captures that happen to share a hashLock and a
+  // checkedAtMs (F2). `rpc` may be a long-lived instance shared across many captures
+  // (`src/watcher.ts`'s per-sweep `rpc`, reused for every candidate) or across many writes
+  // (`EvmHtlcRail`'s own `this.rpc`), so the namespace is reset back to the plain sequence once
+  // this capture's own calls are done — never left set for whatever the caller does with `rpc`
+  // next.
+  rpc.setIdNamespace(`${hashLock}:${nowMs}:${nonce}`);
   try {
     const finality = config.pin.finality;
     const declaredFinalityRecord: EvmCaptureIndex["finality"] =
       finality.mode === "confirmations" ? { mode: "confirmations", confirmations: finality.confirmations } : { mode: "tag", tag: finality.tag };
 
-    // D5 (P22-P24-EVM-FIXES-R2.md): never let a malformed `eth_chainId` result throw —
-    // `parseHexNumber`, the same guard the replay-side decoder uses on captured data, not the
-    // bare `hexToNumber` this used to call directly. A transport-level failure (the node
-    // unreachable, a rejected fetch) still propagates here, same as ever — `watcher.ts`'s sweep
-    // already treats that as a per-candidate skip; D5 is about a *value* the RPC actually
-    // answered with. A response that answers with garbage stops reading here, returning the one
-    // exchange captured so far so it is still persisted and fails closed identically on replay.
-    const chainIdRaw = await rpc.request({ method: "eth_chainId", params: [] });
-    const chainId = parseHexNumber(chainIdRaw);
-    if (chainId === null) return finish(declaredFinalityRecord, 0);
-
-    let blockHash: Hex | null;
-    let finalityRecord: EvmCaptureIndex["finality"] = declaredFinalityRecord;
-
-    if (finality.mode === "confirmations") {
-      blockHash = await readLiveNumberedBlockHash(rpc, finality.confirmations);
-      finalityRecord = { mode: "confirmations", confirmations: finality.confirmations };
-    } else {
-      let tagHash: Hex | null = null;
-      try {
-        const result = await rpc.request({ method: "eth_getBlockByNumber", params: [finality.tag, false] });
-        tagHash = blockResultHash(result);
-      } catch {
-        tagHash = null;
-      }
-
-      if (tagHash !== null) {
-        blockHash = tagHash;
-        finalityRecord = { mode: "tag", tag: finality.tag };
-      } else if (finality.fallbackConfirmations !== undefined) {
-        blockHash = await readLiveNumberedBlockHash(rpc, finality.fallbackConfirmations);
-        finalityRecord = { mode: "confirmations", confirmations: finality.fallbackConfirmations };
-      } else {
-        return finish(declaredFinalityRecord, chainId);
-      }
-    }
-
-    if (blockHash === null) return finish(finalityRecord, chainId);
-
-    const data = encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [hashLock as Hex] });
+    // F1 (P22-P24-EVM-FIXES-R3.md): a JSON-RPC error reply on ANY of this leg's own reads (an
+    // exchange CapturingRpc still recorded despite throwing — a rate-limited/erroring endpoint)
+    // or a genuine transport-level failure (nothing recorded for that particular call — the node
+    // unreachable, a rejected fetch, an abort) must never propagate out of this function
+    // uncaught: that would make the caller (src/watcher.ts's sweep) skip writing this sweep's
+    // own raw/evm/<hashLock>/*.json entirely, leaving a *previous*, possibly stale, sweep's
+    // index as the newest file for a later replay to pick up as "current" instead of this
+    // sweep's own (failed) attempt. Catch broadly here and return the partial capture — whatever
+    // was captured before the failure, often nothing — tagged with why it stopped; `evmEvidence`
+    // checks `capture.index.error` first and always reports `railVerified: null` for it, live or
+    // replayed, off the exact same bytes.
+    let chainId = 0;
     try {
-      await rpc.request({ method: "eth_call", params: [{ to: config.contract, data }, { blockHash }] });
-    } catch {
-      // Recorded regardless (CapturingRpc records before throwing) — evmEvidence sees the
-      // error envelope on replay and fails closed; nothing more for this function to decide.
-    }
+      // D5 (P22-P24-EVM-FIXES-R2.md): never let a malformed (but successfully read) `eth_chainId`
+      // result throw — `parseHexNumber`, the same guard the replay-side decoder uses on captured
+      // data, not the bare `hexToNumber` this used to call directly. A response that answers with
+      // garbage stops reading here (not an `error`: something genuine was captured, `evmEvidence`
+      // already reports a specific "malformed eth_chainId result" reason for it).
+      const chainIdRaw = await rpc.request({ method: "eth_chainId", params: [] });
+      const parsedChainId = parseHexNumber(chainIdRaw);
+      if (parsedChainId === null) return finish(declaredFinalityRecord, 0);
+      chainId = parsedChainId;
 
-    return finish(finalityRecord, chainId);
+      let blockHash: Hex | null;
+      let finalityRecord: EvmCaptureIndex["finality"] = declaredFinalityRecord;
+
+      if (finality.mode === "confirmations") {
+        blockHash = await readLiveNumberedBlockHash(rpc, finality.confirmations);
+        finalityRecord = { mode: "confirmations", confirmations: finality.confirmations };
+      } else {
+        let tagHash: Hex | null = null;
+        try {
+          const result = await rpc.request({ method: "eth_getBlockByNumber", params: [finality.tag, false] });
+          tagHash = blockResultHash(result);
+        } catch {
+          tagHash = null;
+        }
+
+        if (tagHash !== null) {
+          blockHash = tagHash;
+          finalityRecord = { mode: "tag", tag: finality.tag };
+        } else if (finality.fallbackConfirmations !== undefined) {
+          blockHash = await readLiveNumberedBlockHash(rpc, finality.fallbackConfirmations);
+          finalityRecord = { mode: "confirmations", confirmations: finality.fallbackConfirmations };
+        } else {
+          return finish(declaredFinalityRecord, chainId);
+        }
+      }
+
+      if (blockHash === null) return finish(finalityRecord, chainId);
+
+      const data = encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [hashLock as Hex] });
+      try {
+        await rpc.request({ method: "eth_call", params: [{ to: config.contract, data }, { blockHash }] });
+      } catch {
+        // Recorded regardless (CapturingRpc records before throwing) — evmEvidence sees the
+        // error envelope on replay and fails closed; nothing more for this function to decide.
+      }
+
+      return finish(finalityRecord, chainId);
+    } catch (error) {
+      // F1: either a JSON-RPC error reply on eth_chainId/eth_blockNumber/
+      // eth_getBlockByNumber(confirmations) (recorded despite throwing) or a genuine transport
+      // failure (nothing recorded for that call) lands here — stop reading and return whatever
+      // this attempt did manage to capture, tagged with why it stopped.
+      const reason = error instanceof Error ? error.message : String(error);
+      return finish(declaredFinalityRecord, chainId, reason);
+    }
   } finally {
     rpc.setIdNamespace(undefined);
   }
@@ -939,6 +1011,10 @@ function looksLikeCaptureIndexFile(value: unknown, hashLock: string): value is E
   const v = value as Record<string, unknown>;
   if (v.v !== 1 || v.rail !== "evm-htlc") return false;
   if (typeof v.hashLock !== "string" || v.hashLock !== hashLock || !HASH_LOCK_SHAPE.test(v.hashLock)) return false;
+  // F2: every real capture index now carries its own random nonce (`idBoundToCapture`'s
+  // binding depends on it being present) — a file missing one is not a capture this build ever
+  // wrote (or a pre-F2 one, now stale enough to treat the same as any other malformed file).
+  if (typeof v.nonce !== "string" || v.nonce.length === 0) return false;
   if (!Array.isArray(v.exchanges)) return false;
   for (const exchange of v.exchanges) {
     if (exchange === null || typeof exchange !== "object") return false;

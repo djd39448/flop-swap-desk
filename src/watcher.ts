@@ -541,6 +541,14 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
       const hashLock = accepted.railRef;
 
       try {
+        // P22-P24-EVM-FIXES-R3.md F1: `captureEvmLeg` no longer throws for a JSON-RPC error
+        // reply or a transport failure on one of its own chain reads — it returns the partial
+        // capture instead, tagged with `index.error`. That capture is written as *this* sweep's
+        // own raw/evm/<hashLock>/<iso>.json (and fed into this sweep's own live fold via
+        // `chainCaptures`) exactly like a completed one, so a later replay's "latest capture" for
+        // this hashLock is this sweep's own attempt — never a stale earlier sweep's success — and
+        // it fails closed identically live and replayed, since both run the exact same
+        // `evmEvidence` over the exact same bytes.
         const { index, exchanges } = await captureEvmLeg(rpc, evmConfig, hashLock, nowMs);
         await writeCapture(root, exchanges);
         await writeFileAtomic(
@@ -549,8 +557,16 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
         );
         const bytes = verifiedExchangeBytes(exchanges);
         chainCaptures.set(hashLock, { index, bytes });
-        report.chainReads += 1;
+        if (index.error === undefined) {
+          report.chainReads += 1;
+        } else {
+          report.chainReadsSkipped.push({ contract: candidate.contract, reason: index.error });
+        }
       } catch (error) {
+        // A genuine failure persisting this sweep's own attempt (disk full, an unexpected path
+        // error) — nothing safe to hand the live fold; recorded as a skip like any other
+        // per-candidate failure. `captureEvmLeg` itself no longer throws (F1), so this is the
+        // fs-level backstop, not the common case.
         report.chainReadsSkipped.push({
           contract: candidate.contract,
           reason: error instanceof Error ? error.message : String(error),

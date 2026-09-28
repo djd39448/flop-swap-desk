@@ -149,10 +149,16 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
   function jsonRpcResult(id: number | string, result: unknown): string {
     return JSON.stringify({ jsonrpc: "2.0", id, result });
   }
-  /** P22-P24-EVM-FIXES-R2.md D1: the capture-bound id format every real capture now uses —
-   *  every fixture in this block builds its capture at `T0`, so this always binds. */
+  /** P22-P24-EVM-FIXES-R3.md F2: this fixture block's own standard nonce — every `buildCapture`
+   *  below freezes it into `index.nonce`, and `evmId` embeds it, so this block's ordinary
+   *  (non-tampered) fixtures bind exactly as before F2 added the nonce segment. */
+  const NONCE = "aaaaaaaaaaaaaaaa";
+
+  /** P22-P24-EVM-FIXES-R2.md D1/P22-P24-EVM-FIXES-R3.md F2: the capture-bound id format every
+   *  real capture now uses — every fixture in this block builds its capture at `T0`, so this
+   *  always binds. */
   function evmId(hashLock: string, n: number): string {
-    return `${hashLock}:${T0}:${n}`;
+    return `${hashLock}:${T0}:${NONCE}:${n}`;
   }
   function addr(tag: string): Address {
     const hex = Buffer.from(tag, "utf8").toString("hex").padEnd(40, "0").slice(0, 40);
@@ -230,6 +236,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       checkedAtMs: T0,
       finality: { mode: "tag", tag: "finalized" },
       config: EVM_CONFIG,
+      nonce: NONCE,
       exchanges: indexExchanges,
     };
     return { index, bytes: bySha };

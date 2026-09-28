@@ -61,11 +61,21 @@ depends on. `npm test` builds it first. Clone with `--recurse-submodules`.
 
 `examples/audit-export.mjs --root DIR [--expect <swapId>=<status>] [--json]` reproduces a
 watch root's board — every swap's status, reasons, buyer/seller DIDs, the offer-room and
-deal-room seqs it was derived from, and each paper note's `finalizedRef` — purely from what
+deal-room seqs it was derived from, and each rail's `finalizedRef` — purely from what
 `src/watcher.ts` already wrote to `DIR/raw/`. It opens no network connection: the offer-room
-export(s), each deal room's capture(s), and any paper-rail note(s) are read straight off disk
-and folded through the same `foldCaptured` (`src/replay.ts`) the live watcher uses, so a
-capture can be re-verified without trusting the process that produced it.
+export(s), each deal room's capture(s), any paper-rail note(s), and (once a chain rail is
+configured — see "EVM leg" below) any captured EVM chain reads are read straight off disk and
+folded through the same `foldCaptured` (`src/replay.ts`) the live watcher uses.
+
+**What this replay proves, and what it does not (P22-P24-EVM-FIXES-R3.md F3).** Re-reading a
+capture this way independently detects a capture that was *corrupted, spliced, edited, or
+taken under a different rail config* after the fact, and fails that leg closed. It does
+**not** prove the capturing process told the truth about the chain to begin with: a wholesale
+*fabricated* RPC response, named honestly by its own hash, replays exactly as a genuine one
+would — this build adds no signing keys to close that gap. For a chain leg, the independent
+check is its own `finalizedRef`: it names a real block hash, so anyone with their own RPC
+access to that chain can re-query `locks(hashLock)` at that exact block and compare, without
+trusting this repository or whoever ran the sweep.
 
 `fixtures/rehearsal-2026-09-18/` is a byte-exact, watch-root-shaped capture of the real
 2026-09-18 G0 rehearsal on `paper` — the four `tclk-offers` lines that made the pair, both
@@ -148,6 +158,14 @@ EVM contract, with every verdict re-derivable from the exact captured RPC bytes 
 real network, and never with mainnet value at any point in this build (D-09/D-10). The
 Base Sepolia deploy (P2.5) — a real testnet, a real key loaded from env and never printed, the
 account lines exchanged for real — is Dave's own G1 step and is not built here.
+
+Re-deriving a verdict from the captured bytes (see "Audit replay" above, F3) detects the bytes
+being tampered with after the fact — never that the capturing process told the truth about the
+chain to begin with. The independent check is each leg's own `finalizedRef`
+(`anvil-local:finalized:<n>:<blockHash>`, or `base-sepolia:...` once P2.5 deploys): it names a
+real block on the chain it was read from, so anyone with their own RPC access to that chain can
+re-query `locks(hashLock)` at that exact block hash and compare against what this build
+reported, independent of this repository entirely.
 
 ## What this is not
 

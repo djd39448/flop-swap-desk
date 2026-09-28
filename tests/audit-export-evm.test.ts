@@ -59,9 +59,15 @@ function sha256Hex(text: string): string {
 function jsonRpcResult(id: number | string, result: unknown): string {
   return JSON.stringify({ jsonrpc: "2.0", id, result });
 }
-/** P22-P24-EVM-FIXES-R2.md D1: the capture-bound id format every real capture now uses. */
+/** P22-P24-EVM-FIXES-R3.md F2: this fixture file's own standard nonce — every fixture built
+ *  here freezes it into `index.nonce`, and `evmId` embeds it, so the ordinary (non-tampered)
+ *  case binds exactly as before F2 added the nonce segment. */
+const NONCE = "aaaaaaaaaaaaaaaa";
+
+/** P22-P24-EVM-FIXES-R2.md D1/P22-P24-EVM-FIXES-R3.md F2: the capture-bound id format every
+ *  real capture now uses. */
 function evmId(hashLock: string, checkedAtMs: number, n: number): string {
-  return `${hashLock}:${checkedAtMs}:${n}`;
+  return `${hashLock}:${checkedAtMs}:${NONCE}:${n}`;
 }
 function wireRow(rec: ReturnType<typeof record>) {
   return JSON.stringify({ seq: rec.seq, ts: new Date(rec.timestampMs).toISOString(), from: rec.sender, nonce: rec.nonce, sig: rec.signature, text: rec.line });
@@ -143,6 +149,7 @@ function buildEvmFixture(contractAddress: Address) {
     checkedAtMs,
     finality: { mode: "tag", tag: "finalized" },
     config: EVM_CONFIG,
+    nonce: NONCE,
     exchanges: [
       {
         method: "eth_chainId",

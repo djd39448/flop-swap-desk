@@ -971,11 +971,25 @@ describe("runSweep", () => {
       const script = join(dirname(fileURLToPath(import.meta.url)), "..", "examples", "audit-export.mjs");
       const result = spawnSync(process.execPath, [script, "--root", root, "--json"], { encoding: "utf8" });
       expect(result.status).toBe(0);
-      const replayed = JSON.parse(result.stdout) as { swaps: Array<{ swapId: string; settlementView: { a: string }; finalizedRefs: string[] }> };
+      const replayed = JSON.parse(result.stdout) as {
+        swaps: Array<{
+          swapId: string;
+          settlementView: { a: string };
+          finalizedRefs: string[];
+          evidence: { a?: { railVerified: boolean | null; reason?: string; finalizedRef?: string }; aRail?: unknown };
+        }>;
+      };
       const replayedSwap = replayed.swaps.find((s) => s.swapId === swap.swapId);
       expect(replayedSwap).toBeDefined();
       expect(replayedSwap!.settlementView.a).toBe(liveView.settlementView.a);
       expect(replayedSwap!.finalizedRefs.some((ref) => ref.startsWith("anvil-local:finalized:5:"))).toBe(true);
+
+      // P22-P24-EVM-FIXES-R3.md F4: compare the actual verdict in full, never just the coarser
+      // settlementView a mismatched reason or a stale rail observation could still coincide on.
+      expect(replayedSwap!.evidence.a?.railVerified).toBe(liveView.evidence.a.railVerified);
+      expect(replayedSwap!.evidence.a?.reason).toBe(liveView.evidence.a.reason);
+      expect(replayedSwap!.evidence.a?.finalizedRef).toBe(liveView.evidence.a.finalizedRef);
+      expect(replayedSwap!.evidence.aRail).toEqual(liveView.evidence.aRail);
     });
 
     it("a second sweep with the same config does not rewrite rails.json", async () => {
@@ -998,7 +1012,7 @@ describe("runSweep", () => {
       expect(secondWrite).toBe(firstWrite);
     });
 
-    it("a transport failure on the chain read is recorded as a skip, not fatal to the sweep", async () => {
+    it("P22-P24-EVM-FIXES-R3.md F1: a transport failure on the chain read is recorded as a skip AND writes this sweep's own failure index", async () => {
       const swap = buildEvmSwap("aaaa1003", 1, NOW - 100_000);
       const exportBody = ndjson(swap.offerRows);
       const dealARows = swap.dealRowsA(NOW - 50_000);
@@ -1020,7 +1034,82 @@ describe("runSweep", () => {
       expect(report.chainReads).toBe(0);
       expect(report.chainReadsSkipped).toHaveLength(1);
       expect(report.chainReadsSkipped![0]!.contract).toBe(swap.legAAccept.contract);
-      expect(existsSync(join(root, "raw", "evm"))).toBe(false);
+
+      // F1: a failure index IS written for this sweep's own hashLock — never silently absent —
+      // so a later replay's "latest capture" is this sweep's own failed attempt, never whatever
+      // an earlier sweep may have left behind (the pre-F1 behaviour this test used to pin: no
+      // raw/evm directory at all).
+      const evmDir = join(root, "raw", "evm", swap.lock.hash);
+      const files = await readdir(evmDir);
+      expect(files).toHaveLength(1);
+      const failureIndex = JSON.parse(await readFile(join(evmDir, files[0]!), "utf8"));
+      expect(typeof failureIndex.error).toBe("string");
+      expect(failureIndex.exchanges).toEqual([]);
+      expect(report.chainReadsSkipped![0]!.reason).toBe(failureIndex.error);
+
+      // The live board reports no verdict for this leg — never a stale "locked" for a chain it
+      // could not actually read this sweep.
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(view.evidence.a.railVerified).toBeNull();
+    });
+
+    it("P22-P24-EVM-FIXES-R3.md F1: the reviewer's rate-limited second sweep — live and replay agree, never the first sweep's stale success", async () => {
+      const swap = buildEvmSwap("aaaa1006", 1, NOW - 200_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 150_000);
+      const callResult = encodeLockedResult(swap.legATerms);
+
+      const technocore = (url: string) => {
+        if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+        if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+        if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+        return { status: 404, body: "" };
+      };
+
+      // Sweep 1: the endpoint is healthy — a clean, verified Locked capture.
+      const firstFetch = makeEvmFetch({ technocore, rpcEndpoint: EVM_CONFIG.endpoint, rpcResult: evmRpcResponder(callResult), calls: [] });
+      const firstReport = await runSweep({ ...baseOptions({ board: buildBoard, rails: { evm: EVM_CONFIG } }), fetch: firstFetch });
+      expect(firstReport.chainReads).toBe(1);
+      const firstBoard = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const firstView = firstBoard.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(firstView.evidence.a.railVerified).toBe(true);
+
+      // Sweep 2, a little later: the endpoint is now rate-limited on every RPC call — a
+      // genuine JSON-RPC error reply (recorded, not a transport failure), the reviewer's own
+      // probe.
+      const secondFetch = makeEvmFetch({
+        technocore,
+        rpcEndpoint: EVM_CONFIG.endpoint,
+        rpcResult: () => ({ errorMessage: "rate limited, try again" }),
+        calls: [],
+      });
+      const secondReport = await runSweep({
+        ...baseOptions({ board: buildBoard, rails: { evm: EVM_CONFIG }, nowMs: () => NOW + 1000 }),
+        fetch: secondFetch,
+      });
+      expect(secondReport.chainReads).toBe(0);
+      expect(secondReport.chainReadsSkipped).toHaveLength(1);
+
+      const secondBoard = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const secondView = secondBoard.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      // The live board never keeps serving sweep 1's stale "true" once sweep 2 has its own
+      // (failed) attempt on file — this sweep's own verdict is "could not check".
+      expect(secondView.evidence.a.railVerified).toBeNull();
+
+      // The offline replay of the exact same on-disk root reaches the identical verdict: its
+      // "latest capture" for this hashLock is sweep 2's own failed attempt, never sweep 1's
+      // stale (but genuinely captured) success.
+      const script = join(dirname(fileURLToPath(import.meta.url)), "..", "examples", "audit-export.mjs");
+      const result = spawnSync(process.execPath, [script, "--root", root, "--json"], { encoding: "utf8" });
+      expect(result.status).toBe(0);
+      const replayed = JSON.parse(result.stdout) as {
+        swaps: Array<{ swapId: string; evidence: { a?: { railVerified: boolean | null } } }>;
+      };
+      const replayedSwap = replayed.swaps.find((s) => s.swapId === swap.swapId);
+      expect(replayedSwap).toBeDefined();
+      expect(replayedSwap!.evidence.a?.railVerified ?? null).toBeNull();
+      expect(replayedSwap!.evidence.a?.railVerified ?? null).toBe(secondView.evidence.a.railVerified);
     });
 
     it("no rails configured: no RPC endpoint is ever touched, and the report carries no chain fields at all", async () => {

@@ -5,12 +5,25 @@
 // from what a live sweep already wrote to disk — the offer-room export(s), each swap's deal
 // room capture(s), any paper-rail note(s), and (P22-P24-EVM-SPEC.md §5) any captured EVM
 // chain reads — through the exact same fold the live watcher uses (src/replay.ts's
-// `foldCaptured`), so a captured sweep can be re-verified without trusting the process that
-// captured it. Opens no network connection: every input below is a file read under `--root`,
-// and folding only touches the filesystem through `readCapture`'s own re-hashing reads.
-// `SPEC-ATOMIC-SWAP-DESK.md` §8 Phase 1 done-when: "folded to `settled` by the watcher;
-// export persisted; audit replays from export alone … `examples/audit-export.mjs` verifies
-// it."
+// `foldCaptured`). Opens no network connection: every input below is a file read under
+// `--root`, and folding only touches the filesystem through `readCapture`'s own re-hashing
+// reads. `SPEC-ATOMIC-SWAP-DESK.md` §8 Phase 1 done-when: "folded to `settled` by the
+// watcher; export persisted; audit replays from export alone … `examples/audit-export.mjs`
+// verifies it."
+//
+// P22-P24-EVM-FIXES-R3.md F3 — say what this proves, and no more: re-reading a capture this
+// way independently detects a capture that was *corrupted, spliced, edited, or taken under a
+// different rail config after the fact* — a tampered `raw/rpc/<sha256>.json`, a rewritten
+// request, a swapped-in genuine response from a different capture (fails closed either way,
+// A1/D1/F2 above `src/rails/evm-evidence.ts`) — and fails that leg closed. It does **not**
+// prove the capturing process told the truth about the chain to begin with: a wholesale
+// *fabricated* RPC response, named honestly by its own hash and internally consistent with
+// everything else in the capture, replays exactly as a genuine one would. This build adds no
+// signing keys to close that gap (D-10 stays keyless). The independent check for any EVM leg
+// is its own `finalizedRef` (`<pin>:finalized:<n>:<blockHash>`): it names a real block hash on
+// the real chain, so anyone with their own RPC access to that chain can re-query
+// `locks(hashLock)` at that exact block and compare, without trusting this repository, this
+// script, or whoever ran the sweep that produced the capture.
 //
 //   node examples/audit-export.mjs --root DIR [--expect <swapId>=<status>]... [--rails FILE] [--json]
 //
@@ -42,7 +55,11 @@ Offline: reads DIR/raw/ (and DIR/rails.json) only. Opens no network connection.
                                     (latest used); their raw bytes are re-verified from
                                     DIR/raw/rpc/<sha256>.json through readCapture — a tampered
                                     or missing file fails that leg's evidence closed, never
-                                    the whole replay.
+                                    the whole replay. This detects corruption, splicing and
+                                    config drift in what was captured, never forgery of the
+                                    capture itself: independently re-query locks(hashLock) at
+                                    the block named by the leg's own finalizedRef to check the
+                                    real chain (see this file's header, F3).
   DIR/rails.json                   { "evm": EvmRailConfig } the sweep that captured DIR used
                                     (P22-P24-EVM-SPEC.md §5) — absent unless a chain rail was
                                     configured for that sweep.
@@ -366,6 +383,15 @@ function collectSeqs(steps, offerRoomSeqs, dealRoomSeqs) {
   }
 }
 
+/** P22-P24-EVM-FIXES-R3.md F4: the fields a live-vs-replay equivalence test actually needs to
+ *  compare "in full" — `railVerified` and its `reason`, never just the coarser `settlementView`
+ *  a mismatched verdict could still agree on by coincidence. `undefined` (never a thrown access
+ *  on `undefined`) when this leg has no evidence at all. */
+function describeLockEvidence(evidence) {
+  if (evidence === undefined) return undefined;
+  return { rail: evidence.rail, railVerified: evidence.railVerified, reason: evidence.reason, finalizedRef: evidence.finalizedRef };
+}
+
 function describeSwap(view) {
   const offerRoomSeqs = new Set();
   const dealRoomSeqs = new Set();
@@ -388,6 +414,15 @@ function describeSwap(view) {
     offerRoomSeqs: [...offerRoomSeqs].sort((a, b) => a - b),
     dealRoomSeqs: [...dealRoomSeqs].sort((a, b) => a - b),
     finalizedRefs,
+    // F4: each leg's own rail verdict (railVerified/reason/finalizedRef) and the terminal-side
+    // rail observation (aRail/bRail) — a live sweep and this replay must agree on these exactly,
+    // not merely on the coarser settlementView/status a divergence could still coincide on.
+    evidence: {
+      a: describeLockEvidence(view.evidence.a),
+      b: describeLockEvidence(view.evidence.b),
+      aRail: view.evidence.aRail,
+      bRail: view.evidence.bRail,
+    },
   };
 }
 
@@ -399,6 +434,13 @@ function printReport(swaps, unpaired) {
     process.stdout.write(`  offer-room seqs: ${swap.offerRoomSeqs.join(", ") || "(none)"}\n`);
     process.stdout.write(`  deal-room seqs:  ${swap.dealRoomSeqs.join(", ") || "(none)"}\n`);
     for (const ref of swap.finalizedRefs) process.stdout.write(`  finalizedRef: ${ref}\n`);
+    // F4: railVerified (and its reason) for each leg that has any evidence at all.
+    if (swap.evidence.a !== undefined) {
+      process.stdout.write(`  evidence a: railVerified=${swap.evidence.a.railVerified} (${swap.evidence.a.reason ?? "no reason given"})\n`);
+    }
+    if (swap.evidence.b !== undefined) {
+      process.stdout.write(`  evidence b: railVerified=${swap.evidence.b.railVerified} (${swap.evidence.b.reason ?? "no reason given"})\n`);
+    }
     for (const flag of swap.coordinationOnly) process.stdout.write(`  coordination-only: ${flag.reason}\n`);
     for (const reason of swap.reasons) process.stdout.write(`  reason: ${reason}\n`);
   }

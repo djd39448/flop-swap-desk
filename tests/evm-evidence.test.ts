@@ -78,12 +78,20 @@ const HASH_LOCK = TERMS.statement;
 const ACCOUNTS: EvmAccounts = { payee: PAYEE, payer: PAYER };
 const CHECKED_AT_MS = 1_700_000_500_000;
 
-/** P22-P24-EVM-FIXES-R2.md D1: the capture-bound id format every real capture now uses
- *  (`CapturingRpc.setIdNamespace`) — `"<hashLock>:<checkedAtMs>:<n>"` — so `bindExchange`'s new
- *  "id is bound to this capture" check passes for every fixture in this file that isn't
- *  deliberately tampering something else first. */
-function evmId(n: number, hashLock: string = HASH_LOCK, checkedAtMs: number = CHECKED_AT_MS): string {
-  return `${hashLock}:${checkedAtMs}:${n}`;
+/** P22-P24-EVM-FIXES-R3.md F2: this fixture file's own standard nonce — every `buildCapture`
+ *  freezes it into `index.nonce` by default, and every `evmId` call embeds it by default, so
+ *  the ordinary (non-tampered) case in this file binds exactly as it did before F2 added the
+ *  nonce segment; a test that wants to demonstrate the "same-timestamp splice" F2 closes passes
+ *  a *different* nonce explicitly instead. */
+const NONCE = "aaaaaaaaaaaaaaaa";
+
+/** P22-P24-EVM-FIXES-R2.md D1/P22-P24-EVM-FIXES-R3.md F2: the capture-bound id format every
+ *  real capture now uses (`CapturingRpc.setIdNamespace`) —
+ *  `"<hashLock>:<checkedAtMs>:<nonce>:<n>"` — so `bindExchange`'s "id is bound to this capture"
+ *  check passes for every fixture in this file that isn't deliberately tampering something else
+ *  first. */
+function evmId(n: number, hashLock: string = HASH_LOCK, checkedAtMs: number = CHECKED_AT_MS, nonce: string = NONCE): string {
+  return `${hashLock}:${checkedAtMs}:${nonce}:${n}`;
 }
 
 const enum Status {
@@ -140,8 +148,10 @@ function buildCapture(opts: {
   chainId?: number;
   finality?: EvmCaptureIndex["finality"];
   config?: EvmRailConfig;
+  nonce?: string;
   exchanges: ExchangeSpec[];
 }): EvmCapture {
+  const nonce = opts.nonce ?? NONCE;
   const bySha = new Map<string, Uint8Array>();
   const exchanges: EvmCaptureIndexExchange[] = opts.exchanges.map((spec, i) => {
     const sha = sha256Hex(spec.body);
@@ -149,7 +159,12 @@ function buildCapture(opts: {
     return {
       method: spec.method,
       params: spec.params,
-      requestBody: JSON.stringify({ jsonrpc: "2.0", id: evmId(i + 1, opts.hashLock ?? HASH_LOCK), method: spec.method, params: spec.params }),
+      requestBody: JSON.stringify({
+        jsonrpc: "2.0",
+        id: evmId(i + 1, opts.hashLock ?? HASH_LOCK, CHECKED_AT_MS, nonce),
+        method: spec.method,
+        params: spec.params,
+      }),
       responseSha256: sha,
       atMs: CHECKED_AT_MS - 1000 + i,
     };
@@ -166,6 +181,7 @@ function buildCapture(opts: {
     checkedAtMs: CHECKED_AT_MS,
     finality: opts.finality ?? { mode: "tag", tag: "finalized" },
     config: opts.config ?? CONFIG,
+    nonce,
     exchanges,
   };
   return { index, bytes: bySha };
@@ -890,6 +906,71 @@ describe("evmEvidence — D1: ids are bound to their own capture, not merely int
     expect(result.rail).toBeUndefined(); // never asserts "locked" (let alone verified) for this swap
     expect(result.lock.reason).toMatch(/missing\/tampered capture/);
     expect(result.lock.reason).toMatch(/not bound to this capture/);
+  });
+});
+
+// P22-P24-EVM-FIXES-R3.md F2: before F2, `idBoundToCapture` only checked the hashLock/checkedAtMs
+// prefix — no attacker prediction is needed for two *genuine* captures to coincide on both (a
+// retried sweep, two calls under a mocked/coarse clock), so a genuine response from one such
+// capture could splice into the other's index and still bind. F2's random per-capture `nonce`
+// closes this "same-timestamp splice": the donor's own real id carries the donor's own
+// (different) nonce, which can never start with this capture's own.
+describe("evmEvidence — F2: a same-hashLock/same-checkedAtMs splice from a genuinely different capture fails closed", () => {
+  it("the reviewer's same-timestamp splice: a genuine eth_call response captured under this exact hashLock/checkedAtMs but a DIFFERENT nonce does not bind", () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+
+    // A genuine OTHER capture for the identical hashLock AND checkedAtMs — only its (random,
+    // unpredictable) nonce differs, exactly the coincidence F2 defends against.
+    const otherNonce = "bbbbbbbbbbbbbbbb";
+    const genuineOtherId = evmId(3, HASH_LOCK, CHECKED_AT_MS, otherNonce);
+    const genuineOtherBody = jsonRpcResult(genuineOtherId, encodeLocksResult({ status: Status.Refunded }));
+    const sha = sha256Hex(genuineOtherBody);
+    const params = [{ to: CONFIG.contract, data: locksCallData(HASH_LOCK) }, { blockHash: BLOCK_HASH }];
+    const forgedCall: EvmCaptureIndexExchange = {
+      method: "eth_call",
+      params,
+      requestBody: JSON.stringify({ jsonrpc: "2.0", id: genuineOtherId, method: "eth_call", params }),
+      responseSha256: sha,
+      atMs: CHECKED_AT_MS,
+    };
+    const bytes = new Map(capture.bytes);
+    bytes.set(sha, new TextEncoder().encode(genuineOtherBody));
+    const splicedIndex: EvmCaptureIndex = {
+      ...capture.index,
+      exchanges: capture.index.exchanges.map((exchange, i) => (i === 2 ? forgedCall : exchange)),
+    };
+
+    const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: { index: splicedIndex, bytes } });
+    expect(result.lock.railVerified).not.toBe(true);
+    expect(result.rail).toBeUndefined(); // never asserts "refunded" for this swap
+    expect(result.lock.reason).toMatch(/missing\/tampered capture/);
+    expect(result.lock.reason).toMatch(/not bound to this capture/);
+  });
+
+  it("captureEvmLeg mints a nonce, records it in the index, and every exchange's own id embeds it", async () => {
+    const callResult = encodeLocksResult({ status: Status.Locked });
+    const responses: Record<string, string> = {
+      eth_chainId: jsonRpcResult(0, `0x${PIN.chainId.toString(16)}`),
+      eth_getBlockByNumber: jsonRpcResult(0, { number: "0x5", hash: BLOCK_HASH }),
+      eth_call: jsonRpcResult(0, callResult),
+    };
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; id: string };
+      const template = JSON.parse(responses[body.method] ?? "{}") as { result: unknown };
+      const text = jsonRpcResult(body.id, template.result);
+      const bytes = new TextEncoder().encode(text);
+      return { text: async () => text, arrayBuffer: async () => bytes.buffer } as Response;
+    }) as typeof fetch;
+
+    const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => CHECKED_AT_MS });
+    const { index } = await captureEvmLeg(rpc, CONFIG, HASH_LOCK, CHECKED_AT_MS);
+    expect(typeof index.nonce).toBe("string");
+    expect(index.nonce.length).toBeGreaterThan(0);
+    expect(index.exchanges.length).toBeGreaterThan(0);
+    for (const exchange of index.exchanges) {
+      const request = JSON.parse(exchange.requestBody) as { id: string };
+      expect(request.id).toMatch(new RegExp(`^${HASH_LOCK}:${CHECKED_AT_MS}:${index.nonce}:\\d+$`));
+    }
   });
 });
 
