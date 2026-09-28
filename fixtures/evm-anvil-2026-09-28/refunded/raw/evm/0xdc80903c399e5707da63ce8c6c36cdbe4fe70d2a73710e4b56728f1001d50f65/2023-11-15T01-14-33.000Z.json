@@ -1,0 +1,49 @@
+{
+  "v": 1,
+  "rail": "evm-htlc",
+  "chainId": 31337,
+  "caip2": "eip155:31337",
+  "pin": "anvil-local",
+  "endpoint": "http://127.0.0.1:54736",
+  "contract": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+  "hashLock": "0xdc80903c399e5707da63ce8c6c36cdbe4fe70d2a73710e4b56728f1001d50f65",
+  "checkedAtMs": 1700010873000,
+  "finality": {
+    "mode": "tag",
+    "tag": "finalized"
+  },
+  "exchanges": [
+    {
+      "method": "eth_chainId",
+      "params": [],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}",
+      "responseSha256": "82ecccd9b61f57b995f83d15e57ee9dd56691d7110ed2bd8c209a6a7f6b2fd56",
+      "atMs": 1790591645462
+    },
+    {
+      "method": "eth_getBlockByNumber",
+      "params": [
+        "finalized",
+        false
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"eth_getBlockByNumber\",\"params\":[\"finalized\",false]}",
+      "responseSha256": "cde1717a7c3a95b0986e2a02b1f17c5aab978786b17c323a5a291df1c35ba19f",
+      "atMs": 1790591645463
+    },
+    {
+      "method": "eth_call",
+      "params": [
+        {
+          "to": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+          "data": "0xed5e8437dc80903c399e5707da63ce8c6c36cdbe4fe70d2a73710e4b56728f1001d50f65"
+        },
+        {
+          "blockHash": "0xb70f7b5bec157e5216cd18cede07779f0c43a0ce85f96aaedd65ec8df7a1c347"
+        }
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"eth_call\",\"params\":[{\"to\":\"0x5fbdb2315678afecb367f032d93f642f64180aa3\",\"data\":\"0xed5e8437dc80903c399e5707da63ce8c6c36cdbe4fe70d2a73710e4b56728f1001d50f65\"},{\"blockHash\":\"0xb70f7b5bec157e5216cd18cede07779f0c43a0ce85f96aaedd65ec8df7a1c347\"}]}",
+      "responseSha256": "7531e7edbd5cfde333c20e0322de94a8c81e2118fbdf1a103b61245db0f1763a",
+      "atMs": 1790591645463
+    }
+  ]
+}
