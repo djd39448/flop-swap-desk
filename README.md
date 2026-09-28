@@ -290,34 +290,26 @@ repository entirely.
 
 ### Known limits of the Bitcoin leg
 
-None of these can move value to the wrong party or reveal the secret without payment; each is
-written down instead of hidden.
+Each is written down instead of hidden. The first is a real risk that only the timing margins
+bound (a party that misses its window can lose); none of the others can move value to the wrong
+party or reveal the secret without payment.
 
-- **No claim deadline on chain.** The hash branch of the HTLC script stays spendable until the
-  refund branch is spent — Bitcoin Script has nothing equivalent to `block.timestamp <
-  claimByMs` on the *claim* side, only the CLTV `after(T)` guarding the *refund* side. So after
-  `T` the Seller's claim and the Buyer's refund genuinely race for the same outpoint; whichever
-  transaction is mined first wins, and the loser's transaction simply never confirms (it is not
-  dangerous to either party — there is nothing to double-spend into, only a transaction that goes
-  nowhere). Neither side can *bump* its way out of a slow confirmation: `DEFAULT_FEE_SATS` is a
-  fixed constant (see below), and this build never rebroadcasts a raised-fee replacement of its
-  own claim/refund — a losing transaction is left to expire from the mempool, not fee-bumped.
-  Bitcoin Core 28 and later ship full replace-by-fee *on by default*, so a third party's own
-  higher-fee transaction could in principle still evict one of these from a miner's mempool before
-  it confirms, but that changes only which of the two well-formed, already-valid transactions
-  (this Seller's claim, this Buyer's refund) gets mined first — it can never conjure a third,
-  attacker-controlled spend of the same outpoint, since neither transaction can be built without
-  the one thing that makes it valid (the preimage for a claim, the payer's own signature for a
-  refund). `claimByMs` is therefore enforced only by the Seller's own client
-  (`SellerFlow.claimLegA`'s chain-time guard), the same as on the EVM leg, but there it is at
-  least backed by a real on-chain deadline the contract itself enforces; here it is a courtesy the
-  chain never checks, and `BTC_LOCAL_POLICY`'s own margins — a 60-minute claim-inclusion margin
-  and a 60-minute minimum reveal window (`src/client/policy.ts`) — are what actually protect each
-  side against losing that race to slow confirmation, not any fee-bumping this build does not do.
-  `BuyerFlow.refundLegA` also never *reports* a refund as done, or posts its own refund/receipt
-  frames, until the evidence reader itself shows the refund confirmed; if the outpoint was instead
-  claimed first, it refuses outright and points the caller at `learnSecret()`/`claimLegB()`
-  instead of ever claiming a refund that did not happen.
+- **No claim deadline on chain, so after `T` the claim and the refund race, and losing is
+  dangerous.** The hash branch of the HTLC stays spendable until the refund branch is spent;
+  Bitcoin Script has nothing like the EVM contract's `claim` deadline, only the CLTV `after(T)`
+  guarding the refund. After `T` the Seller's claim and the Buyer's refund compete for the same
+  outpoint, and full replace-by-fee is on by default in Bitcoin Core 28 and later. A Seller whose
+  claim loses has already published the secret in the mempool, so the Buyer can take the FLOP leg
+  as well as its refund. A Buyer whose refund is replaced by a later Seller claim loses the BTC
+  unless it learns the secret from that claim and claims the FLOP leg before `B.claimByMs`. What
+  protects each side is timing, not fees (fees are a fixed constant and this build never
+  fee-bumps): the Seller's client claims only while `max(chain time, clock)` leaves at least 60
+  minutes before `A.refundAfterMs` (`BTC_LOCAL_POLICY.claimInclusionMarginMs`), re-checked as the
+  last step before broadcast; the Buyer's rule-2 margin (`finalityAMs`, 3 h) keeps `B.claimBy`
+  open long enough after `T` to learn the secret from a late claim; `BuyerFlow.refundLegA`
+  reports a refund only once it confirms, re-sends the same recorded refund if it dropped out of
+  the mempool, and routes the Buyer to `learnSecret()`/`claimLegB()` when the outpoint was claimed
+  instead. `claimByMs` itself is enforced only by the Seller's own client.
 - **The refund waits for median time past, which lags wall clock.** `T = refundAfterMs / 1000` is
   checked against the chain's median time of its last 11 blocks (BIP113), not the tip block's own
   timestamp or wall-clock "now" — so a refund's real, chain-observable availability lags
