@@ -299,30 +299,47 @@ written down instead of hidden.
   `T` the Seller's claim and the Buyer's refund genuinely race for the same outpoint; whichever
   transaction is mined first wins, and the loser's transaction simply never confirms (it is not
   dangerous to either party — there is nothing to double-spend into, only a transaction that goes
-  nowhere). `claimByMs` is therefore enforced only by the Seller's own client
+  nowhere). Neither side can *bump* its way out of a slow confirmation: `DEFAULT_FEE_SATS` is a
+  fixed constant (see below), and this build never rebroadcasts a raised-fee replacement of its
+  own claim/refund — a losing transaction is left to expire from the mempool, not fee-bumped.
+  Bitcoin Core 28 and later ship full replace-by-fee *on by default*, so a third party's own
+  higher-fee transaction could in principle still evict one of these from a miner's mempool before
+  it confirms, but that changes only which of the two well-formed, already-valid transactions
+  (this Seller's claim, this Buyer's refund) gets mined first — it can never conjure a third,
+  attacker-controlled spend of the same outpoint, since neither transaction can be built without
+  the one thing that makes it valid (the preimage for a claim, the payer's own signature for a
+  refund). `claimByMs` is therefore enforced only by the Seller's own client
   (`SellerFlow.claimLegA`'s chain-time guard), the same as on the EVM leg, but there it is at
   least backed by a real on-chain deadline the contract itself enforces; here it is a courtesy the
-  chain never checks, and `BTC_LOCAL_POLICY`'s wide claim-inclusion margin (60 min) is this
-  build's only defense against losing that race to slow confirmation.
+  chain never checks, and `BTC_LOCAL_POLICY`'s own margins — a 60-minute claim-inclusion margin
+  and a 60-minute minimum reveal window (`src/client/policy.ts`) — are what actually protect each
+  side against losing that race to slow confirmation, not any fee-bumping this build does not do.
+  `BuyerFlow.refundLegA` also never *reports* a refund as done, or posts its own refund/receipt
+  frames, until the evidence reader itself shows the refund confirmed; if the outpoint was instead
+  claimed first, it refuses outright and points the caller at `learnSecret()`/`claimLegB()`
+  instead of ever claiming a refund that did not happen.
 - **The refund waits for median time past, which lags wall clock.** `T = refundAfterMs / 1000` is
   checked against the chain's median time of its last 11 blocks (BIP113), not the tip block's own
   timestamp or wall-clock "now" — so a refund's real, chain-observable availability lags
   `refundAfterMs` by roughly an hour on a normally-mining chain (probe gotcha,
   `src/rails/btc-script.ts`'s own `locktimeFromRefundAfterMs` doc comment).
-  `BTC_LOCAL_POLICY.finalityAMs` (2 h) budgets for this.
+  `BTC_LOCAL_POLICY.finalityAMs` (3 h — the ~1 h MTP lag plus a further budget for the refund's own
+  confirmation, since a refund is not reported until confirmed) budgets for this.
 - **The replay detects damage and splicing, not forgery.** Identical honesty limit to the EVM
   leg's own (see above) — re-reading a capture proves internal consistency and lets anyone
   independently re-query the named block; it does not prove the capturing node was telling the
   truth about the chain to begin with.
-- **A lock whose evidence lookup fails is not announced.** If leg A's funding transaction
-  broadcasts but the adapter's own follow-up read (finding which output paid the HTLC address)
-  then fails, `BuyerFlow.lockLegA` throws before posting the `lock` frame. The funds stay safe
-  (`refundLegA` recovers from the pre-recorded hash lock the same way the EVM leg's own E3 fix
-  does — see its "Known limits" entry above) *for `evm-htlc`, where that pre-recorded value is
-  itself a valid rail ref*; for `btc-htlc` the rail's own ref (the funding outpoint) does not
-  exist until `fund()` returns, so this one recovery path cannot reach a real outpoint from state
-  alone in that narrow failure window. The board simply shows leg A as never funded either way —
-  fail closed, never fail silent.
+- **A lock write that never returns still leaves the outpoint recoverable.** `BuyerFlow.lockLegA`
+  builds and signs the funding transaction (`prepareLock`) and records its own outpoint — already
+  fully determined by the transaction's own bytes, never assigned by the network — *before* ever
+  broadcasting it (`commitLock`). If the broadcast itself then fails, or a flaky read loses the
+  response after a genuine broadcast, `lockLegA` throws before posting the `lock` frame, but
+  `refundLegA`/`learnSecret` still work from the recorded outpoint (P4-BTC-FIXES.md G3), the same
+  as the EVM leg's own pre-recorded hash lock (see its "Known limits" entry above) — this no longer
+  needs the EVM-only fallback a `btc-htlc` leg could not previously use, since the outpoint is
+  known before the write ever runs rather than only once it returns. A failure before
+  `prepareLock` itself completes (nothing yet signed) leaves the board correctly showing leg A as
+  never funded — fail closed, never fail silent.
 - **Fees are a fixed constant, not estimated.** `DEFAULT_FEE_SATS` (`src/rails/btc-htlc.ts`) is
   subtracted from every claim/refund's single output; real fee estimation is out of scope for
   this build (P4-BTC-SPEC.md §0).
