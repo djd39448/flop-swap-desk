@@ -855,12 +855,67 @@ export class BtcHtlcRail {
    * `hashLockHex` — the secret `s` — or `null` when `ref` is unspent, was spent by the refund
    * branch instead (no witness item opens the hash), or the scan window closes first.
    */
+  /**
+   * P4-BTC-FIXES-R3.md K1: does ANY transaction currently in bitcoind's own mempool spend this
+   * outpoint — a claim (or refund) that has been broadcast but not yet mined. `gettxspendingprevout`
+   * only ever answers for the mempool (never the confirmed chain — a MINED spend is what
+   * `findClaimPreimage`'s own bounded block scan is for), so this is the mempool twin of that
+   * scan: without it, a claim sitting unmined is invisible to `findClaimPreimage` until (and
+   * unless) a block confirms it, which is exactly how a Seller's claim could otherwise silently
+   * outrun a Buyer who never learns the secret in time. `null` when nothing in the mempool spends
+   * this outpoint at all.
+   */
+  async findMempoolSpend(ref: string): Promise<{ txid: string; witness: readonly string[] } | null> {
+    const { txid, vout } = parseOutpointRef(ref);
+    const results = await this.request<Array<{ txid: string; vout: number; spendingtxid?: string }>>("gettxspendingprevout", [
+      [{ txid, vout }],
+    ]);
+    const entry = results[0];
+    if (entry === undefined || entry.spendingtxid === undefined) return null;
+    const spender = await this.request<{ vin: Array<{ txid?: string; vout?: number; txinwitness?: string[] }> }>("getrawtransaction", [
+      entry.spendingtxid,
+      true,
+    ]);
+    for (const input of spender.vin) {
+      if (input.txid === txid && input.vout === vout) {
+        return { txid: entry.spendingtxid, witness: input.txinwitness ?? [] };
+      }
+    }
+    return null; // unreachable in practice (gettxspendingprevout only ever names a real spender)
+  }
+
+  /** The 32-byte witness item (as `0x`-hex) whose sha256 equals `hashLockBytes`, or `null` when
+   *  none of `witness`'s items open it (the timelock/refund branch). Shared by the mempool check
+   *  and the mined-block scan below so the two can never classify a witness differently. */
+  private static preimageOpening(witness: readonly string[], hashLockBytes: Uint8Array): string | null {
+    for (const item of witness) {
+      if (!/^[0-9a-fA-F]{64}$/.test(item)) continue;
+      const candidate = hexToBytes(item);
+      if (bytesEqual(sha256(candidate), hashLockBytes)) {
+        return `0x${bytesToHex(candidate)}`;
+      }
+    }
+    return null;
+  }
+
   async findClaimPreimage(ref: string, hashLockHex: string, fromHeight: number): Promise<string | null> {
     const { txid: fundTxid, vout: fundVout } = parseOutpointRef(ref);
     if (!HASH_LOCK_SHAPE.test(hashLockHex)) {
       throw new Error("btc-htlc: hashLock must be 0x + 64 lowercase hex");
     }
     const hashLockBytes = hexToBytes(hashLockHex.slice(2));
+
+    // K1: a claim the Seller has broadcast but that has not yet been mined would otherwise stay
+    // invisible to the bounded block scan below until (and unless) a block confirms it — check
+    // the mempool first, so a pending claim's own secret is learned at once.
+    const mempoolSpend = await this.findMempoolSpend(ref);
+    if (mempoolSpend !== null) {
+      const preimage = BtcHtlcRail.preimageOpening(mempoolSpend.witness, hashLockBytes);
+      if (preimage !== null) return preimage;
+      // Spent in the mempool by something that does not open H (the timelock/refund branch) —
+      // nothing to learn from the mempool itself; fall through to the block scan below in case a
+      // DIFFERENT, already-mined spend exists (e.g. this mempool entry is about to be replaced).
+    }
 
     const info = await this.request<{ blocks: number }>("getblockchaininfo", []);
     for (let height = fromHeight; height <= info.blocks; height += 1) {
@@ -872,17 +927,10 @@ export class BtcHtlcRail {
       for (const tx of block.tx) {
         for (const input of tx.vin) {
           if (input.txid !== fundTxid || input.vout !== fundVout) continue;
-          for (const item of input.txinwitness ?? []) {
-            if (!/^[0-9a-fA-F]{64}$/.test(item)) continue;
-            const candidate = hexToBytes(item);
-            if (bytesEqual(sha256(candidate), hashLockBytes)) {
-              return `0x${bytesToHex(candidate)}`;
-            }
-          }
-          return null; // found the spend, but no witness item opens the hash (the refund branch)
+          return BtcHtlcRail.preimageOpening(input.txinwitness ?? [], hashLockBytes); // found the spend, mined
         }
       }
     }
-    return null; // never spent within the scanned window
+    return null; // never spent within the scanned window (mempool or mined)
   }
 }

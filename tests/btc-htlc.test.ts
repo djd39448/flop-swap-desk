@@ -138,6 +138,13 @@ function baseHandlers(overrides: Partial<Handlers> = {}): Handlers {
     },
     testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: true }],
     sendrawtransaction: () => "bb".repeat(32),
+    // K1: the default, healthy-node answer for "is anything in the mempool spending this
+    // outpoint" is "no" — no `spendingtxid` on the returned entry (Core's own real shape for a
+    // not-found answer). Tests that need a pending mempool spend override this.
+    gettxspendingprevout: (params) => {
+      const outpoints = params[0] as Array<{ txid: string; vout: number }>;
+      return outpoints.map((o) => ({ txid: o.txid, vout: o.vout }));
+    },
     // H2: fund()/prepareFunding go through walletcreatefundedpsbt + walletprocesspsbt now, never
     // sendtoaddress — walletprocesspsbt's own returned `hex` must be a real, decodable funding
     // transaction paying the HTLC address (FUNDING_TX_HEX), since prepareFunding decodes it to
@@ -605,6 +612,85 @@ describe("BtcHtlcRail.findClaimPreimage", () => {
   it("refuses a malformed hashLock", async () => {
     const { rail } = await connectRail(baseHandlers());
     await expect(rail.findClaimPreimage(REF, "not-a-hash", 100)).rejects.toThrow(/hashLock/);
+  });
+
+  // P4-BTC-FIXES-R3.md K1: a claim sitting only in the mempool (never mined) must still be found.
+  describe("K1 — a pending (unmined) claim in the mempool", () => {
+    const SPENDER_TXID = "dd".repeat(32);
+
+    it("returns the preimage from a claim broadcast but not yet mined, without ever needing the block scan", async () => {
+      const { rail, calls } = await connectRail(
+        baseHandlers({
+          gettxspendingprevout: () => [{ txid: FUND_TXID, vout: 1, spendingtxid: SPENDER_TXID }],
+          getrawtransaction: (params) =>
+            params[0] === SPENDER_TXID
+              ? { vin: [{ txid: FUND_TXID, vout: 1, txinwitness: [PREIMAGE_HEX, "aa".repeat(71), "bb".repeat(59)] }] }
+              : params[1] === true
+                ? { vout: [{ n: 1, scriptPubKey: { hex: bytesToHex(SCRIPT.scriptPubKey) } }] }
+                : fakeRawFundingTxHex(SCRIPT.scriptPubKey, 100_000_000n),
+        }),
+      );
+      // fromHeight is past the mocked tip (200, from baseHandlers) — the bounded block scan alone
+      // would find nothing at all, proving the mempool check alone is what found this.
+      const result = await rail.findClaimPreimage(REF, HASH_LOCK, 999_999);
+      expect(result).toBe(`0x${PREIMAGE_HEX}`);
+      expect(calls.some((c) => c.method === "getblock")).toBe(false);
+    });
+
+    it("falls through to the (empty) block scan when the mempool spend is the refund branch, not a claim", async () => {
+      const { rail } = await connectRail(
+        baseHandlers({
+          gettxspendingprevout: () => [{ txid: FUND_TXID, vout: 1, spendingtxid: SPENDER_TXID }],
+          getrawtransaction: (params) =>
+            params[0] === SPENDER_TXID
+              ? { vin: [{ txid: FUND_TXID, vout: 1, txinwitness: ["aa".repeat(71), "", "bb".repeat(59)] }] }
+              : params[1] === true
+                ? { vout: [{ n: 1, scriptPubKey: { hex: bytesToHex(SCRIPT.scriptPubKey) } }] }
+                : fakeRawFundingTxHex(SCRIPT.scriptPubKey, 100_000_000n),
+          getblockhash: (params) => (params[0] === 0 ? BTC_REGTEST_PIN.genesisHash : `hash-${String(params[0])}`),
+          getblock: () => ({ tx: [] }),
+        }),
+      );
+      expect(await rail.findClaimPreimage(REF, HASH_LOCK, 100)).toBeNull();
+    });
+
+    it("returns null when nothing in the mempool spends the outpoint either (the default baseHandlers answer)", async () => {
+      const { rail } = await connectRail(
+        baseHandlers({
+          getblockhash: (params) => (params[0] === 0 ? BTC_REGTEST_PIN.genesisHash : `hash-${String(params[0])}`),
+          getblock: () => ({ tx: [] }),
+        }),
+      );
+      expect(await rail.findClaimPreimage(REF, HASH_LOCK, 100)).toBeNull();
+    });
+  });
+});
+
+describe("BtcHtlcRail.findMempoolSpend", () => {
+  const SPENDER_TXID = "ee".repeat(32);
+
+  it("returns null when gettxspendingprevout names no spender", async () => {
+    const { rail } = await connectRail(baseHandlers());
+    expect(await rail.findMempoolSpend(REF)).toBeNull();
+  });
+
+  it("returns the spender's own witness when gettxspendingprevout names one", async () => {
+    const { rail, calls } = await connectRail(
+      baseHandlers({
+        gettxspendingprevout: (params) => {
+          const outpoints = params[0] as Array<{ txid: string; vout: number }>;
+          return outpoints.map((o) => ({ ...o, spendingtxid: SPENDER_TXID }));
+        },
+        getrawtransaction: (params) =>
+          params[0] === SPENDER_TXID
+            ? { vin: [{ txid: FUND_TXID, vout: 1, txinwitness: ["aa", "bb"] }] }
+            : (baseHandlers().getrawtransaction(params, undefined) as unknown),
+      }),
+    );
+    const result = await rail.findMempoolSpend(REF);
+    expect(result).toEqual({ txid: SPENDER_TXID, witness: ["aa", "bb"] });
+    const spendCall = calls.find((c) => c.method === "gettxspendingprevout");
+    expect(spendCall?.params[0]).toEqual([{ txid: FUND_TXID, vout: 1 }]);
   });
 });
 
