@@ -3,19 +3,21 @@
 //
 // Offline audit replay (P05-SPEC.md deliverable 3): reproduce a watch root's board purely
 // from what a live sweep already wrote to disk — the offer-room export(s), each swap's deal
-// room capture(s), and any paper-rail note(s) — through the exact same fold the live watcher
-// uses (src/replay.ts's `foldCaptured`), so a captured sweep can be re-verified without
-// trusting the process that captured it. Opens no network connection: every input below is
-// a file read under `--root`, and folding is pure. `SPEC-ATOMIC-SWAP-DESK.md` §8 Phase 1
-// done-when: "folded to `settled` by the watcher; export persisted; audit replays from
-// export alone … `examples/audit-export.mjs` verifies it."
+// room capture(s), any paper-rail note(s), and (P22-P24-EVM-SPEC.md §5) any captured EVM
+// chain reads — through the exact same fold the live watcher uses (src/replay.ts's
+// `foldCaptured`), so a captured sweep can be re-verified without trusting the process that
+// captured it. Opens no network connection: every input below is a file read under `--root`,
+// and folding only touches the filesystem through `readCapture`'s own re-hashing reads.
+// `SPEC-ATOMIC-SWAP-DESK.md` §8 Phase 1 done-when: "folded to `settled` by the watcher;
+// export persisted; audit replays from export alone … `examples/audit-export.mjs` verifies
+// it."
 //
-//   node examples/audit-export.mjs --root DIR [--expect <swapId>=<status>]... [--json]
+//   node examples/audit-export.mjs --root DIR [--expect <swapId>=<status>]... [--rails FILE] [--json]
 //
 // Requires a build first: npm run build (this reads ../dist/, not ../src/).
 //
 // Exit codes: 0 ok (and every --expect held); 1 an --expect did not hold; 2 bad arguments
-// (nothing was read); 3 `DIR/raw` is missing.
+// (nothing was read, or --rails did not name readable JSON); 3 `DIR/raw` is missing.
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -25,26 +27,38 @@ import { OFFER_ROOM, paperNote, transcriptRecord } from "@flop-labs/tclk";
 
 import { quoteBigNonces } from "../dist/watcher.js";
 import { findSwapLegCandidates, foldCaptured } from "../dist/replay.js";
+import { readCapture } from "../dist/rails/rpc-capture.js";
 
-const USAGE = `Usage: node examples/audit-export.mjs --root DIR [--expect <swapId>=<status>] [--json]
+const USAGE = `Usage: node examples/audit-export.mjs --root DIR [--expect <swapId>=<status>] [--rails FILE] [--json]
 
-Offline: reads DIR/raw/ only. Opens no network connection.
+Offline: reads DIR/raw/ (and DIR/rails.json) only. Opens no network connection.
 
   DIR/raw/tclk-offers/*.jsonl       one or more byte-exact offer-room exports (union, deduped
                                     by seq — later files in name order win a seq collision)
   DIR/raw/mb-p-tclk-*/*.json        one or more deal-room captures per room (latest used)
   DIR/raw/kv/<ns>/<key>/*.txt       one or more paper-rail note captures per note (latest used)
+  DIR/raw/evm/<hashLock>/*.json     one or more EVM chain-read capture indexes per hashLock
+                                    (latest used); their raw bytes are re-verified from
+                                    DIR/raw/rpc/<sha256>.json through readCapture — a tampered
+                                    or missing file fails that leg's evidence closed, never
+                                    the whole replay.
+  DIR/rails.json                   { "evm": EvmRailConfig } the sweep that captured DIR used
+                                    (P22-P24-EVM-SPEC.md §5) — absent unless a chain rail was
+                                    configured for that sweep.
 
 Options:
   --root DIR              Required. A watch root written by src/watcher.ts (or a fixture
                            shaped like one — see fixtures/rehearsal-2026-09-18/).
   --expect S=STATUS        May repeat. Exit 1 unless swap S folds to exactly STATUS.
+  --rails FILE             Use this JSON file ({ "evm": EvmRailConfig }) instead of
+                           DIR/rails.json — e.g. to replay a capture against a config it
+                           wasn't written next to.
   --json                   Print the result as JSON instead of a human-readable report.
   -h, --help               Show this message and exit 0.
 `;
 
 function parseArgs(argv) {
-  const out = { root: null, expect: [], json: false, help: false };
+  const out = { root: null, expect: [], railsFile: null, json: false, help: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--root") {
@@ -56,6 +70,10 @@ function parseArgs(argv) {
       const eq = typeof raw === "string" ? raw.indexOf("=") : -1;
       if (eq <= 0 || eq === raw.length - 1) return null;
       out.expect.push({ swapId: raw.slice(0, eq), status: raw.slice(eq + 1) });
+      continue;
+    }
+    if (arg === "--rails") {
+      out.railsFile = argv[++i] ?? null;
       continue;
     }
     if (arg === "--json") {
@@ -275,6 +293,54 @@ function loadNotes(root, offers) {
   return notes;
 }
 
+/** Every `raw/evm/<hashLock>/*.json` capture index (P22-P24-EVM-SPEC.md §4/§5), latest per
+ *  hashLock (ISO-stamped names sort chronologically) — paired with a `load` that re-verifies
+ *  its raw bytes from `raw/rpc/<sha256>.json` through `readCapture` on every read, so a
+ *  tampered or missing response file fails only that hashLock's evidence, never the replay
+ *  itself. No network: every byte `readCapture` returns comes from `--root`. */
+function loadEvmCaptures(root) {
+  const evmDir = join(root, "raw", "evm");
+  const chain = new Map();
+  let entries;
+  try {
+    entries = readdirSync(evmDir, { withFileTypes: true });
+  } catch {
+    return chain;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const hashLock = entry.name;
+    const files = listFiles(join(evmDir, hashLock));
+    if (files.length === 0) continue;
+    const latest = files[files.length - 1];
+    const index = JSON.parse(readFileSync(join(evmDir, hashLock, latest), "utf8"));
+    chain.set(hashLock, { index, load: (sha256Hex) => readCapture(root, sha256Hex) });
+  }
+  return chain;
+}
+
+/** `{ "evm": EvmRailConfig }` for the fold's `rails` input (P22-P24-EVM-SPEC.md §5):
+ *  `railsFileOverride` (`--rails FILE`) when given, else `DIR/rails.json`. `undefined` when
+ *  neither exists — a watch root a chain rail was never configured for, folded exactly as
+ *  before this option existed. Throws only when `--rails` named a file that could not be
+ *  read or parsed (a bad argument, per `main`'s exit code 2) — `DIR/rails.json` being absent
+ *  is not an error, since most watch roots never had one. */
+function loadRails(root, railsFileOverride) {
+  const path = railsFileOverride ?? join(root, "rails.json");
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if (railsFileOverride === undefined) return undefined; // DIR/rails.json is optional
+    throw new Error(`cannot read --rails file ${path}: ${error.message}`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`--rails file ${path} is not valid JSON: ${error.message}`);
+  }
+}
+
 function collectSeqs(steps, offerRoomSeqs, dealRoomSeqs) {
   for (const step of steps) {
     if (step.room === OFFER_ROOM) offerRoomSeqs.add(step.seq);
@@ -324,7 +390,7 @@ function printReport(swaps, unpaired) {
   }
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args === null) {
     process.stderr.write(USAGE);
@@ -339,6 +405,14 @@ function main() {
   if (!existsSync(rawDir)) {
     process.stderr.write(`audit-export: no raw/ under ${args.root}\n`);
     return 3;
+  }
+
+  let rails;
+  try {
+    rails = loadRails(args.root, args.railsFile ?? undefined);
+  } catch (error) {
+    process.stderr.write(`audit-export: ${error.message}\n`);
+    return 2;
   }
 
   const { records: ringOffers, malformedLines } = loadOffers(args.root);
@@ -359,7 +433,11 @@ function main() {
   }
 
   const notes = loadNotes(args.root, offers);
-  const board = foldCaptured({ offers, dealRooms, notes, nowMs: Date.now() });
+  // P22-P24-EVM-SPEC.md §5: chain-read captures and their pinned config, both optional and
+  // both absent from a watch root that never configured a chain rail — foldCaptured then
+  // folds exactly as it always did. Still no network: readCapture only ever reads --root.
+  const chain = loadEvmCaptures(args.root);
+  const board = await foldCaptured({ offers, dealRooms, notes, chain, rails, nowMs: Date.now() });
   const swaps = board.swaps.map(describeSwap);
 
   if (args.json) {
@@ -402,9 +480,19 @@ export {
   loadNotes,
   loadArchivedOfferLines,
   loadDealRoomsFromSwapArchive,
+  loadEvmCaptures,
+  loadRails,
   describeSwap,
   parseArgs,
 };
 if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
-  process.exitCode = main();
+  main().then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (error) => {
+      process.stderr.write(`audit-export: unexpected error: ${error instanceof Error ? error.stack : String(error)}\n`);
+      process.exitCode = 3;
+    },
+  );
 }
