@@ -1,38 +1,37 @@
 {
   "swapId": "0xf606337768df1bacad6a46342809d1e4622140f9227297648a834a3f5a3ef62d",
   "legA": {
-    "contract": "0xa9e4a00f1443b696a7bb041b48d11de1c9aaa7c5044f0d641ca5f973f9ff199a",
+    "contract": "0x20450f2ed79e45a2134aeb22e9163a1ae579d4f765bb9337d07ca93a5ed04e7a",
     "rail": "evm-htlc"
   },
   "legB": {
-    "contract": "0xba55fe120976c444fc7e1a1f31f4108923131f19ee086e6629faaff07fc74866",
+    "contract": "0xaa607397eda44ecfc47a7bfc4792728430da2d89b96623dcabe239bc3ae32234",
     "rail": "paper"
   },
   "feeBps": 0,
-  "status": "settled",
   "writes": [
     {
       "leg": "a",
       "step": "lock",
       "rail": "evm-htlc",
       "evidence": {
-        "ref": "0x9892ff1032d2413e77214b43d28fcab2a36ea3620a844139ecf56ef89f24bc35",
+        "ref": "0x1144d54e5f06fd81ecf9775f08ad694252f2d22febcdaf6befe2e49deb42887f",
         "event": "Locked",
-        "txHash": "0xdce300efe35ebdff9900d3f298cbbbc8464e8bfe4ac1e96132e6ba1f07a853e9",
+        "txHash": "0x04b31d6aca7d8ac48e14b128c73c626adaacab4fa61a2203e734144ef144c553",
         "blockNumber": "5",
-        "blockHash": "0x24cf78e4d88fc24816bcfbbb06bbfa405c34b1549edc5fc34676cdd72dde3865",
+        "blockHash": "0x86ad065106d38fd7e4b1497897ee3dcbc9ea2744c450ff1c07c2ee03915d96dc",
         "logIndex": 0,
         "raw": [
-          "527cd4f1abfb550074873e79bc2495bec7172fe07002c69d0f8a3881a38d8dfc",
-          "166a31ff55c7afe2c3758f2da7182d8d878ddc81fe66c493f48bea5cf526b44b",
-          "2decc11f20465d4fce83c3eff0b1b6cf22d0924460722d1cb736b2527717b31a",
-          "61cd16f2d8a62f4c0f4d9d7e62da0a207931f66363e9c0ea8d3f2e5f6b085760",
-          "2536481491b810b41167b296572627f0bbd5f3a35b88b5d86f9d9d83987a1bf9",
-          "d8ede2d375a1d7956bc3a1b00f579fac9e9d262cae694bfeae06ce8e02d0426c",
-          "ea34a28f57f16cbbac388b4be7994a4bfa55c4cec1915292df8f078ffe8cfea1",
-          "e776a79dca20a6e8f99a3900c62c7993264f372ee43a6a5a386b655012d5a3f1",
-          "2175cd62859ca7c99d83d86e24973095c8ef6cfe6cbc6dd22ff73ffeadab18b6",
-          "ffc08266166d3e6822a7f4677c6428f4bd1726abcb6df111e76978aa6de5d5bd"
+          "f317ef3f4ce1db1909677f5856fe6643f9cfba9e497e7f33293f77a58ea95360",
+          "9d611246b700c78ede68f1ff9ea8a4e2ce053270ab0282b298959783b84c5ce2",
+          "264ef3f69ab55b17c38df4cd691369895d8787d788fef153052bbc2f5af70f4f",
+          "0d71a889d0a6180a9bed2a527b96f2ad41da4945488f5b37bf708fb8795d0e23",
+          "c806cdc5d702b531f597d9bb9ec5badb6fb7b30e868f9865b76cf466dcf78919",
+          "9d1d55676826c69b0a677480f27531ef62bc7ec4a7514dde8b8b9b528fbd060e",
+          "d4cbae2ac46cdf130a93ce259287e6816d338579190caf0a5899decb48a18ede",
+          "0b63571059d47b82e57f7ec303e4c176182f03194908edb2405553e39c766d7c",
+          "be88918c4fde66a818fa55d47a865a8dfae8ceafa8ffec8589668049ff03b333",
+          "eee937bd02cb94623ac2773e7df563e2b5b62c735734f16e90c96c1824c8b84d"
         ]
       }
     },
@@ -41,33 +40,33 @@
       "step": "claim",
       "rail": "evm-htlc",
       "evidence": {
-        "ref": "0x9892ff1032d2413e77214b43d28fcab2a36ea3620a844139ecf56ef89f24bc35",
+        "ref": "0x1144d54e5f06fd81ecf9775f08ad694252f2d22febcdaf6befe2e49deb42887f",
         "event": "Claimed",
-        "txHash": "0xe6a8673c5a2a8bf60a0eb7d42f1f7d923c911e2c791bbc41310eba3f084219ba",
+        "txHash": "0x2b7494b2496f5dc480ab3c05288c40d2908f67cb89c1d15b3513b5467ea31b80",
         "blockNumber": "8",
-        "blockHash": "0xc378c5293f7eb35277407f2ed0d95885a8f6bd311cc34e8bce0979dd0d723b1a",
+        "blockHash": "0x22ad51bddc4cab1805f67a1ebe8db95b173b62703627b3b6ddd3425aca88c2f2",
         "logIndex": 0,
         "raw": [
-          "82ecccd9b61f57b995f83d15e57ee9dd56691d7110ed2bd8c209a6a7f6b2fd56",
-          "22ad6bab97da50cbfe01590ec9dc24e19dd789f608bd1f5fefaf9a021a441d7b",
-          "1f6c5e8cb79ecd692e7592f8218d542cb02768a4e82b6c8ee94de439611169e3",
-          "552f11540c8501510a44d0338d510766796d2c374344c0fcb02cb73388baf8a3",
-          "9526e2734994461ae0dffe366fe15c140345da15cad5a520633b44c393d8ccc7",
-          "4881fa03caef60ea560508c3dafdea185eee526f6464523fa3bf154cf30c3cba",
-          "38016c30f7465896f115aa1200f99ca7d80b5162a4b2741a8b54fc29ccc7edac",
-          "9a3d944b02ea55fd51f18f66703a10d569da61c7094ef82f670407525de394e1",
-          "c6500d7924b13809eb901df1581c8018b27b6e3ccc2bf8fa3e7ab0f341a45d15",
-          "a22075f7616e457b05935c997a3d9f810d27dad1f292592274b0d6867aa427f1",
+          "ab1fdfab9713858b316d81d2e93b1c5415d231385082be785731165890c30d0d",
+          "70336c6645688210ca6185f3d6e61d4a400b0873f4b5e6cb4c9b6f2490cb8271",
+          "63b9b9198c1cb59cd8c2e95bbfcd3705664552b1dd430cf5ee1891fb4dc72f0f",
           "0a8ea4a787dc544645abc51ca533867f5151743f2644301ccf92c835c3d91c9c",
-          "30f9187800b3ab09205ff24c16029448075e5d7911fe51626728a06032131391",
-          "97f2587625629c0c76a297aeaed8dd15b1219cd8ba1133604c3dad8f9ca39f6d",
-          "0cc9c0056c76bfa80fbbc904713f740fc6e68d9ea6b997665dbb5fd507b7d776",
-          "dedefc1df2cdb8e133a408dc559a3182bd695aebc3a1b9cbf6f1d57214cddcf9"
+          "3b8ca8fe34c50bfe5e64888725ba93deb931c778edb6ee933432c491b9a2573c",
+          "2fbb6f0a072f001aeb2ea259044f87c960fd70d8fcc17ed9355ff421b1515f5a",
+          "2decc11f20465d4fce83c3eff0b1b6cf22d0924460722d1cb736b2527717b31a",
+          "e34c3c6cf9571a4d9cf5ec6365f76ab7ff268e979fb20aae2263c7ddf8def02f",
+          "f0b7a096aa6f0327ef864625a50678693dfaeccb3d6c3edafef7428f1abec308",
+          "dd46f542b192b2c8ed9ae4a92cbc3b603e786ce1f5aeb248c580f2fedce986e9",
+          "b90080cc9bbc459d6a47420691dea544151945b96955c7c5302a599fb01a1448"
         ]
       }
     }
   ],
-  "finalizedRefs": [],
   "startedAtMs": 1700000000000,
-  "finishedAtMs": 1700000000000
+  "finishedAtMs": 1700000000000,
+  "status": "settled",
+  "finalizedRefs": [
+    "paper:sha256:b885f44c063543ae10278e2ef21ecc6a23b967a7a95c0d44032e652b53c6984b",
+    "anvil-local:finalized:8:0x22ad51bddc4cab1805f67a1ebe8db95b173b62703627b3b6ddd3425aca88c2f2"
+  ]
 }

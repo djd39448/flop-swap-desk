@@ -1,38 +1,37 @@
 {
   "swapId": "0x96b50bd3277b4434bbc450b58106a21ed470c49764a7f72f240123055377f35e",
   "legA": {
-    "contract": "0xf699680d8aeefb877b83025c2138b60ddfc6386917274fe086e3ac2135f54117",
+    "contract": "0x351ba4ab6b515855f08e2ea2271c6b18e8a60311bf08b82b120145701e39f4cd",
     "rail": "evm-htlc"
   },
   "legB": {
-    "contract": "0x15f297f4f955ffb142956cf51dfabff5d0d0540d8c0b24ec0121589944f4ab54",
+    "contract": "0xc71d4e3824262c3054d0125345d25e65e671a7be9e0749cb8fbb5f2fdf2a447f",
     "rail": "paper"
   },
   "feeBps": 0,
-  "status": "refunded",
   "writes": [
     {
       "leg": "a",
       "step": "lock",
       "rail": "evm-htlc",
       "evidence": {
-        "ref": "0xdc80903c399e5707da63ce8c6c36cdbe4fe70d2a73710e4b56728f1001d50f65",
+        "ref": "0x74c4c20afc73c7256a4237b2ed5c99ac971b8c3b79c54f3c0d634fb7bfcd876b",
         "event": "Locked",
-        "txHash": "0xf2f45eaa937bca445a1a9d8bd9f89b918ab77550fc58365d1fda1084fcfa0eb0",
+        "txHash": "0xadf2bbd7e61cf0e9ab6f530e66b8d56a03d6b9ffd0016f89216febeb93210f78",
         "blockNumber": "12",
-        "blockHash": "0xcb529dbbd0be7efcdefc1d72ba3444066a5ca6de142f9ad662aee1a62516c18a",
+        "blockHash": "0xaeb0b0aaf03d9e728115e4148e7693d33f3c0e8d865faf6d8891e348f4c55a22",
         "logIndex": 0,
         "raw": [
-          "527cd4f1abfb550074873e79bc2495bec7172fe07002c69d0f8a3881a38d8dfc",
-          "98e51c0f039f1f73a58c760f601f0228bba98bd57a8b34f53efd617bbf72a6f8",
-          "2decc11f20465d4fce83c3eff0b1b6cf22d0924460722d1cb736b2527717b31a",
-          "806797de122da8c0aa21a0779a614cd0fe65d00e0765f5ae5686d47df44f5e19",
-          "6543b9f2002a925990aa3bf743191c880addd1d90fa4984877479b7dfff8f0b6",
-          "d8ede2d375a1d7956bc3a1b00f579fac9e9d262cae694bfeae06ce8e02d0426c",
-          "c4075db49a672cbeca780bf6f51c2be9fcae6f4e866e0f66b663e11c6982dabf",
-          "ac10e99ba2df37ae58eb635cdd2b5d6b1d76508a15ecf336260c72b1ff21ef54",
-          "1cd9a1093c80695e8839b5dc409ff67d24ddf165dd35cfdcc312a70a809d6077",
-          "d2b75c69a447c8d432266c4b04c00865aeb1a531d4ff4cf6fe24ba9b1959f3ba"
+          "f317ef3f4ce1db1909677f5856fe6643f9cfba9e497e7f33293f77a58ea95360",
+          "002fafbf4ace8e16f595b875e49448d0ade9dbfdfff73d689c8699e6c736af1f",
+          "264ef3f69ab55b17c38df4cd691369895d8787d788fef153052bbc2f5af70f4f",
+          "8a53c2e108d9aa3c0b32be067fdb5e50b5450a3092446b6c6b66df50d10d8283",
+          "c4fe5928c33e1b039a541c97a8ddab07f43273cb61d719aa6429e19fb7db7915",
+          "9d1d55676826c69b0a677480f27531ef62bc7ec4a7514dde8b8b9b528fbd060e",
+          "8776d5f3e1ef2a3ab632b4933199d2c32b37c617dcf7e1925fc75deba3124de2",
+          "9d97739ec3d759525230123cc3ec9e971481eb42723662b7be78d76e0dfdbabd",
+          "728c4404c8388ae3594319dbd49b9503a8d6f4b0e141907e91bb787b04322a11",
+          "d773718cefa7b5b389c1f9fb25b76e18ae4379370434b1b3d03b12196a896e56"
         ]
       }
     },
@@ -41,30 +40,33 @@
       "step": "refund",
       "rail": "evm-htlc",
       "evidence": {
-        "ref": "0xdc80903c399e5707da63ce8c6c36cdbe4fe70d2a73710e4b56728f1001d50f65",
+        "ref": "0x74c4c20afc73c7256a4237b2ed5c99ac971b8c3b79c54f3c0d634fb7bfcd876b",
         "event": "Refunded",
-        "txHash": "0x9aaa1b7c692a67b63f2bf69565094a88684f2bd5880f5d6365f677562dccead2",
+        "txHash": "0x3a1fdd0960e44ee2ed1de6007a36d9da889a963824c8bf555ec04da663c6fc87",
         "blockNumber": "16",
-        "blockHash": "0x7e370cec84d79325169a59ace828629413d81df93ff3a97d1e91641a2b33ed89",
+        "blockHash": "0x3394abdfcaa57d08e32b5ae6113f76124afc39b09c473e3aef16b47455f33cbe",
         "logIndex": 0,
         "raw": [
-          "c2ebbcc34386886dd83cf78f8ccd661b2a8491e2a1970102051897055241d70c",
-          "d26ae5e29cdf7a63b59fc84611854ac393d2d15f65d62a88bb5dfb7cc9c327af",
-          "3fffc00a6da5e84e3929be4421acd5c40fee74a537184182e23e2d2eeba64b2c",
-          "5ef3a80fe9a38956df2a60592588139e8d06da94a3695d6976e26f4c3eb765ca",
-          "8816205d4985b3cec3f32221673a78b417af9ec94c872f82ae051851fa2e6132",
-          "a033cce595cd26f80f35ff471b29fe779e2b27fe865981e0f97c3f3b33c923d4",
-          "f747db26ef1a0b098b4c1ffabcc7af223d02e28196f437781a13f3875543aadb",
+          "bf7955a4b8b90b897e51e57f8adedee8189812b1032c1cfbc151761e1ddd850d",
+          "96007c39b896238c40e486bc29b84c5edda8a18c32f63118d6e8ce8537879d54",
+          "86060c92b30a947117cd1f7deacd998f705680474032aa0ea0b961d5f80823d2",
           "bb51be0a8c8d4a69863c3cd6f6bf43e862c8b4d68300eac74136bfe751a59ae5",
-          "a10de3932918f8b6c04a541508234ef530adadf136aa1324c325a3f80cf51962",
-          "4c6bfa3b9e861891eea00eb8c6509363a9ec6b5c66a1fcec39cbabd6b92d3c02",
-          "c76f6ecd9abf9bcb638a18d56fa1559dfd5f4a546d77cece04e0e3214e387c80",
-          "201bf56c4b90f7f7f5c689ab602b16ee87999dc319c4d05f72b007872b09f61e"
+          "71257c3b482bfd785210e33fb1cd2bb943666d6f506be7113a93de87fe97540c",
+          "fe943adca25283015872c4a2359e8b202169a1bb360b4353175bf6d6851913c1",
+          "ce70ac8175e9907300d2a8613a107f0956739aec9e85e49cf6717183cbef4a21",
+          "09ffce8b553d071c090b186c62e0d2af124d4916c944cd2f3aa02937ed1c8f15",
+          "fd18f9fd063483733d3f4f3949b504301765aedf92ee9af7ff92057cb433168c",
+          "68534a00a824b10d2c68c3e4712bc156b75cf13dc2e1bcbc0712cdc935c4e499",
+          "0e19f24539cccccc25f18e4f40f82d44eda4d01edd78d988bb46f4704a27c68c"
         ]
       }
     }
   ],
-  "finalizedRefs": [],
   "startedAtMs": 1700000000000,
-  "finishedAtMs": 1700010873000
+  "finishedAtMs": 1700010872000,
+  "status": "refunded",
+  "finalizedRefs": [
+    "paper:sha256:59ae2cf1845e7474e9d65a7190334b3fb390899e9e12dc0cdd436ec24112f576",
+    "anvil-local:finalized:17:0x9a68002ec32f5f3bd82f890540d677fccfe7fa34c0c22ce94e82047754c91924"
+  ]
 }

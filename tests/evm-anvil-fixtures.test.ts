@@ -29,35 +29,28 @@ interface Case {
   swapId: string;
   status: string;
   settlementView: { a: string; b: string };
-  /** P22-P24-EVM-FIXES.md A4: the index format gained a required `config` field (the
-   *  `EvmRailConfig` a capture was taken under), and a capture without one now fails closed
-   *  ("capture index has no usable config") rather than being silently trusted — correct
-   *  behaviour, but it means these three committed fixtures (captured before A4) no longer
-   *  carry chain evidence for leg A. Group B's B4 regenerates them once, behind
-   *  `CAPTURE_EVM_FIXTURES=1`, after which these flags (and the `it.skip`s below) go away. */
-  overallStatusStaleUntilB4?: boolean;
-  settlementViewStaleUntilB4?: boolean;
 }
 
 // One entry per fixture directory under fixtures/evm-anvil-2026-09-28/ — swapId and expected
 // status/settlementView as tests-anvil/client-flows.anvil.test.ts's own scenarios 1-3 produced
 // them (re-derive by running `node examples/audit-export.mjs --root <dir> --json` if the
-// fixtures are ever recaptured).
+// fixtures are ever recaptured). P22-P24-EVM-FIXES.md B4: regenerated once, behind
+// `CAPTURE_EVM_FIXTURES=1 npm run test:anvil`, after group A's A4 (capture index gained a
+// required `config` field) and A9 (wire-byte hashing) landed — the swapIds are unchanged
+// (deterministic from each scenario's fixed buyer DID + nonce) but every raw byte and
+// timestamp is fresh.
 const CASES: Case[] = [
   {
     scenario: "settled",
     swapId: "0xf606337768df1bacad6a46342809d1e4622140f9227297648a834a3f5a3ef62d",
     status: "settled",
     settlementView: { a: "claimed", b: "claimed" },
-    overallStatusStaleUntilB4: true,
-    settlementViewStaleUntilB4: true,
   },
   {
     scenario: "refunded",
     swapId: "0x96b50bd3277b4434bbc450b58106a21ed470c49764a7f72f240123055377f35e",
     status: "refunded",
     settlementView: { a: "refunded", b: "refunded" },
-    settlementViewStaleUntilB4: true,
   },
   {
     scenario: "refunded-b",
@@ -71,16 +64,14 @@ describe("examples/audit-export.mjs — committed anvil client-flow fixtures (20
   for (const testCase of CASES) {
     const root = join(fixturesRoot, testCase.scenario);
 
-    const expectIt = testCase.overallStatusStaleUntilB4 === true ? it.skip : it;
-    expectIt(`${testCase.scenario}: --expect ${testCase.swapId}=${testCase.status} exits 0`, () => {
+    it(`${testCase.scenario}: --expect ${testCase.swapId}=${testCase.status} exits 0`, () => {
       const result = run(["--root", root, "--expect", `${testCase.swapId}=${testCase.status}`]);
       expect(result.stderr).toBe("");
       expect(result.status).toBe(0);
       expect(result.stdout).toContain(`swap ${testCase.swapId} -> ${testCase.status}`);
     });
 
-    const settlementViewIt = testCase.settlementViewStaleUntilB4 === true ? it.skip : it;
-    settlementViewIt(`${testCase.scenario}: settlementView is a=${testCase.settlementView.a} b=${testCase.settlementView.b}`, () => {
+    it(`${testCase.scenario}: settlementView is a=${testCase.settlementView.a} b=${testCase.settlementView.b}`, () => {
       const result = run(["--root", root, "--json"]);
       expect(result.status).toBe(0);
       const parsed = JSON.parse(result.stdout) as { swaps: Array<{ swapId: string; status: string; settlementView: { a: string; b: string } }> };
@@ -97,11 +88,9 @@ describe("examples/audit-export.mjs — committed anvil client-flow fixtures (20
     });
   }
 
-  // P22-P24-EVM-FIXES.md A4 (see the Case interface's doc comment above): the committed
-  // `settled` fixture predates the `config` field, so its leg-A chain evidence now fails
-  // closed and carries no `anvil-local:finalized:` ref. Un-skip once B4 regenerates the
-  // fixtures.
-  it.skip("the settled fixture's chain evidence names the anvil-local pin, finalized", () => {
+  // P22-P24-EVM-FIXES.md B4/A4: now that the fixtures are regenerated with a `config` field,
+  // the settled fixture's leg-A chain evidence resolves again.
+  it("the settled fixture's chain evidence names the anvil-local pin, finalized", () => {
     const result = run(["--root", join(fixturesRoot, "settled"), "--json"]);
     expect(result.status).toBe(0);
     const parsed = JSON.parse(result.stdout) as { swaps: Array<{ finalizedRefs: string[] }> };
@@ -109,6 +98,35 @@ describe("examples/audit-export.mjs — committed anvil client-flow fixtures (20
     expect(swap?.finalizedRefs.some((ref) => ref.startsWith("anvil-local:finalized:"))).toBe(true);
     expect(swap?.finalizedRefs.some((ref) => ref.startsWith("paper:sha256:"))).toBe(true);
   });
+
+  // P22-P24-EVM-FIXES.md B5: every raw sha256 a fixture's evidence summary names (each write's
+  // `WriteEvidence.raw`) must resolve to real bytes under that fixture's own `raw/rpc/`, and
+  // those bytes must actually re-hash to the name — the whole point of `writeBundle` persisting
+  // `SellerFlow`/`BuyerFlow`'s own write exchanges (B5) rather than leaving the summary's
+  // sha256s dangling.
+  for (const testCase of CASES) {
+    it(`${testCase.scenario}: every raw hash in the evidence summary exists in raw/rpc and re-hashes`, async () => {
+      const { readFile } = await import("node:fs/promises");
+      const { createHash } = await import("node:crypto");
+      const evidenceDir = join(fixturesRoot, testCase.scenario, "evidence");
+      const evidencePath = join(evidenceDir, `${testCase.swapId}.json`);
+      const summary = JSON.parse(await readFile(evidencePath, "utf8")) as {
+        writes: Array<{ evidence: { raw?: string[] } }>;
+      };
+      const hashes = summary.writes.flatMap((write) => write.evidence.raw ?? []);
+      // refunded-b (SPEC §6 scenario 3: the Buyer never locks A) makes no EVM write at all, so
+      // its only write is the paper-rail refund, which carries no `raw` sha256s to check.
+      if (testCase.scenario === "refunded-b") {
+        expect(hashes.length).toBe(0);
+        return;
+      }
+      expect(hashes.length).toBeGreaterThan(0);
+      for (const hash of hashes) {
+        const bytes = await readFile(join(fixturesRoot, testCase.scenario, "raw", "rpc", `${hash}.json`));
+        expect(createHash("sha256").update(bytes).digest("hex")).toBe(hash);
+      }
+    });
+  }
 
   it("no committed fixture holds anything resembling a private key or mnemonic", async () => {
     const { readdirSync, readFileSync, statSync } = await import("node:fs");

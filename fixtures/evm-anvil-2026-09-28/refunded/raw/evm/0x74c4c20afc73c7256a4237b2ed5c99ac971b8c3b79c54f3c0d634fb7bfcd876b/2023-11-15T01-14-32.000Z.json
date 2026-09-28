@@ -1,0 +1,65 @@
+{
+  "v": 1,
+  "rail": "evm-htlc",
+  "chainId": 31337,
+  "caip2": "eip155:31337",
+  "pin": "anvil-local",
+  "endpoint": "http://127.0.0.1:62489",
+  "contract": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+  "hashLock": "0x74c4c20afc73c7256a4237b2ed5c99ac971b8c3b79c54f3c0d634fb7bfcd876b",
+  "checkedAtMs": 1700010872000,
+  "finality": {
+    "mode": "tag",
+    "tag": "finalized"
+  },
+  "config": {
+    "pin": {
+      "chainId": 31337,
+      "name": "anvil-local",
+      "caip2": "eip155:31337",
+      "finality": {
+        "mode": "tag",
+        "tag": "finalized"
+      }
+    },
+    "endpoint": "http://127.0.0.1:62489",
+    "contract": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+    "assets": {
+      "USDC": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
+    }
+  },
+  "exchanges": [
+    {
+      "method": "eth_chainId",
+      "params": [],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}",
+      "responseSha256": "82ecccd9b61f57b995f83d15e57ee9dd56691d7110ed2bd8c209a6a7f6b2fd56",
+      "atMs": 1790599289535
+    },
+    {
+      "method": "eth_getBlockByNumber",
+      "params": [
+        "finalized",
+        false
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"eth_getBlockByNumber\",\"params\":[\"finalized\",false]}",
+      "responseSha256": "a7f8b96b885bd935f76f8d8ec5b770b6f69e45695c2bb42c57d227b9e41119ce",
+      "atMs": 1790599289536
+    },
+    {
+      "method": "eth_call",
+      "params": [
+        {
+          "to": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+          "data": "0xed5e843774c4c20afc73c7256a4237b2ed5c99ac971b8c3b79c54f3c0d634fb7bfcd876b"
+        },
+        {
+          "blockHash": "0x9a68002ec32f5f3bd82f890540d677fccfe7fa34c0c22ce94e82047754c91924"
+        }
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"eth_call\",\"params\":[{\"to\":\"0x5fbdb2315678afecb367f032d93f642f64180aa3\",\"data\":\"0xed5e843774c4c20afc73c7256a4237b2ed5c99ac971b8c3b79c54f3c0d634fb7bfcd876b\"},{\"blockHash\":\"0x9a68002ec32f5f3bd82f890540d677fccfe7fa34c0c22ce94e82047754c91924\"}]}",
+      "responseSha256": "c9adf9ff3d9d846c6e14a16869d5d7cc3ba50eb09721b196a9b6cf4f01a42244",
+      "atMs": 1790599289537
+    }
+  ]
+}
