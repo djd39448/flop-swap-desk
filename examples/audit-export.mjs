@@ -41,6 +41,8 @@ import { OFFER_ROOM, paperNote, transcriptRecord } from "@flop-labs/tclk";
 
 import { quoteBigNonces } from "../dist/watcher.js";
 import { findSwapLegCandidates, foldCaptured } from "../dist/replay.js";
+import { loadBtcCapture } from "../dist/rails/btc-evidence.js";
+import { checkBtcRailConfig } from "../dist/rails/btc-htlc.js";
 import { loadEvmCapture } from "../dist/rails/evm-evidence.js";
 import { checkEvmRailConfig } from "../dist/rails/evm-htlc.js";
 
@@ -62,8 +64,17 @@ Offline: reads DIR/raw/ (and DIR/rails.json) only. Opens no network connection.
                                     capture itself: independently re-query locks(hashLock) at
                                     the block named by the leg's own finalizedRef to check the
                                     real chain (see this file's header, F3).
-  DIR/rails.json                   { "evm": EvmRailConfig } the sweep that captured DIR used
-                                    (P22-P24-EVM-SPEC.md §5) — absent unless a chain rail was
+  DIR/raw/btc/<txid>-<vout>/*.json  one or more Bitcoin chain-read capture indexes per funding
+                                    outpoint (P4-BTC-SPEC.md §7 — newest only, same "never
+                                    falls back" rule as raw/evm above; their raw bytes are
+                                    re-verified from DIR/raw/rpc/<sha256>.json the same way).
+                                    The honesty limit is identical to F3 above: this detects
+                                    corruption/splicing/config drift, never forgery — the
+                                    independent check is a leg's own finalizedRef, which names
+                                    a real block hash and height anyone can re-query.
+  DIR/rails.json                   { "evm"?: EvmRailConfig, "btc"?: BtcRailConfig } the
+                                    sweep that captured DIR used (P22-P24-EVM-SPEC.md §5;
+                                    P4-BTC-SPEC.md §7) — absent unless a chain rail was
                                     configured for that sweep.
 
 Options:
@@ -345,6 +356,37 @@ async function loadEvmCaptures(root, notes = []) {
   return chain;
 }
 
+/** Every `raw/btc/<txid>-<vout>/*.json` capture index (P4-BTC-SPEC.md §7), the newest one per
+ *  outpoint — the Bitcoin twin of `loadEvmCaptures` above, over `loadBtcCapture`
+ *  (src/rails/btc-evidence.ts) instead of `loadEvmCapture`. Directory names are
+ *  `<64-hex txid>-<vout>` (a hyphen, never the ref's own `:` — not a legal Windows filename
+ *  character); reconstructed back into `"<txid>:<vout>"` before calling `loadBtcCapture`, which
+ *  expects the ref in that shape. A directory name that doesn't match is skipped, not fatal —
+ *  same tolerant treatment as every other read of anonymous on-disk state in this file. */
+async function loadBtcCaptures(root, notes = []) {
+  const btcDir = join(root, "raw", "btc");
+  const chain = new Map();
+  let entries;
+  try {
+    entries = readdirSync(btcDir, { withFileTypes: true });
+  } catch {
+    return chain;
+  }
+  const REF_DIR_SHAPE = /^([0-9a-f]{64})-([0-9]+)$/;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const match = REF_DIR_SHAPE.exec(entry.name);
+    if (match === null) continue; // not a ref-shaped directory: skipped, not fatal
+    const ref = `${match[1]}:${match[2]}`;
+    const { capture, skipped } = await loadBtcCapture(root, ref);
+    if (capture !== null) chain.set(ref, capture);
+    for (const name of skipped) {
+      notes.push(`raw/btc/${entry.name}/${name}: invalid newest capture index, skipped; this leg has no chain evidence`);
+    }
+  }
+  return chain;
+}
+
 /** `{ "evm": EvmRailConfig }` for the fold's `rails` input (P22-P24-EVM-SPEC.md §5):
  *  `railsFileOverride` (`--rails FILE`) when given, else `DIR/rails.json`. `undefined` when
  *  neither exists — a watch root a chain rail was never configured for, folded exactly as
@@ -373,6 +415,12 @@ function loadRails(root, railsFileOverride) {
     const check = checkEvmRailConfig(parsed.evm);
     if (!check.ok) {
       throw new Error(`${path}: evm rail config is invalid: ${check.reason}`);
+    }
+  }
+  if (parsed !== null && typeof parsed === "object" && parsed.btc !== undefined) {
+    const check = checkBtcRailConfig(parsed.btc);
+    if (!check.ok) {
+      throw new Error(`${path}: btc rail config is invalid: ${check.reason}`);
     }
   }
   return parsed;
@@ -501,13 +549,22 @@ async function main() {
   // A5: `evmCaptureNotes` collects one line per invalid newest capture index (that leg fails closed).
   const evmCaptureNotes = [];
   const chain = await loadEvmCaptures(args.root, evmCaptureNotes);
-  const board = foldCaptured({ offers, dealRooms, notes, chain, rails, nowMs: Date.now() });
+  const btcCaptureNotes = [];
+  const btcChain = await loadBtcCaptures(args.root, btcCaptureNotes);
+  const board = foldCaptured({ offers, dealRooms, notes, chain, btcChain, rails, nowMs: Date.now() });
   const swaps = board.swaps.map(describeSwap);
 
   if (args.json) {
     process.stdout.write(
       `${JSON.stringify(
-        { swaps, unpaired: board.unpaired, malformedOfferLines: malformedLines, archivedOfferLines, evmCaptureNotes },
+        {
+          swaps,
+          unpaired: board.unpaired,
+          malformedOfferLines: malformedLines,
+          archivedOfferLines,
+          evmCaptureNotes,
+          btcCaptureNotes,
+        },
         null,
         2,
       )}\n`,
@@ -520,6 +577,7 @@ async function main() {
       process.stdout.write(`offers: recovered ${archivedOfferLines} line(s) from raw/swaps/*/offer-room/ (ring rolled)\n`);
     }
     for (const note of evmCaptureNotes) process.stdout.write(`${note}\n`);
+    for (const note of btcCaptureNotes) process.stdout.write(`${note}\n`);
     printReport(swaps, board.unpaired);
   }
 
@@ -546,6 +604,7 @@ export {
   loadArchivedOfferLines,
   loadDealRoomsFromSwapArchive,
   loadEvmCaptures,
+  loadBtcCaptures,
   loadRails,
   describeSwap,
   parseArgs,

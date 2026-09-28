@@ -16,13 +16,17 @@ import {
   type RevealFrame,
 } from "@flop-labs/tclk";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { bytesToHex } from "@noble/hashes/utils.js";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
+import { Transaction } from "@scure/btc-signer";
 import { encodeFunctionData, encodeFunctionResult, type Address, type Hex } from "viem";
 import { describe, expect, it } from "vitest";
 
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
 import { findSwapLegCandidates, foldCaptured } from "../src/replay.js";
-import { formatAccountLine } from "../src/rails/account-line.js";
+import { formatAccountLine, formatPubkeyLine } from "../src/rails/account-line.js";
+import type { BtcCapture, BtcCaptureIndex, BtcCaptureIndexExchange } from "../src/rails/btc-evidence.js";
+import { BTC_REGTEST_PIN, type BtcRailConfig } from "../src/rails/btc-htlc.js";
+import { BTC_REGTEST_NETWORK, buildHtlcScript } from "../src/rails/btc-script.js";
 import type { EvmCapture, EvmCaptureIndex } from "../src/rails/evm-evidence.js";
 import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
@@ -775,5 +779,469 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     expect(view).toBeDefined();
     expect(view!.evidence.a?.railVerified).toBeNull();
     expect(view!.evidence.a?.reason).toMatch(/rail config invalid.*not on the allow list/);
+  });
+});
+
+// P4-BTC-SPEC.md §7: the btc-htlc branch of foldCaptured's dispatch — leg A on the btc-htlc
+// rail (leg B stays on paper, mirroring the evm-htlc block above), captured with synthetic
+// bitcoind-shaped RPC responses built the same way tests/btc-evidence.test.ts builds them.
+// Unlike evm-htlc, the outpoint ref is never derived from `terms` (chosen at fund time, not
+// committed in the offer/accept), and evidence needs BOTH parties' pubkeys (§6), posted as
+// pubkey lines (not a single account line).
+describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
+  function sha256Hex(text: string): string {
+    return bytesToHex(sha256(new TextEncoder().encode(text)));
+  }
+  function jsonRpcResult(id: number | string, result: unknown): string {
+    return JSON.stringify({ jsonrpc: "2.0", id, result });
+  }
+
+  const PAYEE_PUBKEY = "0361c6efa7529b0f113fe6ea467248133aba7f14927a7163d6333048ebbf01318a"; // seller
+  const PAYER_PUBKEY = "0372320de1e3ad1abed6a51d6c435cd1312657a62d6b3545cfca062bc8fd08a627"; // buyer
+  const FUND_TXID = "ab08a3ba29a27d8ccbc37fe3efe3f56018e34978328bc421361e688dc8d66694";
+  const FUND_VOUT = 1;
+  const REF = `${FUND_TXID}:${FUND_VOUT}`;
+  const AMOUNT_SATS = 100_000_000n;
+  const BTC_CONFIG: BtcRailConfig = { pin: BTC_REGTEST_PIN, endpoint: "http://127.0.0.1:19000" };
+  const BTC_NONCE = "bbbbbbbbbbbbbbbb";
+  const TIP_HEIGHT = 110;
+  const FUNDING_BLOCK_HASH = "bb".repeat(32);
+
+  /** Every fixture in this block builds its capture at T0 under this fixed nonce, so it always
+   *  binds (mirrors the evm-htlc block's own `evmId` above). */
+  function btcId(n: number, ref: string = REF): string {
+    return `${ref}:${T0}:${BTC_NONCE}:${n}`;
+  }
+
+  function scriptFor(hashLockHex: string, locktime: number) {
+    return buildHtlcScript(
+      { hashLock: hexToBytes(hashLockHex.slice(2)), payeePubkey: hexToBytes(PAYEE_PUBKEY), payerPubkey: hexToBytes(PAYER_PUBKEY), locktime },
+      BTC_REGTEST_NETWORK,
+    );
+  }
+
+  /** A 2-output funding transaction (unsigned — decoding an output never needs a valid
+   *  signature), the same technique tests/btc-evidence.test.ts's own `fakeRawFundingTxHex`
+   *  uses. */
+  function fakeRawFundingTxHex(scriptPubKey: Uint8Array, amountSats: bigint): string {
+    const tx = new Transaction({ allowUnknownInputs: true, allowUnknownOutputs: true, disableScriptCheck: true, version: 2, lockTime: 0 });
+    tx.addInput({ txid: new Uint8Array(32), index: 0, witnessUtxo: { amount: 1n, script: new Uint8Array([0x00]) } });
+    tx.addOutput({ script: new Uint8Array([0x00, 0x14, ...new Array(20).fill(0)]), amount: 1_000_000n }); // vout 0: unrelated
+    tx.addOutput({ script: scriptPubKey, amount: amountSats }); // vout 1: the HTLC output
+    return bytesToHex(tx.unsignedTx);
+  }
+
+  interface ExchangeSpec { method: string; params: unknown; body: string }
+
+  function buildBtcCapture(opts: { ref?: string; config?: BtcRailConfig; exchanges: ExchangeSpec[] }): BtcCapture {
+    const ref = opts.ref ?? REF;
+    const bySha = new Map<string, Uint8Array>();
+    const indexExchanges: BtcCaptureIndexExchange[] = opts.exchanges.map((spec, i) => {
+      const sha = sha256Hex(spec.body);
+      bySha.set(sha, new TextEncoder().encode(spec.body));
+      return {
+        method: spec.method,
+        params: spec.params,
+        requestBody: JSON.stringify({ jsonrpc: "2.0", id: btcId(i + 1, ref), method: spec.method, params: spec.params }),
+        responseSha256: sha,
+        atMs: T0,
+      };
+    });
+    const index: BtcCaptureIndex = {
+      v: 1,
+      rail: "btc-htlc",
+      ref,
+      pin: BTC_CONFIG.pin.name,
+      caip2: BTC_CONFIG.pin.caip2,
+      endpoint: BTC_CONFIG.endpoint,
+      checkedAtMs: T0,
+      config: opts.config ?? BTC_CONFIG,
+      nonce: BTC_NONCE,
+      exchanges: indexExchanges,
+    };
+    return { index, bytes: bySha };
+  }
+
+  function chainInfoSpec(opts: { chain?: string; blocks?: number } = {}): ExchangeSpec {
+    return { method: "getblockchaininfo", params: [], body: jsonRpcResult(btcId(1), { chain: opts.chain ?? "regtest", blocks: opts.blocks ?? TIP_HEIGHT }) };
+  }
+  function genesisSpec(hash: string = BTC_REGTEST_PIN.genesisHash): ExchangeSpec {
+    return { method: "getblockhash", params: [0], body: jsonRpcResult(btcId(2), hash) };
+  }
+  function rawTxSpec(opts: { hex: string; confirmations: number; blockhash: string }): ExchangeSpec {
+    return {
+      method: "getrawtransaction",
+      params: [FUND_TXID, true],
+      body: jsonRpcResult(btcId(3), { hex: opts.hex, confirmations: opts.confirmations, blockhash: opts.blockhash }),
+    };
+  }
+  function txoutSpec(opts: { spent: boolean; scriptPubKey?: Uint8Array }): ExchangeSpec {
+    const body = opts.spent
+      ? jsonRpcResult(btcId(4), null)
+      : jsonRpcResult(btcId(4), { confirmations: 3, value: 1.0, scriptPubKey: { hex: bytesToHex(opts.scriptPubKey as Uint8Array) } });
+    return { method: "gettxout", params: [FUND_TXID, FUND_VOUT, false], body };
+  }
+  function blockHashSpec(n: number, height: number, hash: string): ExchangeSpec {
+    return { method: "getblockhash", params: [height], body: jsonRpcResult(btcId(n), hash) };
+  }
+  function emptyBlockSpec(n: number, hash: string): ExchangeSpec {
+    return { method: "getblock", params: [hash, 2], body: jsonRpcResult(btcId(n), { tx: [] }) };
+  }
+  function spendBlockSpec(n: number, hash: string, witness: readonly string[]): ExchangeSpec {
+    return {
+      method: "getblock",
+      params: [hash, 2],
+      body: jsonRpcResult(btcId(n), { tx: [{ vin: [{ txid: FUND_TXID, vout: FUND_VOUT, txinwitness: witness }] }] }),
+    };
+  }
+
+  /** The standard four "setup" exchanges for a funded, unspent, `confirmations`-confirmed
+   *  outpoint whose funding script is the real HTLC script for `hashLockHex`/`locktime`. */
+  function unspentExchanges(hashLockHex: string, locktime: number, confirmations: number): ExchangeSpec[] {
+    const scriptPubKey = scriptFor(hashLockHex, locktime).scriptPubKey;
+    const rawHex = fakeRawFundingTxHex(scriptPubKey, AMOUNT_SATS);
+    return [chainInfoSpec(), genesisSpec(), rawTxSpec({ hex: rawHex, confirmations, blockhash: FUNDING_BLOCK_HASH }), txoutSpec({ spent: false, scriptPubKey })];
+  }
+
+  /** Funding confirmed at height `fundingHeight`, spent at `spendHeight` — used by the
+   *  claimed/refunded fixtures below. */
+  function spentExchanges(
+    hashLockHex: string,
+    locktime: number,
+    opts: { fundingHeight: number; spendHeight: number; witness: readonly string[] },
+  ): ExchangeSpec[] {
+    const scriptPubKey = scriptFor(hashLockHex, locktime).scriptPubKey;
+    const rawHex = fakeRawFundingTxHex(scriptPubKey, AMOUNT_SATS);
+    const specs: ExchangeSpec[] = [
+      chainInfoSpec(),
+      genesisSpec(),
+      rawTxSpec({ hex: rawHex, confirmations: TIP_HEIGHT - opts.fundingHeight + 1, blockhash: FUNDING_BLOCK_HASH }),
+      txoutSpec({ spent: true }),
+    ];
+    let n = 5;
+    for (let height = opts.fundingHeight; height <= opts.spendHeight; height += 1) {
+      const hash = `${height.toString(16).padStart(2, "0")}`.repeat(32).slice(0, 64);
+      specs.push(blockHashSpec(n, height, hash));
+      n += 1;
+      if (height === opts.spendHeight) specs.push(spendBlockSpec(n, hash, opts.witness));
+      else specs.push(emptyBlockSpec(n, hash));
+      n += 1;
+    }
+    return specs;
+  }
+
+  /** Leg A's pubkey lines (P4-BTC-SPEC.md §6): both parties are required, unlike evm-htlc's
+   *  single (payee-only-required) account line. */
+  function pubkeyLineRecords(dealRoomA: string, seq: number, ts: number) {
+    const sellerLine = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYEE_PUBKEY });
+    const buyerLine = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYER_PUBKEY });
+    return [
+      record(dealRoomA, seq, ts, seller, sellerLine),
+      record(dealRoomA, seq + 1, ts + 1, buyer, buyerLine),
+    ];
+  }
+
+  /** Leg A on btc-htlc, leg B on paper (the Bitcoin twin of buildMixedSwapBase above). */
+  function buildBtcSwapBase(nonce: string) {
+    const swapId = makeSwapId(buyer.did, nonce);
+    const lock = generateHashLock();
+
+    const legAOffer = makeOffer({
+      from: buyer.did,
+      role: "payer",
+      amount: AMOUNT_SATS.toString(),
+      asset: "BTC",
+      lock: "hash",
+      rails: ["btc-htlc"],
+      claimByMs: T0 + 45 * MIN,
+      refundAfterMs: T0 + 60 * MIN,
+      expiresMs: T0 + 30 * MIN,
+      job: { proto: "swap", id: swapId, context: legAContext({ wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc" }) },
+    });
+    const legAAccept = makeAccept(legAOffer, { from: seller.did, statement: lock.hash });
+
+    const legBOffer = makeOffer({
+      from: seller.did,
+      role: "payer",
+      amount: "52070000",
+      asset: "FLOP",
+      lock: "hash",
+      rails: ["flop-htlc", "paper"],
+      claimByMs: T0 + 70 * MIN,
+      refundAfterMs: T0 + 180 * MIN,
+      expiresMs: T0 + 40 * MIN,
+      job: { proto: "swap", id: swapId, context: legBContext(legAOffer.id) },
+    });
+    const legBAccept = makeAccept(legBOffer, { from: buyer.did, statement: lock.hash });
+
+    const offers = [
+      record(OFFER_ROOM, 1, T0, buyer, encodeFrame(legAOffer)),
+      record(OFFER_ROOM, 2, T0 + 1 * MIN, seller, encodeFrame(legAAccept)),
+      record(OFFER_ROOM, 3, T0 + 2 * MIN, seller, encodeFrame(legBOffer)),
+      record(OFFER_ROOM, 4, T0 + 3 * MIN, buyer, encodeFrame(legBAccept)),
+    ];
+
+    return {
+      swapId,
+      lock,
+      legAOffer,
+      legAAccept,
+      legBOffer,
+      legBAccept,
+      offers,
+      dealRoomA: dealRoom(legAAccept.contract),
+      dealRoomB: dealRoom(legBAccept.contract),
+      legATerms: offerAcceptLockTerms(legAOffer, legAAccept),
+    };
+  }
+
+  it("a-locked: both legs locked, leg A's lock evidence comes from a captured BTC read", async () => {
+    const s = buildBtcSwapBase("b001b001b001b001");
+    const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const dealRoomsA = [
+      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
+      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+    ];
+    const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+
+    const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+    const locktime = s.legATerms.refundAfterMs / 1000;
+    const capture = buildBtcCapture({ exchanges: unspentExchanges(s.lock.hash, locktime, 2) });
+
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
+      btcChain: new Map([[REF, capture]]),
+      rails: { btc: BTC_CONFIG },
+      nowMs: T0 + 6 * MIN,
+    });
+
+    const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+    expect(view).toBeDefined();
+    expect(view!.evidence.a?.rail).toBe("btc-htlc");
+    expect(view!.evidence.a?.railVerified).toBe(true);
+    expect(view!.evidence.aRail).toEqual({ status: "locked", final: true, checkedAtMs: T0, finalizedRef: `btc-regtest:confirmations-1:109:${FUNDING_BLOCK_HASH}` });
+    expect(view!.status).toBe("a-locked");
+  });
+
+  it("settled: both legs reveal, and both rails report a final claim", async () => {
+    const s = buildBtcSwapBase("b002b002b002b002");
+    const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
+    const revealA: RevealFrame = { type: "reveal", from: seller.did, contract: s.legAAccept.contract, ref: REF, secret: s.lock.preimage };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const revealB: RevealFrame = { type: "reveal", from: buyer.did, contract: s.legBAccept.contract, ref: s.legBAccept.contract, secret: s.lock.preimage };
+
+    const dealRoomsA = [
+      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
+      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      record(s.dealRoomA, 4, T0 + 5 * MIN, seller, encodeFrame(revealA)),
+    ];
+    const dealRoomsB = [
+      record(s.dealRoomB, 1, T0 + 5.5 * MIN, seller, encodeFrame(lockB)),
+      record(s.dealRoomB, 2, T0 + 6 * MIN, buyer, encodeFrame(revealB)),
+    ];
+
+    const noteBValue = encodePaperRecord({
+      status: "claimed",
+      lock: "hash",
+      statement: s.lock.hash,
+      refundAfterMs: s.legBOffer.refundAfterMs,
+      secret: s.lock.preimage,
+    });
+    const locktime = s.legATerms.refundAfterMs / 1000;
+    const witnessScriptHex = bytesToHex(scriptFor(s.lock.hash, locktime).witnessScript);
+    // A genuine claim's witness stack (probe Q3): [preimage, sig, witnessScript].
+    const claimWitness = [s.lock.preimage.slice(2), "3044022001020304050607080910111213141516171819202122232425262728293001", witnessScriptHex];
+    const capture = buildBtcCapture({ exchanges: spentExchanges(s.lock.hash, locktime, { fundingHeight: 100, spendHeight: 102, witness: claimWitness }) });
+
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
+      btcChain: new Map([[REF, capture]]),
+      rails: { btc: BTC_CONFIG },
+      nowMs: T0 + 7 * MIN,
+    });
+
+    const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+    expect(view).toBeDefined();
+    expect(view!.evidence.aRail?.status).toBe("claimed");
+    expect(view!.evidence.aRail?.final).toBe(true);
+    expect(view!.evidence.bRail?.status).toBe("claimed");
+    expect(view!.status).toBe("settled");
+  });
+
+  it("refunded-a: a captured Refunded state settles leg A even with no refund frame posted", async () => {
+    const s = buildBtcSwapBase("b003b003b003b003");
+    const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const dealRoomsA = [
+      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
+      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+    ];
+    const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+
+    const locktime = s.legATerms.refundAfterMs / 1000;
+    const witnessScriptHex = bytesToHex(scriptFor(s.lock.hash, locktime).witnessScript);
+    // A genuine refund's witness stack (probe Q4): [sig, <empty>, witnessScript] — never a
+    // 32-byte item that opens H, so classifySpend reports "refunded", never a false claim.
+    const refundWitness = ["3044022001020304050607080910111213141516171819202122232425262728293001", "", witnessScriptHex];
+    const capture = buildBtcCapture({ exchanges: spentExchanges(s.lock.hash, locktime, { fundingHeight: 100, spendHeight: 101, witness: refundWitness }) });
+
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map(), // leg B's note was never captured: irrelevant to this leg-A case
+      btcChain: new Map([[REF, capture]]),
+      rails: { btc: BTC_CONFIG },
+      nowMs: T0 + 6 * MIN,
+    });
+
+    const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+    expect(view).toBeDefined();
+    expect(view!.evidence.aRail).toEqual({
+      status: "refunded",
+      final: true,
+      checkedAtMs: T0,
+      finalizedRef: `btc-regtest:confirmations-1:101:${"65".repeat(32)}`,
+    });
+    expect(view!.status).toBe("refunded-a");
+  });
+
+  it("a tampered capture (a response no longer hashes to its own name) leaves leg A unverified, not thrown", async () => {
+    const s = buildBtcSwapBase("b004b004b004b004");
+    const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const dealRoomsA = [
+      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
+      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+    ];
+    const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+
+    const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+    const locktime = s.legATerms.refundAfterMs / 1000;
+    const capture = buildBtcCapture({ exchanges: unspentExchanges(s.lock.hash, locktime, 2) });
+    const tamperedCapture: BtcCapture = { index: capture.index, bytes: new Map() }; // every read now "missing"
+
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
+      btcChain: new Map([[REF, tamperedCapture]]),
+      rails: { btc: BTC_CONFIG },
+      nowMs: T0 + 6 * MIN,
+    });
+
+    const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+    expect(view).toBeDefined();
+    expect(view!.evidence.a?.railVerified).toBeNull();
+    expect(view!.evidence.a?.reason).toMatch(/missing\/tampered capture/);
+    expect(view!.status).toBe("b-locked"); // leg B corroborated, leg A is not
+    expect(view!.reasons).toContain("leg A lock unverified");
+  });
+
+  it("a capture from the wrong chain leaves leg A unverified", async () => {
+    const s = buildBtcSwapBase("b005b005b005b005");
+    const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const dealRoomsA = [
+      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
+      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+    ];
+    const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+
+    const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+    const locktime = s.legATerms.refundAfterMs / 1000;
+    const scriptPubKey = scriptFor(s.lock.hash, locktime).scriptPubKey;
+    const rawHex = fakeRawFundingTxHex(scriptPubKey, AMOUNT_SATS);
+    // The RPC itself reports "signet", but rails.btc below still pins regtest.
+    const capture = buildBtcCapture({
+      exchanges: [
+        chainInfoSpec({ chain: "signet" }),
+        genesisSpec(),
+        rawTxSpec({ hex: rawHex, confirmations: 2, blockhash: FUNDING_BLOCK_HASH }),
+        txoutSpec({ spent: false, scriptPubKey }),
+      ],
+    });
+
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
+      btcChain: new Map([[REF, capture]]),
+      rails: { btc: BTC_CONFIG },
+      nowMs: T0 + 6 * MIN,
+    });
+
+    const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+    expect(view).toBeDefined();
+    expect(view!.evidence.a?.railVerified).toBeNull();
+    expect(view!.evidence.a?.reason).toMatch(/does not match pin/);
+    expect(view!.status).toBe("b-locked");
+  });
+
+  it("a lock frame signed by anyone other than the leg's own payer is ignored entirely", async () => {
+    const s = buildBtcSwapBase("b006b006b006b006");
+    // Signed by the seller (leg A's payee, not its payer) — tclk's own machine never accepts
+    // a lock transition from anyone but the leg's own payer, so foldAcceptedLock must not
+    // treat it as leg A's lock either.
+    const forgedLockA: LockFrame = { type: "lock", from: seller.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const dealRoomsA = [
+      record(s.dealRoomA, 1, T0 + 4 * MIN, seller, encodeFrame(forgedLockA)),
+      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+    ];
+    const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+
+    const locktime = s.legATerms.refundAfterMs / 1000;
+    const capture = buildBtcCapture({ exchanges: unspentExchanges(s.lock.hash, locktime, 2) });
+
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map(),
+      btcChain: new Map([[REF, capture]]),
+      rails: { btc: BTC_CONFIG },
+      nowMs: T0 + 6 * MIN,
+    });
+
+    const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+    expect(view).toBeDefined();
+    expect(view!.evidence.a).toBeUndefined();
+    expect(view!.evidence.aRail).toBeUndefined();
+  });
+
+  it("no rails configured: a btc-htlc lock plus a captured chain read still yield no evidence (identical to before this option existed)", async () => {
+    const s = buildBtcSwapBase("b007b007b007b007");
+    const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const dealRoomsA = [
+      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
+      ...pubkeyLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+    ];
+    const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+
+    const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+    const locktime = s.legATerms.refundAfterMs / 1000;
+    const capture = buildBtcCapture({ exchanges: unspentExchanges(s.lock.hash, locktime, 2) });
+
+    // No `rails` field at all — same as every call in this file before §7 existed.
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
+      btcChain: new Map([[REF, capture]]), // present, but must be ignored without rails.btc
+      nowMs: T0 + 6 * MIN,
+    });
+
+    const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+    expect(view).toBeDefined();
+    expect(view!.evidence.a).toBeUndefined();
+    expect(view!.evidence.aRail).toBeUndefined();
+    // Leg B's paper path is completely unaffected by leg A's ignored btc-htlc lock.
+    expect(view!.evidence.b?.railVerified).toBe(true);
+    expect(view!.status).toBe("b-locked");
   });
 });

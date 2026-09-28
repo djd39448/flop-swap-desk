@@ -20,10 +20,14 @@ import {
   type ReceiptFrame,
   type RevealFrame,
 } from "@flop-labs/tclk";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
+import { Transaction } from "@scure/btc-signer";
 import { encodeFunctionResult, type Address } from "viem";
 import { buildBoard } from "../src/board.js";
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
-import { formatAccountLine } from "../src/rails/account-line.js";
+import { formatAccountLine, formatPubkeyLine } from "../src/rails/account-line.js";
+import { BTC_REGTEST_PIN, type BtcRailConfig } from "../src/rails/btc-htlc.js";
+import { BTC_REGTEST_NETWORK, buildHtlcScript } from "../src/rails/btc-script.js";
 import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
@@ -1221,6 +1225,332 @@ describe("runSweep", () => {
       expect(report.railsConfigError).toMatch(/not on the allow list/);
       expect(calls).toEqual([]); // nothing was ever fetched — not even the offer-room export
       expect(existsSync(join(root, "board.json"))).toBe(false);
+    });
+  });
+
+  // P4-BTC-SPEC.md §7: the btc-htlc twin of the evm-htlc "chain evidence" block above — same
+  // "nothing runs unless the caller configured this rail" contract, adapted for Bitcoin's own
+  // shape (an opaque funding outpoint, node-level JSON-RPC reads instead of eth_call).
+  describe("chain evidence (btc-htlc rail, P4-BTC-SPEC.md §7)", () => {
+    const FUND_TXID = "ab08a3ba29a27d8ccbc37fe3efe3f56018e34978328bc421361e688dc8d66694";
+    const FUND_VOUT = 1;
+    const REF = `${FUND_TXID}:${FUND_VOUT}`;
+    const AMOUNT_SATS = 100_000_000n;
+    const PAYEE_PUBKEY = "0361c6efa7529b0f113fe6ea467248133aba7f14927a7163d6333048ebbf01318a"; // seller
+    const PAYER_PUBKEY = "0372320de1e3ad1abed6a51d6c435cd1312657a62d6b3545cfca062bc8fd08a627"; // buyer
+    const TIP_HEIGHT = 110;
+    const FUNDING_BLOCK_HASH = "bb".repeat(32);
+
+    const BTC_CONFIG: BtcRailConfig = { pin: BTC_REGTEST_PIN, endpoint: "http://127.0.0.1:19999" };
+
+    /** Same shape as `buildEvmSwap`, but leg A's rail is `btc-htlc`, its own outpoint `ref` is
+     *  fixed (`REF` — chosen at fund time, never derived from terms), and its deal room carries
+     *  both parties' D-08 pubkey lines (P4-BTC-SPEC.md §6), not a single account line. */
+    function buildBtcSwap(nonceHex: string, baseSeq: number, baseMs: number) {
+      const swapId = makeSwapId(buyer.did, nonceHex);
+      const lock = generateHashLock();
+
+      const legAOffer = makeOffer({
+        from: buyer.did,
+        role: "payer",
+        amount: AMOUNT_SATS.toString(),
+        asset: "BTC",
+        lock: "hash",
+        rails: ["btc-htlc"],
+        claimByMs: baseMs + 3_600_000,
+        refundAfterMs: baseMs + 7_200_000,
+        expiresMs: baseMs + 600_000,
+        job: { proto: "swap", id: swapId, context: legAContext({ wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc" }) },
+      });
+      const legAAccept = makeAccept(legAOffer, { from: seller.did, statement: lock.hash });
+
+      const legBOffer = makeOffer({
+        from: seller.did,
+        role: "payer",
+        amount: "52070000",
+        asset: "FLOP",
+        lock: "hash",
+        rails: ["flop-htlc"],
+        claimByMs: baseMs + 10_800_000,
+        refundAfterMs: baseMs + 14_400_000,
+        expiresMs: baseMs + 600_000,
+        job: { proto: "swap", id: swapId, context: legBContext(legAOffer.id) },
+      });
+      const legBAccept = makeAccept(legBOffer, { from: buyer.did, statement: lock.hash });
+
+      const offerRows = [
+        record(OFFER_ROOM, baseSeq, baseMs, buyer, encodeFrame(legAOffer)),
+        record(OFFER_ROOM, baseSeq + 1, baseMs + 1, seller, encodeFrame(legAAccept)),
+        record(OFFER_ROOM, baseSeq + 2, baseMs + 2, seller, encodeFrame(legBOffer)),
+        record(OFFER_ROOM, baseSeq + 3, baseMs + 3, buyer, encodeFrame(legBAccept)),
+      ].map(rowFromRecord);
+
+      const dealRoomA = dealRoom(legAAccept.contract);
+      const dealRoomB = dealRoom(legBAccept.contract);
+      const legATerms = offerAcceptLockTerms(legAOffer, legAAccept);
+      const lockA: LockFrame = { type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "btc-htlc", ref: REF };
+
+      function dealRowsA(baseDealMs: number) {
+        const sellerLine = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYEE_PUBKEY });
+        const buyerLine = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYER_PUBKEY });
+        return [
+          rowFromRecord(record(dealRoomA, 1, baseDealMs, buyer, encodeFrame(lockA))),
+          rowFromRecord(record(dealRoomA, 2, baseDealMs + 1, seller, sellerLine)),
+          rowFromRecord(record(dealRoomA, 3, baseDealMs + 2, buyer, buyerLine)),
+        ];
+      }
+
+      return { swapId, lock, legAOffer, legAAccept, legBOffer, legBAccept, offerRows, dealRoomA, dealRoomB, legATerms, dealRowsA };
+    }
+
+    function scriptFor(hashLockHex: string, locktime: number) {
+      return buildHtlcScript(
+        { hashLock: hexToBytes(hashLockHex.slice(2)), payeePubkey: hexToBytes(PAYEE_PUBKEY), payerPubkey: hexToBytes(PAYER_PUBKEY), locktime },
+        BTC_REGTEST_NETWORK,
+      );
+    }
+
+    /** A 2-output funding transaction whose vout `FUND_VOUT` output is the real HTLC script for
+     *  `hashLockHex`/`locktime` — the same technique tests/btc-evidence.test.ts's own
+     *  `fakeRawFundingTxHex` uses. */
+    function fakeRawFundingTxHex(scriptPubKey: Uint8Array, amountSats: bigint): string {
+      const tx = new Transaction({ allowUnknownInputs: true, allowUnknownOutputs: true, disableScriptCheck: true, version: 2, lockTime: 0 });
+      tx.addInput({ txid: new Uint8Array(32), index: 0, witnessUtxo: { amount: 1n, script: new Uint8Array([0x00]) } });
+      tx.addOutput({ script: new Uint8Array([0x00, 0x14, ...new Array(20).fill(0)]), amount: 1_000_000n });
+      tx.addOutput({ script: scriptPubKey, amount: amountSats });
+      return bytesToHex(tx.unsignedTx);
+    }
+
+    type RpcOutcome = { result: unknown } | { errorMessage: string } | "throw";
+
+    /** A combined fetch: technocore-style GET/POST responses plus JSON-RPC POSTs to
+     *  `rpcEndpoint` (bitcoind-shaped, no `path` distinction needed here since the watcher's own
+     *  btc chain-read step never targets a per-wallet path — see `captureBtcLeg`). */
+    function makeBtcFetch(opts: {
+      technocore: (url: string) => FakeResponse;
+      rpcEndpoint: string;
+      rpcResult: (method: string, params: unknown) => RpcOutcome;
+      calls: Array<{ url: string; body?: string; headers?: Record<string, string> }>;
+    }): typeof fetch {
+      return (async (input: unknown, init?: unknown) => {
+        const url = String(input);
+        const initObj = init as { body?: string; headers?: Record<string, string> } | undefined;
+        opts.calls.push({ url, body: initObj?.body, headers: initObj?.headers });
+        if (url === opts.rpcEndpoint && typeof initObj?.body === "string") {
+          const parsed = JSON.parse(initObj.body) as { id: number | string; method: string; params: unknown };
+          const outcome = opts.rpcResult(parsed.method, parsed.params);
+          if (outcome === "throw") throw new TypeError(`rpc endpoint unreachable: ${parsed.method}`);
+          const envelope =
+            "errorMessage" in outcome
+              ? { jsonrpc: "2.0", id: parsed.id, error: { code: -32000, message: outcome.errorMessage } }
+              : { jsonrpc: "2.0", id: parsed.id, result: outcome.result };
+          const text = JSON.stringify(envelope);
+          const bytes = new TextEncoder().encode(text);
+          return { status: 200, text: async () => text, arrayBuffer: async () => bytes.buffer } as Response;
+        }
+        const outcome = opts.technocore(url);
+        return { status: outcome.status, text: async () => outcome.body } as Response;
+      }) as typeof fetch;
+    }
+
+    /** Responds as a funded, unspent, sufficiently-confirmed outpoint whose funding script
+     *  matches `terms`. */
+    function btcRpcResponder(terms: { statement: string; refundAfterMs: number }): (method: string, params: unknown) => RpcOutcome {
+      const locktime = terms.refundAfterMs / 1000;
+      const scriptPubKey = scriptFor(terms.statement, locktime).scriptPubKey;
+      const rawHex = fakeRawFundingTxHex(scriptPubKey, AMOUNT_SATS);
+      return (method, params) => {
+        if (method === "getblockchaininfo") return { result: { chain: "regtest", blocks: TIP_HEIGHT } };
+        if (method === "getblockhash" && Array.isArray(params) && params[0] === 0) return { result: BTC_REGTEST_PIN.genesisHash };
+        if (method === "getrawtransaction") return { result: { hex: rawHex, confirmations: 2, blockhash: FUNDING_BLOCK_HASH } };
+        if (method === "gettxout") return { result: { confirmations: 2, value: 1.0, scriptPubKey: { hex: bytesToHex(scriptPubKey) } } };
+        return { errorMessage: `unexpected method ${method}` };
+      };
+    }
+
+    it("captures a locked btc-htlc leg live, writes raw/rpc + raw/btc + rails.json, and reports btcChainReads", async () => {
+      const swap = buildBtcSwap("bbbb1001", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+
+      const calls: Array<{ url: string; body?: string; headers?: Record<string, string> }> = [];
+      const fetchImpl = makeBtcFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: BTC_CONFIG.endpoint,
+        rpcResult: btcRpcResponder({ statement: swap.lock.hash, refundAfterMs: swap.legAOffer.refundAfterMs }),
+        calls,
+      });
+
+      const report = await runSweep({
+        ...baseOptions({ board: buildBoard, rails: { btc: BTC_CONFIG }, btcRpcHeaders: () => ({ Authorization: "Basic dGVzdDp0ZXN0" }) }),
+        fetch: fetchImpl,
+      });
+      expect(report.ok).toBe(true);
+      expect(report.btcChainReads).toBe(1);
+      expect(report.btcChainReadsSkipped).toEqual([]);
+      // chainReads (the EVM field) never appears at all — this sweep never configured rails.evm.
+      expect(report.chainReads).toBeUndefined();
+
+      const railsJson = JSON.parse(await readFile(join(root, "rails.json"), "utf8"));
+      expect(railsJson).toEqual({ btc: BTC_CONFIG });
+
+      const btcDir = join(root, "raw", "btc", `${FUND_TXID}-${FUND_VOUT}`);
+      const btcFiles = await readdir(btcDir);
+      expect(btcFiles.length).toBe(1);
+      const index = JSON.parse(await readFile(join(btcDir, btcFiles[0]!), "utf8"));
+      expect(index.ref).toBe(REF);
+      expect(index.exchanges).toHaveLength(4);
+
+      const rpcFiles = await readdir(join(root, "raw", "rpc"));
+      expect(rpcFiles.length).toBe(4);
+
+      // The node's cookie-derived auth header reached the RPC call but was never recorded on
+      // any captured exchange, request body, or written index/rails.json (the keyless rule's
+      // "never logged, never persisted" extended to the RPC cookie, P4-BTC-SPEC.md §1/§4).
+      const rpcCall = calls.find((c) => c.url === BTC_CONFIG.endpoint);
+      expect(rpcCall?.headers?.Authorization).toBe("Basic dGVzdDp0ZXN0");
+      const wholeIndexText = JSON.stringify(index);
+      expect(wholeIndexText).not.toContain("Authorization");
+      expect(wholeIndexText).not.toContain("dGVzdDp0ZXN0");
+      expect(JSON.stringify(railsJson)).not.toContain("dGVzdDp0ZXN0");
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(view).toBeDefined();
+      expect(view.evidence.aRail).toMatchObject({ status: "locked", final: true });
+      expect(view.evidence.a.railVerified).toBe(true);
+    });
+
+    it("a transport failure on the btc chain read is recorded as a skip AND writes this sweep's own failure index (mirrors F1)", async () => {
+      const swap = buildBtcSwap("bbbb1002", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+
+      const fetchImpl = makeBtcFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: BTC_CONFIG.endpoint,
+        rpcResult: () => "throw",
+        calls: [],
+      });
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { btc: BTC_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.btcChainReads).toBe(0);
+      expect(report.btcChainReadsSkipped).toHaveLength(1);
+      expect(report.btcChainReadsSkipped![0]!.contract).toBe(swap.legAAccept.contract);
+
+      const btcDir = join(root, "raw", "btc", `${FUND_TXID}-${FUND_VOUT}`);
+      const files = await readdir(btcDir);
+      expect(files).toHaveLength(1);
+      const failureIndex = JSON.parse(await readFile(join(btcDir, files[0]!), "utf8"));
+      expect(typeof failureIndex.error).toBe("string");
+      expect(failureIndex.exchanges).toEqual([]);
+      expect(report.btcChainReadsSkipped![0]!.reason).toBe(failureIndex.error);
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(view.evidence.a.railVerified).toBeNull();
+    });
+
+    it("no rails configured: no RPC endpoint is ever touched, and the report carries no btc chain fields at all", async () => {
+      const swap = buildBtcSwap("bbbb1003", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+      const calls: Array<{ url: string; body?: string }> = [];
+
+      const fetchImpl = makeBtcFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: BTC_CONFIG.endpoint,
+        rpcResult: () => "throw",
+        calls,
+      });
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.btcChainReads).toBeUndefined();
+      expect(report.btcChainReadsSkipped).toBeUndefined();
+      expect(calls.some((c) => c.url === BTC_CONFIG.endpoint)).toBe(false);
+      expect(existsSync(join(root, "rails.json"))).toBe(false);
+      expect(existsSync(join(root, "raw", "btc"))).toBe(false);
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(view).toBeDefined();
+      expect(view.evidence.aRail).toBeUndefined();
+      expect(view.evidence.a).toBeUndefined();
+    });
+
+    it("A3 (mirrored): a malformed options.rails.btc fails the sweep closed, before any fetch at all", async () => {
+      const swap = buildBtcSwap("bbbb1004", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const calls: Array<{ url: string; body?: string }> = [];
+      const fetchImpl = makeBtcFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          return { status: 200, body: dealRoomBody([]) };
+        },
+        rpcEndpoint: BTC_CONFIG.endpoint,
+        rpcResult: () => "throw",
+        calls,
+      });
+
+      // "mainnet" is off the allow list (regtest/signet only).
+      const badConfig = { ...BTC_CONFIG, pin: { ...BTC_CONFIG.pin, network: "mainnet" as unknown as "regtest" } };
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { btc: badConfig } }), fetch: fetchImpl });
+
+      expect(report.ok).toBe(false);
+      expect(report.railsConfigError).toMatch(/not on the allow list/);
+      expect(calls).toEqual([]);
+      expect(existsSync(join(root, "board.json"))).toBe(false);
+    });
+
+    it("both rails configured: rails.json carries both, keyed evm-first-then-btc", async () => {
+      const swap = buildBtcSwap("bbbb1005", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+      const EVM_CONFIG: EvmRailConfig = {
+        pin: ANVIL_LOCAL_PIN,
+        endpoint: "http://127.0.0.1:9998/rpc",
+        contract: "0x1111111111111111111111111111111111111111".slice(0, 42) as `0x${string}`,
+        assets: {},
+      };
+
+      const fetchImpl = makeBtcFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: BTC_CONFIG.endpoint,
+        rpcResult: btcRpcResponder({ statement: swap.lock.hash, refundAfterMs: swap.legAOffer.refundAfterMs }),
+        calls: [],
+      });
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { evm: EVM_CONFIG, btc: BTC_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.btcChainReads).toBe(1);
+      // The evm rail was configured but its own endpoint was never touched by this test's
+      // fetch, so its own chain read fails closed as a skip — irrelevant to what this test
+      // pins (rails.json's own key order/shape with both configured).
+      const railsJson = JSON.parse(await readFile(join(root, "rails.json"), "utf8"));
+      expect(Object.keys(railsJson)).toEqual(["evm", "btc"]);
+      expect(railsJson).toEqual({ evm: EVM_CONFIG, btc: BTC_CONFIG });
     });
   });
 });

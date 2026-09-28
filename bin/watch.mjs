@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs";
 
 import { runSweep } from "../dist/watcher.js";
 
-const USAGE = `Usage: node bin/watch.mjs --root DIR [--base-url URL] [--max-deal-rooms N] [--timeout SEC] [--rails FILE] --once
+const USAGE = `Usage: node bin/watch.mjs --root DIR [--base-url URL] [--max-deal-rooms N] [--timeout SEC] [--rails FILE] [--btc-rpc-cookie FILE] --once
 
 Runs one read-only sweep of technocore.chat's tclk-offers export (and any deal rooms it
 implies) and writes the board under DIR. Never posts, signs, or writes outside DIR.
@@ -23,22 +23,38 @@ Options:
   --base-url URL        Venue base URL (default https://technocore.chat).
   --max-deal-rooms N     Cap on deal rooms fetched per sweep (default 50).
   --timeout SEC          Per-request timeout in seconds (default 45).
-  --rails FILE           P22-P24-EVM-SPEC.md §5: a JSON file shaped { "evm": EvmRailConfig }
-                          naming a chain rail to capture live evidence from. Absent (the
-                          default): no RPC endpoint is ever touched, unchanged from before
-                          this option existed.
+  --rails FILE           A JSON file shaped { "evm"?: EvmRailConfig, "btc"?: BtcRailConfig }
+                          naming the chain rail(s) to capture live evidence from
+                          (P22-P24-EVM-SPEC.md §5; P4-BTC-SPEC.md §7). Absent (the default):
+                          no RPC endpoint is ever touched, unchanged from before this option
+                          existed.
+  --btc-rpc-cookie FILE  P4-BTC-SPEC.md §1/§4/§7: bitcoind's own cookie file (its regtest/
+                          signet datadir's ".cookie") — read once, turned into an HTTP Basic
+                          auth header, and used ONLY for the "btc" rail's own RPC calls.
+                          Never logged, never written to rails.json, a capture index, or any
+                          other file this sweep writes. Required when --rails names a "btc"
+                          config against a cookie-authenticated node; ignored otherwise.
   --once                 Run exactly one sweep and exit. Required — there is no built-in
                           loop; run this repeatedly from a scheduler instead.
   -h, --help              Show this message and exit 0.
 
 Exit codes:
   0  sweep completed
-  2  bad or missing arguments (nothing was run), or --rails did not name readable JSON
+  2  bad or missing arguments (nothing was run), --rails did not name readable JSON, or
+     --btc-rpc-cookie did not name a readable file
   3  the sweep hit a transport failure or could not parse the offers export
 `;
 
 function parseArgs(argv) {
-  const out = { root: null, baseUrl: null, maxDealRooms: null, timeoutSec: null, railsFile: null, once: false };
+  const out = {
+    root: null,
+    baseUrl: null,
+    maxDealRooms: null,
+    timeoutSec: null,
+    railsFile: null,
+    btcRpcCookieFile: null,
+    once: false,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     switch (arg) {
@@ -56,6 +72,9 @@ function parseArgs(argv) {
         break;
       case "--rails":
         out.railsFile = argv[++i];
+        break;
+      case "--btc-rpc-cookie":
+        out.btcRpcCookieFile = argv[++i];
         break;
       case "--once":
         out.once = true;
@@ -82,10 +101,13 @@ function summarize(report) {
   // §5) — omitted here too, rather than printed as 0, so a sweep without it prints exactly
   // what it always did.
   const chainPart = report.chainReads !== undefined ? ` chainReads=${report.chainReads}` : "";
+  // btcChainReads only appears when --rails named a "btc" config (P4-BTC-SPEC.md §7) —
+  // identical omission rule, and a separate field from chainReads (see SweepReport's own doc).
+  const btcChainPart = report.btcChainReads !== undefined ? ` btcChainReads=${report.btcChainReads}` : "";
   return (
     `offers=${report.offerRecords} swapLegs=${report.swapLegOffers} ` +
     `dealRooms=${report.dealRoomsFetched} notes=${report.noteFetches} swaps[${statusPart}] ` +
-    `swapsWritten=${report.swapsWritten} hit=${report.hitCreated} ok=${report.ok}${chainPart}`
+    `swapsWritten=${report.swapsWritten} hit=${report.hitCreated} ok=${report.ok}${chainPart}${btcChainPart}`
   );
 }
 
@@ -137,6 +159,21 @@ async function main() {
       process.stderr.write(`watch.mjs: --rails file ${args.railsFile} is not valid JSON: ${error.message}\n`);
       return 2;
     }
+  }
+  if (args.btcRpcCookieFile !== null) {
+    // P4-BTC-SPEC.md §1/§4/§7: read once, turned into a Basic-auth header held only in this
+    // process's memory — never logged, never assigned onto `options.rails` or anything else
+    // that reaches disk (rpc-capture.ts's own `headers` option is never recorded on an
+    // Exchange, and `RunSweepOptions.btcRpcHeaders`/`rails.json` never carry it either).
+    let cookie;
+    try {
+      cookie = readFileSync(args.btcRpcCookieFile, "utf8").trim();
+    } catch (error) {
+      process.stderr.write(`watch.mjs: cannot read --btc-rpc-cookie file ${args.btcRpcCookieFile}: ${error.message}\n`);
+      return 2;
+    }
+    const authHeader = `Basic ${Buffer.from(cookie).toString("base64")}`;
+    options.btcRpcHeaders = () => ({ Authorization: authHeader });
   }
 
   const report = await runSweep(options);

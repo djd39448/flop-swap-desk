@@ -40,7 +40,9 @@ import {
 import { buildBoard as defaultBuildBoard } from "./board.js";
 import { paperEvidence, stripNoteBanner, PAPER_RAIL_ID } from "./paper-evidence.js";
 import { classifySwapOffer } from "./profile.js";
-import { resolveAccounts } from "./rails/account-line.js";
+import { resolveAccounts, resolvePubkeys } from "./rails/account-line.js";
+import { btcEvidence, BTC_RAIL_ID, type BtcCapture } from "./rails/btc-evidence.js";
+import { checkBtcRailConfig, type BtcRailConfig } from "./rails/btc-htlc.js";
 import { evmEvidence, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
 import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
 import { offerAcceptLockTerms } from "./swap.js";
@@ -259,11 +261,18 @@ export interface FoldCapturedInput {
    *  candidate with no captured note — whether it was never captured, or a replay simply
    *  didn't have it on disk. Absent entirely behaves exactly like an empty map. */
   chain?: ReadonlyMap<string, EvmCapture>;
+  /** P4-BTC-SPEC.md §7: captured Bitcoin chain reads, keyed by the funding outpoint (a
+   *  `btc-htlc` lock frame's own `.ref`, `"<txid>:<vout>"` — unlike `chain` above, this is
+   *  never derived from `terms`, since a Bitcoin outpoint is chosen at fund time, not committed
+   *  in the offer/accept). A candidate whose deal room shows an accepted `btc-htlc` lock but has
+   *  no entry here gets no evidence for that leg, the same treatment as every other captured-but-
+   *  absent case in this file. Absent entirely behaves exactly like an empty map. */
+  btcChain?: ReadonlyMap<string, BtcCapture>;
   /** The chain rails this fold may draw evidence from. Absent (the default — and what the
-   *  live watch passes when it isn't given `RunSweepOptions.rails`): the `evm-htlc` branch
-   *  below never runs at all, so `foldCaptured` is exactly the paper-only fold it always was,
-   *  byte-for-byte (tests/replay.test.ts's "no rails configured" case pins this). */
-  rails?: { evm?: EvmRailConfig };
+   *  live watch passes when it isn't given `RunSweepOptions.rails`): neither the `evm-htlc` nor
+   *  the `btc-htlc` branch below ever runs, so `foldCaptured` is exactly the paper-only fold it
+   *  always was, byte-for-byte (tests/replay.test.ts's "no rails configured" cases pin this). */
+  rails?: { evm?: EvmRailConfig; btc?: BtcRailConfig };
   nowMs: number;
   board?: (input: BoardInput) => Board;
 }
@@ -296,6 +305,9 @@ export function foldCaptured(input: FoldCapturedInput): Board {
   // so a malformed config never silently reaches `evmEvidence`; it fails every `evm-htlc` leg
   // closed instead, each with the same specific reason.
   const evmConfigCheck = evmConfig === undefined ? null : checkEvmRailConfig(evmConfig);
+  // P4-BTC-SPEC.md §7: the `btc-htlc` twin of the above — validated once per fold, same A3 rule.
+  const btcConfig = input.rails?.btc;
+  const btcConfigCheck = btcConfig === undefined ? null : checkBtcRailConfig(btcConfig);
 
   for (const candidate of candidates) {
     const room = dealRoom(candidate.contract);
@@ -354,6 +366,64 @@ export function foldCaptured(input: FoldCapturedInput): Board {
               railVerified: null,
               checkedAtMs: input.nowMs,
               reason: `evm-htlc: evidence check threw unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          };
+        }
+      }
+    } else if (accepted.rail === BTC_RAIL_ID) {
+      // P4-BTC-SPEC.md §7: unlike paper/evm-htlc above, `accepted.railRef` (the funding
+      // outpoint) is never derived from `terms` — it is chosen at fund time — so there is no
+      // equality check to gate dispatch on here; `btcEvidence` itself checks the rebuilt
+      // script/amount against `terms`/`accounts` once a capture is found.
+      if (btcConfigCheck === null) continue; // no chain rail configured: no evidence at all
+      if (!btcConfigCheck.ok) {
+        // A3 (mirrored for Bitcoin): a bad config fails every btc-htlc leg closed, with the
+        // specific reason — never silently "no evidence".
+        result = {
+          lock: {
+            rail: BTC_RAIL_ID,
+            ref: accepted.railRef,
+            terms,
+            railVerified: null,
+            checkedAtMs: input.nowMs,
+            reason: `btc-htlc: rail config invalid: ${btcConfigCheck.reason}`,
+          },
+        };
+      } else {
+        const capture = input.btcChain?.get(accepted.railRef);
+        if (capture === undefined) continue; // not captured (yet, or ever): evidence absent
+        // P4-BTC-SPEC.md §6: a P2WSH script commits to BOTH parties' pubkeys, unlike the
+        // account line's single-address resolution for evm-htlc — resolved fresh from the same
+        // deal room with `resolvePubkeys`, never cached across candidates.
+        const pubkeys = resolvePubkeys(dealRoomRecords, {
+          contract: candidate.contract,
+          payerDid: terms.payer,
+          payeeDid: terms.payee,
+          rail: BTC_RAIL_ID,
+          caip2: btcConfigCheck.config.pin.caip2,
+        });
+        // D4-style defense in depth (mirrors the evm-htlc branch above): this call sits inside
+        // a loop that folds *every* candidate in one pass, so an unanticipated throw here must
+        // still fail only this one leg closed, never the whole replay.
+        try {
+          result = btcEvidence({
+            terms,
+            config: btcConfigCheck.config,
+            accounts: {
+              ...(pubkeys.payer === undefined ? {} : { payerPubkey: pubkeys.payer }),
+              ...(pubkeys.payee === undefined ? {} : { payeePubkey: pubkeys.payee }),
+            },
+            capture,
+          });
+        } catch (error) {
+          result = {
+            lock: {
+              rail: BTC_RAIL_ID,
+              ref: accepted.railRef,
+              terms,
+              railVerified: null,
+              checkedAtMs: input.nowMs,
+              reason: `btc-htlc: evidence check threw unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
             },
           };
         }

@@ -27,6 +27,8 @@ import {
   type CapturedNote,
   type SwapLegCandidate,
 } from "./replay.js";
+import { captureBtcLeg, BTC_RAIL_ID, type BtcCapture } from "./rails/btc-evidence.js";
+import { checkBtcRailConfig, type BtcRailConfig } from "./rails/btc-htlc.js";
 import { captureEvmLeg, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
 import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
 import { CapturingRpc, verifiedExchangeBytes, writeCapture } from "./rails/rpc-capture.js";
@@ -79,6 +81,13 @@ export interface SweepReport {
    *  was (the live watch never sets `options.rails`, so it never sees this field at all). */
   chainReads?: number;
   chainReadsSkipped?: ChainReadSkip[];
+  /** P4-BTC-SPEC.md §7: `btc-htlc` chain reads captured this sweep — present only when
+   *  `options.rails.btc` is configured, exactly mirroring `chainReads`/`chainReadsSkipped`'s own
+   *  presence rule for `options.rails.evm` (kept as separate fields, not merged into the EVM
+   *  ones, so a sweep configuring only one of the two rails reports exactly that rail's own
+   *  counts, and a sweep configuring both never conflates the two). */
+  btcChainReads?: number;
+  btcChainReadsSkipped?: ChainReadSkip[];
   swapsByStatus?: Record<string, number>; // board.swaps grouped by status
   swapsWritten: number; // lines appended to swaps.jsonl this sweep (status changes only)
   hitCreated: boolean;
@@ -100,7 +109,16 @@ export interface RunSweepOptions {
    *  files and report are byte-for-byte what they are today — the RPC endpoint is never
    *  touched, no `raw/evm/`/`raw/rpc/`/`rails.json` is written, and `chainReads`/
    *  `chainReadsSkipped` never appear on the report. */
-  rails?: { evm?: EvmRailConfig };
+  /** P4-BTC-SPEC.md §7: the `btc-htlc` twin of `rails.evm` above — same absence rule (no
+   *  `btc-htlc` chain read, no `raw/btc/`/rewritten `rails.json` entry, no `btcChainReads`
+   *  field on the report). */
+  rails?: { evm?: EvmRailConfig; btc?: BtcRailConfig };
+  /** P4-BTC-SPEC.md §1/§4/§7: the bitcoind RPC's own HTTP auth headers (the node's cookie),
+   *  supplied out of band by the caller (`bin/watch.mjs`'s `--btc-rpc-cookie` reads the file and
+   *  builds this) and read fresh on every call — never persisted anywhere this sweep writes
+   *  (not `rails.json`, not a capture index, not this report). Required for `rails.btc` reads to
+   *  succeed against a real cookie-authenticated node; ignored when `rails.btc` is absent. */
+  btcRpcHeaders?: () => Record<string, string>;
 }
 
 const DEFAULT_BASE_URL = "https://technocore.chat";
@@ -153,6 +171,12 @@ function underRoot(root: string, ...segments: string[]): string {
 // validation, but a path built from network-derived text gets its own belt-and-suspenders
 // check anyway (same convention as SWAP_ID_SHAPE below).
 const HASH_LOCK_SHAPE = /^0x[0-9a-f]{64}$/;
+
+// P4-BTC-SPEC.md §7: same defense-in-depth purpose as HASH_LOCK_SHAPE above, for the
+// `raw/btc/<txid>-<vout>/` path segment below — a `btc-htlc` lock's own `ref` is already
+// grammar-checked by tclk's frame validation, but a path built from network-derived text gets
+// its own belt-and-suspenders check anyway.
+const BTC_REF_SHAPE = /^[0-9a-f]{64}:[0-9]+$/;
 
 async function writeFileAtomic(path: string, data: string | Uint8Array): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
@@ -365,6 +389,17 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
       return report;
     }
   }
+  // P4-BTC-SPEC.md §7: the same A3 rule for `rails.btc` — validated before this sweep does
+  // anything at all, right alongside the evm check above.
+  const btcConfig = options.rails?.btc;
+  if (btcConfig !== undefined) {
+    const check = checkBtcRailConfig(btcConfig);
+    if (!check.ok) {
+      report.railsConfigError = check.reason;
+      notes.push(`rails.btc config is invalid, sweep aborted: ${check.reason}`);
+      return report;
+    }
+  }
 
   // Step 1: fetch and persist the offer-room export, byte-exact, before any parsing.
   const exportUrl = `${baseUrl}/r/${OFFER_ROOM}/export`;
@@ -509,15 +544,25 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   // (A3) before Step 1 ran — which is what keeps a by-default sweep's network calls, files and
   // report byte-for-byte what they were before this option existed.
   const chainCaptures = new Map<string, EvmCapture>();
+  const btcChainCaptures = new Map<string, BtcCapture>();
 
-  if (evmConfig !== undefined) {
-    // The pinned config (endpoint included; nothing secret ever lives in an EvmRailConfig) —
-    // written once per sweep, atomically, and only rewritten when it actually changed.
+  if (evmConfig !== undefined || btcConfig !== undefined) {
+    // The pinned config(s) (endpoints included; nothing secret ever lives in an EvmRailConfig
+    // or a BtcRailConfig — the bitcoind RPC cookie is `options.btcRpcHeaders`, never written
+    // here) — written once per sweep, atomically, and only rewritten when it actually changed.
+    // Key order (evm first, then btc) keeps an evm-only sweep's `rails.json` byte-for-byte what
+    // it always was.
     const railsPath = underRoot(root, "rails.json");
-    const railsJson = `${JSON.stringify({ evm: evmConfig }, null, 2)}\n`;
+    const railsJson = `${JSON.stringify(
+      { ...(evmConfig === undefined ? {} : { evm: evmConfig }), ...(btcConfig === undefined ? {} : { btc: btcConfig }) },
+      null,
+      2,
+    )}\n`;
     const existingRailsJson = await readFile(railsPath, "utf8").catch(() => null);
     if (existingRailsJson !== railsJson) await writeFileAtomic(railsPath, railsJson);
+  }
 
+  if (evmConfig !== undefined) {
     report.chainReads = 0;
     report.chainReadsSkipped = [];
     // A9: the same timeoutMs this sweep uses for every other fetch, so a stalled RPC endpoint
@@ -575,15 +620,78 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
     }
   }
 
+  // Step 2.6b (P4-BTC-SPEC.md §7): the `btc-htlc` twin of Step 2.6 above — same A6 dispatch
+  // (the tclk machine's own accepted lock, not the first authenticated-looking frame), same
+  // "nothing runs unless the caller configured this rail" rule. Unlike the EVM step, the
+  // captured index is keyed by the funding outpoint (`accepted.railRef`), never a value derived
+  // from `terms` — a Bitcoin outpoint is chosen at fund time, not committed in the offer/accept.
+  if (btcConfig !== undefined) {
+    report.btcChainReads = 0;
+    report.btcChainReadsSkipped = [];
+    // The node's own RPC cookie, supplied out of band (never persisted — see
+    // `RunSweepOptions.btcRpcHeaders`'s own doc) and read fresh on every call by `CapturingRpc`
+    // itself; A9's same per-sweep timeout applies here too.
+    const btcRpc = new CapturingRpc({
+      endpoint: btcConfig.endpoint,
+      fetch: fetchImpl,
+      clock: () => nowMs,
+      timeoutMs,
+      ...(options.btcRpcHeaders === undefined ? {} : { headers: options.btcRpcHeaders }),
+    });
+
+    for (const candidate of cappedCandidates) {
+      const room = roomByContract.get(candidate.contract);
+      if (room === undefined) continue; // deal room wasn't fetched this sweep (404/error)
+      const dealRoomRecords = dealRooms.get(room) ?? [];
+      const accepted = foldAcceptedLock(candidate.offerRecord, candidate.acceptRecord, dealRoomRecords);
+      if (accepted === null || accepted.rail !== BTC_RAIL_ID || !BTC_REF_SHAPE.test(accepted.railRef)) {
+        continue;
+      }
+      const ref = accepted.railRef;
+      const [refTxid, refVoutStr] = ref.split(":");
+      if (refTxid === undefined || refVoutStr === undefined) continue; // unreachable given BTC_REF_SHAPE
+
+      try {
+        // Mirrors F1 (captureEvmLeg): captureBtcLeg never throws for a chain-state reason —
+        // only a genuine transport failure sets `index.error`, and that capture is still
+        // written and fed into this sweep's own live fold, so a later replay's "latest
+        // capture" for this ref is this sweep's own attempt, never a stale earlier success.
+        const { index, exchanges } = await captureBtcLeg(btcRpc, btcConfig, ref, nowMs);
+        await writeCapture(root, exchanges);
+        await writeFileAtomic(
+          underRoot(root, "raw", "btc", `${refTxid}-${refVoutStr}`, `${sweepIso}.json`),
+          `${JSON.stringify(index, null, 2)}\n`,
+        );
+        const bytes = verifiedExchangeBytes(exchanges);
+        btcChainCaptures.set(ref, { index, bytes });
+        if (index.error === undefined) {
+          report.btcChainReads += 1;
+        } else {
+          report.btcChainReadsSkipped.push({ contract: candidate.contract, reason: index.error });
+        }
+      } catch (error) {
+        // The fs-level backstop, not the common case — see the identical comment on the EVM
+        // step above.
+        report.btcChainReadsSkipped.push({
+          contract: candidate.contract,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
   // Step 3: fold the board — the same code path an offline replay uses.
   const board = foldCaptured({
     offers: offerRoomRecords,
     dealRooms,
     notes: capturedNotes,
     chain: chainCaptures,
+    btcChain: btcChainCaptures,
     nowMs,
     board: buildBoard,
-    ...(evmConfig === undefined ? {} : { rails: { evm: evmConfig } }),
+    ...(evmConfig === undefined && btcConfig === undefined
+      ? {}
+      : { rails: { ...(evmConfig === undefined ? {} : { evm: evmConfig }), ...(btcConfig === undefined ? {} : { btc: btcConfig }) } }),
   });
 
   const swapsByStatus: Record<string, number> = {};
