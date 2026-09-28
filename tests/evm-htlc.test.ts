@@ -515,6 +515,7 @@ describe("EvmHtlcRail write path — bounded eth_getLogs -> WriteEvidence", () =
     const notAfterMs = TERMS.refundAfterMs - 5 * 60_000;
     const { rpc, calls } = mockCapturingRpc({
       eth_chainId: () => ({ result: "0x7a69" }),
+      eth_blockNumber: () => ({ result: "0x6" }),
       eth_call: claimAllowedEthCall,
       // The pending block is already at notAfterMs itself.
       eth_getBlockByNumber: () => ({ result: { timestamp: numberToHex(Math.floor(notAfterMs / 1000)) } }),
@@ -525,6 +526,43 @@ describe("EvmHtlcRail write path — bounded eth_getLogs -> WriteEvidence", () =
       /pending chain time .* is at\/after the given deadline/,
     );
     expect(calls.some((call) => call.method === "eth_sendTransaction")).toBe(false);
+  });
+
+  // Main-loop review 2026-09-28 (after P22-P24-EVM-FIXES-R3.md E4): the pending-time guard is
+  // the last read before the claim transaction, and nothing is retried. The round-3 reviewer
+  // showed viem's default transport retries (and a getBlockNumber placed after the guard) could
+  // let a rate-limited endpoint push eth_sendTransaction past refundAfterMs.
+  it("claim(): only the transaction itself follows the last deadline guard, and nothing is retried", async () => {
+    const secret = ("0x" + "cd".repeat(32)) as Hex;
+    const config = configFor(ANVIL_LOCAL_PIN);
+    // Every read after the guard's pending-block read is rate-limited (-32005, which viem's
+    // default transport retries up to three more times). viem itself never retries
+    // eth_sendTransaction, so the observable risk is the chain-id assertion viem makes inside
+    // writeContract: with retries on it is attempted four times after the guard.
+    let guardPassed = false;
+    const rateLimited = { error: { code: -32005, message: "limit exceeded" } };
+    const { rpc, calls } = mockCapturingRpc({
+      eth_chainId: () => (guardPassed ? rateLimited : { result: "0x7a69" }),
+      eth_blockNumber: () => (guardPassed ? rateLimited : { result: "0x6" }),
+      eth_call: claimAllowedEthCall,
+      eth_getBlockByNumber: (params) => {
+        if (params[0] === "pending") guardPassed = true;
+        return pendingBlockHandlers().eth_getBlockByNumber();
+      },
+      eth_sendTransaction: () => rateLimited,
+    });
+    const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+    await expect(rail.claim(TERMS.statement as Hex, secret, TERMS.refundAfterMs)).rejects.toThrow();
+
+    const lastGuard = calls.map((call) => call.method === "eth_getBlockByNumber" && (call.params as unknown[])[0] === "pending").lastIndexOf(true);
+    expect(lastGuard).toBeGreaterThan(-1);
+    const afterGuard = calls.slice(lastGuard + 1).map((call) => call.method);
+    // Nothing but viem's own chain-id assertion and the transaction itself may follow the
+    // guard, and each is a single attempt: the rate-limited chain-id read is not retried, so
+    // the claim fails without ever reaching eth_sendTransaction.
+    expect(afterGuard.filter((method) => method !== "eth_chainId" && method !== "eth_sendTransaction")).toEqual([]);
+    expect(afterGuard.filter((method) => method === "eth_chainId").length).toBeLessThanOrEqual(1);
+    expect(afterGuard.filter((method) => method === "eth_sendTransaction").length).toBeLessThanOrEqual(1);
   });
 
   it("refund() resolves against the Refunded event", async () => {

@@ -2,7 +2,7 @@
 //
 // The desk-facing `evm-htlc` adapter: wraps src/vendor/evm-hash-rail.ts (byte-identical,
 // never edited) and adds what a real deployment needs that the vendored binding doesn't try
-// to be — a chain pin with a mainnet deny list, byte-exact write evidence, and a fail-closed
+// to be — a chain pin with an allow list (anvil-local, base-sepolia), byte-exact write evidence, and a fail-closed
 // finalized-view read shared with the offline replay (src/rails/evm-evidence.ts). Every write
 // goes through a viem `WalletClient` built on a plain address (`createWalletClient({ account:
 // <address>, transport })`, a JSON-RPC account): no private key, mnemonic or seed for any EVM
@@ -427,7 +427,12 @@ export class EvmHtlcRail {
     }
 
     const chain = chainFromPin(options.config.pin);
-    const transport = custom(options.rpc);
+    // Main-loop review 2026-09-28 (after P22-P24-EVM-FIXES-R3.md E4): no transport-level
+    // retries. viem's default (3 retries per request) let a rate-limited endpoint stretch the
+    // gap between claim()'s last deadline guard and the broadcast well past the 5-minute
+    // inclusion margin; with retries off, every request is one attempt bounded by the
+    // CapturingRpc timeout, and every attempt is a single captured exchange.
+    const transport = custom(options.rpc, { retryCount: 0 });
     const publicClient = createPublicClient({ chain, transport });
     const walletClient = createWalletClient({ account: options.account, chain, transport });
 
@@ -565,12 +570,16 @@ export class EvmHtlcRail {
   async claim(hashLock: Hex, secret: Hex, notAfterMs: number): Promise<WriteEvidence> {
     await this.assertPinnedChainId();
     await this.simulateClaimPreChecksOrThrow(hashLock);
-    await this.assertBeforeNotAfterMsOrThrow(notAfterMs);
     const before = this.rpc.exchanges().length;
     // D1: see the identical comment on `approve` above.
     this.rpc.setIdNamespace(`write-claim:${hashLock}:${this.clock()}`);
     try {
       const fromBlock = await this.publicClient.getBlockNumber();
+      // Main-loop review 2026-09-28: the deadline guard is the last read before the claim
+      // transaction itself (only viem's own chain-id assertion and eth_sendTransaction follow,
+      // each a single attempt with retries off), so no slow read can run between the guard
+      // passing and the preimage going out.
+      await this.assertBeforeNotAfterMsOrThrow(notAfterMs);
       await this.rail.claim(hashLock, secret);
       return await this.captureWriteEvidence("Claimed", hashLock, fromBlock, before);
     } finally {
