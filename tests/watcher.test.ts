@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -234,14 +234,20 @@ function makeFetch(router: Router, calls: Array<{ url: string; init: unknown }>)
   }) as typeof fetch;
 }
 
+// `root` lives one level down inside a private `sandbox` so "never writes outside root" can
+// check root's siblings without racing other test files (or anything else on the machine)
+// creating entries directly under the shared system temp dir.
+let sandbox: string;
 let root: string;
 
 beforeEach(async () => {
-  root = await mkdtemp(join(tmpdir(), "swap-desk-watcher-"));
+  sandbox = await mkdtemp(join(tmpdir(), "swap-desk-watcher-"));
+  root = join(sandbox, "root");
+  await mkdir(root);
 });
 
 afterEach(async () => {
-  await rm(root, { recursive: true, force: true });
+  await rm(sandbox, { recursive: true, force: true });
 });
 
 function baseOptions(overrides: Partial<RunSweepOptions> = {}): Omit<RunSweepOptions, "fetch"> {
@@ -511,14 +517,11 @@ describe("runSweep", () => {
       return { status: 200, body: dealRoomBody([]) };
     }, []);
 
-    const beforeSiblings = await readdir(tmpdir());
+    expect(await readdir(sandbox)).toEqual(["root"]);
     await runSweep({ ...baseOptions(), fetch: fetchImpl });
-    const afterSiblings = await readdir(tmpdir());
 
-    // The only new top-level entry under the system temp dir is `root` itself (created by
-    // mkdtemp before the sweep ran) — nothing new appeared beside it.
-    const newEntries = afterSiblings.filter((e) => !beforeSiblings.includes(e));
-    expect(newEntries).toEqual([]);
+    // `root` is still the only entry in its private parent — nothing appeared beside it.
+    expect(await readdir(sandbox)).toEqual(["root"]);
     expect(existsSync(join(root, "board.json"))).toBe(true);
   });
 
