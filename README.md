@@ -76,6 +76,49 @@ node examples/audit-export.mjs --root fixtures/rehearsal-2026-09-18 \
   --expect 0xb0fa70a3c2a914134967fa423ae3295c2e35b6c3dfd6d461fb7a17fef2430d46=settled
 ```
 
+## EVM leg (local, keyless)
+
+`src/rails/evm-htlc.ts` binds the vendored `EvmHashRail` (`src/vendor/evm-hash-rail.ts`,
+`contracts/EvmHashRail.sol`) into a desk rail with a chain pin (a mainnet deny list refuses
+Ethereum/Base/Optimism/Arbitrum/Polygon/BNB/Avalanche mainnet by name even if someone pins
+them), byte-exact JSON-RPC capture (`src/rails/rpc-capture.ts`) so every verdict can be
+re-derived from the exact bytes it rested on, and a fail-closed finalized-view read
+(`src/rails/evm-evidence.ts`) shared between the live path and the offline replay. `src/client/`
+(`venue.ts`, `seller.ts`, `buyer.ts`, `bundle.ts`) drives both parties of one swap end to end —
+the counter-asset leg on `evm-htlc`, the FLOP leg on tclk's own `paper` rail (there is still no
+real FLOP chain adapter) — against a real, local `anvil` node, with the D-08 account-line
+exchange (`src/rails/account-line.ts`) in between.
+
+Run it:
+
+```bash
+npm run test:anvil
+```
+
+This builds `dist/` and the contracts, then spawns a real `anvil` node (found via `ANVIL_BIN`,
+`%USERPROFILE%\.foundry\bin\anvil`, or PATH — see `tests-anvil/helpers/anvil.ts`) and drives
+`tests-anvil/evm-htlc.anvil.test.ts` (the adapter alone: chain-pin refusal, approve+lock,
+`verifyLockFinal` before/after finality, claim, refund, `findClaimedPreimage`) and
+`tests-anvil/client-flows.anvil.test.ts` (the Seller/Buyer flows end to end: the happy path to
+`settled`; both refund paths, `refunded` and `refunded-b`; a claim refused before
+`verifyLockFinal(A)` is `true` and allowed two blocks later; the Buyer learning the secret from
+the on-chain `Claimed` log alone when the Seller never posts a reveal frame). `npm test` never
+spawns `anvil` — a missing binary fails `test:anvil` loudly instead.
+
+**Keyless throughout (D-10):** no private key, mnemonic, or seed for any EVM account exists
+anywhere in this build — writes go out as JSON-RPC accounts (`eth_sendTransaction` from one of
+anvil's own unlocked addresses) via a plain-address viem `WalletClient`. tclk's Ed25519 test
+identities (`tests/helpers/identity.ts`) sign the deal-room transcript; they are not wallet keys.
+
+**What this proves, and what it does not.** The three committed fixtures
+(`fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b}/`, replayed hermetically by
+`tests/evm-anvil-fixtures.test.ts`) show a real ERC20 escrowed, claimed or refunded on a real
+EVM contract, with every verdict re-derivable from the exact captured RPC bytes — but on
+`anvil-local` (chain id `31337`), an ephemeral node this repo itself starts and stops, never a
+real network, and never with mainnet value at any point in this build (D-09/D-10). The
+Base Sepolia deploy (P2.5) — a real testnet, a real key loaded from env and never printed, the
+account lines exchanged for real — is Dave's own G1 step and is not built here.
+
 ## What this is not
 
 No AMM, no pool, no custody, no relayer (yellow paper R10.4's allowlisted relayer is

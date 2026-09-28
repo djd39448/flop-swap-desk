@@ -54,6 +54,31 @@ Derived from `contracts/EvmHashRail.sol` above (source blob
 contract's own header comment. `refund` and `lock` are identical to upstream. Not vendored from
 anywhere upstream — this file and `test/EvmHashRailFee.t.sol` are new, written for this repo.
 
+## First-party EVM-leg files (P22-P24-EVM-SPEC.md) — unaudited, testnet-only
+
+Not vendored — original to this repo, written for the local/keyless EVM leg
+(`handoff/P22-P24-EVM-SPEC.md`). Listed here per that spec's own instruction, not because
+anything below reuses outside code: **unaudited, testnet-only**, same as the vendored contracts
+above — none of it has been reviewed for a real deployment, and no deployment this repo drives
+today carries mainnet value (D-09/D-10: a mainnet chain-id deny list, no private key anywhere).
+
+- `src/rails/rpc-capture.ts` — byte-exact JSON-RPC capture (§2.1).
+- `src/rails/evm-htlc.ts` — the desk-facing `evm-htlc` adapter over the vendored binding, chain
+  pin, mainnet deny list, write evidence (§2.2).
+- `src/rails/evm-evidence.ts` — the pure, fail-closed finalized-view evidence decoder shared by
+  the live rail and the offline replay (§2.2 point 3, §4).
+- `src/rails/account-line.ts` — the D-08 account-line grammar and `resolveAccounts` (§3).
+- `src/client/venue.ts` — the `Venue`/`MemoryVenue` abstraction the client flows post through
+  (§6).
+- `src/client/seller.ts`, `src/client/buyer.ts` — the Seller/Buyer step functions (§6).
+- `src/client/bundle.ts` — the watch-root-shaped evidence bundle writer `examples/audit-export.
+  mjs` replays unmodified (§6).
+
+`fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b}/` are also first-party: real
+capture bytes from a real, local, ephemeral `anvil` node this repo itself starts and stops
+(`tests-anvil/client-flows.anvil.test.ts`) — not from any external service, and containing no
+private key material (nothing in this build holds one to begin with).
+
 ## Settlement-view vocabulary — pinned to tclk PR #173
 
 `none | unverified | unfunded | funded | claimed | refunded` (per-leg `SwapView.settlementView`,
