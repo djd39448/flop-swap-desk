@@ -85,11 +85,11 @@ import {
 
 import { checkSwapDeadlines } from "../deadlines.js";
 import { checkOrientation, classifySwapOffer, legBContext } from "../profile.js";
+import { EVM_RAIL_ID } from "../rails/evm-evidence.js";
 import type { Exchange } from "../rails/rpc-capture.js";
-import { findAuthenticatedLock } from "../replay.js";
+import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
 import { offerAcceptLockTerms } from "../swap.js";
-import type { CounterAssetRail, RailWriteEvidence } from "./counter-rail.js";
-import { EVM_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
+import { belowMinLockable, type CounterAssetRail, type RailAccounts, type RailWriteEvidence } from "./counter-rail.js";
 import type { Signer, Venue } from "./venue.js";
 
 export interface SellerFlowOptions {
@@ -103,10 +103,6 @@ export interface SellerFlowOptions {
    *  `src/client/btc-rail.ts`'s `createBtcCounterRail`. This Seller only ever claims or refunds
    *  through it; only the Buyer ever locks. */
   rail: CounterAssetRail;
-  /** The deadline policy every `checkSwapDeadlines`/margin guard in this flow checks against —
-   *  `EVM_LOCAL_POLICY` when omitted (see `BuyerFlowOptions.policy`'s identical doc); a
-   *  `btc-htlc` rail is paired with `BTC_LOCAL_POLICY`. */
-  policy?: RailLocalPolicy;
   /** Wall-clock ms, injected — never `Date.now()` inside this class (house rule). */
   clock: () => number;
 }
@@ -145,11 +141,24 @@ export class SellerFlow {
   private readonly venue: Venue;
   private readonly paperRail: PaperRail;
   private readonly rail: CounterAssetRail;
-  private readonly policy: RailLocalPolicy;
   private readonly clock: () => number;
 
   private offerA?: OfferFrame;
   private acceptA?: AcceptFrame;
+  /** P4-BTC-FIXES.md G1/G8: the actual signed records leg A's offer/accept arrived as —
+   *  captured once, in `acceptLegA`, so `claimLegA` can later fold this leg's own transcript
+   *  (`foldAcceptedLock`) to learn the lock rail/ref the tclk contract machine actually
+   *  *accepted*, and the venue `seq` it was accepted at, without ever re-deriving them from a
+   *  bare, caller-supplied frame. `undefined` only when a caller bypassed `acceptLegA` entirely
+   *  (a test harness injecting state directly) — `claimLegA` falls back to the pre-G8 behaviour
+   *  in that case. */
+  private offerARecord?: TranscriptRecord;
+  private acceptARecord?: TranscriptRecord;
+  /** P4-BTC-FIXES.md G1: this leg's resolved payer/payee identities and the rail ref
+   *  `claimLegA` actually claimed with, frozen the first time `verifyLockFinal` returns `true` —
+   *  a pubkey/account line posted after that point can neither help nor hinder a later call. */
+  private frozenLegAAccounts?: RailAccounts;
+  private frozenLegARailRef?: string;
   private offerB?: OfferFrame;
   private hashLock?: HashLock;
   private lockedLegBContract?: string;
@@ -181,7 +190,6 @@ export class SellerFlow {
     this.venue = options.venue;
     this.paperRail = options.paperRail;
     this.rail = options.rail;
-    this.policy = options.policy ?? EVM_LOCAL_POLICY;
     this.clock = options.clock;
   }
 
@@ -232,11 +240,21 @@ export class SellerFlow {
       throw new Error(`seller: refusing to accept an unsafe leg A offer: ${orientation.reason}`);
     }
 
+    // P4-BTC-FIXES.md G6: refuse an amount this rail could never actually lock (below the fixed
+    // spend fee plus the worst-case dust limit, with margin) before ever minting a statement or
+    // posting anything for it.
+    if (belowMinLockable(this.rail, offerA.amount)) {
+      throw new Error(
+        `seller: refusing to accept leg A — ${offerA.amount} ${offerA.asset} is below this rail's minimum lockable amount ` +
+          `${this.rail.minLockableAmount} (G6)`,
+      );
+    }
+
     const inclusionWindowMs = offerA.refundAfterMs - offerA.claimByMs;
-    if (inclusionWindowMs < this.policy.claimInclusionMarginMs) {
+    if (inclusionWindowMs < this.rail.policy.claimInclusionMarginMs) {
       throw new Error(
         `seller: refusing to accept leg A — its claimByMs..refundAfterMs window (${inclusionWindowMs} ms) is ` +
-          `below the EVM claim-inclusion margin (${this.policy.claimInclusionMarginMs} ms) (B2)`,
+          `below the EVM claim-inclusion margin (${this.rail.policy.claimInclusionMarginMs} ms) (B2)`,
       );
     }
 
@@ -265,7 +283,7 @@ export class SellerFlow {
     // B2: the pair this Seller is about to propose, checked before anything is posted — a
     // runner that got `legB`'s deadlines wrong should not be able to make this flow commit to
     // a hash statement (and a public offer B) that the Buyer's own check would refuse anyway.
-    const deadlineCheck = checkSwapDeadlines(offerA, offerB, lockTimeMs, this.policy);
+    const deadlineCheck = checkSwapDeadlines(offerA, offerB, lockTimeMs, this.rail.policy);
     if (!deadlineCheck.ok) {
       throw new Error(
         `seller: refusing to accept leg A — the leg B deadlines it would propose are unsafe: ${deadlineCheck.violations.join("; ")}`,
@@ -275,13 +293,41 @@ export class SellerFlow {
     const acceptARecord = await this.venue.post("tclk-offers", encodeFrame(acceptA), this.identity);
     const offerBRecord = await this.venue.post("tclk-offers", encodeFrame(offerB), this.identity);
 
+    // P4-BTC-FIXES.md G1/G8: capture the actual signed record leg A's own offer arrived as, so
+    // `claimLegA` can later fold this leg's real transcript (`foldAcceptedLock`) instead of
+    // re-deriving facts from the bare `offerA` frame this method was handed. Best-effort: `null`
+    // only if the offer genuinely never reached `tclk-offers` under this exact id (a caller that
+    // handed this method a frame that was never actually posted) — `claimLegA` falls back to its
+    // pre-G8 behaviour in that case, so this can never make an otherwise-working flow throw here.
+    const offerARecord = await this.findOfferRecord(offerA.id);
+
     // Only now, after both posts succeeded, does this flow consider leg A accepted — a post
     // failure must not leave `this.hashLock` set with nothing on the venue to back it.
     this.offerA = offerA;
     this.acceptA = acceptA;
     this.hashLock = hashLock;
     this.offerB = offerB;
+    if (offerARecord !== null) {
+      this.offerARecord = offerARecord;
+      this.acceptARecord = acceptARecord;
+    }
     return { acceptA, acceptARecord, offerB, offerBRecord };
+  }
+
+  /** P4-BTC-FIXES.md G1/G8: find the authenticated `tclk-offers` record for the offer named
+   *  `offerId` — the Buyer's own original, signed post, never re-derived from the bare frame a
+   *  caller handed `acceptLegA`. `null` when no such authenticated record exists (never thrown:
+   *  the caller falls back to the pre-G8 behaviour in that case). */
+  private async findOfferRecord(offerId: string): Promise<TranscriptRecord | null> {
+    const offerRoomRecords = await this.venue.read(OFFER_ROOM);
+    for (const candidate of offerRoomRecords) {
+      if (candidate.room !== OFFER_ROOM || !verifyTranscriptRecord(candidate).ok) continue;
+      const frame = tryDecodeFrame(candidate.line);
+      if (frame !== null && frame.type === "offer" && frame.from === candidate.sender && frame.id === offerId) {
+        return candidate;
+      }
+    }
+    return null;
   }
 
   /** Post this Seller's own leg-A account/key line (D-08) into leg A's deal room, as the payee
@@ -428,12 +474,53 @@ export class SellerFlow {
     }
 
     const termsA = offerAcceptLockTerms(offerA, acceptA);
-    const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
-    const accounts = this.rail.resolveAccounts(dealRoomARecords, {
-      contract: acceptA.contract,
-      payerDid: termsA.payer,
-      payeeDid: termsA.payee,
-    });
+
+    // P4-BTC-FIXES.md G1: once this leg's lock has verified, its resolved accounts and railRef
+    // are frozen permanently — a later call (only reachable when an earlier one threw before
+    // ever verifying, e.g. before enough confirmations existed) reuses them rather than ever
+    // re-reading the deal room, so a pubkey/account line posted meanwhile can neither help nor
+    // hinder this call.
+    let accounts: RailAccounts;
+    let railRef: string;
+    if (this.frozenLegAAccounts !== undefined && this.frozenLegARailRef !== undefined) {
+      accounts = this.frozenLegAAccounts;
+      railRef = this.frozenLegARailRef;
+    } else {
+      const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
+
+      // P4-BTC-FIXES.md G8: the lock rail/ref the tclk contract machine actually *accepted* for
+      // this leg — never merely the first authenticated-looking payer frame
+      // `findAuthenticatedLock` would find — and, alongside it, the venue seq it was accepted at
+      // (G1: bounds the pubkey/account-line resolution below to lines posted strictly before
+      // that point, so a line posted after the Buyer's lock can neither newly resolve nor
+      // conflict-and-unresolve a party's identity for this, necessarily-later, resolution).
+      const accepted =
+        this.offerARecord !== undefined && this.acceptARecord !== undefined
+          ? foldAcceptedLock(this.offerARecord, this.acceptARecord, dealRoomARecords)
+          : null;
+      // Fallback for a caller that bypassed `acceptLegA` (this flow never captured the offer's
+      // own record) — the pre-G8 check, unchanged.
+      const legacyLockFrame = accepted === null ? findAuthenticatedLock(dealRoomARecords, acceptA.contract, termsA.payer) : null;
+
+      if (accepted !== null && accepted.rail === this.rail.railId) {
+        // For EVM the rail ref IS the hashLock this Seller already knows authoritatively — never
+        // trust the frame's own copy of it, even though the two must agree (G8: "for EVM it
+        // keeps its own hashLock"). For every other rail (btc-htlc: a funding outpoint this
+        // Seller has no other way to learn) the frame's own accepted ref is the only source.
+        railRef = this.rail.railId === EVM_RAIL_ID ? hashLockHex : accepted.railRef;
+      } else if (legacyLockFrame !== null && legacyLockFrame.rail === this.rail.railId) {
+        railRef = legacyLockFrame.ref;
+      } else {
+        railRef = hashLockHex;
+      }
+
+      accounts = this.rail.resolveAccounts(dealRoomARecords, {
+        contract: acceptA.contract,
+        payerDid: termsA.payer,
+        payeeDid: termsA.payee,
+        ...(accepted !== null ? { beforeSeq: accepted.seq } : {}),
+      });
+    }
 
     const connected = await this.rail.connect(termsA, accounts);
 
@@ -452,28 +539,26 @@ export class SellerFlow {
     if (chainNow >= offerA.claimByMs) {
       throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time) (B2/C3)");
     }
-    if (offerA.refundAfterMs - chainNow < this.policy.claimInclusionMarginMs) {
+    if (offerA.refundAfterMs - chainNow < this.rail.policy.claimInclusionMarginMs) {
       throw new Error(
         `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
-          `(${this.policy.claimInclusionMarginMs} ms) remains before refundAfterMs (chain time) (B2/C3)`,
+          `(${this.rail.policy.claimInclusionMarginMs} ms) remains before refundAfterMs (chain time) (B2/C3)`,
       );
     }
-
-    // P4-BTC-SPEC.md §7a: the rail's own write ref for this leg's lock — the Buyer's outpoint
-    // for btc-htlc, the hashLock itself for evm-htlc (where the two happen to coincide, which is
-    // why `hashLockHex` alone used to double as both, and remains the fallback below). Read from
-    // the Buyer's own authenticated lock frame in leg A's deal room when one exists; a leg whose
-    // rail's ref is always the hashLock (evm-htlc — verified on-chain by `verifyLockFinal` alone,
-    // never by trusting this frame) has no need of one, so its absence is never itself a refusal
-    // here — only `verifyLockFinal`/`claim` below can fail this claim closed.
-    const lockFrame = findAuthenticatedLock(dealRoomARecords, acceptA.contract, termsA.payer);
-    const railRef = lockFrame !== null && lockFrame.rail === this.rail.railId ? lockFrame.ref : hashLockHex;
 
     const evidence = await connected.verifyLockFinal(termsA, railRef, accounts);
     if (evidence.lock.railVerified !== true) {
       throw new Error(
         `seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): ${evidence.lock.reason ?? "unverified"}`,
       );
+    }
+
+    // P4-BTC-FIXES.md G1: freeze the accounts/railRef this call resolved, now that the lock has
+    // verified for the first time — a later call (from a runner retrying after some other
+    // failure below) must never re-resolve them.
+    if (this.frozenLegAAccounts === undefined) {
+      this.frozenLegAAccounts = accounts;
+      this.frozenLegARailRef = railRef;
     }
 
     // P22-P24-EVM-FIXES-R3.md E4: `verifyLockFinal` can itself take a long time (a slow or
@@ -486,10 +571,10 @@ export class SellerFlow {
     if (chainNowAfterVerify >= offerA.claimByMs) {
       throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time, re-checked after verifyLockFinal) (E4)");
     }
-    if (offerA.refundAfterMs - chainNowAfterVerify < this.policy.claimInclusionMarginMs) {
+    if (offerA.refundAfterMs - chainNowAfterVerify < this.rail.policy.claimInclusionMarginMs) {
       throw new Error(
         `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
-          `(${this.policy.claimInclusionMarginMs} ms) remains before refundAfterMs ` +
+          `(${this.rail.policy.claimInclusionMarginMs} ms) remains before refundAfterMs ` +
           `(chain time, re-checked after verifyLockFinal) (E4)`,
       );
     }
@@ -497,7 +582,7 @@ export class SellerFlow {
     // E4: the leg-A rail's own `claim` re-checks this same bound once more, against its own
     // freshly-read chain time, immediately before it actually broadcasts (defense in depth
     // against however long its own preimage-free pre-checks (E5) themselves take).
-    const notAfterMs = offerA.refundAfterMs - this.policy.claimInclusionMarginMs;
+    const notAfterMs = offerA.refundAfterMs - this.rail.policy.claimInclusionMarginMs;
     const before = connected.exchanges.length;
     const writeEvidence = await connected.claim(railRef, this.hashLock.preimage, notAfterMs);
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
