@@ -728,6 +728,24 @@ export async function captureEvmLeg(
   return finish(finalityRecord, chainId);
 }
 
+/** P22-P24-EVM-FIXES.md B5: just the finalized-view identifier a capture resolves to — the
+ *  same string `evmEvidence`'s `LockEvidence.finalizedRef` carries, computed the identical way
+ *  (`resolveFinalizedBlock`, under the capture's own frozen config per A4), but without
+ *  needing a particular lock's `LockTerms`/`EvmAccounts` to check anything against. Used by
+ *  `src/client/bundle.ts` to fill `BundleEvidenceSummary.finalizedRefs` from the capture it
+ *  just wrote. `null` for the same reasons `evmEvidence` would report `railVerified: null` for
+ *  the finalized view itself (no usable config, a chain id that disagrees, the RPC lacking the
+ *  finalized tag with no fallback, …). */
+export function captureFinalizedRef(config: EvmRailConfig, capture: EvmCapture): string | null {
+  const capturedConfig = looksLikeEvmRailConfig(capture.index.config) ? capture.index.config : config;
+  if (capturedConfig.pin.chainId !== config.pin.chainId || !isAddressEqual(capturedConfig.contract, config.contract)) {
+    return null;
+  }
+  const finalized = resolveFinalizedBlock(capturedConfig, capture);
+  if (!finalized.ok) return null;
+  return `${config.pin.name}:${finalized.finalityLabel}:${finalized.number}:${finalized.hash}`;
+}
+
 const SHA256_HEX_LOWER = /^[0-9a-f]{64}$/;
 
 /** P22-P24-EVM-FIXES.md A5: whether a parsed `raw/evm/<hashLock>/*.json` file actually looks

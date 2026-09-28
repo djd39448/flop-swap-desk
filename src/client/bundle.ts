@@ -12,20 +12,34 @@
 // Also writes `evidence/<swapId>.json`, an E.48-shaped human/audit summary (not read by
 // `audit-export.mjs` — it consumes `raw/` and `rails.json` only) naming both legs' contracts
 // and rails, every on-chain `WriteEvidence` this swap produced, each final `finalizedRef`, the
-// raw sha256s behind them, timestamps, `feeBps`, and the final board status the runner already
-// knows (this module does not fold anything itself — no network, no clock of its own beyond
-// `input.nowMs`, which the caller supplies).
+// raw sha256s behind them, timestamps, `feeBps`, and the board status.
 //
-// Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6.
+// P22-P24-EVM-FIXES.md B5 ("the evidence summary is verifiable"): three things this module used
+// to get wrong. (1) A write's own `Exchange`s (`SellerFlow`/`BuyerFlow`'s `.exchanges`, the raw
+// bytes behind `WriteEvidence.raw`) were never persisted here, so a sha256 in the summary's
+// `writes[]` could name a hash with no file at `raw/rpc/<sha256>.json` for a fresh reader to
+// check — `writeExchanges` (below) fixes that. (2) `finalizedRefs` was whatever the caller
+// happened to pass (the anvil test always passed `[]`); this module now fills it itself, from
+// the EVM capture it just wrote (`captureFinalizedRef`) and each paper note's own ref (the same
+// `paper:sha256:<hash>` format `src/paper-evidence.ts`'s `paperEvidence` computes). (3) `status`
+// was likewise whatever the caller asserted; this module now derives it by folding the exact
+// bytes it just wrote (`foldCaptured`, the same pure fold the live watcher and
+// `examples/audit-export.mjs` use) — a bundle's own evidence summary can no longer disagree
+// with what a replay of that same bundle would find.
+//
+// Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B5.
 
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { OFFER_ROOM, paperNote, type TranscriptRecord } from "@flop-labs/tclk";
 
-import { captureEvmLeg } from "../rails/evm-evidence.js";
+import { foldCaptured, type CapturedNote } from "../replay.js";
+import { captureEvmLeg, captureFinalizedRef, type EvmCapture } from "../rails/evm-evidence.js";
 import type { EvmRailConfig } from "../rails/evm-htlc.js";
-import { writeCapture, type CapturingRpc } from "../rails/rpc-capture.js";
+import { writeCapture, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 
 /** The exact banner text `stripNoteBanner` (src/paper-evidence.ts) strips before decoding a
  *  paper note's last non-empty line — copied verbatim from the real
@@ -87,11 +101,14 @@ export interface BundleEvidenceSummary {
   legA: { contract: string; rail: string };
   legB: { contract: string; rail: string };
   feeBps: number;
-  /** The final board status the runner observed (informational only — this module does not
-   *  fold anything itself, so nothing here re-derives or checks it). */
-  status: string;
+  /** P22-P24-EVM-FIXES.md B5: `writeBundle` derives this itself, by folding the exact bytes it
+   *  just wrote (`foldCaptured`) — any value supplied here is ignored and overwritten. Optional
+   *  so a caller need not compute one at all. */
+  status?: string;
   writes: BundleWriteRecord[];
-  finalizedRefs: string[];
+  /** B5: `writeBundle` fills this from the EVM capture it writes (`captureFinalizedRef`) and
+   *  each paper note's own ref — any value supplied here is ignored and overwritten. */
+  finalizedRefs?: string[];
   startedAtMs: number;
   finishedAtMs: number;
 }
@@ -121,6 +138,12 @@ export interface WriteBundleInput {
    *  `MemoryNoteStore.raw(ns, key)`'s return value, already `tclkpaper1 ...`-prefixed) — not
    *  re-encoded here, so a bundle's note is byte-identical to what the shared `NoteStore` holds. */
   paperNotes: ReadonlyMap<string, string>;
+  /** B5: every EVM write this swap's two flows made (`SellerFlow.exchanges` +
+   *  `BuyerFlow.exchanges`, concatenated — order does not matter, `writeCapture` is keyed by
+   *  content hash), so every sha256 named in `evidence.writes[].evidence.raw` resolves to real
+   *  bytes at `raw/rpc/<sha256>.json`. Omitted (or empty) for a swap that made no EVM writes at
+   *  all (SPEC §6 scenario 3: the Buyer never locks). */
+  writeExchanges?: readonly Exchange[];
   evm?: EvmBundleCapture;
   evidence: BundleEvidenceSummary;
 }
@@ -153,21 +176,61 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
     await writeFileAtomic(join(input.root, "raw", room, `${stamp}.json`), `${JSON.stringify(body, null, 1)}\n`);
   }
 
+  // B5: the paper notes this bundle carries, in exactly the two shapes this function needs
+  // them in — the banner-wrapped body `raw/kv/.../*.txt` gets (and `foldCaptured`'s `notes` map
+  // wants, since `paperEvidence` strips the same banner a live `/kv` read would carry), and each
+  // note's own `paper:sha256:<hash>` finalizedRef (the same format `paperEvidence` computes,
+  // over the identical bytes: the raw note line has no banner to strip in the first place).
+  const notesForFold = new Map<string, CapturedNote>();
+  const finalizedRefs: string[] = [];
   for (const [contract, rawLine] of input.paperNotes) {
     const { ns, key } = paperNote(contract);
-    await writeFileAtomic(join(input.root, "raw", "kv", ns, key, `${stamp}.txt`), `${PAPER_NOTE_BANNER}\n\n${rawLine}\n`);
+    const bannered = `${PAPER_NOTE_BANNER}\n\n${rawLine}\n`;
+    await writeFileAtomic(join(input.root, "raw", "kv", ns, key, `${stamp}.txt`), bannered);
+    notesForFold.set(contract, { body: bannered, endpoint: "local-bundle" });
+    finalizedRefs.push(`paper:sha256:${bytesToHex(sha256(new TextEncoder().encode(rawLine)))}`);
   }
 
+  // B5: this write's own raw exchanges (the bytes behind every `WriteEvidence.raw` sha256 the
+  // flows produced) — persisted before the evidence summary that names their hashes, so a
+  // reader who checks the summary against the bundle right after this call finds everything.
+  if (input.writeExchanges !== undefined && input.writeExchanges.length > 0) {
+    await writeCapture(input.root, input.writeExchanges);
+  }
+
+  const chainForFold = new Map<string, EvmCapture>();
+  let evmRailConfig: EvmRailConfig | undefined;
   if (input.evm !== undefined) {
     const { config, rpc, hashLock } = input.evm;
+    evmRailConfig = config;
     await writeFileAtomic(join(input.root, "rails.json"), `${JSON.stringify({ evm: config }, null, 2)}\n`);
     const { index, exchanges } = await captureEvmLeg(rpc, config, hashLock, input.nowMs);
     await writeCapture(input.root, exchanges);
     await writeFileAtomic(join(input.root, "raw", "evm", hashLock, `${stamp}.json`), `${JSON.stringify(index, null, 2)}\n`);
+
+    const bytes = new Map(exchanges.map((exchange) => [exchange.responseSha256, new TextEncoder().encode(exchange.responseBody)]));
+    const capture: EvmCapture = { index, bytes };
+    chainForFold.set(hashLock, capture);
+    const evmRef = captureFinalizedRef(config, capture);
+    if (evmRef !== null) finalizedRefs.push(evmRef);
   }
 
+  // B5: derive `status` by folding the exact bytes this call just wrote — never trust the
+  // caller's own idea of the final status, which could silently drift from what a later
+  // `examples/audit-export.mjs` replay of this same bundle actually finds.
+  const board = foldCaptured({
+    offers: input.offerRoomRecords,
+    dealRooms: input.dealRooms,
+    notes: notesForFold,
+    chain: chainForFold,
+    ...(evmRailConfig === undefined ? {} : { rails: { evm: evmRailConfig } }),
+    nowMs: input.nowMs,
+  });
+  const status = board.swaps.find((swap) => swap.swapId === input.evidence.swapId)?.status ?? "unpaired";
+
+  const evidence: BundleEvidenceSummary = { ...input.evidence, status, finalizedRefs };
   await writeFileAtomic(
-    join(input.root, "evidence", `${input.evidence.swapId}.json`),
-    `${JSON.stringify(input.evidence, jsonReplacer, 2)}\n`,
+    join(input.root, "evidence", `${evidence.swapId}.json`),
+    `${JSON.stringify(evidence, jsonReplacer, 2)}\n`,
   );
 }
