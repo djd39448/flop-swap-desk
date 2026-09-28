@@ -406,12 +406,19 @@ export function foldCaptured(input: FoldCapturedInput): Board {
         // P4-BTC-SPEC.md §6: a P2WSH script commits to BOTH parties' pubkeys, unlike the
         // account line's single-address resolution for evm-htlc — resolved fresh from the same
         // deal room with `resolvePubkeys`, never cached across candidates.
+        //
+        // P4-BTC-FIXES-R2.md R2-3: `beforeSeq: accepted.seq` — the same "only lines posted
+        // before the accepted lock frame" rule the client flows have applied since G1 — so a
+        // pubkey line posted AFTER the lock the tclk machine actually accepted can neither newly
+        // resolve nor conflict-and-unresolve a party's pubkey on replay, exactly as it already
+        // cannot for the live client flows themselves.
         const pubkeys = resolvePubkeys(dealRoomRecords, {
           contract: candidate.contract,
           payerDid: terms.payer,
           payeeDid: terms.payee,
           rail: BTC_RAIL_ID,
           caip2: btcConfigCheck.config.pin.caip2,
+          beforeSeq: accepted.seq,
         });
         // D4-style defense in depth (mirrors the evm-htlc branch above): this call sits inside
         // a loop that folds *every* candidate in one pass, so an unanticipated throw here must
