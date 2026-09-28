@@ -142,6 +142,9 @@ export class BuyerFlow {
    *  line posted after funding can therefore neither add to nor conflict with what this flow
    *  already committed to acting on. */
   private lockedAccounts?: RailAccounts;
+  /** P4-BTC-FIXES-R3.md K5: set once this leg's own `lock` frame has actually posted — see
+   *  `announceLockA`. */
+  private lockFramePosted = false;
   /** G7: the refund's own write evidence, recorded the first time `refundLegA` actually
    *  broadcasts — a later call (made because the first one found the refund not yet confirmed)
    *  must never re-broadcast; it just re-checks. */
@@ -489,13 +492,33 @@ export class BuyerFlow {
     const writeEvidence = await connected.commitLock();
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
 
-    await this.venue.post(
-      dealRoom(acceptA.contract),
-      encodeFrame({ type: "lock", from: this.identity.did, contract: acceptA.contract, rail: this.rail.railId, ref: writeEvidence.ref }),
-      this.identity,
-    );
+    // P4-BTC-FIXES-R3.md K5: posting the lock frame is broken out into its own idempotent method
+    // (`announceLockA`) so `reconcileLockA` can re-post it later if THIS post itself is what fails
+    // (or is lost) — a genuinely-funded outpoint must never stay invisible to tclk's own machine
+    // just because the one frame that would have announced it never landed.
+    await this.announceLockA(acceptA.contract, writeEvidence.ref);
 
     return { hashLock, writeEvidence };
+  }
+
+  /**
+   * P4-BTC-FIXES-R3.md K5: post this leg's own `lock` frame for the recorded outpoint —
+   * idempotent (posts at most once per flow; tclk's own machine would reject a second `lock` for
+   * an already-locked contract anyway, but this flag saves the round trip). Called directly by
+   * `lockLegAUnlatched` right after a successful `commitLock`, and again by `reconcileLockA`
+   * whenever the chain itself already shows the funding landed — so a lost `commitLock` reply, OR
+   * a lock-frame post that itself failed the first time, never leaves a genuinely-funded outpoint
+   * unannounced to tclk's own machine (which would otherwise eventually read as "never locked" and
+   * force the swap toward refunds).
+   */
+  private async announceLockA(contract: string, ref: string): Promise<void> {
+    if (this.lockFramePosted) return;
+    await this.venue.post(
+      dealRoom(contract),
+      encodeFrame({ type: "lock", from: this.identity.did, contract, rail: this.rail.railId, ref }),
+      this.identity,
+    );
+    this.lockFramePosted = true;
   }
 
   /**
@@ -505,6 +528,11 @@ export class BuyerFlow {
    * }` when this flow never even got as far as recording a prepared ref (nothing to check yet);
    * a genuine `verifyLockFinal` observation (locked, claimed or refunded) at any point after that
    * reports `{ locked: true }`.
+   *
+   * P4-BTC-FIXES-R3.md K5: whenever the chain itself already shows the funding landed, this also
+   * (re-)announces it (`announceLockA`) — a lost `commitLock` reply, or a lock-frame post that
+   * itself failed, must not force the swap toward refunds just because tclk's own machine never
+   * saw the `lock` frame despite the money genuinely being on chain.
    */
   async reconcileLockA(): Promise<{ locked: boolean }> {
     if (!this.legALockAttempted) {
@@ -517,7 +545,11 @@ export class BuyerFlow {
     const termsA = offerAcceptLockTerms(offerA, acceptA);
     const connected = await this.rail.connect(termsA, this.lockedAccounts);
     const evidence = await connected.verifyLockFinal(termsA, this.lockedRailRef, this.lockedAccounts);
-    return { locked: evidence.rail !== undefined };
+    const locked = evidence.rail !== undefined;
+    if (locked) {
+      await this.announceLockA(acceptA.contract, this.lockedRailRef);
+    }
+    return { locked };
   }
 
   /** Learn the secret from the Seller's signed `reveal` frame when it posted one, or (SPEC

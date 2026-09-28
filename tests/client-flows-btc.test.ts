@@ -16,12 +16,12 @@
 //
 // Design source: flop-contrib/handoff/P4-BTC-FIXES.md G2, G5, G6, G7, G9.
 
-import { dealRoom, MemoryNoteStore, PaperRail } from "@flop-labs/tclk";
+import { dealRoom, MemoryNoteStore, PaperRail, tryDecodeFrame, type TranscriptRecord } from "@flop-labs/tclk";
 import { describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
 import { SellerFlow } from "../src/client/seller.js";
-import { MemoryVenue } from "../src/client/venue.js";
+import { MemoryVenue, type Signer, type Venue } from "../src/client/venue.js";
 import { BTC_LOCAL_POLICY } from "../src/client/policy.js";
 import type {
   ConnectedCounterAssetRail,
@@ -404,6 +404,84 @@ describe("G2 — one funding per swap", () => {
     const h = harness(new FakeCounterAssetRail({}), new FakeCounterAssetRail({}));
     await pairLockBAndAccountLines(h);
     await expect(h.buyerFlow.reconcileLockA()).rejects.toThrow(/leg A lock was never attempted/);
+  });
+});
+
+// ── K5: a recorded funding can be announced ─────────────────────────────────────────────────
+
+/** A `Venue` wrapper that throws once, the first time a posted `line` matches `shouldFail` —
+ *  simulates a lock-frame post that itself fails (a dropped ack, a venue-side error) even though
+ *  the underlying write it is announcing genuinely landed. */
+class FailOnceVenue implements Venue {
+  private failed = false;
+  constructor(
+    private readonly inner: Venue,
+    private readonly shouldFail: (line: string) => boolean,
+  ) {}
+  async post(room: string, line: string, signer: Signer): Promise<TranscriptRecord> {
+    if (!this.failed && this.shouldFail(line)) {
+      this.failed = true;
+      throw new Error("FailOnceVenue: simulated failed post");
+    }
+    return this.inner.post(room, line, signer);
+  }
+  async read(room: string): Promise<readonly TranscriptRecord[]> {
+    return this.inner.read(room);
+  }
+}
+
+function lockFramesIn(records: readonly TranscriptRecord[]): TranscriptRecord[] {
+  return records.filter((record) => tryDecodeFrame(record.line)?.type === "lock");
+}
+
+describe("K5 — a recorded funding can be announced", () => {
+  it("reconcileLockA posts the lock frame once the chain confirms it, when lockLegA's own post of it failed", async () => {
+    const buyer = ident(1);
+    const seller = ident(2);
+    const clockRef = { ms: T0 };
+    const clock = () => clockRef.ms;
+    const innerVenue = new MemoryVenue(clock);
+    // Leg A's own lock frame carries `"type":"lock"` AND this leg's own outpoint `ref` (`REF`);
+    // leg B's paper-rail lock frame also says `"type":"lock"` but never names this outpoint, so
+    // only leg A's own post ever fails.
+    const venue = new FailOnceVenue(innerVenue, (line) => line.includes('"type":"lock"') && line.includes(REF));
+    const noteStore = new MemoryNoteStore();
+    const rail = new FakeCounterAssetRail({
+      currentBlockMarker: async () => 0,
+      prepareLock: async () => ({ ref: REF }),
+      commitLock: async () => ({ ref: REF, raw: [] }),
+    });
+    const sellerRail = new FakeCounterAssetRail({});
+    const buyerFlow = new BuyerFlow({ identity: buyer, venue, paperRail: new PaperRail(noteStore, clock), rail, clock });
+    const sellerFlow = new SellerFlow({ identity: seller, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock });
+    // `pairLockBAndAccountLines` only ever reads `h.buyer.did` and the two flows — the cast lets
+    // this test hand it a harness built around `FailOnceVenue` instead of a bare `MemoryVenue`.
+    const h = { buyer, seller, clockRef, clock, buyerFlow, sellerFlow } as unknown as ReturnType<typeof harness>;
+    const { acceptA } = await pairLockBAndAccountLines(h);
+    const dealRoomA = dealRoom(acceptA.contract);
+
+    // The write genuinely lands (commitLock resolves), but announcing it fails — lockLegA itself
+    // must surface that failure rather than swallow it.
+    await expect(buyerFlow.lockLegA()).rejects.toThrow(/simulated failed post/);
+    expect(lockFramesIn(await venue.read(dealRoomA))).toHaveLength(0);
+
+    // The chain now confirms the funding really is there (a real evidence reader would report
+    // this once the outpoint reaches its own required confirmations).
+    (rail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
+      new FakeConnectedRail({
+        verifyLockFinal: async () => ({
+          lock: { rail: "btc-htlc", ref: REF, terms: {} as never, railVerified: true, checkedAtMs: 0 },
+          rail: { status: "locked", final: true, checkedAtMs: 0 },
+        }),
+      });
+
+    const reconciled = await buyerFlow.reconcileLockA();
+    expect(reconciled.locked).toBe(true);
+    expect(lockFramesIn(await venue.read(dealRoomA))).toHaveLength(1);
+
+    // Idempotent: a second reconcile (or a runner that calls it defensively) never posts twice.
+    await buyerFlow.reconcileLockA();
+    expect(lockFramesIn(await venue.read(dealRoomA))).toHaveLength(1);
   });
 });
 
