@@ -11,7 +11,14 @@
 // USDC in the asset book (D-09) — this is the local, keyless build; a real key on Base Sepolia
 // is Dave's own G1 step, loaded from env, never printed, and not built here.
 //
-// Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §1, §2.2.
+// P22-P24-EVM-FIXES-R3.md E4/E5: `claim()` now takes a `notAfterMs` bound (enforced against
+// fresh `pending`-block time right before it broadcasts) and no longer hands the real preimage
+// to the RPC endpoint until two preimage-free simulations already prove the lock is open-able
+// and the payout is not blocked — see `claim()`'s and `simulateClaimPreChecksOrThrow`'s own
+// comments below.
+//
+// Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §1, §2.2; P22-P24-EVM-FIXES-R3.md
+// E4, E5.
 
 import {
   createPublicClient,
@@ -318,6 +325,28 @@ const ERC20_APPROVE_ABI = [
   },
 ] as const;
 
+/** P22-P24-EVM-FIXES-R3.md E5(b): the payout `claim()` itself makes internally
+ *  (`IERC20(held.token).transfer(held.payee, held.amount)`) — simulated here, impersonated
+ *  from the rail contract's own address, before the real claim ever sends. */
+const ERC20_TRANSFER_ABI = [
+  {
+    type: "function",
+    name: "transfer",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "to", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
+
+/** E5(a): a zero preimage never opens a real hashLock (sha256 preimage resistance) — simulating
+ *  `claim(hashLock, ZERO_BYTES32)` and requiring the contract's own specific "secret does not
+ *  open the statement" revert proves the lock exists, is `Locked`, and is inside its window,
+ *  without this method ever naming the real secret to do it. */
+const ZERO_BYTES32: Hex = `0x${"00".repeat(32)}`;
+
 /** §2.2 point 2: what one `lock`/`claim`/`refund` write produced, bound to the single
  *  on-chain event it must have emitted. `raw` lists (in call order) the response sha256s of
  *  every exchange that produced this — the block-number read, the write itself, its receipt
@@ -515,12 +544,28 @@ export class EvmHtlcRail {
    * secret"): a claim against a blacklisted (or otherwise refusing) payee still reverts
    * on-chain, but the preimage is already public in the reverted transaction's own calldata the
    * moment it is broadcast — mined or not, the leak already happened. Simulating first
-   * (`eth_call` at `latest`, never a real transaction) means a doomed claim is never sent at
-   * all; any revert cause refuses it, not only a blacklist.
+   * (`eth_call`, never a real transaction) means a doomed claim is never sent at all; any
+   * revert cause refuses it, not only a blacklist.
+   *
+   * P22-P24-EVM-FIXES-R3.md E5: the simulation this used to run here carried the *real* secret
+   * straight to whatever RPC endpoint this rail is configured against — an `eth_call`, never
+   * broadcast, but the endpoint still saw the plaintext preimage on every attempt, successful
+   * or not, before this method had even decided to send anything. `simulateClaimPreChecksOrThrow`
+   * replaces it with two checks that never name the real secret; only once both pass does
+   * `secret` ever reach a wire, and only then to broadcast the one real claim. README.md's EVM
+   * section documents that the claim endpoint DOES see the real preimage at that final,
+   * unavoidable step and must be one the operator trusts.
+   *
+   * P22-P24-EVM-FIXES-R3.md E4: `notAfterMs` (the caller's own `refundAfterMs −
+   * claimInclusionMarginMs`) is enforced again, against fresh chain time, immediately before
+   * the real broadcast — the last guard this method runs, after both pre-checks above have
+   * already spent their own round trips (during which real wall-clock time keeps passing,
+   * exactly what the reviewer's slow-RPC probe exploits).
    */
-  async claim(hashLock: Hex, secret: Hex): Promise<WriteEvidence> {
+  async claim(hashLock: Hex, secret: Hex, notAfterMs: number): Promise<WriteEvidence> {
     await this.assertPinnedChainId();
-    await this.simulateClaimOrThrow(hashLock, secret);
+    await this.simulateClaimPreChecksOrThrow(hashLock);
+    await this.assertBeforeNotAfterMsOrThrow(notAfterMs);
     const before = this.rpc.exchanges().length;
     // D1: see the identical comment on `approve` above.
     this.rpc.setIdNamespace(`write-claim:${hashLock}:${this.clock()}`);
@@ -533,34 +578,103 @@ export class EvmHtlcRail {
     }
   }
 
-  /** `eth_call` the vendored contract's own `claim(hashLock, preimage)` through this rail's
-   *  `walletClient.account` — never broadcasts. Throws (never broadcasts) when the simulation
-   *  reverts, for any reason.
+  /**
+   * P22-P24-EVM-FIXES-R3.md E5: two preimage-free checks, both simulated (`eth_call`, never
+   * broadcast) at the `pending` block (P22-P24-EVM-FIXES-R2.md C3's reasoning applies
+   * identically here — `pending` never reports a time earlier than the one a real broadcast
+   * will actually be evaluated at).
    *
-   *  P22-P24-EVM-FIXES-R2.md C3: judged at the `pending` block, never `latest`. An idle chain's
-   *  `latest` block can lag real time indefinitely — nothing forces a new block just because
-   *  time passes — so simulating against it can see a stale "still within `refundAfterMs`"
-   *  reading for a claim that will actually land well after `refundAfterMs` once it is finally
-   *  mined (the contract's own `claim()` also enforces `block.timestamp * 1000 <
-   *  refundAfterMs`, and a claim that reverts on-chain still publishes the secret in its own
-   *  calldata the moment it is broadcast — USD-COIN-FIT-2026-09-28). `pending` is every EVM
-   *  node's own best-effort next-block timestamp (`max(parent + 1, wall clock)` on anvil,
-   *  empirically verified 2026-09-28 against anvil 1.8.3 — it visibly tracks real elapsed time
-   *  during an idle gap where `latest` does not move), so it never reports a time earlier than
-   *  the one this claim will actually be evaluated at once sent. */
-  private async simulateClaimOrThrow(hashLock: Hex, secret: Hex): Promise<void> {
+   * (a) `claim(hashLock, ZERO_BYTES32)`: a zero preimage can never open a real hashLock, so the
+   * *only* way this simulation can revert with exactly "EvmHashRail: secret does not open the
+   * statement" is if every earlier `require` in the contract's own `claim()` already passed —
+   * the lock exists, is `Locked` (not `None`/`Claimed`/`Refunded`), and `pending`'s own view is
+   * still strictly before `refundAfterMs`. Any other revert (or no revert at all, which should
+   * never happen for a real hashLock) refuses this claim with that other reason instead.
+   *
+   * (b) the lock's own `payee`/`token`/`amount` are public on-chain data (`locks(hashLock)`) —
+   * reading them names no secret. Simulating the token's own `transfer(payee, amount)`,
+   * impersonated from the rail contract's own address (exactly the internal call `claim()`
+   * makes), proves the payout itself is not blocked — a blacklist, a pause, a token that has
+   * quietly stopped honoring transfers — before the real secret is ever risked on a wire.
+   */
+  private async simulateClaimPreChecksOrThrow(hashLock: Hex): Promise<void> {
+    let zeroPreimageReverted = false;
     try {
       await this.publicClient.simulateContract({
         address: this.config.contract,
         abi: EVM_HASH_RAIL_ABI,
         functionName: "claim",
-        args: [hashLock, secret],
+        args: [hashLock, ZERO_BYTES32],
         account: this.walletClient.account,
         blockTag: "pending",
       });
     } catch (err) {
-      throw new Error(`evm-htlc: refusing to broadcast claim — it simulates to a revert (${extractShortMessage(err)})`);
+      const message = extractShortMessage(err);
+      if (!message.includes("EvmHashRail: secret does not open the statement")) {
+        throw new Error(
+          `evm-htlc: refusing to broadcast claim — the pre-check simulation did not show an open, in-window lock (${message})`,
+        );
+      }
+      zeroPreimageReverted = true;
     }
+    // A zero preimage can never actually open a real hashLock (sha256 preimage resistance) — a
+    // simulation that did NOT revert at all is not "fine", it means this endpoint's own
+    // responses cannot be trusted to reflect the real contract (a stub, a lie, a bug), which is
+    // exactly the situation this pre-check exists to catch before the real secret goes anywhere.
+    if (!zeroPreimageReverted) {
+      throw new Error(
+        "evm-htlc: refusing to broadcast claim — the pre-check simulation unexpectedly did not revert for a zero preimage",
+      );
+    }
+
+    const [, payee, token, amount] = await this.publicClient.readContract({
+      address: this.config.contract,
+      abi: EVM_HASH_RAIL_ABI,
+      functionName: "locks",
+      args: [hashLock],
+    });
+    try {
+      await this.publicClient.simulateContract({
+        address: token,
+        abi: ERC20_TRANSFER_ABI,
+        functionName: "transfer",
+        args: [payee, amount],
+        account: this.config.contract,
+        blockTag: "pending",
+      });
+    } catch (err) {
+      throw new Error(`evm-htlc: refusing to broadcast claim — the payout itself simulates to a revert (${extractShortMessage(err)})`);
+    }
+  }
+
+  /** P22-P24-EVM-FIXES-R3.md E4: the last guard before `claim()` ever broadcasts, read fresh
+   *  here rather than trusted from anything a caller measured before calling this method — a
+   *  caller's own pre-checks (`SellerFlow.claimLegA`'s chain-time guard) can still be stale by
+   *  the time execution actually reaches this line if enough wall-clock time passed inside this
+   *  same method's own two prior round trips. `max(pendingMs, clock())` never reports a time
+   *  earlier than either input, the same rule C3's `chainNow` already applies elsewhere. */
+  private async assertBeforeNotAfterMsOrThrow(notAfterMs: number): Promise<void> {
+    const pendingMs = await this.pendingBlockTimestampMsOrThrow();
+    const chainNow = Math.max(pendingMs, this.clock());
+    if (chainNow >= notAfterMs) {
+      throw new Error(
+        `evm-htlc: refusing to broadcast claim — pending chain time ${chainNow} is at/after the given deadline (notAfterMs ${notAfterMs})`,
+      );
+    }
+  }
+
+  /** The `pending` twin of `latestBlockTimestampMs` — every EVM node's own best-effort
+   *  next-block timestamp (`max(parent + 1, wall clock)` on anvil; P22-P24-EVM-FIXES-R2.md C3
+   *  verified this empirically 2026-09-28 against anvil 1.8.3), so it never lags real elapsed
+   *  time the way an idle chain's `latest` block can. */
+  private async pendingBlockTimestampMsOrThrow(): Promise<number> {
+    const result = (await this.rpc.request({ method: "eth_getBlockByNumber", params: ["pending", false] })) as {
+      timestamp?: Hex;
+    } | null;
+    if (result === null || typeof result.timestamp !== "string") {
+      throw new Error("evm-htlc: eth_getBlockByNumber(pending) returned no usable timestamp");
+    }
+    return hexToNumber(result.timestamp) * 1000;
   }
 
   /** B2: the contract's only clock is `block.timestamp`; this reads the chain's own current

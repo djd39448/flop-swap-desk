@@ -12,8 +12,10 @@
 import {
   encodeAbiParameters,
   encodeEventTopics,
+  encodeFunctionData,
   encodeFunctionResult,
   getAddress,
+  numberToHex,
   type Address,
   type Hex,
 } from "viem";
@@ -308,10 +310,6 @@ describe("EvmHtlcRail write path — bounded eth_getLogs -> WriteEvidence", () =
     return {
       eth_chainId: () => ({ result: "0x7a69" }),
       eth_blockNumber: () => ({ result: "0x5" }),
-      // B2: EvmHtlcRail.claim() simulates via `eth_call` before ever broadcasting — every
-      // fixture in this describe block that calls claim() needs a non-reverting simulation
-      // result (an empty return, `claim`'s own ABI declares no outputs).
-      eth_call: () => ({ result: "0x" }),
       eth_sendTransaction: () => ({ result: TX_HASH }),
       eth_getTransactionReceipt: () => ({
         result: {
@@ -331,6 +329,41 @@ describe("EvmHtlcRail write path — bounded eth_getLogs -> WriteEvidence", () =
       }),
       eth_getLogs: () => ({ result: logs }),
     };
+  }
+
+  // P22-P24-EVM-FIXES-R3.md E5: `claim()` no longer runs one preimage-carrying simulation —
+  // it runs two preimage-free ones, routed by which contract (`to`) and which function
+  // (`data`'s own selector) each `eth_call` targets: a zero-preimage `claim()` against the
+  // rail contract (must revert with its own exact "secret does not open the statement"
+  // reason), a `locks(hashLock)` read against the rail contract (used to learn payee/token/
+  // amount for the second check), and an ERC20 `transfer` simulate against the token contract,
+  // impersonated from the rail contract's own address (must succeed). E4: the pending-block
+  // read `eth_getBlockByNumber("pending", …)` this rail's own last-moment guard makes.
+  const LOCKS_SELECTOR = encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [TERMS.statement as Hex] }).slice(0, 10);
+  const CLAIM_SUCCEEDS_LOCKS_RESULT = encodeFunctionResult({
+    abi: EVM_HASH_RAIL_ABI,
+    functionName: "locks",
+    result: [PAYER, PAYEE, TOKEN, BigInt(TERMS.amount), BigInt(TERMS.claimByMs), BigInt(TERMS.refundAfterMs), 1],
+  });
+  const ERC20_BOOL_TRUE = `0x${"0".repeat(63)}1` as Hex;
+
+  /** A `pending` block comfortably before `TERMS.refundAfterMs` (and any `notAfterMs` this
+   *  block's own tests pass in), so E4's own last-moment guard never trips unless a test
+   *  deliberately arranges otherwise. */
+  function pendingBlockHandlers() {
+    return { eth_getBlockByNumber: () => ({ result: { timestamp: numberToHex(Math.floor((TERMS.claimByMs - 5 * 60_000) / 1000)) } }) };
+  }
+
+  /** claim()'s own `eth_call` traffic for a claim that should be allowed to broadcast:
+   *  check (a) sees the zero-preimage revert it expects, the `locks()` read reports a real,
+   *  matching, `Locked` lock, and check (b)'s ERC20 transfer simulation succeeds. */
+  function claimAllowedEthCall(params: readonly unknown[]): { result?: unknown; error?: { code: number; message: string } } {
+    const [callObject] = params as [{ to?: string; data?: string }];
+    const to = (callObject.to ?? "").toLowerCase();
+    if (to === TOKEN.toLowerCase()) return { result: ERC20_BOOL_TRUE };
+    const data = (callObject.data ?? "").toLowerCase();
+    if (data.startsWith(LOCKS_SELECTOR)) return { result: CLAIM_SUCCEEDS_LOCKS_RESULT };
+    return { error: { code: 3, message: "execution reverted: EvmHashRail: secret does not open the statement" } };
   }
 
   it("happy path: exactly one Locked log -> WriteEvidence with matching identity and raw sha256s", async () => {
@@ -397,25 +430,100 @@ describe("EvmHtlcRail write path — bounded eth_getLogs -> WriteEvidence", () =
       { blockNumber: "0x7", blockHash: BLOCK_HASH, txHash: TX_HASH, logIndex: "0x0" },
     );
     const config = configFor(ANVIL_LOCAL_PIN);
-    const { rpc } = mockCapturingRpc(lockHandlers([log]));
+    const { rpc } = mockCapturingRpc({ ...lockHandlers([log]), ...pendingBlockHandlers(), eth_call: claimAllowedEthCall });
     const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
-    const evidence = await rail.claim(TERMS.statement as Hex, secret);
+    const evidence = await rail.claim(TERMS.statement as Hex, secret, TERMS.refundAfterMs);
     expect(evidence.event).toBe("Claimed");
   });
 
-  // P22-P24-EVM-FIXES.md B2 (USD-COIN-FIT-2026-09-28.md).
-  it("claim() never broadcasts when the simulation reverts", async () => {
+  // P22-P24-EVM-FIXES.md B2 (USD-COIN-FIT-2026-09-28.md). P22-P24-EVM-FIXES-R3.md E5: the
+  // pre-check simulation is now preimage-free (E5(a): a zero-preimage `claim()` simulate) —
+  // a mock that reverts every `eth_call` with an unrelated reason ("blacklisted") no longer
+  // reaches the old single-simulation message; it fails the *new* pre-check instead, for a
+  // different (but still fund-safety-equivalent) reason: the pre-check never saw proof of an
+  // open, in-window lock. Either way the claim never broadcasts.
+  it("claim() never broadcasts when the pre-check simulation does not show an open, in-window lock", async () => {
     const secret = ("0x" + "cd".repeat(32)) as Hex;
     const config = configFor(ANVIL_LOCAL_PIN);
     const { rpc, calls } = mockCapturingRpc({
       eth_chainId: () => ({ result: "0x7a69" }),
       eth_call: () => ({ error: { code: 3, message: "execution reverted: EvmHashRail: blacklisted" } }),
-      // No eth_sendTransaction/eth_getTransactionReceipt/eth_blockNumber handlers at all: if
-      // claim() ever broadcast past the simulation, this mock would throw "unexpected method"
-      // instead of failing with the assertion below.
+      // No eth_sendTransaction/eth_getTransactionReceipt/eth_blockNumber/eth_getBlockByNumber
+      // handlers at all: if claim() ever broadcast (or even reached the E4 pending-time check)
+      // past the pre-check above, this mock would throw "unexpected method" instead of failing
+      // with the assertion below.
     });
     const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
-    await expect(rail.claim(TERMS.statement as Hex, secret)).rejects.toThrow(/simulates to a revert/);
+    await expect(rail.claim(TERMS.statement as Hex, secret, TERMS.refundAfterMs)).rejects.toThrow(
+      /pre-check simulation did not show an open, in-window lock/,
+    );
+    expect(calls.some((call) => call.method === "eth_sendTransaction")).toBe(false);
+  });
+
+  // P22-P24-EVM-FIXES-R3.md E5(b): the zero-preimage pre-check (a) passes (a real, open,
+  // in-window lock), but the payout itself (b) is blocked — a blacklisted payee, or a paused
+  // token. The real claim, carrying the real secret, must never be sent.
+  it("claim() never broadcasts when the payout itself simulates to a revert (E5(b))", async () => {
+    const secret = ("0x" + "cd".repeat(32)) as Hex;
+    const config = configFor(ANVIL_LOCAL_PIN);
+    const { rpc, calls } = mockCapturingRpc({
+      eth_chainId: () => ({ result: "0x7a69" }),
+      eth_call: (params) => {
+        const [callObject] = params as [{ to?: string; data?: string }];
+        const to = (callObject.to ?? "").toLowerCase();
+        if (to === TOKEN.toLowerCase()) {
+          return { error: { code: 3, message: "execution reverted: blacklisted payee" } };
+        }
+        const data = (callObject.data ?? "").toLowerCase();
+        if (data.startsWith(LOCKS_SELECTOR)) return { result: CLAIM_SUCCEEDS_LOCKS_RESULT };
+        return { error: { code: 3, message: "execution reverted: EvmHashRail: secret does not open the statement" } };
+      },
+      // No eth_sendTransaction handler: the real claim (carrying the real secret) must never
+      // be sent once the payout pre-check fails.
+    });
+    const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+    await expect(rail.claim(TERMS.statement as Hex, secret, TERMS.refundAfterMs)).rejects.toThrow(/payout itself simulates to a revert/);
+    expect(calls.some((call) => call.method === "eth_sendTransaction")).toBe(false);
+  });
+
+  // P22-P24-EVM-FIXES-R3.md E5(a): a zero preimage can never actually open a real hashLock — an
+  // endpoint whose zero-preimage simulation does NOT revert at all cannot be trusted to reflect
+  // the real contract, and the real claim must never be sent to it.
+  it("claim() never broadcasts when the zero-preimage pre-check unexpectedly does not revert", async () => {
+    const secret = ("0x" + "cd".repeat(32)) as Hex;
+    const config = configFor(ANVIL_LOCAL_PIN);
+    const { rpc, calls } = mockCapturingRpc({
+      eth_chainId: () => ({ result: "0x7a69" }),
+      // Every eth_call "succeeds" (no revert at all) — including the zero-preimage claim
+      // simulate, which for a real hashLock should be impossible.
+      eth_call: () => ({ result: "0x" }),
+      // No eth_sendTransaction handler: the real claim must never be sent.
+    });
+    const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+    await expect(rail.claim(TERMS.statement as Hex, secret, TERMS.refundAfterMs)).rejects.toThrow(
+      /pre-check simulation unexpectedly did not revert for a zero preimage/,
+    );
+    expect(calls.some((call) => call.method === "eth_sendTransaction")).toBe(false);
+  });
+
+  // P22-P24-EVM-FIXES-R3.md E4: both pre-checks (a)/(b) pass, but the chain's own `pending`
+  // view is already at/after the caller's `notAfterMs` bound — the real claim must never be
+  // sent, even though nothing about the lock itself looked wrong.
+  it("claim() never broadcasts when pending chain time is at/after the given notAfterMs (E4)", async () => {
+    const secret = ("0x" + "cd".repeat(32)) as Hex;
+    const config = configFor(ANVIL_LOCAL_PIN);
+    const notAfterMs = TERMS.refundAfterMs - 5 * 60_000;
+    const { rpc, calls } = mockCapturingRpc({
+      eth_chainId: () => ({ result: "0x7a69" }),
+      eth_call: claimAllowedEthCall,
+      // The pending block is already at notAfterMs itself.
+      eth_getBlockByNumber: () => ({ result: { timestamp: numberToHex(Math.floor(notAfterMs / 1000)) } }),
+      // No eth_sendTransaction handler: the real claim must never be sent.
+    });
+    const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+    await expect(rail.claim(TERMS.statement as Hex, secret, notAfterMs)).rejects.toThrow(
+      /pending chain time .* is at\/after the given deadline/,
+    );
     expect(calls.some((call) => call.method === "eth_sendTransaction")).toBe(false);
   });
 
@@ -500,7 +608,9 @@ describe("EvmHtlcRail write path — bounded eth_getLogs -> WriteEvidence", () =
     const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
 
     await expect(rail.lock(TERMS, 0)).rejects.toThrow(/chain id 8453 no longer matches pin "anvil-local"/);
-    await expect(rail.claim(TERMS.statement as Hex, ("0x" + "cd".repeat(32)) as Hex)).rejects.toThrow(/no longer matches pin/);
+    await expect(rail.claim(TERMS.statement as Hex, ("0x" + "cd".repeat(32)) as Hex, TERMS.refundAfterMs)).rejects.toThrow(
+      /no longer matches pin/,
+    );
     await expect(rail.refund(TERMS.statement as Hex)).rejects.toThrow(/no longer matches pin/);
     await expect(rail.approve("USDC", "1")).rejects.toThrow(/no longer matches pin/);
   });

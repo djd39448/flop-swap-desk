@@ -14,9 +14,18 @@
 // directly against `EvmHtlcRail.claim` in tests/evm-htlc.test.ts ("claim() never broadcasts when
 // the simulation reverts") — `SellerFlow.claimLegA` calls that exact method unmodified, so this
 // file does not duplicate the (fairly heavy) ABI-encoded `locks()`/finalized-block mocking that
-// would be needed to also drive it from here.
+// would be needed to also drive it from here — except for P22-P24-EVM-FIXES-R3.md E4's own
+// client-side re-check (below), which needs `verifyLockFinal` to actually succeed once and so
+// cannot avoid that mocking.
 //
-// Design source: flop-contrib/handoff/P22-P24-EVM-FIXES.md B1, B2, B3, B6.
+// P22-P24-EVM-FIXES-R3.md group E (fund safety under failure and repetition): E1 (a Buyer pairs
+// leg B once, and re-verifies it immediately before spending), E2 (a Seller's leg-B lock latch
+// never reopens once attempted), E3 (a Buyer records its own lock state before ever sending it),
+// E4 (a Seller re-checks chain time again after `verifyLockFinal` returns, immediately before
+// claiming).
+//
+// Design source: flop-contrib/handoff/P22-P24-EVM-FIXES.md B1, B2, B3, B6;
+// P22-P24-EVM-FIXES-R3.md E1, E2, E3, E4.
 
 import {
   MemoryNoteStore,
@@ -28,10 +37,11 @@ import {
   makeOffer,
   tryDecodeFrame,
   type AcceptFrame,
+  type NoteStore,
   type OfferFrame,
   type TranscriptRecord,
 } from "@flop-labs/tclk";
-import { getAddress, numberToHex, type Address, type Hex } from "viem";
+import { encodeEventTopics, encodeFunctionData, encodeFunctionResult, getAddress, numberToHex, type Address, type Hex } from "viem";
 import { describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
@@ -40,6 +50,7 @@ import { MemoryVenue } from "../src/client/venue.js";
 import { EVM_LOCAL_POLICY } from "../src/client/policy.js";
 import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
+import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { swapId as computeSwapId } from "../src/profile.js";
 import { identity, record, unsignedRecord, type Identity } from "./helpers/identity.js";
 
@@ -59,9 +70,54 @@ const RAIL_CONTRACT = addr("client-flows-rail");
 const TOKEN = addr("client-flows-usdc");
 const BUYER_ACCOUNT = addr("client-flows-buyer-account");
 const SELLER_ACCOUNT = addr("client-flows-seller-account");
+const TX_HASH = ("0x" + "aa".repeat(32)) as Hex;
+const BLOCK_HASH = ("0x" + "cd".repeat(32)) as Hex;
 
 function evmConfig(): EvmRailConfig {
   return { pin: ANVIL_LOCAL_PIN, endpoint: "http://mock-evm", contract: RAIL_CONTRACT, assets: { USDC: TOKEN } };
+}
+
+const REFUNDED_EVENT = {
+  type: "event",
+  name: "Refunded",
+  inputs: [{ name: "hashLock", type: "bytes32", indexed: true }],
+} as const;
+
+/** E3: a minimal, correctly-encoded `Refunded` log — the same small helper pattern
+ *  tests/evm-htlc.test.ts's own `buildLog` uses, kept local here since this file needs only
+ *  this one event shape. */
+function buildRefundedLog(hashLock: Hex, meta: { blockNumber: string; blockHash: Hex; txHash: Hex; logIndex: string }) {
+  const topics = encodeEventTopics({ abi: [REFUNDED_EVENT], eventName: "Refunded", args: { hashLock } } as never);
+  return {
+    address: RAIL_CONTRACT,
+    topics,
+    data: "0x" as Hex,
+    blockNumber: meta.blockNumber,
+    blockHash: meta.blockHash,
+    transactionHash: meta.txHash,
+    transactionIndex: "0x0",
+    logIndex: meta.logIndex,
+    removed: false,
+  };
+}
+
+/** A generic ERC20/receipt-shaped mined-and-succeeded transaction receipt — every write path
+ *  test in this file that needs one uses this same shape (only `to` varies meaningfully). */
+function successReceipt(to: Address, blockNumber: string) {
+  return {
+    status: "0x1",
+    transactionHash: TX_HASH,
+    blockHash: BLOCK_HASH,
+    blockNumber,
+    transactionIndex: "0x0",
+    from: BUYER_ACCOUNT,
+    to,
+    cumulativeGasUsed: "0x5208",
+    gasUsed: "0x5208",
+    logs: [],
+    logsBloom: "0x" + "00".repeat(256),
+    type: "0x2",
+  };
 }
 
 /** A `CapturingRpc` whose transport throws on any call — every test that expects a refusal to
@@ -559,5 +615,283 @@ describe("SellerFlow.lockLegB — C1 (one leg-B lock per swap)", () => {
     if (secondResult.status === "rejected") {
       expect(String(secondResult.reason)).toMatch(/already locked, or a lock is already in flight/);
     }
+  });
+});
+
+/** A second, independent SellerFlow sharing the same venue and offer — used to build a genuine,
+ *  independently-signed second `(acceptA, offerB)` pair for the SAME leg A offer (its own fresh
+ *  CSPRNG hash statement, per `SellerFlow.acceptLegA`), the E1 tests' "second genuine acceptA
+ *  under a new hash" probe. Its own paper rail is never exercised in these tests. */
+function secondSellerFlow(h: Harness, tag: number): SellerFlow {
+  return new SellerFlow({
+    identity: ident(tag),
+    venue: h.venue,
+    paperRail: new PaperRail(new MemoryNoteStore(), h.clock),
+    account: addr(`client-flows-seller2-account-${tag}`),
+    rpc: unreachableRpc(),
+    evmConfig: evmConfig(),
+    clock: h.clock,
+  });
+}
+
+describe("BuyerFlow.acceptLegB — E1 (pairs leg B once)", () => {
+  it("refuses a second pairing for this flow, even from a second, independently genuine acceptA/offerB pair (a second genuine acceptA under a new hash)", async () => {
+    const h = harness(74, 75);
+    const { offerA, acceptARecord, offerBRecord } = await bidAndAcceptA(h, "00000001");
+    await expect(h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0)).resolves.toBeDefined();
+
+    // A second, independent Seller genuinely accepts the SAME leg A offer under its own fresh
+    // CSPRNG hash statement (a "new hash") and its own signed acceptA/offerB pair. Before E1,
+    // `acceptLegB` had no guard against re-pairing at all and would have overwritten this
+    // flow's own `offerB`/`acceptA`/`acceptB` with the second pairing.
+    const seller2Flow = secondSellerFlow(h, 76);
+    const { acceptARecord: acceptARecord2, offerBRecord: offerBRecord2 } = await seller2Flow.acceptLegA(offerA, legBDeadlines(T0), T0);
+    await expect(h.buyerFlow.acceptLegB(offerBRecord2, acceptARecord2, T0)).rejects.toThrow(
+      /already paired, or a pairing is already in flight/,
+    );
+  });
+
+  it("refuses a concurrent second pairing attempt while the first is still in flight", async () => {
+    const h = harness(77, 78);
+    const { offerA, acceptARecord, offerBRecord } = await bidAndAcceptA(h, "00000001");
+    const seller2Flow = secondSellerFlow(h, 79);
+    const { acceptARecord: acceptARecord2, offerBRecord: offerBRecord2 } = await seller2Flow.acceptLegA(offerA, legBDeadlines(T0), T0);
+
+    const [firstResult, secondResult] = await Promise.allSettled([
+      h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0),
+      h.buyerFlow.acceptLegB(offerBRecord2, acceptARecord2, T0),
+    ]);
+    expect(firstResult.status).toBe("fulfilled");
+    expect(secondResult.status).toBe("rejected");
+    if (secondResult.status === "rejected") {
+      expect(String(secondResult.reason)).toMatch(/already paired, or a pairing is already in flight/);
+    }
+  });
+});
+
+describe("BuyerFlow.lockLegA — E1 (re-verifies leg B immediately before spending)", () => {
+  it("refuses when leg B no longer verifies on the paper rail, even though legBVerified was set true earlier", async () => {
+    const h = harness(80, 81);
+    await pairLockBAndAccountLines(h, "00000001");
+    // Field injection: this flow's own stored `acceptB` now points at a contract nothing is
+    // actually locked under — isolates the E1 re-check from `legBVerified`'s own (already-true)
+    // flag, which a stale-flag bug would otherwise still trust at lock time.
+    const staleAcceptB: AcceptFrame = {
+      ...(h.buyerFlow as unknown as { acceptB: AcceptFrame }).acceptB,
+      contract: `0x${"ab".repeat(32)}`,
+    };
+    (h.buyerFlow as unknown as { acceptB: AcceptFrame }).acceptB = staleAcceptB;
+    await expect(h.buyerFlow.lockLegA()).rejects.toThrow(/leg B no longer verifies on the paper rail \(E1\)/);
+  });
+});
+
+describe("BuyerFlow.lockLegA — E3 (records its lock before sending it)", () => {
+  it("a lock that succeeds on-chain but whose own evidence capture fails (eth_getLogs finds nothing) still lets refundLegA proceed", async () => {
+    let getLogsCalls = 0;
+    let capturedHashLock: Hex | undefined;
+    const rpc = mockRpc({
+      eth_chainId: () => ({ result: "0x7a69" }),
+      eth_blockNumber: () => ({ result: "0x5" }),
+      eth_sendTransaction: () => ({ result: TX_HASH }),
+      eth_getTransactionReceipt: () => ({ result: successReceipt(RAIL_CONTRACT, "0x6") }),
+      eth_getLogs: () => {
+        getLogsCalls += 1;
+        if (getLogsCalls === 1) return { result: [] }; // the Locked-event lookup: an evidence-capture gap.
+        if (capturedHashLock === undefined) throw new Error("test setup: hashLock not captured yet");
+        return {
+          result: [buildRefundedLog(capturedHashLock, { blockNumber: "0x9", blockHash: BLOCK_HASH, txHash: TX_HASH, logIndex: "0x0" })],
+        };
+      },
+    });
+    const h = harness(82, 83, { buyerRpc: rpc });
+    await pairLockBAndAccountLines(h, "00000001");
+    capturedHashLock = h.sellerFlow.statement! as Hex;
+
+    // The on-chain write itself succeeds (approve + lock both mine with status success), but
+    // `rail.lock`'s own bounded `eth_getLogs` finds zero matching `Locked` logs and throws —
+    // before E3, this left the Buyer's own state believing leg A was never locked at all.
+    await expect(h.buyerFlow.lockLegA()).rejects.toThrow(/expected exactly one Locked log/);
+
+    // E3: despite the throw, this flow's own state must already know leg A is locked — refund
+    // must work off the chain (which it now can, via a genuine on-chain Refunded log), not off
+    // whether `lockLegA` itself ever returned successfully.
+    h.clockRef.ms = legADeadlines(T0).refundAfterMs;
+    await expect(h.buyerFlow.refundLegA()).resolves.toBeDefined();
+  });
+});
+
+/** E2: wraps a real `MemoryNoteStore` so its writes genuinely commit, but the first `set()`
+ *  call throws right after committing — simulating a `NoteStore` whose write landed but whose
+ *  ack never came back (a crash, a dropped response), the exact gap `lockLegB`'s own latch
+ *  (`attemptedAcceptB`) must survive. */
+class CommitsThenThrowsOnceStore implements NoteStore {
+  private thrown = false;
+  constructor(private readonly inner: NoteStore) {}
+
+  async get(ns: string, key: string): Promise<string | null> {
+    return this.inner.get(ns, key);
+  }
+
+  async set(ns: string, key: string, value: string, condition?: { ifAbsent: true } | { if: string }): Promise<boolean> {
+    const result = await this.inner.set(ns, key, value, condition);
+    if (!this.thrown) {
+      this.thrown = true;
+      throw new Error("client-flows.test.ts: simulated NoteStore ack failure after a real commit (E2)");
+    }
+    return result;
+  }
+}
+
+describe("SellerFlow.lockLegB / reconcileLegB — E2 (leg-B latch never reopens)", () => {
+  it("a NoteStore that commits then throws leaves the latch set; a second genuine accept is refused; reconcileLegB finds the real lock", async () => {
+    const buyer = ident(84);
+    const seller = ident(85);
+    const clockRef = { ms: T0 };
+    const clock = () => clockRef.ms;
+    const venue = new MemoryVenue(clock);
+    const flakyStore = new CommitsThenThrowsOnceStore(new MemoryNoteStore());
+    const config = evmConfig();
+    const buyerFlow = new BuyerFlow({
+      identity: buyer,
+      venue,
+      paperRail: new PaperRail(new MemoryNoteStore(), clock),
+      account: BUYER_ACCOUNT,
+      rpc: unreachableRpc(),
+      evmConfig: config,
+      clock,
+    });
+    const sellerFlow = new SellerFlow({
+      identity: seller,
+      venue,
+      paperRail: new PaperRail(flakyStore, clock),
+      account: SELLER_ACCOUNT,
+      rpc: unreachableRpc(),
+      evmConfig: config,
+      clock,
+    });
+    void buyerFlow;
+
+    const swapId = computeSwapId(buyer.did, "00000001");
+    const offerA = await buyerFlow.bid({
+      swapId,
+      wantAsset: "FLOP",
+      wantAmount: "52070000",
+      wantRail: "flop-htlc",
+      amount: "1000000",
+      asset: "USDC",
+      ...legADeadlines(T0),
+    });
+    const { offerB } = await sellerFlow.acceptLegA(offerA, legBDeadlines(T0), T0);
+    const acceptB = makeAccept(offerB, { from: buyer.did, statement: sellerFlow.statement! });
+    const acceptBRecord = await venue.post(OFFER_ROOM, encodeFrame(acceptB), buyer);
+
+    // The first attempt's own `paperRail.lock` call commits (the underlying store now genuinely
+    // has the note) but then throws (the simulated ack failure) — `lockLegB` must surface that
+    // failure, never silently succeed.
+    await expect(sellerFlow.lockLegB(acceptBRecord)).rejects.toThrow(/simulated NoteStore ack failure/);
+
+    // E2: a second, independently genuine accept for the same leg B offer must still be refused
+    // outright — the latch is permanent the moment any lock was attempted, whether or not this
+    // flow itself knows the attempt succeeded.
+    const secondAccept = makeAccept(offerB, { from: buyer.did, statement: sellerFlow.statement! });
+    const secondRecord = await venue.post(OFFER_ROOM, encodeFrame(secondAccept), buyer);
+    await expect(sellerFlow.lockLegB(secondRecord)).rejects.toThrow(/already locked, or a lock is already in flight/);
+
+    // `reconcileLegB()` is the only way forward: it reads the paper rail directly (for the
+    // *first* attempt's own contract, never the second) and finds that the write actually landed.
+    await expect(sellerFlow.reconcileLegB()).resolves.toEqual({ locked: true });
+
+    // Now that reconciliation confirms it, refundLegB (which needs `lockedLegBContract`) works.
+    clockRef.ms = legBDeadlines(T0).refundAfterMs;
+    await expect(sellerFlow.refundLegB()).resolves.toBeDefined();
+  });
+
+  it("reconcileLegB throws when nothing was ever attempted", async () => {
+    const h = harness(86, 87);
+    await bidAndAcceptA(h, "00000001");
+    await expect(h.sellerFlow.reconcileLegB()).rejects.toThrow(/leg B lock was never attempted/);
+  });
+});
+
+describe("SellerFlow.claimLegA — E4 (re-checks chain time again after verifyLockFinal)", () => {
+  it("refuses to claim when a slow verifyLockFinal (the reviewer's 29-minute locks() read) eats the safety margin, and never broadcasts", async () => {
+    // A tight leg-A window so a 29-minute delay inside verifyLockFinal clearly breaches
+    // claimByMs — legA.refundAfterMs must still clear EVM_LOCAL_POLICY.minRevealWindowMs (45
+    // min) measured from lockTimeMs (T0) for acceptLegA's own deadline check to pass.
+    const claimByMs = T0 + 20 * 60_000;
+    const refundAfterMs = T0 + 50 * 60_000;
+
+    // This flow's own injected `clock()` never itself advances a single tick in this test —
+    // "latest" answering differently on its second call (below) is what simulates 29 real
+    // minutes having passed *inside* `verifyLockFinal`'s own round trip, exactly the way a real
+    // process's `Date.now()` would have moved on even though nothing here fakes that directly.
+    let latestCalls = 0;
+    const locksResultBytes = encodeFunctionResult({
+      abi: EVM_HASH_RAIL_ABI,
+      functionName: "locks",
+      result: [BUYER_ACCOUNT, SELLER_ACCOUNT, TOKEN, 1_000_000n, BigInt(claimByMs), BigInt(refundAfterMs), 1],
+    });
+    const locksSelector = encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [`0x${"0".repeat(64)}`] }).slice(0, 10);
+    const rpc = mockRpc({
+      eth_chainId: () => ({ result: "0x7a69" }),
+      eth_blockNumber: () => ({ result: "0x5" }),
+      eth_getBlockByNumber: (params) => {
+        if (params[0] === "finalized") return { result: { number: "0x5", hash: BLOCK_HASH } };
+        if (params[0] === "pending") {
+          // P22-P24-EVM-FIXES-R3.md E4: `EvmHtlcRail.claim`'s OWN last-moment guard reads this —
+          // kept safely early throughout. That guard has its own dedicated, isolated test in
+          // tests/evm-htlc.test.ts ("claim() never broadcasts when pending chain time is
+          // at/after the given notAfterMs"); keeping it safe here isolates *this* test to
+          // `SellerFlow.claimLegA`'s own re-check, the thing this test is actually about.
+          return { result: { timestamp: numberToHex(Math.floor(T0 / 1000)) } };
+        }
+        // "latest": read once before `verifyLockFinal` (safe), and once more after it returns
+        // (E4's own re-check) — the second reading is what a slow `verifyLockFinal` would have
+        // let drift forward in reality.
+        latestCalls += 1;
+        const ms = latestCalls === 1 ? T0 : T0 + 29 * 60_000;
+        return { result: { timestamp: numberToHex(Math.floor(ms / 1000)) } };
+      },
+      // If execution ever reaches `rail.claim()` at all (i.e. without the E4 fix), both E5
+      // pre-checks are set up to pass here — a real, matching, Locked lock, and a payout that
+      // simulates cleanly — so this test proves the claim would otherwise have gone on toward a
+      // real broadcast (no eth_sendTransaction handler exists below, so it would fail loudly
+      // with "unexpected method" instead of silently passing).
+      eth_call: (params) => {
+        const [callObject] = params as [{ to?: string; data?: string }];
+        const to = (callObject.to ?? "").toLowerCase();
+        if (to === TOKEN.toLowerCase()) return { result: `0x${"0".repeat(63)}1` }; // ERC20 transfer simulate: succeed.
+        const data = (callObject.data ?? "").toLowerCase();
+        if (data.startsWith(locksSelector)) return { result: locksResultBytes };
+        // The rail contract, not a locks() read: the E5(a) zero-preimage claim() simulate.
+        return { error: { code: 3, message: "execution reverted: EvmHashRail: secret does not open the statement" } };
+      },
+      // No eth_sendTransaction handler: if this ever reached a real broadcast, the mock would
+      // throw "unexpected method" instead of failing with the assertion below.
+    });
+    const h = harness(88, 89, { sellerRpc: rpc });
+
+    const swapId = computeSwapId(h.buyer.did, "00000001");
+    const offerA = await h.buyerFlow.bid({
+      swapId,
+      wantAsset: "FLOP",
+      wantAmount: "52070000",
+      wantRail: "flop-htlc",
+      amount: "1000000",
+      asset: "USDC",
+      claimByMs,
+      refundAfterMs,
+      expiresMs: T0 + 10 * 60_000,
+    });
+    await h.sellerFlow.acceptLegA(offerA, legBDeadlines(T0), T0);
+    // Only the payee's account line is required (D-08) for `verifyLockFinal` to resolve; the
+    // Buyer's own line is optional corroboration this test does not need (posting it would
+    // require the full `acceptLegB` pairing dance, which this test's own custom leg-A deadlines
+    // have no need for either).
+    await h.sellerFlow.postAccountLineA(SELLER_ACCOUNT);
+
+    await expect(h.sellerFlow.claimLegA(h.sellerFlow.statement!)).rejects.toThrow(
+      /at\/after its claimByMs \(chain time, re-checked after verifyLockFinal\) \(E4\)/,
+    );
   });
 });

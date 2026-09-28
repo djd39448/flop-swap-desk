@@ -128,6 +128,18 @@ anywhere in this build — writes go out as JSON-RPC accounts (`eth_sendTransact
 anvil's own unlocked addresses) via a plain-address viem `WalletClient`. tclk's Ed25519 test
 identities (`tests/helpers/identity.ts`) sign the deal-room transcript; they are not wallet keys.
 
+**The claim endpoint sees the real preimage once, at the one moment it must.** Before
+`EvmHtlcRail.claim` ever sends a real transaction, it runs two preimage-free simulations against
+the configured RPC endpoint (`eth_call`, never broadcast): a zero-preimage `claim()` that must
+revert with exactly the contract's own "secret does not open the statement" reason (proving the
+lock exists, is open, and is still inside its window), and a simulated ERC20 payout impersonated
+from the rail contract's own address (proving the transfer itself is not blocked, e.g. by a
+blacklist or a pause). Neither of those ever carries the real secret. Only once both hold does
+the real `claim(hashLock, preimage)` transaction go out — and broadcasting is inherently public,
+so the configured RPC endpoint (and anyone else watching that transaction) does see the real
+preimage at that final step. The endpoint a deployment's `EvmRailConfig.endpoint` points at must
+therefore be one the operator trusts with that; this build never sends a claim before it has to.
+
 **What this proves, and what it does not.** The three committed fixtures
 (`fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b}/`, replayed hermetically by
 `tests/evm-anvil-fixtures.test.ts`) show a real ERC20 escrowed, claimed or refunded on a real

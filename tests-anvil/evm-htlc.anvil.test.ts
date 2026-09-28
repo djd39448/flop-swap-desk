@@ -172,7 +172,7 @@ describe("EvmHtlcRail against a real anvil node", () => {
         finalizedRef: expect.stringMatching(/^anvil-local:finalized:\d+:0x[0-9a-f]{64}$/),
       });
 
-      const claimEvidence = await rail.claim(hashLock.hash as Hex, hashLock.preimage as Hex);
+      const claimEvidence = await rail.claim(hashLock.hash as Hex, hashLock.preimage as Hex, terms.refundAfterMs);
       expect(claimEvidence.event).toBe("Claimed");
 
       await anvil.rpcCall("anvil_mine", ["0x2"]);
@@ -235,7 +235,14 @@ describe("EvmHtlcRail against a real anvil node", () => {
   // let this claim broadcast, exactly the leak USD-COIN-FIT-2026-09-28 describes). Left last in
   // this file: `evm_setNextBlockTimestamp` leaves its override queued for whatever block mines
   // next, which would otherwise contaminate a later test's own deadline arithmetic.
-  it("C3: claim refuses to broadcast when the pending block is already past refundAfterMs, even though latest is not", async () => {
+  //
+  // P22-P24-EVM-FIXES-R3.md E5: the pre-check simulation is now the zero-preimage `claim()` call
+  // (E5(a)) rather than one carrying the real secret — against a `pending` view already past
+  // `refundAfterMs`, the contract's own `require` order reverts with "claim after refundAfterMs"
+  // (checked before the secret at all), not the "secret does not open" message a real-secret
+  // simulation would have reached. Either way this pre-check refuses before ever letting the
+  // real secret near a wire — the assertion below is updated for the new (more specific) reason.
+  it("C3/E5: claim refuses to broadcast when the pending block is already past refundAfterMs, even though latest is not", async () => {
     const hashLock = generateHashLock();
     const rail = await EvmHtlcRail.connect({ config, rpc: freshRpc(), account: payer, addressBook, clock: RAIL_CLOCK });
 
@@ -264,8 +271,8 @@ describe("EvmHtlcRail against a real anvil node", () => {
 
     const blockNumberBefore = await anvil.rpcCall<Hex>("eth_blockNumber", []);
 
-    await expect(rail.claim(hashLock.hash as Hex, hashLock.preimage as Hex)).rejects.toThrow(
-      /refusing to broadcast claim — it simulates to a revert/,
+    await expect(rail.claim(hashLock.hash as Hex, hashLock.preimage as Hex, terms.refundAfterMs)).rejects.toThrow(
+      /pre-check simulation did not show an open, in-window lock[\s\S]*claim after refundAfterMs/,
     );
 
     // Never broadcast: no new block was ever mined for this attempt.

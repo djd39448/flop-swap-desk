@@ -29,8 +29,16 @@
 // `SellerFlow.lockLegB` already does for leg B's — an accept whose `contract` field disagrees
 // with what tclk itself derives for that offer/accept pair is refused rather than trusted.
 //
+// P22-P24-EVM-FIXES-R3.md E1: `acceptLegB` refuses a second pairing (already paired, or one in
+// flight) the same way `SellerFlow.lockLegB` refuses a second leg-B lock (C1); `lockLegA`
+// re-verifies leg B is *still* locked on the paper rail immediately before spending, never
+// trusting `legBVerified` as anything but "was true once". E3: `lockLegA` records its own lock
+// state (from `termsA.statement`, already known before ever touching the chain) before
+// approve/lock ever run, so a failed evidence capture or a failed lock-frame post becomes
+// "locked, evidence pending" to this flow, never "never locked".
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
-// P22-P24-EVM-FIXES-R2.md C2, C4.
+// P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3.
 
 import type { Address, Hex } from "viem";
 import {
@@ -114,6 +122,11 @@ export class BuyerFlow {
   private offerB?: OfferFrame;
   private acceptA?: AcceptFrame;
   private acceptB?: AcceptFrame;
+  /** P22-P24-EVM-FIXES-R3.md E1: set synchronously, before `acceptLegB`'s first `await`, the
+   *  same re-entry pattern `SellerFlow.lockLegB` uses (C1) — so two calls issued back to back
+   *  (even two independently genuine `offerB`/`acceptA` pairs, e.g. a Seller who posted a
+   *  second leg-B offer for the same leg A) can never both pair this flow to a leg B. */
+  private legBPairingPending = false;
   private legBVerified = false;
   private lockedHashLock?: Hex;
   private lockedFromBlock?: bigint;
@@ -193,12 +206,40 @@ export class BuyerFlow {
    * (`profile.ts`'s `checkLegBMatchesWant`): `checkOrientation` alone only ever verified that
    * leg B pays *some* FLOP on *a* flop-htlc rail, never that it is the amount/asset this Buyer
    * actually asked for.
+   *
+   * P22-P24-EVM-FIXES-R3.md E1: refuses outright when this flow is already paired to a leg B,
+   * or another call is already in flight — checked, and the in-flight flag set, before anything
+   * else runs (including before this method's first `await`), the same C1 pattern
+   * `SellerFlow.lockLegB` uses. Without this, a second genuinely-signed `offerB`/`acceptA` pair
+   * (a Seller race, or a second leg-B offer for the same leg A) could re-pair this flow after
+   * `verifyLegBLocked`/`postAccountLineA` already ran against the first pairing, and `lockLegA`
+   * would then spend real value against whichever pairing happened to be stored last — never
+   * necessarily the one this flow itself actually verified.
    */
   async acceptLegB(
     offerBRecord: TranscriptRecord,
     acceptARecord: TranscriptRecord,
     lockTimeMs: number,
   ): Promise<{ acceptB: AcceptFrame; acceptBRecord: TranscriptRecord }> {
+    if (this.offerA === undefined) throw new Error("buyer: no leg A offer to pair leg B against");
+    if (this.offerB !== undefined || this.legBPairingPending) {
+      throw new Error("buyer: refusing to accept leg B — already paired, or a pairing is already in flight (E1)");
+    }
+    this.legBPairingPending = true;
+    try {
+      return await this.acceptLegBUnlatched(offerBRecord, acceptARecord, lockTimeMs);
+    } finally {
+      this.legBPairingPending = false;
+    }
+  }
+
+  private async acceptLegBUnlatched(
+    offerBRecord: TranscriptRecord,
+    acceptARecord: TranscriptRecord,
+    lockTimeMs: number,
+  ): Promise<{ acceptB: AcceptFrame; acceptBRecord: TranscriptRecord }> {
+    // this.offerA is already known defined (checked by acceptLegB before this is called), but
+    // TypeScript's narrowing does not survive the method boundary.
     if (this.offerA === undefined) throw new Error("buyer: no leg A offer to pair leg B against");
 
     if (acceptARecord.room !== OFFER_ROOM || !verifyTranscriptRecord(acceptARecord).ok) {
@@ -294,12 +335,18 @@ export class BuyerFlow {
    * `acceptLegB` checked it is not guaranteed to still be safe by the time this method actually
    * runs (a slow runner, a delayed leg B lock), and this is the last check before this Buyer
    * spends real value.
+   *
+   * P22-P24-EVM-FIXES-R3.md E1: also re-verifies leg B is *still* locked on the paper rail,
+   * immediately before approve+lock — `legBVerified` is a flag `verifyLegBLocked` set once and
+   * never revisits; it is not evidence leg B is still locked right now, only that it was at some
+   * earlier moment this flow chose to check. Closes the same window B3 already closes for the
+   * deadline arithmetic, for leg B's own lock state instead.
    */
   async lockLegA(): Promise<{ hashLock: Hex; writeEvidence: WriteEvidence }> {
     if (!this.legBVerified) {
       throw new Error("buyer: refusing to lock leg A before leg B verifies");
     }
-    const { offerA, offerB, acceptA } = this.requirePaired();
+    const { offerA, offerB, acceptA, acceptB } = this.requirePaired();
 
     const deadlineCheck = checkSwapDeadlines(offerA, offerB, this.clock(), EVM_LOCAL_POLICY);
     if (!deadlineCheck.ok) {
@@ -319,6 +366,13 @@ export class BuyerFlow {
     const pairCheck = checkLegBMatchesWant(offerB, legAClassification.context);
     if (!pairCheck.ok) {
       throw new Error(`buyer: refusing to lock leg A — leg B no longer matches what leg A asked for: ${pairCheck.reason} (C2)`);
+    }
+
+    // E1: leg B must still verify right now, not merely have verified once.
+    const termsB = offerAcceptLockTerms(offerB, acceptB);
+    const legBStillLocked = await this.paperRail.verifyLock(termsB, acceptB.contract);
+    if (!legBStillLocked) {
+      throw new Error("buyer: refusing to lock leg A — leg B no longer verifies on the paper rail (E1)");
     }
 
     const termsA = offerAcceptLockTerms(offerA, acceptA);
@@ -347,11 +401,22 @@ export class BuyerFlow {
     const fromBlock = await this.rpc
       .request({ method: "eth_blockNumber", params: [] })
       .then((hex) => BigInt(hex as string));
+
+    // P22-P24-EVM-FIXES-R3.md E3: record this flow's own lock state from what it already knows
+    // — `termsA.statement` is the hash lock the Seller committed to in `acceptA`, known before
+    // this flow ever touches the chain — BEFORE approve/lock ever run, not after. `refundLegA`
+    // and `learnSecret` then read the chain itself (`locks(hashLock)`) as the truth; a failed
+    // evidence capture (`rail.lock`'s own bounded `eth_getLogs` finding zero or several matching
+    // logs) or a failed lock-frame post below must never leave this flow believing leg A was
+    // "never locked" when the on-chain write may already have succeeded.
+    const hashLock = termsA.statement as Hex;
+    this.lockedHashLock = hashLock;
+    this.lockedFromBlock = fromBlock;
+
     const before = this.rpc.exchanges().length;
     await rail.approve(termsA.asset, termsA.amount);
     const writeEvidence = await rail.lock(termsA, 0);
     this.writeExchanges.push(...this.rpc.exchanges().slice(before)); // B5
-    const hashLock = writeEvidence.ref;
 
     await this.venue.post(
       dealRoom(acceptA.contract),
@@ -359,8 +424,6 @@ export class BuyerFlow {
       this.identity,
     );
 
-    this.lockedHashLock = hashLock;
-    this.lockedFromBlock = fromBlock;
     return { hashLock, writeEvidence };
   }
 

@@ -48,8 +48,16 @@
 // time alone — an idle chain's own last block can lag real time indefinitely, which chain time
 // alone would otherwise read as more safety margin than actually remains.
 //
+// P22-P24-EVM-FIXES-R3.md E2: `lockLegB`'s own leg-B latch (`attemptedAcceptB`, replacing a
+// latch keyed only on confirmed success) never reopens once any lock has been attempted, even
+// if the attempt itself threw — `reconcileLegB()` is the only way to learn whether it actually
+// landed, and it only ever checks the same contract, never a different one. E4: `claimLegA`
+// re-reads chain time and re-applies its own claimByMs/margin guards a second time immediately
+// after `verifyLockFinal` returns (which can itself take a long time on a slow RPC), and passes
+// `EvmHtlcRail.claim` a `notAfterMs` bound for its own last-moment check.
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
-// B5; P22-P24-EVM-FIXES-R2.md C1, C3.
+// B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4.
 
 import type { Address, Hex } from "viem";
 import {
@@ -153,6 +161,15 @@ export class SellerFlow {
   private offerB?: OfferFrame;
   private hashLock?: HashLock;
   private lockedLegBContract?: string;
+  /** P22-P24-EVM-FIXES-R3.md E2: the accept `lockLegB` is about to call `paperRail.lock` for,
+   *  recorded *before* that call runs and never cleared afterward, success or failure — see
+   *  `lockLegB`'s own comment. `lockedLegBContract` only ever means "we confirmed the lock
+   *  landed"; this means "we attempted one", which must latch permanently the moment it is
+   *  true, since a `NoteStore` that commits its write and then throws (a crash, a dropped ack)
+   *  leaves this flow genuinely unable to tell the two apart from the exception alone. The only
+   *  way past a set `attemptedAcceptB` is `reconcileLegB()`, and it only ever reads the rail for
+   *  *this* same accept's own contract — this flow never locks under a different one, ever. */
+  private attemptedAcceptB?: AcceptFrame;
   /** P22-P24-EVM-FIXES-R2.md C1: set synchronously, before `lockLegB`'s first `await`, so a
    *  second call that starts while the first is still in flight sees it already set — the same
    *  re-entry pattern `acceptLegA` gets for free by checking `this.offerA` as its very first
@@ -308,9 +325,16 @@ export class SellerFlow {
    * (including before this method's first `await`), so two calls issued back to back (even two
    * independently genuine accepts for the same leg B offer, each under its own fresh nonce and
    * therefore its own tclk contract id) can never both reach `paperRail.lock`.
+   *
+   * P22-P24-EVM-FIXES-R3.md E2: the same guard now also refuses once any lock has ever been
+   * *attempted* (`attemptedAcceptB`), whether or not it is known to have succeeded — a failed
+   * `paperRail.lock` call (a `NoteStore` that commits its write and then throws) must not leave
+   * this flow free to believe leg B was never touched and try again, possibly under a different
+   * contract, while the first attempt may have actually landed. `reconcileLegB()` is the only
+   * way to learn the truth about that one attempt; this method itself never retries.
    */
   async lockLegB(acceptBRecord: TranscriptRecord): Promise<TranscriptRecord> {
-    if (this.lockedLegBContract !== undefined || this.legBLockPending) {
+    if (this.attemptedAcceptB !== undefined || this.legBLockPending) {
       throw new Error("seller: refusing to lock leg B — already locked, or a lock is already in flight (C1)");
     }
     this.legBLockPending = true;
@@ -349,13 +373,40 @@ export class SellerFlow {
 
       const acceptB = frame;
       const termsB = offerAcceptLockTerms(offerB, acceptB);
+      // E2: latch the attempted accept *before* calling `paperRail.lock` — if that call throws
+      // after its own write actually committed (a crash, a dropped ack), this flow must still
+      // remember which contract it tried, permanently, rather than forget the attempt the
+      // moment the promise rejects.
+      this.attemptedAcceptB = acceptB;
       await this.paperRail.lock(termsB);
       this.lockedLegBContract = acceptB.contract;
       const lockFrame: LockFrame = { type: "lock", from: this.identity.did, contract: acceptB.contract, rail: "paper", ref: acceptB.contract };
       return await this.venue.post(dealRoom(acceptB.contract), encodeFrame(lockFrame), this.identity);
     } finally {
+      // E2: `attemptedAcceptB` is deliberately NEVER cleared here, success or failure — see the
+      // field's own comment and `reconcileLegB` below.
       this.legBLockPending = false;
     }
+  }
+
+  /**
+   * P22-P24-EVM-FIXES-R3.md E2: the only way forward after a `lockLegB` call that threw — reads
+   * the paper rail for the *exact* contract this flow attempted (never a different one) and
+   * reports the truth `lockLegB` itself could not: whether the lock actually landed despite the
+   * error, or never happened at all. Sets `lockedLegBContract` (so `refundLegB` can proceed)
+   * when it did. Throws if `lockLegB` was never called, or never got far enough to attempt a
+   * lock (nothing to reconcile).
+   */
+  async reconcileLegB(): Promise<{ locked: boolean }> {
+    if (this.attemptedAcceptB === undefined) {
+      throw new Error("seller: nothing to reconcile — leg B lock was never attempted (E2)");
+    }
+    if (this.offerB === undefined) throw new Error("seller: leg B has not been opened yet");
+    const acceptB = this.attemptedAcceptB;
+    const termsB = offerAcceptLockTerms(this.offerB, acceptB);
+    const locked = await this.paperRail.verifyLock(termsB, acceptB.contract);
+    if (locked) this.lockedLegBContract = acceptB.contract;
+    return { locked };
   }
 
   /**
@@ -432,8 +483,30 @@ export class SellerFlow {
       );
     }
 
+    // P22-P24-EVM-FIXES-R3.md E4: `verifyLockFinal` can itself take a long time (a slow or
+    // rate-limited RPC — the reviewer's own probe was a 29-minute `locks()` read); the margin
+    // checked above, before it ran, is not evidence that any margin still remains now that it
+    // has returned. Re-read chain time and re-apply the identical claimByMs/margin guards
+    // immediately before ever calling `claim()` — never trusting the earlier reading alone.
+    const chainTimeAfterVerifyMs = await rail.latestBlockTimestampMs();
+    const chainNowAfterVerify = Math.max(chainTimeAfterVerifyMs, this.clock());
+    if (chainNowAfterVerify >= offerA.claimByMs) {
+      throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time, re-checked after verifyLockFinal) (E4)");
+    }
+    if (offerA.refundAfterMs - chainNowAfterVerify < EVM_LOCAL_POLICY.claimInclusionMarginMs) {
+      throw new Error(
+        `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
+          `(${EVM_LOCAL_POLICY.claimInclusionMarginMs} ms) remains before refundAfterMs ` +
+          `(chain time, re-checked after verifyLockFinal) (E4)`,
+      );
+    }
+
+    // E4: `EvmHtlcRail.claim` re-checks this same bound once more, against its own freshly-read
+    // `pending` chain time, immediately before it actually broadcasts (defense in depth against
+    // however long its own two preimage-free pre-checks (E5) themselves take).
+    const notAfterMs = offerA.refundAfterMs - EVM_LOCAL_POLICY.claimInclusionMarginMs;
     const before = this.rpc.exchanges().length;
-    const writeEvidence = await rail.claim(hashLockHex, this.hashLock.preimage as Hex);
+    const writeEvidence = await rail.claim(hashLockHex, this.hashLock.preimage as Hex, notAfterMs);
     this.writeExchanges.push(...this.rpc.exchanges().slice(before)); // B5
 
     const reveal = options?.skipReveal === true

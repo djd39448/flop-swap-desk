@@ -65,6 +65,18 @@ export class RpcCaptureError extends Error {
   }
 }
 
+/** P22-P24-EVM-FIXES-R3.md E4: every `CapturingRpc` gets this timeout unless a caller passes
+ *  its own — a stalled or badly rate-limited RPC endpoint (the reviewer's slow-`locks()`-read
+ *  probe) must never be able to hang a client flow's chain read indefinitely just because that
+ *  particular call site forgot to configure one. `src/watcher.ts`'s own `DEFAULT_TIMEOUT_MS`
+ *  (45s, for its technocore HTTP reads) is the closest existing precedent; this is the same
+ *  order of magnitude for the same reason. Passing `timeoutMs: undefined` explicitly (as
+ *  opposed to omitting the field) still falls back to this default — only a caller that wants
+ *  *no* timeout at all has no way to ask for that anymore, which is the point (P22-P24-EVM-
+ *  FIXES-R3.md E4 group E is fund-safety: a chain read that never gives up is exactly what let
+ *  a claim's own safety margin quietly erode while nobody was watching). */
+export const DEFAULT_RPC_TIMEOUT_MS = 45_000;
+
 export interface CapturingRpcOptions {
   endpoint: string;
   /** Defaults to the global `fetch`. Injected so tests never touch the network. */
@@ -72,10 +84,9 @@ export interface CapturingRpcOptions {
   /** Defaults to `Date.now`. Injected per the house rule: no clock in an untested corner. */
   clock?: () => number;
   /** P22-P24-EVM-FIXES.md A9: aborts a call that has not answered within this many ms, so one
-   *  stalled/unreachable RPC endpoint can never hang a sweep forever. `undefined` (the
-   *  default) never aborts on its own — a caller that wants this protection passes its own
-   *  `timeoutMs` (`src/watcher.ts`'s sweep passes the same `timeoutMs` it uses for every other
-   *  fetch). */
+   *  stalled/unreachable RPC endpoint can never hang a sweep forever. P22-P24-EVM-FIXES-R3.md
+   *  E4: defaults to `DEFAULT_RPC_TIMEOUT_MS` rather than never aborting — every caller gets
+   *  this protection unless it explicitly asks for a different one. */
   timeoutMs?: number;
 }
 
@@ -105,7 +116,7 @@ export class CapturingRpc implements CaptureSink {
     this.endpoint = options.endpoint;
     this.fetchImpl = options.fetch ?? fetch;
     this.clock = options.clock ?? Date.now;
-    this.timeoutMs = options.timeoutMs;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   }
 
   /**
