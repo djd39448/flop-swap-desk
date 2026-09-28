@@ -881,6 +881,10 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
       : jsonRpcResult(btcId(4), { confirmations: 3, value: 1.0, scriptPubKey: { hex: bytesToHex(opts.scriptPubKey as Uint8Array) } });
     return { method: "gettxout", params: [FUND_TXID, FUND_VOUT, false], body };
   }
+  /** H6: position 4, present once the funding is confirmed. */
+  function blockHeaderSpec(n: number, hash: string, height: number): ExchangeSpec {
+    return { method: "getblockheader", params: [hash], body: jsonRpcResult(btcId(n), { height }) };
+  }
   function blockHashSpec(n: number, height: number, hash: string): ExchangeSpec {
     return { method: "getblockhash", params: [height], body: jsonRpcResult(btcId(n), hash) };
   }
@@ -895,12 +899,18 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     };
   }
 
-  /** The standard four "setup" exchanges for a funded, unspent, `confirmations`-confirmed
+  /** The standard five "setup" exchanges for a funded, unspent, `confirmations`-confirmed
    *  outpoint whose funding script is the real HTLC script for `hashLockHex`/`locktime`. */
-  function unspentExchanges(hashLockHex: string, locktime: number, confirmations: number): ExchangeSpec[] {
+  function unspentExchanges(hashLockHex: string, locktime: number, confirmations: number, fundingHeight: number = TIP_HEIGHT - confirmations + 1): ExchangeSpec[] {
     const scriptPubKey = scriptFor(hashLockHex, locktime).scriptPubKey;
     const rawHex = fakeRawFundingTxHex(scriptPubKey, AMOUNT_SATS);
-    return [chainInfoSpec(), genesisSpec(), rawTxSpec({ hex: rawHex, confirmations, blockhash: FUNDING_BLOCK_HASH }), txoutSpec({ spent: false, scriptPubKey })];
+    return [
+      chainInfoSpec(),
+      genesisSpec(),
+      rawTxSpec({ hex: rawHex, confirmations, blockhash: FUNDING_BLOCK_HASH }),
+      txoutSpec({ spent: false, scriptPubKey }),
+      blockHeaderSpec(5, FUNDING_BLOCK_HASH, fundingHeight),
+    ];
   }
 
   /** Funding confirmed at height `fundingHeight`, spent at `spendHeight` — used by the
@@ -917,8 +927,9 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
       genesisSpec(),
       rawTxSpec({ hex: rawHex, confirmations: TIP_HEIGHT - opts.fundingHeight + 1, blockhash: FUNDING_BLOCK_HASH }),
       txoutSpec({ spent: true }),
+      blockHeaderSpec(5, FUNDING_BLOCK_HASH, opts.fundingHeight),
     ];
-    let n = 5;
+    let n = 6;
     for (let height = opts.fundingHeight; height <= opts.spendHeight; height += 1) {
       const hash = `${height.toString(16).padStart(2, "0")}`.repeat(32).slice(0, 64);
       specs.push(blockHashSpec(n, height, hash));

@@ -1364,6 +1364,7 @@ describe("runSweep", () => {
         if (method === "getblockhash" && Array.isArray(params) && params[0] === 0) return { result: BTC_REGTEST_PIN.genesisHash };
         if (method === "getrawtransaction") return { result: { hex: rawHex, confirmations: 2, blockhash: FUNDING_BLOCK_HASH } };
         if (method === "gettxout") return { result: { confirmations: 2, value: 1.0, scriptPubKey: { hex: bytesToHex(scriptPubKey) } } };
+        if (method === "getblockheader") return { result: { height: TIP_HEIGHT - 1 } }; // H6: real height, read directly
         return { errorMessage: `unexpected method ${method}` };
       };
     }
@@ -1404,10 +1405,11 @@ describe("runSweep", () => {
       expect(btcFiles.length).toBe(1);
       const index = JSON.parse(await readFile(join(btcDir, btcFiles[0]!), "utf8"));
       expect(index.ref).toBe(REF);
-      expect(index.exchanges).toHaveLength(4);
+      // H6 added a fifth exchange (getblockheader, for the funding block's real height).
+      expect(index.exchanges).toHaveLength(5);
 
       const rpcFiles = await readdir(join(root, "raw", "rpc"));
-      expect(rpcFiles.length).toBe(4);
+      expect(rpcFiles.length).toBe(5);
 
       // The node's cookie-derived auth header reached the RPC call but was never recorded on
       // any captured exchange, request body, or written index/rails.json (the keyless rule's

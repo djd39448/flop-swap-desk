@@ -133,6 +133,9 @@ function buildBtcFixture() {
   const genesisBody = jsonRpcResult(btcId(checkedAtMs, 2), BTC_REGTEST_PIN.genesisHash);
   const rawTxBody = jsonRpcResult(btcId(checkedAtMs, 3), { hex: rawHex, confirmations: 2, blockhash: FUNDING_BLOCK_HASH });
   const txoutBody = jsonRpcResult(btcId(checkedAtMs, 4), { confirmations: 2, value: 1.0, scriptPubKey: { hex: bytesToHex(scriptPubKey) } });
+  // H6: the funding block's own real height, read directly via getblockheader.
+  const FUNDING_HEIGHT = TIP_HEIGHT - 2 + 1;
+  const blockHeaderBody = jsonRpcResult(btcId(checkedAtMs, 5), { height: FUNDING_HEIGHT });
 
   // P4-BTC-SPEC.md §7, mirroring evm-evidence's own A1/D1 binding rules: each exchange's own
   // `requestBody` must actually ask for its declared `method`/`params`, and every id is bound
@@ -176,10 +179,17 @@ function buildBtcFixture() {
         responseSha256: sha256Hex(txoutBody),
         atMs: T0,
       },
+      {
+        method: "getblockheader",
+        params: [FUNDING_BLOCK_HASH],
+        requestBody: JSON.stringify({ jsonrpc: "2.0", id: btcId(checkedAtMs, 5), method: "getblockheader", params: [FUNDING_BLOCK_HASH] }),
+        responseSha256: sha256Hex(blockHeaderBody),
+        atMs: T0,
+      },
     ],
   };
 
-  return { swapId, lock, legAOffer, legAAccept, legBOffer, legBAccept, legATerms, offerRows, dealRoomA, dealRoomARows, index, chainInfoBody, genesisBody, rawTxBody, txoutBody };
+  return { swapId, lock, legAOffer, legAAccept, legBOffer, legBAccept, legATerms, offerRows, dealRoomA, dealRoomARows, index, chainInfoBody, genesisBody, rawTxBody, txoutBody, blockHeaderBody };
 }
 
 async function writeWatchRoot(root: string, fixture: ReturnType<typeof buildBtcFixture>, opts: { rails?: unknown } = {}) {
@@ -195,6 +205,7 @@ async function writeWatchRoot(root: string, fixture: ReturnType<typeof buildBtcF
     [fixture.index.exchanges[1]!.responseSha256, fixture.genesisBody],
     [fixture.index.exchanges[2]!.responseSha256, fixture.rawTxBody],
     [fixture.index.exchanges[3]!.responseSha256, fixture.txoutBody],
+    [fixture.index.exchanges[4]!.responseSha256, fixture.blockHeaderBody],
   ] as const) {
     await writeFile(join(root, "raw", "rpc", `${sha}.json`), body);
   }
