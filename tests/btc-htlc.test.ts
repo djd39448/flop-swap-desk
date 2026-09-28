@@ -616,6 +616,43 @@ describe("chain time helpers", () => {
     expect(await rail.tipBlockTimeMs()).toBe(1_000_000);
     expect(await rail.medianTimePastMs()).toBe(900_000);
   });
+
+  // P4-BTC-FIXES-R3.md K6: a missing/malformed `time`/`mediantime` must throw, never silently
+  // become `NaN` — every deadline comparison built on a `NaN` chain time evaluates to `false`
+  // (neither `>=` nor `<` is ever true against `NaN`), which would make a claim's own
+  // `assertChainTimeBeforeOrThrow` refuse nothing, no matter how far past its deadline.
+  describe("K6 — fail closed on a missing/malformed tip time", () => {
+    it("tipBlockTimeMs throws when getblockchaininfo has no time field", async () => {
+      const { rail } = await connectRail(baseHandlers({ getblockchaininfo: () => ({ chain: "regtest", mediantime: 900 }) }));
+      await expect(rail.tipBlockTimeMs()).rejects.toThrow(/finite integer tip time/);
+    });
+
+    it("tipBlockTimeMs throws when time is not a finite number (NaN/Infinity/a string)", async () => {
+      const { rail: railNaN } = await connectRail(baseHandlers({ getblockchaininfo: () => ({ chain: "regtest", time: Number.NaN }) }));
+      await expect(railNaN.tipBlockTimeMs()).rejects.toThrow(/finite integer tip time/);
+      const { rail: railInf } = await connectRail(baseHandlers({ getblockchaininfo: () => ({ chain: "regtest", time: Number.POSITIVE_INFINITY }) }));
+      await expect(railInf.tipBlockTimeMs()).rejects.toThrow(/finite integer tip time/);
+      const { rail: railStr } = await connectRail(baseHandlers({ getblockchaininfo: () => ({ chain: "regtest", time: "1000" }) }));
+      await expect(railStr.tipBlockTimeMs()).rejects.toThrow(/finite integer tip time/);
+    });
+
+    it("medianTimePastMs throws when getblockchaininfo has no mediantime field", async () => {
+      const { rail } = await connectRail(baseHandlers({ getblockchaininfo: () => ({ chain: "regtest", time: 1000 }) }));
+      await expect(rail.medianTimePastMs()).rejects.toThrow(/finite integer median time past/);
+    });
+
+    it("a claim never broadcasts against a NaN chain time — refuses instead of racing past its own deadline", async () => {
+      // Before K6: `assertChainTimeBeforeOrThrow`'s own `chainNow >= notAfterMs` was `NaN >=
+      // notAfterMs`, always `false`, so the claim sailed straight through to
+      // testmempoolaccept/sendrawtransaction no matter what `notAfterMs` was.
+      const { rail, calls } = await connectRail(baseHandlers({ getblockchaininfo: () => ({ chain: "regtest", blocks: 200, mediantime: 1_690_000_000 }) }));
+      calls.length = 0;
+      const notAfterMs = 1_690_000_000_000; // deliberately already in the past — must never broadcast
+      await expect(rail.claim(REF, TERMS, `0x${PREIMAGE_HEX}`, SELLER, DESTINATION_ADDRESS, notAfterMs)).rejects.toThrow(/finite integer tip time/);
+      expect(calls.some((c) => c.method === "testmempoolaccept")).toBe(false);
+      expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
+    });
+  });
 });
 
 // ── key/path parsing helpers ─────────────────────────────────────────────────────────────────

@@ -494,16 +494,32 @@ export class BtcHtlcRail {
     return { ref, txid, blockHeight: null, blockHash: null, raw, ...(rawTx === undefined ? {} : { rawTx }) };
   }
 
-  /** The chain's tip block time, in ms. One of the two chain-time helpers spec §4 asks for. */
+  /** The chain's tip block time, in ms. One of the two chain-time helpers spec §4 asks for.
+   *
+   *  P4-BTC-FIXES-R3.md K6: fails closed unless `getblockchaininfo().time` is a finite integer —
+   *  a missing/malformed field became `NaN` here before this fix, and `NaN * 1000` stays `NaN`,
+   *  which makes EVERY `>=`/`<` deadline comparison built on it silently evaluate to `false` (a
+   *  claim's own `assertChainTimeBeforeOrThrow` would then never refuse, no matter how far past
+   *  its deadline). Never guess a time; throw instead. */
   async tipBlockTimeMs(): Promise<number> {
-    const info = await this.request<{ time: number }>("getblockchaininfo", []);
+    const info = await this.request<{ time: unknown }>("getblockchaininfo", []);
+    if (typeof info.time !== "number" || !Number.isFinite(info.time) || !Number.isInteger(info.time)) {
+      throw new Error("btc-htlc: getblockchaininfo did not return a finite integer tip time (time) — refusing to guess a chain-time deadline");
+    }
     return info.time * 1000;
   }
 
   /** The chain's median time past (the last 11 blocks), in ms — what CLTV's `after(T)` branch is
-   *  actually checked against, and the second chain-time helper spec §4 asks for. */
+   *  actually checked against, and the second chain-time helper spec §4 asks for.
+   *
+   *  P4-BTC-FIXES-R3.md K6: the same fail-closed rule as `tipBlockTimeMs` — a missing/malformed
+   *  `mediantime` must throw, never silently become `NaN` and let a deadline comparison built on
+   *  it pass by accident. */
   async medianTimePastMs(): Promise<number> {
-    const info = await this.request<{ mediantime: number }>("getblockchaininfo", []);
+    const info = await this.request<{ mediantime: unknown }>("getblockchaininfo", []);
+    if (typeof info.mediantime !== "number" || !Number.isFinite(info.mediantime) || !Number.isInteger(info.mediantime)) {
+      throw new Error("btc-htlc: getblockchaininfo did not return a finite integer median time past (mediantime) — refusing to guess a chain-time deadline");
+    }
     return info.mediantime * 1000;
   }
 
