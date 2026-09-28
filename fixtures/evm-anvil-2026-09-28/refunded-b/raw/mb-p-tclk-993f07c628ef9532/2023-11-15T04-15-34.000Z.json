@@ -1,0 +1,25 @@
+{
+ "room": "mb-p-tclk-993f07c628ef9532",
+ "count": 2,
+ "first_seq": 1,
+ "last_seq": 2,
+ "generation": 1,
+ "messages": [
+  {
+   "seq": 1,
+   "ts": "2023-11-15T01:14:34.000Z",
+   "from": "did:key:z6MkmWxsPnqTxDhGB7uuiA3hxrFDw258aBSh6PWbjHLtKbJM",
+   "text": "swap1 account evm-htlc eip155:31337:0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+   "nonce": "10001",
+   "sig": "yf3OkZkA3Jp3G0qhjYLF2eCWUecKWKudWnsYUAPfjgT2BGO-RpdWYswiSqwrStEu51QfkbTo5Puy2kFe5fJYBQ"
+  },
+  {
+   "seq": 2,
+   "ts": "2023-11-15T01:14:34.000Z",
+   "from": "did:key:z6MkqgTgrmU9RmnNpKnggispapnngzYDwgscEr7MWuJnFeYG",
+   "text": "swap1 account evm-htlc eip155:31337:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+   "nonce": "10002",
+   "sig": "LehugCJNJsPuQGyyHBs4W5Y6i_nhz7XJNCMZGqAQvRT_RD1W7479ZJrS-srbcmPfEvHPEOcLnoA8aFpGym_rDQ"
+  }
+ ]
+}
