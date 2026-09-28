@@ -31,7 +31,7 @@ import type { LockTerms } from "@flop-labs/tclk";
 import { verifyHashPreimage } from "@flop-labs/tclk";
 
 import { EvmHashRail, type AddressBook, type AssetBook } from "../vendor/evm-hash-rail.js";
-import { captureEvmLeg, evmEvidence, type EvmAccounts, type EvmEvidenceResult } from "./evm-evidence.js";
+import { captureEvmLeg, evmEvidence, EVM_RAIL_ID, hashLockRefMismatch, type EvmAccounts, type EvmEvidenceResult } from "./evm-evidence.js";
 import type { CapturingRpc } from "./rpc-capture.js";
 
 /** §2.2 point 1. Only `"finalized"` is a defined tag today; the union leaves room for a
@@ -378,11 +378,26 @@ export class EvmHtlcRail {
    * §2.2 point 3, implemented per §4 as "capture live, then evmEvidence": performs the live
    * read once (`captureEvmLeg`) and hands the exact bytes it produced straight to the pure
    * decoder, so the verdict this returns and the verdict a later replay of the same bytes
-   * returns can never diverge. Never throws for a chain-state reason (an absent lock, a
-   * mismatched field, a chain the RPC lacks a finalized view for) — only a genuine transport
-   * failure (the node unreachable) propagates.
+   * returns can never diverge. P22-P24-EVM-FIXES.md A8: `ref`/`terms.lock` are checked
+   * *before* `captureEvmLeg` ever runs — a malformed ref can never resolve to real evidence,
+   * so there is no reason to spend a live round trip finding that out. Otherwise never throws
+   * for a chain-state reason (an absent lock, a mismatched field, a chain the RPC lacks a
+   * finalized view for) — only a genuine transport failure (the node unreachable) propagates.
    */
   async verifyLockFinal(terms: LockTerms, ref: string, accounts: EvmAccounts): Promise<EvmEvidenceResult> {
+    if (hashLockRefMismatch(terms, ref)) {
+      return {
+        lock: {
+          rail: EVM_RAIL_ID,
+          ref,
+          terms,
+          checkedAtMs: this.clock(),
+          endpoint: this.config.endpoint,
+          railVerified: false,
+          reason: 'evm-htlc: ref/lock mismatch (ref must equal terms.statement and lock must be "hash")',
+        },
+      };
+    }
     const checkedAtMs = this.clock();
     const { index, exchanges } = await captureEvmLeg(this.rpc, this.config, ref, checkedAtMs);
     const bytes = new Map(exchanges.map((exchange) => [exchange.responseSha256, new TextEncoder().encode(exchange.responseBody)]));

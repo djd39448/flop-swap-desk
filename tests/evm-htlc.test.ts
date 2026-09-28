@@ -524,6 +524,80 @@ describe("EvmHtlcRail.verifyLockFinal — representative finalized-view branches
     expect(evidence.lock.railVerified).toBeNull();
     expect(evidence.lock.reason).toMatch(/no fallbackConfirmations is configured/);
   });
+
+  // P22-P24-EVM-FIXES.md A8: `ref`/`terms.lock` are checked before any RPC — a malformed ref
+  // or lock kind can never resolve to real evidence, so `verifyLockFinal` must refuse without
+  // ever calling `captureEvmLeg`'s transport. Every handler below is a genuinely working one
+  // (a broken guard would not crash — it would quietly complete a live round trip and still
+  // land on the same "ref/lock mismatch" verdict via `evmEvidence`'s own gate), so the only
+  // way to actually catch a regression is counting `calls`: `connect()` makes exactly one
+  // (`eth_chainId`); `verifyLockFinal` must add zero more.
+  describe("verifyLockFinal — A8: refuses before any RPC", () => {
+    it('terms.lock !== "hash" -> railVerified false, no RPC beyond connect()', async () => {
+      const config = configFor(ANVIL_LOCAL_PIN);
+      const { rpc, calls } = mockCapturingRpc({
+        eth_chainId: () => ({ result: "0x7a69" }),
+        eth_getBlockByNumber: () => ({ result: { number: "0x5", hash: BLOCK_HASH } }),
+        eth_call: () => ({ result: locksResult(1) }),
+      });
+      const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+      expect(calls).toHaveLength(1); // just connect()'s own eth_chainId
+      const pointTerms: LockTerms = { ...TERMS, lock: "point" };
+      const evidence = await rail.verifyLockFinal(pointTerms, pointTerms.statement, { payee: PAYEE });
+      expect(evidence.lock.railVerified).toBe(false);
+      expect(evidence.lock.reason).toMatch(/ref\/lock mismatch/);
+      expect(calls).toHaveLength(1); // verifyLockFinal touched the RPC zero times
+    });
+
+    it("ref !== terms.statement -> railVerified false, no RPC beyond connect()", async () => {
+      const config = configFor(ANVIL_LOCAL_PIN);
+      const { rpc, calls } = mockCapturingRpc({
+        eth_chainId: () => ({ result: "0x7a69" }),
+        eth_getBlockByNumber: () => ({ result: { number: "0x5", hash: BLOCK_HASH } }),
+        eth_call: () => ({ result: locksResult(1) }),
+      });
+      const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+      const wrongRef = "0x" + "ab".repeat(32);
+      const evidence = await rail.verifyLockFinal(TERMS, wrongRef, { payee: PAYEE, payer: PAYER });
+      expect(evidence.lock.railVerified).toBe(false);
+      expect(evidence.lock.reason).toMatch(/ref\/lock mismatch/);
+      expect(evidence.lock.ref).toBe(wrongRef);
+      expect(calls).toHaveLength(1); // verifyLockFinal touched the RPC zero times
+    });
+
+    it("a malformed hashLock shape (not 0x + 64 lowercase hex) -> railVerified false, no RPC beyond connect()", async () => {
+      const config = configFor(ANVIL_LOCAL_PIN);
+      const { rpc, calls } = mockCapturingRpc({
+        eth_chainId: () => ({ result: "0x7a69" }),
+        eth_getBlockByNumber: () => ({ result: { number: "0x5", hash: BLOCK_HASH } }),
+        eth_call: () => ({ result: locksResult(1) }),
+      });
+      const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+      const evidence = await rail.verifyLockFinal(TERMS, "0xnothex", { payee: PAYEE });
+      expect(evidence.lock.railVerified).toBe(false);
+      expect(evidence.lock.reason).toMatch(/ref\/lock mismatch/);
+      expect(calls).toHaveLength(1); // verifyLockFinal touched the RPC zero times
+    });
+  });
+
+  // P22-P24-EVM-FIXES.md A8, `captureEvmLeg`'s own copy of the guard (called directly, the
+  // way `src/watcher.ts` does, rather than through `verifyLockFinal`).
+  describe("captureEvmLeg — A8: refuses a malformed hashLock before any RPC", () => {
+    it("returns an empty-exchange index and makes zero RPC calls", async () => {
+      const config = configFor(ANVIL_LOCAL_PIN);
+      const { rpc, calls } = mockCapturingRpc({
+        eth_chainId: () => ({ result: "0x7a69" }),
+        eth_getBlockByNumber: () => ({ result: { number: "0x5", hash: BLOCK_HASH } }),
+        eth_call: () => ({ result: locksResult(1) }),
+      });
+      const { captureEvmLeg } = await import("../src/rails/evm-evidence.js");
+      const { index, exchanges } = await captureEvmLeg(rpc, config, "not-a-hash-lock", NOW());
+      expect(exchanges).toEqual([]);
+      expect(index.exchanges).toEqual([]);
+      expect(index.hashLock).toBe("not-a-hash-lock");
+      expect(calls).toHaveLength(0);
+    });
+  });
 });
 
 describe("EvmHtlcRail.findClaimedPreimage", () => {

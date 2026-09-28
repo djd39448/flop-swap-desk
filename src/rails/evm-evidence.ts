@@ -28,7 +28,7 @@
 // trust level `paperEvidence` gives a `/kv` note.
 //
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §2.2 point 3, §4;
-// flop-contrib/handoff/P22-P24-EVM-FIXES.md A1, A2, A4, A7, A11.
+// flop-contrib/handoff/P22-P24-EVM-FIXES.md A1, A2, A4, A7, A8, A11.
 
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -64,10 +64,11 @@ export const HASH_LOCK_SHAPE = /^0x[0-9a-f]{64}$/;
 const BLOCK_HASH_SHAPE = /^0x[0-9a-fA-F]{64}$/;
 const HEX_VALUE = /^0x[0-9a-fA-F]+$/;
 
-/** §2.2 point 3's ref/lock gate, hoisted into its own function: `ref` must equal
- *  `terms.statement` (lowercase `0x` + 64 hex) and `terms.lock` must be `"hash"`. Exported so a
- *  caller can apply the identical check before ever building a capture (P22-P24-EVM-FIXES.md
- *  A8, a later commit). */
+/** A8/§2.2 point 3's guard, hoisted so it can run *before* any network call: `ref` must equal
+ *  `terms.statement` (lowercase `0x` + 64 hex) and `terms.lock` must be `"hash"`. Used both by
+ *  `evmEvidence` (as the first check over already-captured bytes) and by
+ *  `EvmHtlcRail.verifyLockFinal`/`captureEvmLeg` (to refuse before ever touching the RPC —
+ *  P22-P24-EVM-FIXES.md A8). */
 export function hashLockRefMismatch(terms: LockTerms, ref: string): boolean {
   return terms.lock !== "hash" || !HASH_LOCK_SHAPE.test(ref) || ref !== terms.statement;
 }
@@ -658,9 +659,12 @@ function buildIndex(
  * describes), and `eth_call locks(hashLock)` pinned to that block by hash (EIP-1898
  * `{ blockHash }`) — every call through `rpc`, so every byte is captured. Returns the index
  * (§4's on-disk manifest shape) plus the raw `Exchange`s (for `writeCapture`/an in-memory
- * `EvmCapture.bytes`). Never throws for a rejected finalized tag (falls back or gives up per
- * config, still returning whatever it captured) — only a genuine transport failure (the node
- * unreachable) propagates, since there is nothing this function could paper over for that.
+ * `EvmCapture.bytes`). A8: a malformed `hashLock` can never resolve to real evidence, so it
+ * is refused up front — before ever touching `rpc` — the same guard `verifyLockFinal` applies
+ * before calling this at all. Otherwise never throws for a rejected finalized tag (falls back
+ * or gives up per config, still returning whatever it captured) — only a genuine transport
+ * failure (the node unreachable) propagates, since there is nothing this function could paper
+ * over for that.
  */
 export async function captureEvmLeg(
   rpc: CapturingRpc,
@@ -668,6 +672,13 @@ export async function captureEvmLeg(
   hashLock: string,
   nowMs: number,
 ): Promise<{ index: EvmCaptureIndex; exchanges: Exchange[] }> {
+  if (!HASH_LOCK_SHAPE.test(hashLock)) {
+    const finality = config.pin.finality;
+    const finalityRecord: EvmCaptureIndex["finality"] =
+      finality.mode === "confirmations" ? { mode: "confirmations", confirmations: finality.confirmations } : { mode: "tag", tag: finality.tag };
+    return { index: buildIndex(config, 0, hashLock, nowMs, [], finalityRecord), exchanges: [] };
+  }
+
   const before = rpc.exchanges().length;
   const finish = (finality: EvmCaptureIndex["finality"], chainId: number) => {
     const exchanges = rpc.exchanges().slice(before);
