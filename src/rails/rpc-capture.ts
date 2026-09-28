@@ -42,6 +42,12 @@ export interface Exchange {
    *  file it writes, and the value `readCapture` re-derives to catch tampering. */
   responseSha256: string;
   atMs: number;
+  /** P4-BTC-SPEC.md §4: set when this exchange targeted `endpoint + path` instead of the bare
+   *  endpoint — bitcoind's per-wallet JSON-RPC dispatch (`/wallet/<name>`) needs this; every EVM
+   *  call leaves it unset (the bare endpoint). Never a secret (a wallet name is not credential
+   *  material), so recording it is safe — unlike the auth header (see `CapturingRpcOptions.headers`
+   *  below), which is never recorded anywhere on an `Exchange`. */
+  path?: string;
 }
 
 /** What `CapturingRpc` exposes beyond the EIP-1193 `request` method: the exchanges it has
@@ -88,6 +94,16 @@ export interface CapturingRpcOptions {
    *  E4: defaults to `DEFAULT_RPC_TIMEOUT_MS` rather than never aborting — every caller gets
    *  this protection unless it explicitly asks for a different one. */
   timeoutMs?: number;
+  /** P4-BTC-SPEC.md §1/§4: extra HTTP headers merged into every request this instance makes —
+   *  chiefly the `Authorization: Basic <cookie>` header bitcoind's regtest RPC needs
+   *  (tests-regtest/helpers/bitcoind.ts reads the node's own throwaway cookie file and passes it
+   *  here). Read fresh on every call (a function, not a static object) rather than baked in once,
+   *  so nothing forces a caller to have the credential in hand before constructing this instance.
+   *  Never merged into `requestBody`, never stored on an `Exchange`, and so never written to
+   *  `raw/rpc/*.json` or any capture index — the keyless rule's "never logged, never persisted"
+   *  extends to the node's own RPC cookie exactly as it does to a private key. Defaults to no
+   *  extra headers (every existing EVM caller is unaffected). */
+  headers?: () => Record<string, string>;
 }
 
 /**
@@ -107,6 +123,7 @@ export class CapturingRpc implements CaptureSink {
   private readonly fetchImpl: typeof fetch;
   private readonly clock: () => number;
   private readonly timeoutMs: number | undefined;
+  private readonly headersFn: () => Record<string, string>;
   private readonly log: Exchange[] = [];
   private nextId = 1;
   private idNamespace: string | undefined;
@@ -117,6 +134,7 @@ export class CapturingRpc implements CaptureSink {
     this.fetchImpl = options.fetch ?? fetch;
     this.clock = options.clock ?? Date.now;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+    this.headersFn = options.headers ?? (() => ({}));
   }
 
   /**
@@ -149,10 +167,15 @@ export class CapturingRpc implements CaptureSink {
     return `${this.idNamespace}:${this.namespaceCounter}`;
   }
 
-  async request({ method, params }: { method: string; params?: unknown }): Promise<unknown> {
+  async request({ method, params, path }: { method: string; params?: unknown; path?: string }): Promise<unknown> {
     const id = this.mintId();
     const requestBody = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? [] });
     const atMs = this.clock();
+    // P4-BTC-SPEC.md §4: bitcoind's per-wallet RPC dispatch needs `/wallet/<name>` appended to
+    // the base endpoint for wallet calls (walletprocesspsbt, sendtoaddress, …); every other
+    // call (and every existing EVM caller, which never passes `path`) still targets the bare
+    // endpoint exactly as before.
+    const url = path === undefined || path === "" ? this.endpoint : `${this.endpoint}${path}`;
 
     // A9/D6: a stalled/unreachable endpoint must not be able to hang a sweep forever — abort
     // after `timeoutMs` (when the caller configured one) exactly like `src/watcher.ts`'s own
@@ -166,9 +189,12 @@ export class CapturingRpc implements CaptureSink {
     const timer = this.timeoutMs === undefined ? undefined : setTimeout(() => controller.abort(), this.timeoutMs);
     let responseBytes: Uint8Array;
     try {
-      const response = await this.fetchImpl(this.endpoint, {
+      // The auth header (if any) is read fresh here and only ever placed on the outgoing HTTP
+      // request — it never reaches `requestBody` above, and is therefore never part of what
+      // gets pushed onto `this.log` below (an `Exchange` carries no headers field at all).
+      const response = await this.fetchImpl(url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...this.headersFn() },
         body: requestBody,
         signal: controller.signal,
       });
@@ -185,7 +211,16 @@ export class CapturingRpc implements CaptureSink {
     // exchange afterward) is decoded from that same byte buffer, once, as a separate copy.
     const responseSha256 = bytesToHex(sha256(responseBytes));
     const responseBody = new TextDecoder("utf-8").decode(responseBytes);
-    this.log.push({ method, params: params ?? [], requestBody, responseBody, responseBytes, responseSha256, atMs });
+    this.log.push({
+      method,
+      params: params ?? [],
+      requestBody,
+      responseBody,
+      responseBytes,
+      responseSha256,
+      atMs,
+      ...(path === undefined || path === "" ? {} : { path }),
+    });
 
     let parsed: unknown;
     try {
