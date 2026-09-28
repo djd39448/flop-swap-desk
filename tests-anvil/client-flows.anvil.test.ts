@@ -44,6 +44,14 @@ const FIXTURES_ROOT = join(REPO_ROOT, "fixtures", "evm-anvil-2026-09-28");
  *  directory that nothing ever reads back, so the committed fixtures never move. */
 const CAPTURE_FIXTURES = process.env.CAPTURE_EVM_FIXTURES === "1";
 
+/** P22-P24-EVM-FIXES-R2.md D7: every scenario's own `mkdtemp` bundle directory (never the
+ *  committed fixtures under `CAPTURE_FIXTURES` — those are never removed here), so `afterAll`
+ *  can remove them once the suite is done — an ordinary `npm run test:anvil` run otherwise
+ *  leaves five fresh directories under the OS temp dir behind every time it runs, forever.
+ *  `KEEP_ANVIL_BUNDLES=1` skips the cleanup, for inspecting a scenario's exact written bundle
+ *  by hand after the run. */
+const scenarioRoots: string[] = [];
+
 async function scenarioRoot(scenario: string): Promise<string> {
   if (CAPTURE_FIXTURES) {
     const dir = join(FIXTURES_ROOT, scenario);
@@ -51,7 +59,9 @@ async function scenarioRoot(scenario: string): Promise<string> {
     await mkdir(dir, { recursive: true });
     return dir;
   }
-  return mkdtemp(join(tmpdir(), `flop-evm-anvil-${scenario}-`));
+  const dir = await mkdtemp(join(tmpdir(), `flop-evm-anvil-${scenario}-`));
+  scenarioRoots.push(dir);
+  return dir;
 }
 
 const MOCK_ERC20_MINT_ABI = [
@@ -208,6 +218,12 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
 
   afterAll(async () => {
     await anvil?.stop();
+    // D7: clean up every scenario's own mkdtemp bundle directory — never the committed
+    // fixtures (CAPTURE_FIXTURES never pushes to `scenarioRoots`) — unless a caller explicitly
+    // wants to inspect what got written.
+    if (process.env.KEEP_ANVIL_BUNDLES !== "1") {
+      await Promise.all(scenarioRoots.map((dir) => rm(dir, { recursive: true, force: true })));
+    }
   });
 
   function freshParty(id: Identity, account: Address): Party {

@@ -118,6 +118,11 @@ which overwrites `fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b}/` 
 the result and then confirm both that `tests/evm-anvil-fixtures.test.ts` (hermetic, `npm test`)
 replays it and that a plain `npm run test:anvil` afterward leaves `git status` clean.
 
+An ordinary (non-capture) run removes its own `mkdtemp` bundle directories once the suite
+finishes, so `npm run test:anvil` never leaves anything behind under the OS temp dir; set
+`KEEP_ANVIL_BUNDLES=1` to keep them around for inspecting a scenario's exact written bundle by
+hand.
+
 **Keyless throughout (D-10):** no private key, mnemonic, or seed for any EVM account exists
 anywhere in this build — writes go out as JSON-RPC accounts (`eth_sendTransaction` from one of
 anvil's own unlocked addresses) via a plain-address viem `WalletClient`. tclk's Ed25519 test

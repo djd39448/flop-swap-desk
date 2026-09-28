@@ -2,8 +2,10 @@
 
 import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -924,6 +926,56 @@ describe("runSweep", () => {
       expect(view).toBeDefined();
       expect(view.evidence.aRail).toMatchObject({ status: "locked", final: true });
       expect(view.evidence.a.railVerified).toBe(true);
+    });
+
+    // P22-P24-EVM-FIXES-R2.md D7: a live-vs-replay equivalence test through the *real* watcher
+    // (`runSweep`, not a hand-built index/config fixture) and the *real* `examples/audit-
+    // export.mjs` CLI (a genuine child process), at two different `nowMs` values — the sweep's
+    // own fixed `NOW` (2025-12-24) versus the CLI's baked-in `Date.now()` (whenever this test
+    // actually runs, always meaningfully later). The verdict must agree either way, since it
+    // rests on the capture's own frozen `checkedAtMs` (A7), never on whichever wall clock
+    // happened to be replaying it.
+    it("D7: the real watcher's own live capture replays identically through the real audit-export CLI, at a different nowMs", async () => {
+      const swap = buildEvmSwap("aaaa1099", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+      const callResult = encodeLockedResult(swap.legATerms);
+
+      const calls: Array<{ url: string; body?: string }> = [];
+      const fetchImpl = makeEvmFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: EVM_CONFIG.endpoint,
+        rpcResult: evmRpcResponder(callResult),
+        calls,
+      });
+
+      // The real watcher, live, at its own fixed sweep time (`baseOptions`'s `nowMs: () => NOW`).
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { evm: EVM_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.chainReads).toBe(1);
+
+      const liveBoard = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const liveView = liveBoard.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(liveView).toBeDefined();
+      expect(liveView.evidence.a.railVerified).toBe(true);
+      expect(liveView.settlementView.a).toBe("funded");
+
+      // The real audit-export CLI, replaying the exact same on-disk root the sweep above just
+      // wrote — its own `nowMs` is `Date.now()`, never overridden, genuinely different from
+      // `NOW` (fixed, always in the past relative to whenever this test runs).
+      const script = join(dirname(fileURLToPath(import.meta.url)), "..", "examples", "audit-export.mjs");
+      const result = spawnSync(process.execPath, [script, "--root", root, "--json"], { encoding: "utf8" });
+      expect(result.status).toBe(0);
+      const replayed = JSON.parse(result.stdout) as { swaps: Array<{ swapId: string; settlementView: { a: string }; finalizedRefs: string[] }> };
+      const replayedSwap = replayed.swaps.find((s) => s.swapId === swap.swapId);
+      expect(replayedSwap).toBeDefined();
+      expect(replayedSwap!.settlementView.a).toBe(liveView.settlementView.a);
+      expect(replayedSwap!.finalizedRefs.some((ref) => ref.startsWith("anvil-local:finalized:5:"))).toBe(true);
     });
 
     it("a second sweep with the same config does not rewrite rails.json", async () => {
