@@ -62,15 +62,20 @@ export const EVM_LOCAL_POLICY: EvmLocalPolicy = Object.freeze({
 // something the chain enforces, so it is sized the same order of magnitude as EVM's own 45 min
 // rather than shaved to the bare regtest minimum.
 //
-// `finalityAMs` (N confirmations plus a 2 h median-time-past budget): `btc-script.ts`'s own
-// documented consequence of the unix-time CLTV rule is that a refund's real, chain-observable
-// time lags `refundAfterMs` by roughly an hour (median-time-past of the last 11 blocks) — this
-// build budgets a full 2 h so the Buyer's own rule-2 check (`legB.claimByMs >=
-// legA.refundAfterMs + finalityAMs`) stays safe even on a slow or irregularly-mined chain, well
-// above the ~1 h MTP lag alone. `BTC_REGTEST_PIN.finality.confirmations` (1) contributes
-// negligibly next to that lag on a regtest node that mines on demand, so this constant does not
-// scale it in separately — a real mainnet/signet pin choosing more confirmations would need its
-// own wider constant, out of scope here (P4-BTC-SPEC.md §0).
+// `finalityAMs` (N confirmations plus a 2 h median-time-past budget, P4-BTC-FIXES.md G5: raised
+// to 3 h to also cover the refund's own confirmation): `btc-script.ts`'s own documented
+// consequence of the unix-time CLTV rule is that a refund's real, chain-observable time lags
+// `refundAfterMs` by roughly an hour (median-time-past of the last 11 blocks) — on top of that
+// lag, G7's own "a refund counts only when confirmed" rule means the Buyer's own refund is not
+// reported (or reflected in the Seller's own `verifyLockFinal`) until it additionally clears the
+// pin's own confirmation count, which itself takes real wall-clock time on anything but an
+// on-demand-mined regtest node. This build budgets a full 3 h — the ~1 h MTP lag plus a further
+// ~2 h for the refund's own confirmation to land — so the Buyer's own rule-2 check
+// (`legB.claimByMs >= legA.refundAfterMs + finalityAMs`) stays safe even on a slow or
+// irregularly-mined chain. `BTC_REGTEST_PIN.finality.confirmations` (1) contributes negligibly
+// next to that budget on a regtest node that mines on demand, so this constant does not scale it
+// in separately — a real mainnet/signet pin choosing more confirmations would need its own wider
+// constant, out of scope here (P4-BTC-SPEC.md §0).
 //
 // `claimInclusionMarginMs` (60 min, spec's own "a claim-inclusion margin of 60 min"): the
 // Seller's own `claimLegA`-equivalent last-moment guard — the minimum gap this build insists on
@@ -89,6 +94,6 @@ export interface BtcLocalPolicy extends DeadlinePolicy {
 export const BTC_LOCAL_POLICY: BtcLocalPolicy = Object.freeze({
   ...DEFAULT_POLICY_EXAMPLE,
   minRevealWindowMs: 60 * 60_000,
-  finalityAMs: 2 * 60 * 60_000,
+  finalityAMs: 3 * 60 * 60_000,
   claimInclusionMarginMs: 60 * 60_000,
 });

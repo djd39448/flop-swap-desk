@@ -298,6 +298,23 @@ export function keyFromAddressInfo(info: { pubkey: string; hdmasterfingerprint: 
  *  fees …"). */
 export const DEFAULT_FEE_SATS = 1000n;
 
+/** Bitcoin's own standardness floor for a single output (BIP: any output below this is
+ *  non-standard and most nodes/miners will never relay or mine a transaction that creates one).
+ *  P4-BTC-FIXES.md G6. */
+export const DUST_LIMIT_SATS = 546n;
+
+/** G6 margin: extra headroom above the bare fee+dust floor. `amountSats` funds the P2WSH output
+ *  itself; once a claim or refund subtracts `DEFAULT_FEE_SATS`, the single remaining output must
+ *  still clear `DUST_LIMIT_SATS` — this margin keeps it comfortably clear rather than exactly on
+ *  the line, a single satoshi of fee-estimate drift away from becoming non-standard. */
+export const MIN_LOCKABLE_MARGIN_SATS = 500n;
+
+/** G6: the smallest `amountSats` this rail will ever lock — the fixed fee plus the worst-case
+ *  dust limit, with margin (spec: "the fixed fee plus the worst-case 546-sat dust limit, with
+ *  margin"). The reviewer's 1,200-sat and 900-sat cases are both refused (this floor is 2,046
+ *  sats). */
+export const BTC_MIN_LOCKABLE_SATS: bigint = DEFAULT_FEE_SATS + DUST_LIMIT_SATS + MIN_LOCKABLE_MARGIN_SATS;
+
 /** P4-BTC-FIXES.md H2: a funding transaction built and signed, but never yet broadcast — every
  *  field a caller needs to record BEFORE broadcasting (so a crash between `prepareFunding` and
  *  `broadcastFunding` leaves enough on disk to recover from, via `recoverFunding`, rather than

@@ -335,6 +335,14 @@ export interface ResolvePubkeysInput {
   rail: string;
   /** The chain pin's own `caip2` (e.g. `BtcChainPin.caip2`). */
   caip2: string;
+  /** P4-BTC-FIXES.md G1: when set, a candidate record with `seq >= beforeSeq` is ignored
+   *  entirely — "only lines posted before the accepted lock frame" — so a line posted after a
+   *  swap's own leg-A lock was accepted can neither newly resolve nor conflict-and-unresolve a
+   *  party's pubkey for a caller (`SellerFlow.claimLegA`) whose own resolution necessarily runs
+   *  after that lock exists in the room. Omitted (the default): every record counts, unchanged
+   *  from this function's behaviour before G1 (every non-flow caller — `src/replay.ts`'s
+   *  `foldCaptured`, the live watcher, `examples/audit-export.mjs` — never passes this). */
+  beforeSeq?: number;
 }
 
 export interface ResolvedPubkeys {
@@ -378,6 +386,7 @@ export function resolvePubkeys(records: readonly TranscriptRecord[], input: Reso
   const pubkeysByDid = new Map<string, Set<string>>();
 
   for (const candidate of records) {
+    if (input.beforeSeq !== undefined && candidate.seq >= input.beforeSeq) continue; // G1: after the accepted lock
     if (!verifyTranscriptRecord(candidate).ok) continue; // unsigned or forged: not authenticated
     if (candidate.room !== room) continue; // not this leg's own deal room
 
@@ -438,6 +447,9 @@ export interface ResolveAccountsInput {
    *  ignored (with a reason), even if it is otherwise a well-formed line for the same rail id
    *  (a rail id like `evm-htlc` is not itself chain-specific; the pin is). */
   caip2: string;
+  /** P4-BTC-FIXES.md G1 (see `ResolvePubkeysInput.beforeSeq`'s identical doc) — omitted by every
+   *  non-flow caller. */
+  beforeSeq?: number;
 }
 
 export interface ResolvedAccounts {
@@ -484,6 +496,7 @@ export function resolveAccounts(
   const addressesByDid = new Map<string, Set<string>>();
 
   for (const candidate of records) {
+    if (input.beforeSeq !== undefined && candidate.seq >= input.beforeSeq) continue; // G1: after the accepted lock
     if (!verifyTranscriptRecord(candidate).ok) continue; // unsigned or forged: not authenticated
     if (candidate.room !== room) continue; // not this leg's own deal room
 

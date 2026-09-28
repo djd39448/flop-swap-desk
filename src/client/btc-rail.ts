@@ -26,21 +26,25 @@ import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 import { formatPubkeyLine, resolvePubkeys } from "../rails/account-line.js";
 import { btcEvidence, captureBtcLeg, BTC_RAIL_ID, type BtcAccounts, type BtcCapture } from "../rails/btc-evidence.js";
 import {
+  BTC_MIN_LOCKABLE_SATS,
   BtcHtlcRail,
   type BtcHtlcTerms,
   type BtcRailConfig,
   type BtcSignerKey,
   type BtcWalletHandle,
+  type PreparedFunding,
 } from "../rails/btc-htlc.js";
 import { verifiedExchangeBytes, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import type {
   ConnectedCounterAssetRail,
   CounterAssetRail,
+  PreparedLock,
   RailAccounts,
   RailBlockMarker,
   RailEvidenceResult,
   RailWriteEvidence,
 } from "./counter-rail.js";
+import { BTC_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
 
 export interface BtcCounterRailOptions {
   config: BtcRailConfig;
@@ -92,6 +96,10 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
   private readonly options: BtcCounterRailOptions;
   private readonly terms: LockTerms;
   private readonly accounts: RailAccounts;
+  /** G3 (client half of H2): what `prepareLock` built and signed but has not yet broadcast —
+   *  `commitLock` consumes exactly this, never re-derives it, so the transaction that gets
+   *  broadcast is byte-identical to the one whose `ref` was already recorded. */
+  private prepared: PreparedFunding | undefined;
 
   constructor(btcRail: BtcHtlcRail, options: BtcCounterRailOptions, terms: LockTerms, accounts: RailAccounts) {
     this.btcRail = btcRail;
@@ -108,13 +116,27 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
     return { wallet: this.options.wallet, key: this.options.key };
   }
 
-  /** The Buyer's own lock — funds the P2WSH from its own wallet (P4-BTC-SPEC.md §4/§7). */
-  async lock(terms: LockTerms, feeBps: number): Promise<RailWriteEvidence> {
+  /** G3: builds and signs the funding PSBT (via `BtcHtlcRail.prepareFunding`) WITHOUT
+   *  broadcasting it — the outpoint (`ref`) is already fully determined by the transaction's own
+   *  bytes at this point, so a caller can record it before ever risking a broadcast. */
+  async prepareLock(terms: LockTerms, feeBps: number): Promise<PreparedLock> {
     if (feeBps !== 0) {
       throw new Error("btc-rail: this deployment has no fee; declared feeBps must be 0");
     }
     const btcTerms = toBtcHtlcTerms(terms, this.accounts);
-    const evidence = await this.btcRail.fund(btcTerms, this.ownWallet());
+    const prepared = await this.btcRail.prepareFunding(btcTerms, this.ownWallet());
+    this.prepared = prepared;
+    return { ref: prepared.ref };
+  }
+
+  /** G3: broadcasts exactly what `prepareLock` most recently prepared. */
+  async commitLock(): Promise<RailWriteEvidence> {
+    if (this.prepared === undefined) {
+      throw new Error("btc-rail: commitLock called before prepareLock");
+    }
+    const prepared = this.prepared;
+    this.prepared = undefined;
+    const evidence = await this.btcRail.broadcastFunding(prepared);
     return toWriteEvidence(evidence);
   }
 
@@ -179,6 +201,11 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
 class BtcCounterRail implements CounterAssetRail {
   readonly railId: string = BTC_RAIL_ID;
   readonly caip2: string;
+  /** G5: frozen, never a constructor option — see `CounterAssetRail.policy`'s own doc. */
+  readonly policy: RailLocalPolicy = BTC_LOCAL_POLICY;
+  /** G6: the fixed fee plus the worst-case dust limit, with margin — see
+   *  `BTC_MIN_LOCKABLE_SATS`'s own doc. */
+  readonly minLockableAmount: string = BTC_MIN_LOCKABLE_SATS.toString();
   private readonly options: BtcCounterRailOptions;
 
   constructor(options: BtcCounterRailOptions) {
@@ -196,7 +223,7 @@ class BtcCounterRail implements CounterAssetRail {
 
   resolveAccounts(
     records: readonly TranscriptRecord[],
-    input: { contract: string; payerDid: string; payeeDid: string },
+    input: { contract: string; payerDid: string; payeeDid: string; beforeSeq?: number },
   ): RailAccounts {
     const resolved = resolvePubkeys(records, { ...input, rail: this.railId, caip2: this.caip2 });
     return {

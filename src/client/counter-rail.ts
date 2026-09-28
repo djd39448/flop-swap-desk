@@ -27,6 +27,7 @@ import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
 import type { Exchange } from "../rails/rpc-capture.js";
 import type { LockEvidence, RailObservation } from "../types.js";
+import type { RailLocalPolicy } from "./policy.js";
 
 /** The parties' resolved chain identities for this swap's leg (D-08/§6): a chain address for
  *  `evm-htlc`, a compressed pubkey for `btc-htlc` once its own adapter lands — deliberately
@@ -88,6 +89,20 @@ export interface RailEvidenceResult {
 export type RailBlockMarker = unknown;
 
 /**
+ * P4-BTC-FIXES.md G3 (client half of H2)/G2's own "record before sending" rule, generalised
+ * over every rail: everything a caller needs to RECORD, before ever risking a broadcast that
+ * might succeed on the wire without this flow ever learning so (a flaky read on the response,
+ * a crash between `testmempoolaccept` and `sendrawtransaction`'s own reply). `ref` is already
+ * knowable before broadcast for every rail this build has: a Bitcoin outpoint hashes the
+ * PREPARED transaction's own bytes (never assigned by the network), and an EVM write's own ref
+ * is simply the hashLock, known before ANY write happens at all (P22-P24-EVM-FIXES-R3.md E3).
+ * `commitLock()` is the only way to actually broadcast what this prepared.
+ */
+export interface PreparedLock {
+  ref: string;
+}
+
+/**
  * One party's live handle on a rail leg — built fresh whenever a flow needs to write or read
  * (never held across a whole swap; `src/rails/evm-htlc.ts`'s `EvmHtlcRail.connect()` already
  * re-checks the pin on every connect, and this interface's `connect()` is that same call,
@@ -95,11 +110,19 @@ export type RailBlockMarker = unknown;
  * implements this same shape once it lands (P4-BTC-SPEC.md §7a).
  */
 export interface ConnectedCounterAssetRail {
-  /** The Buyer's own lock — the only write a Seller's connected handle should never call
-   *  (nothing here enforces that; `SellerFlow` simply never calls it, the same discipline its
-   *  own comments document). `feeBps` is basis points on this leg's own amount; a deployment
-   *  with no fee concept refuses anything but `0`. */
-  lock(terms: LockTerms, feeBps: number): Promise<RailWriteEvidence>;
+  /**
+   * G3/G2: build (and, for a rail that needs one, sign) the Buyer's own lock transaction
+   * WITHOUT broadcasting it, returning enough (`PreparedLock.ref`) to record before ever
+   * touching a network call that could succeed without this flow ever finding out —
+   * `commitLock()` is the only way to actually send it. The only write a Seller's connected
+   * handle should never call (nothing here enforces that; `SellerFlow` simply never calls it,
+   * the same discipline its own comments document). `feeBps` is basis points on this leg's own
+   * amount; a deployment with no fee concept refuses anything but `0`.
+   */
+  prepareLock(terms: LockTerms, feeBps: number): Promise<PreparedLock>;
+  /** Broadcasts whatever `prepareLock` most recently prepared on this same connected handle;
+   *  throws if `prepareLock` was never called first. */
+  commitLock(): Promise<RailWriteEvidence>;
   /** The Seller's claim — `notAfterMs` is this write's own last-moment deadline bound
    *  (re-checked against fresh chain time immediately before broadcast,
    *  P22-P24-EVM-FIXES-R3.md E4); a rail whose claim path could otherwise leak a secret on
@@ -152,7 +175,7 @@ export interface CounterAssetRail {
    *  "first wins"). Only the payee's is required for a lock to verify. */
   resolveAccounts(
     records: readonly TranscriptRecord[],
-    input: { contract: string; payerDid: string; payeeDid: string },
+    input: { contract: string; payerDid: string; payeeDid: string; beforeSeq?: number },
   ): RailAccounts;
 
   /** Connect (validates the static config, then a live pin check) and bind the handle to this
@@ -160,4 +183,27 @@ export interface CounterAssetRail {
    *  identities this adapter already knows or `accounts` resolved) — never cached, called fresh
    *  by a flow every time it needs to write or read. */
   connect(terms: LockTerms, accounts: RailAccounts): Promise<ConnectedCounterAssetRail>;
+
+  /** P4-BTC-FIXES.md G5: this rail's own frozen local deadline policy (`EVM_LOCAL_POLICY` /
+   *  `BTC_LOCAL_POLICY`, src/client/policy.ts) — the only source `BuyerFlow`/`SellerFlow` ever
+   *  read one from (the flows' own `options.policy` constructor field is gone); a flow can
+   *  therefore never run one rail's leg under another rail's deadline numbers, whatever a caller
+   *  passes in. */
+  readonly policy: RailLocalPolicy;
+
+  /** P4-BTC-FIXES.md G6: the smallest `terms.amount` (decimal string, this rail's own smallest
+   *  unit — satoshis for `btc-htlc`) this rail will ever lock — below the fixed spend fee plus
+   *  the worst-case dust limit, a claim or refund's own single output could never itself be a
+   *  standard, relayable transaction. `undefined` for a rail with no such floor (`evm-htlc`: an
+   *  ERC20 balance has no dust concept). `BuyerFlow.bid`/`lockLegA` and `SellerFlow.acceptLegA`
+   *  refuse an amount below this before ever touching the network. */
+  readonly minLockableAmount?: string;
+}
+
+/** P4-BTC-FIXES.md G6: `true` iff `amount` (a decimal-integer string, this rail's own smallest
+ *  unit) is below `rail.minLockableAmount` — `false` for a rail with no floor. Shared by
+ *  `BuyerFlow.bid`/`lockLegA` and `SellerFlow.acceptLegA` so the three call sites can never
+ *  drift on what "below the floor" means. */
+export function belowMinLockable(rail: CounterAssetRail, amount: string): boolean {
+  return rail.minLockableAmount !== undefined && BigInt(amount) < BigInt(rail.minLockableAmount);
 }

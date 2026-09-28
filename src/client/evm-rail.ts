@@ -20,11 +20,13 @@ import type { AddressBook } from "../vendor/evm-hash-rail.js";
 import type {
   ConnectedCounterAssetRail,
   CounterAssetRail,
+  PreparedLock,
   RailAccounts,
   RailBlockMarker,
   RailEvidenceResult,
   RailWriteEvidence,
 } from "./counter-rail.js";
+import { EVM_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
 
 export interface EvmCounterRailOptions {
   config: EvmRailConfig;
@@ -57,6 +59,10 @@ function addressBookFor(terms: LockTerms, accounts: RailAccounts, ownAccount: Ad
 class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
   private readonly rail: EvmHtlcRail;
   private readonly rpc: CapturingRpc;
+  /** G3: `prepareLock`'s own recorded intent — EVM's write ref (the hashLock) is already known
+   *  before any write happens at all (P22-P24-EVM-FIXES-R3.md E3), so preparing needs no network
+   *  call of its own; `commitLock` consumes this and does the real approve+lock. */
+  private prepared: { terms: LockTerms; feeBps: number } | undefined;
 
   constructor(rail: EvmHtlcRail, rpc: CapturingRpc) {
     this.rail = rail;
@@ -67,13 +73,23 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
     return this.rpc.exchanges();
   }
 
+  async prepareLock(terms: LockTerms, feeBps: number): Promise<PreparedLock> {
+    this.prepared = { terms, feeBps };
+    return { ref: terms.statement };
+  }
+
   /** Mirrors `src/client/buyer.ts`'s pre-stage `lockLegA`: an ERC20 `approve` to the rail
    *  contract always precedes the lock write itself — `EvmHashRail.lock`'s own `transferFrom`
    *  reverts on-chain without it. Both writes land on the same `CapturingRpc` log this
    *  connected handle's `exchanges` getter already exposes, so a flow's own before/after slicing
    *  around this one call still captures both (B5), exactly as it did when a flow called
    *  `approve` then `lock` directly. */
-  async lock(terms: LockTerms, feeBps: number): Promise<RailWriteEvidence> {
+  async commitLock(): Promise<RailWriteEvidence> {
+    if (this.prepared === undefined) {
+      throw new Error("evm-rail: commitLock called before prepareLock");
+    }
+    const { terms, feeBps } = this.prepared;
+    this.prepared = undefined;
     await this.rail.approve(terms.asset, terms.amount);
     return this.rail.lock(terms, feeBps);
   }
@@ -111,6 +127,8 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
 class EvmCounterRail implements CounterAssetRail {
   readonly railId: string = EVM_RAIL_ID;
   readonly caip2: string;
+  /** G5: frozen, never a constructor option — see `CounterAssetRail.policy`'s own doc. */
+  readonly policy: RailLocalPolicy = EVM_LOCAL_POLICY;
   private readonly options: EvmCounterRailOptions;
 
   constructor(options: EvmCounterRailOptions) {
@@ -124,7 +142,7 @@ class EvmCounterRail implements CounterAssetRail {
 
   resolveAccounts(
     records: readonly TranscriptRecord[],
-    input: { contract: string; payerDid: string; payeeDid: string },
+    input: { contract: string; payerDid: string; payeeDid: string; beforeSeq?: number },
   ): RailAccounts {
     const resolved = resolveAccounts(records, { ...input, rail: this.railId, caip2: this.caip2 });
     return {

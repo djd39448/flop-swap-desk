@@ -208,6 +208,15 @@ export function findAuthenticatedLock(
 export interface AcceptedLock {
   rail: string;
   railRef: string;
+  /** P4-BTC-FIXES.md G1/G8: the venue `seq` (within the leg's own deal room) of the one record
+   *  that transitioned the contract machine to `"locked"` — `vendor/tclk/src/machine.ts`'s own
+   *  `"lock"` case accepts at most one such frame per contract (a second attempt is rejected
+   *  outright, `state.status !== "accepted"`), so this is unambiguous whenever `foldAcceptedLock`
+   *  itself returns non-null. `SellerFlow.claimLegA` uses it to bound its own pubkey/account-line
+   *  resolution to lines posted strictly before this point (G1: "count only lines posted before
+   *  the accepted lock frame") and, for a `btc-htlc` leg, as the trustworthy source of the
+   *  funding outpoint (G8). */
+  seq: number;
 }
 
 /**
@@ -232,9 +241,11 @@ export function foldAcceptedLock(
   acceptRecord: TranscriptRecord,
   dealRoomRecords: readonly TranscriptRecord[],
 ): AcceptedLock | null {
-  const { state } = foldTranscript([offerRecord, acceptRecord, ...dealRoomRecords]);
+  const { state, steps } = foldTranscript([offerRecord, acceptRecord, ...dealRoomRecords]);
   if (state === null || state.rail === undefined || state.railRef === undefined) return null;
-  return { rail: state.rail, railRef: state.railRef };
+  const lockStep = steps.find((step) => step.ok && step.type === "lock");
+  if (lockStep === undefined) return null; // unreachable given state.rail is set, kept defensively
+  return { rail: state.rail, railRef: state.railRef, seq: lockStep.seq };
 }
 
 /** One captured paper-rail note: its raw `/kv` body (banner included) and the endpoint it
