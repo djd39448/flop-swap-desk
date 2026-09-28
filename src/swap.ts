@@ -378,7 +378,12 @@ export function foldSwap(input: SwapFoldInput): SwapView {
   if (legAState.status === "claimed") {
     if (legAState.secret !== undefined) view.secret = legAState.secret;
     if (legBState.status === "claimed") {
-      if (evidence.aRail?.final === true && evidence.bRail?.final === true) {
+      // P4-BTC-FIXES-R3.md K4: `settled` means both rail OBSERVATIONS report `claimed` (and
+      // final) — not merely `final`. A leg whose rail is still `locked` (a reveal frame posted,
+      // but the on-chain claim not yet observed) is final in the trivial sense of "nothing left
+      // to wait for at this confirmation count" without ever having been claimed at all; folding
+      // that to `settled` would report money moved that the rail never actually saw move.
+      if (evidence.aRail?.status === "claimed" && evidence.aRail.final === true && evidence.bRail?.status === "claimed" && evidence.bRail.final === true) {
         view.status = "settled";
         return view;
       }

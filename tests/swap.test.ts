@@ -216,6 +216,26 @@ describe("foldSwap — SPEC §4 states", () => {
     expect(view.reasons).toContain("awaiting finality");
   });
 
+  it("K4: a leg whose rail is still 'locked' (final, but never claimed) stays 'revealed', never 'settled'", () => {
+    // The reviewer's case: leg A has a reveal frame (so legAState.status is tclk's own
+    // "claimed"), leg B likewise has a reveal frame, but leg A's own RAIL observation is still
+    // `locked` (final:true — e.g. a Bitcoin funding output sitting at its required confirmation
+    // count, simply never yet spent). Before K4, checking `final` alone would fold this straight
+    // to `settled`, reporting money moved that the rail never actually observed moving.
+    const s = build();
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.revealA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.revealB],
+      evidence: {
+        aRail: { status: "locked", final: true, checkedAtMs: T0 + 9 * MIN },
+        bRail: { status: "claimed", final: true, checkedAtMs: T0 + 9 * MIN },
+      },
+      nowMs: T0 + 9 * MIN,
+    });
+    expect(view.status).toBe("revealed");
+    expect(view.reasons).toContain("awaiting finality");
+  });
+
   it("settled: both legs claimed and both rails report final", () => {
     const s = build();
     const view = foldSwap({
