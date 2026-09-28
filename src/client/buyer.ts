@@ -666,20 +666,25 @@ export class BuyerFlow {
     const termsA = offerAcceptLockTerms(offerA, acceptA);
     const connected = await this.rail.connect(termsA, this.lockedAccounts);
 
-    if (this.legARefundEvidence === undefined) {
-      // P4-BTC-FIXES-R3.md K2: read the outpoint's own state — including a claim that has only
-      // been broadcast, not yet mined (K1) — BEFORE ever building a refund against it. Building
-      // one anyway and letting the rail's own broadcast-time check discover the missing input is
-      // too late to route anywhere useful (a raw rejection, never this class's own clear reason).
-      if (connected.checkPendingClaim !== undefined) {
-        const pendingSecret = await connected.checkPendingClaim(railRef, this.lockedFromBlock);
-        if (pendingSecret !== null) {
-          throw new Error(
-            "buyer: refusing to refund leg A — the lock has been claimed (on chain or already broadcast); " +
-              "call learnSecret() then claimLegB() instead of refundLegA() (K2)",
-          );
-        }
+    // P4-BTC-FIXES-R3.md K2: read the outpoint's own state — including a claim that has only
+    // been broadcast, not yet mined (K1) — BEFORE ever building a refund against it. Building one
+    // anyway and letting the rail's own broadcast-time check discover the missing input is too
+    // late to route anywhere useful (a raw rejection, never this class's own clear reason).
+    // Main-loop review 2026-09-28: this runs on EVERY call, retries included. A Seller can
+    // replace the Buyer's pending refund with a higher-fee claim (full replace-by-fee); a retry
+    // that skipped this check kept answering "not yet confirmed" instead of routing the Buyer to
+    // learnSecret()/claimLegB() while its window on leg B was still open.
+    if (connected.checkPendingClaim !== undefined) {
+      const pendingSecret = await connected.checkPendingClaim(railRef, this.lockedFromBlock);
+      if (pendingSecret !== null) {
+        throw new Error(
+          "buyer: refusing to refund leg A — the lock has been claimed (on chain or already broadcast); " +
+            "call learnSecret() then claimLegB() instead of refundLegA() (K2)",
+        );
       }
+    }
+
+    if (this.legARefundEvidence === undefined) {
       const before = connected.exchanges.length;
       this.legARefundEvidence = await connected.refund(railRef);
       this.writeExchanges.push(...connected.exchanges.slice(before)); // B5

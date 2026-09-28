@@ -601,6 +601,40 @@ describe("G7 — a refund counts only when confirmed", () => {
     expect(refundCalls).toBe(1);
   });
 
+  // Main-loop review 2026-09-28: the final round-3 review proved a Seller can replace the
+  // Buyer's pending refund with a higher-fee claim; the retry must route to learnSecret() rather
+  // than keep reporting "not yet confirmed".
+  it("a refund retry re-checks for a pending claim and routes to learnSecret()/claimLegB() when the Seller replaced the refund", async () => {
+    let refundCalls = 0;
+    let resendCalls = 0;
+    let claimSeen = false;
+    const { h, rail } = await lockedFlow();
+    (rail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
+      new FakeConnectedRail({
+        // First call: nothing spends the outpoint yet. After the refund goes out, the Seller's
+        // replacing claim shows up as the outpoint's (pending) spender.
+        checkPendingClaim: async () => (claimSeen ? `0x${"22".repeat(32)}` : null),
+        refund: async () => {
+          refundCalls += 1;
+          claimSeen = true;
+          return { ref: REF, raw: [] };
+        },
+        resendRefundIfDropped: async () => {
+          resendCalls += 1;
+          return { ref: REF, raw: [] };
+        },
+        verifyLockFinal: async () => ({
+          lock: { rail: "btc-htlc", ref: REF, terms: {} as never, railVerified: true, checkedAtMs: 0 },
+          rail: { status: "locked", final: true, checkedAtMs: 0 },
+        }),
+      });
+
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/not yet confirmed/);
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/learnSecret\(\) then claimLegB\(\)/);
+    expect(refundCalls).toBe(1);
+    expect(resendCalls).toBe(0); // the retry never tried to resend over a pending claim
+  });
+
   it("R2-1: a retry checks resendRefundIfDropped (never re-broadcasts through refund() itself) and can recover a dropped refund", async () => {
     let refundCalls = 0;
     let resendCalls = 0;
