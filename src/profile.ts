@@ -171,6 +171,38 @@ export function checkOrientation(offer: OfferFrame, context: SwapContext): Orien
   return { ok: true };
 }
 
+/**
+ * P22-P24-EVM-FIXES-R2.md C2: does `offerB`'s own terms actually answer what leg A's own
+ * context declared wanting? `checkOrientation` only checks that leg B pays *some* FLOP on *a*
+ * rail that includes `flop-htlc` — nothing before this compared its actual `amount`/`asset`
+ * against the Buyer's own signed bid (`want.wantAmount`/`want.wantAsset`), and nothing checked
+ * that leg B's `rails` actually include the specific rail leg A asked for. Without this, a
+ * Seller could counter a bid for 52,070,000 FLOP with an offer for 1 FLOP and still pass every
+ * other check. Reused by both `BuyerFlow.acceptLegB` (accept time) and `BuyerFlow.lockLegA`
+ * (re-checked at lock time), rather than re-derived at each call site.
+ */
+export function checkLegBMatchesWant(offerB: OfferFrame, want: LegAContext): OrientationVerdict {
+  if (offerB.asset !== want.wantAsset) {
+    return { ok: false, reason: `leg B pays asset ${offerB.asset}, not the ${want.wantAsset} leg A asked for` };
+  }
+  if (offerB.amount !== want.wantAmount) {
+    return { ok: false, reason: `leg B pays amount ${offerB.amount}, not the ${want.wantAmount} leg A asked for` };
+  }
+  let rails: string[];
+  try {
+    rails = offerB.rails.map(normalizeRailId);
+  } catch {
+    return { ok: false, reason: "leg B names an unregistered rail" };
+  }
+  if (!rails.includes(want.wantRail)) {
+    return {
+      ok: false,
+      reason: `leg B rails (${rails.join(", ")}) do not include the ${want.wantRail} rail leg A asked for`,
+    };
+  }
+  return { ok: true };
+}
+
 /** The DID-note token a Seller adds beside tclk's own `tclk1:<rails>` token. A routing hint. */
 export const SELLER_CAPABILITY_TOKEN = "swap1:sell-flop";
 

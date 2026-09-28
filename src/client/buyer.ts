@@ -17,10 +17,24 @@
 // pair that was safe at accept time is not guaranteed to still be safe by the time this Buyer
 // actually locks.
 //
-// Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5.
+// P22-P24-EVM-FIXES-R2.md C2: `acceptLegB`'s leg B offer itself was still a bare `OfferFrame`
+// object — a caller could hand this flow an offer nobody ever actually signed and posted, and
+// nothing here compared its `amount`/`asset`/`rails` against what this flow's own leg A offer
+// declared wanting. `offerB` is now taken as the actual signed offer-room record it must have
+// arrived as (authenticated the same way `acceptARecord` already was), and both `acceptLegB`
+// and `lockLegA` check it against leg A's own context with `profile.ts`'s
+// `checkLegBMatchesWant` — a Seller offering 1 FLOP against a 52,070,000 FLOP want is refused,
+// not merely "some FLOP on some flop-htlc rail". C4: `acceptLegB` also recomputes the tclk
+// contract id for leg A's own accept and requires it to equal `acceptA.contract`, the same way
+// `SellerFlow.lockLegB` already does for leg B's — an accept whose `contract` field disagrees
+// with what tclk itself derives for that offer/accept pair is refused rather than trusted.
+//
+// Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
+// P22-P24-EVM-FIXES-R2.md C2, C4.
 
 import type { Address, Hex } from "viem";
 import {
+  contractId,
   dealRoom,
   encodeFrame,
   makeAccept,
@@ -36,7 +50,7 @@ import {
 } from "@flop-labs/tclk";
 
 import { checkSwapDeadlines } from "../deadlines.js";
-import { checkOrientation, classifySwapOffer, legAContext } from "../profile.js";
+import { checkLegBMatchesWant, checkOrientation, classifySwapOffer, legAContext } from "../profile.js";
 import { formatAccountLine, resolveAccounts } from "../rails/account-line.js";
 import { EvmHtlcRail, type EvmRailConfig, type WriteEvidence } from "../rails/evm-htlc.js";
 import type { CapturingRpc, Exchange } from "../rails/rpc-capture.js";
@@ -167,9 +181,21 @@ export class BuyerFlow {
    * object a caller merely asserts came from somewhere. `acceptB.statement` is copied straight
    * from the authenticated frame's own `statement`, so `acceptA.statement === acceptB.statement`
    * holds by construction, never by a separate check that could be skipped.
+   *
+   * P22-P24-EVM-FIXES-R2.md C4: also recomputes the tclk contract id for `(offerA, acceptA)` and
+   * requires it to equal `acceptAFrame.contract`, the same way `SellerFlow.lockLegB` already does
+   * for leg B's accept — the frame's own claimed `contract` field is otherwise attacker-controlled
+   * data until this check runs.
+   *
+   * P22-P24-EVM-FIXES-R2.md C2: `offerBRecord` must likewise be the actual signed offer-room
+   * record leg B's offer arrived as — authenticated and decoded the same way `acceptARecord` is
+   * — and its own terms are checked against what this flow's leg A offer declared wanting
+   * (`profile.ts`'s `checkLegBMatchesWant`): `checkOrientation` alone only ever verified that
+   * leg B pays *some* FLOP on *a* flop-htlc rail, never that it is the amount/asset this Buyer
+   * actually asked for.
    */
   async acceptLegB(
-    offerB: OfferFrame,
+    offerBRecord: TranscriptRecord,
     acceptARecord: TranscriptRecord,
     lockTimeMs: number,
   ): Promise<{ acceptB: AcceptFrame; acceptBRecord: TranscriptRecord }> {
@@ -185,8 +211,31 @@ export class BuyerFlow {
     if (acceptAFrame.ref !== this.offerA.id) {
       throw new Error("buyer: refusing to accept — the leg A accept does not reference this flow's own offer");
     }
+    const expectedContractA = contractId(this.offerA, {
+      from: acceptAFrame.from,
+      ref: acceptAFrame.ref,
+      statement: acceptAFrame.statement,
+      ...(acceptAFrame.paymentKey === undefined ? {} : { paymentKey: acceptAFrame.paymentKey }),
+      nonce: acceptAFrame.nonce,
+    });
+    if (acceptAFrame.contract !== expectedContractA) {
+      throw new Error("buyer: refusing to accept leg B — leg A accept's contract id does not match this offer/accept pair (C4)");
+    }
+
+    if (offerBRecord.room !== OFFER_ROOM || !verifyTranscriptRecord(offerBRecord).ok) {
+      throw new Error("buyer: refusing to accept leg B — leg B offer record does not authenticate (C2)");
+    }
+    const offerB = tryDecodeFrame(offerBRecord.line);
+    if (offerB === null || offerB.type !== "offer" || offerB.from !== offerBRecord.sender) {
+      throw new Error("buyer: refusing to accept leg B — leg B offer record is not an authenticated offer frame (C2)");
+    }
+
     if (acceptAFrame.from !== offerB.from) {
       throw new Error("buyer: refusing to accept leg B — leg A accept is not from the Seller who posted leg B's offer (B3)");
+    }
+    const legAClassification = classifySwapOffer(this.offerA);
+    if (legAClassification === null || legAClassification.context.leg !== "a") {
+      throw new Error("buyer: refusing to accept — this flow's own leg A offer is not a valid swap leg");
     }
     const classification = classifySwapOffer(offerB);
     if (classification === null || classification.context.leg !== "b" || classification.context.legAOfferId !== this.offerA.id) {
@@ -195,6 +244,10 @@ export class BuyerFlow {
     const orientation = checkOrientation(offerB, classification.context);
     if (!orientation.ok) {
       throw new Error(`buyer: refusing to accept an unsafe leg B offer: ${orientation.reason}`);
+    }
+    const pairCheck = checkLegBMatchesWant(offerB, legAClassification.context);
+    if (!pairCheck.ok) {
+      throw new Error(`buyer: refusing to accept leg B — ${pairCheck.reason} (C2)`);
     }
     const deadlineCheck = checkSwapDeadlines(this.offerA, offerB, lockTimeMs, EVM_LOCAL_POLICY);
     if (!deadlineCheck.ok) {
@@ -253,6 +306,19 @@ export class BuyerFlow {
       throw new Error(
         `buyer: refusing to lock leg A — deadlines are no longer safe at lock time (B3): ${deadlineCheck.violations.join("; ")}`,
       );
+    }
+
+    // C2: re-check leg B still answers what leg A asked for, the same way B3 re-checks
+    // deadlines above — defense in depth, since this flow's own stored `offerA`/`offerB` should
+    // never actually disagree with what `acceptLegB` already checked, but spending real value is
+    // exactly the place to check "should never" rather than assume it.
+    const legAClassification = classifySwapOffer(offerA);
+    if (legAClassification === null || legAClassification.context.leg !== "a") {
+      throw new Error("buyer: refusing to lock leg A — this flow's own leg A offer is not a valid swap leg");
+    }
+    const pairCheck = checkLegBMatchesWant(offerB, legAClassification.context);
+    if (!pairCheck.ok) {
+      throw new Error(`buyer: refusing to lock leg A — leg B no longer matches what leg A asked for: ${pairCheck.reason} (C2)`);
     }
 
     const termsA = offerAcceptLockTerms(offerA, acceptA);

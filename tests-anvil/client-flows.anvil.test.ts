@@ -251,8 +251,8 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
       ...legADeadlines(t0),
     });
 
-    const { acceptA, acceptARecord, offerB } = await sellerFlow.acceptLegA(offerA, legBDeadlines(t0), t0);
-    const { acceptB, acceptBRecord } = await buyerFlow.acceptLegB(offerB, acceptARecord, t0);
+    const { acceptA, acceptARecord, offerB, offerBRecord } = await sellerFlow.acceptLegA(offerA, legBDeadlines(t0), t0);
+    const { acceptB, acceptBRecord } = await buyerFlow.acceptLegB(offerBRecord, acceptARecord, t0);
     await sellerFlow.lockLegB(acceptBRecord);
     await buyerFlow.verifyLegBLocked();
     await sellerFlow.postAccountLineA(sellerAccount);

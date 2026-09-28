@@ -25,6 +25,7 @@ import {
   encodeFrame,
   generateHashLock,
   makeAccept,
+  makeOffer,
   tryDecodeFrame,
   type AcceptFrame,
   type OfferFrame,
@@ -145,7 +146,14 @@ async function bidAndAcceptA(
   h: Harness,
   nonceHex: string,
   legB: { claimByMs: number; refundAfterMs: number; expiresMs: number } = legBDeadlines(T0),
-): Promise<{ swapId: string; offerA: OfferFrame; acceptA: AcceptFrame; acceptARecord: TranscriptRecord; offerB: OfferFrame }> {
+): Promise<{
+  swapId: string;
+  offerA: OfferFrame;
+  acceptA: AcceptFrame;
+  acceptARecord: TranscriptRecord;
+  offerB: OfferFrame;
+  offerBRecord: TranscriptRecord;
+}> {
   const swapId = computeSwapId(h.buyer.did, nonceHex);
   const offerA = await h.buyerFlow.bid({
     swapId,
@@ -156,15 +164,15 @@ async function bidAndAcceptA(
     asset: "USDC",
     ...legADeadlines(T0),
   });
-  const { acceptA, acceptARecord, offerB } = await h.sellerFlow.acceptLegA(offerA, legB, T0);
-  return { swapId, offerA, acceptA, acceptARecord, offerB };
+  const { acceptA, acceptARecord, offerB, offerBRecord } = await h.sellerFlow.acceptLegA(offerA, legB, T0);
+  return { swapId, offerA, acceptA, acceptARecord, offerB, offerBRecord };
 }
 
 /** bid -> acceptLegA -> acceptLegB -> lockLegB -> verifyLegBLocked -> both account lines — the
  *  full happy prefix, reused by tests that need to reach `lockLegA`. */
 async function pairLockBAndAccountLines(h: Harness, nonceHex: string) {
-  const { swapId, offerA, acceptA, acceptARecord, offerB } = await bidAndAcceptA(h, nonceHex);
-  const { acceptB, acceptBRecord } = await h.buyerFlow.acceptLegB(offerB, acceptARecord, T0);
+  const { swapId, offerA, acceptA, acceptARecord, offerB, offerBRecord } = await bidAndAcceptA(h, nonceHex);
+  const { acceptB, acceptBRecord } = await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0);
   await h.sellerFlow.lockLegB(acceptBRecord);
   await h.buyerFlow.verifyLegBLocked();
   await h.sellerFlow.postAccountLineA(SELLER_ACCOUNT);
@@ -212,8 +220,8 @@ describe("SellerFlow.acceptLegA — B2 deadline/margin refusals", () => {
 describe("SellerFlow.lockLegB — B1 (CRITICAL)", () => {
   it("locks leg B on a genuine, correctly-authenticated accept (sanity check)", async () => {
     const h = harness(5, 6);
-    const { offerB, acceptARecord } = await bidAndAcceptA(h, "00000001");
-    const { acceptBRecord } = await h.buyerFlow.acceptLegB(offerB, acceptARecord, T0);
+    const { offerBRecord, acceptARecord } = await bidAndAcceptA(h, "00000001");
+    const { acceptBRecord } = await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0);
     await expect(h.sellerFlow.lockLegB(acceptBRecord)).resolves.toBeDefined();
   });
 
@@ -286,46 +294,103 @@ describe("SellerFlow.lockLegB — B1 (CRITICAL)", () => {
 describe("BuyerFlow.acceptLegB — B3", () => {
   it("refuses an unauthenticated leg A accept record", async () => {
     const h = harness(22, 23);
-    const { offerB, acceptA } = await bidAndAcceptA(h, "00000001");
+    const { offerBRecord, acceptA } = await bidAndAcceptA(h, "00000001");
     const forged = unsignedRecord(OFFER_ROOM, 999, T0, encodeFrame(acceptA));
-    await expect(h.buyerFlow.acceptLegB(offerB, forged, T0)).rejects.toThrow(/leg A accept record does not authenticate/);
+    await expect(h.buyerFlow.acceptLegB(offerBRecord, forged, T0)).rejects.toThrow(/leg A accept record does not authenticate/);
   });
 
   it("refuses a leg A accept record whose signer differs from the frame's own claimed sender", async () => {
     const h = harness(24, 25);
     const attacker = ident(26);
-    const { offerB, acceptA } = await bidAndAcceptA(h, "00000001");
+    const { offerBRecord, acceptA } = await bidAndAcceptA(h, "00000001");
     const forged = record(OFFER_ROOM, 999, T0, attacker, encodeFrame(acceptA));
-    await expect(h.buyerFlow.acceptLegB(offerB, forged, T0)).rejects.toThrow(/not an authenticated accept frame/);
+    await expect(h.buyerFlow.acceptLegB(offerBRecord, forged, T0)).rejects.toThrow(/not an authenticated accept frame/);
   });
 
   it("refuses a leg A accept that is not from the Seller who posted leg B's offer", async () => {
     const h = harness(27, 28);
     const impostor = ident(29);
-    const { offerA, offerB } = await bidAndAcceptA(h, "00000001");
+    const { offerA, offerBRecord } = await bidAndAcceptA(h, "00000001");
     // A properly authenticated accept for leg A — just not from the DID that actually posted
     // offerB.
     const impostorAccept = makeAccept(offerA, { from: impostor.did, statement: generateHashLock().hash });
     const impostorRecord = await h.venue.post(OFFER_ROOM, encodeFrame(impostorAccept), impostor);
-    await expect(h.buyerFlow.acceptLegB(offerB, impostorRecord, T0)).rejects.toThrow(
+    await expect(h.buyerFlow.acceptLegB(offerBRecord, impostorRecord, T0)).rejects.toThrow(
       /not from the Seller who posted leg B's offer/,
     );
   });
 
   it("refuses an unsafe deadline pair even with a fully genuine leg A accept", async () => {
     const h = harness(30, 31);
-    const { offerB, acceptARecord } = await bidAndAcceptA(h, "00000001");
+    const { offerBRecord, acceptARecord } = await bidAndAcceptA(h, "00000001");
     // lockTimeMs so late that rule 1 (the Seller's real reveal window) is violated.
     const unsafeLockTimeMs = legADeadlines(T0).refundAfterMs - 60_000;
-    await expect(h.buyerFlow.acceptLegB(offerB, acceptARecord, unsafeLockTimeMs)).rejects.toThrow(/unsafe deadlines/);
+    await expect(h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, unsafeLockTimeMs)).rejects.toThrow(/unsafe deadlines/);
+  });
+});
+
+describe("BuyerFlow.acceptLegB — C4 (leg-A accept fully bound)", () => {
+  it("refuses a leg A accept whose contract id does not match tclk's own derivation for that offer/accept pair", async () => {
+    const h = harness(60, 61);
+    const { offerA, offerBRecord } = await bidAndAcceptA(h, "00000001");
+    // A genuinely signed accept for leg A — the same statement the Seller actually minted, from
+    // the Seller's own identity, referencing this flow's own leg A offer — but a fresh call to
+    // `makeAccept` mints its own fresh nonce, so its `contract` is well-formed on its own terms;
+    // tampering it afterwards is what this test needs to isolate the C4 check.
+    const acceptA = makeAccept(offerA, { from: h.seller.did, statement: h.sellerFlow.statement! });
+    const frame = tryDecodeFrame(encodeFrame(acceptA));
+    if (frame === null || frame.type !== "accept") throw new Error("test setup: expected an accept frame");
+    const tampered = { ...frame, contract: `0x${"cd".repeat(32)}` };
+    const tamperedRecord = await h.venue.post(OFFER_ROOM, encodeFrame(tampered), h.seller);
+    await expect(h.buyerFlow.acceptLegB(offerBRecord, tamperedRecord, T0)).rejects.toThrow(
+      /leg A accept's contract id does not match/,
+    );
+  });
+});
+
+describe("BuyerFlow.acceptLegB / lockLegA — C2 (paid what it asked for)", () => {
+  it("refuses a leg B offer whose amount does not match what leg A's own bid asked for (a Seller offering 1 FLOP against a 52,070,000 FLOP want)", async () => {
+    const h = harness(62, 63);
+    const { offerB, acceptARecord } = await bidAndAcceptA(h, "00000001");
+    // A leg B offer that is otherwise completely well-formed (same swap, same leg-A reference,
+    // right asset, right rails) except that it pays far less than leg A's own bid declared
+    // wanting. Built fresh with `makeOffer` (not a spread of the real `offerB`) since `amount`
+    // is part of what the frame's own `id` commits to — a spread-and-override would fail
+    // `encodeFrame`'s own "offer id mismatch" check before this test ever reaches acceptLegB.
+    const stingyOfferB = makeOffer({
+      from: offerB.from,
+      role: offerB.role,
+      amount: "1",
+      asset: offerB.asset,
+      lock: offerB.lock,
+      rails: offerB.rails,
+      claimByMs: offerB.claimByMs,
+      refundAfterMs: offerB.refundAfterMs,
+      expiresMs: offerB.expiresMs,
+      job: offerB.job,
+    });
+    const stingyRecord = await h.venue.post(OFFER_ROOM, encodeFrame(stingyOfferB), h.seller);
+    await expect(h.buyerFlow.acceptLegB(stingyRecord, acceptARecord, T0)).rejects.toThrow(
+      /leg B pays amount 1, not the 52070000 leg A asked for/,
+    );
+  });
+
+  it("lockLegA re-checks the same pairing at lock time, not only at accept time", async () => {
+    const h = harness(64, 65);
+    await pairLockBAndAccountLines(h, "00000001");
+    // Field injection: this flow's own stored `offerB` no longer answers what its own `offerA`
+    // asked for — isolates lockLegA's own re-check from acceptLegB's (already covered above).
+    const tamperedOfferB: OfferFrame = { ...(h.buyerFlow as unknown as { offerB: OfferFrame }).offerB, amount: "1" };
+    (h.buyerFlow as unknown as { offerB: OfferFrame }).offerB = tamperedOfferB;
+    await expect(h.buyerFlow.lockLegA()).rejects.toThrow(/leg B no longer matches what leg A asked for/);
   });
 });
 
 describe("BuyerFlow.lockLegA — refusals never touch the network", () => {
   it("refuses before leg B verifies", async () => {
     const h = harness(32, 33);
-    const { offerB, acceptARecord } = await bidAndAcceptA(h, "00000001");
-    await h.buyerFlow.acceptLegB(offerB, acceptARecord, T0);
+    const { offerBRecord, acceptARecord } = await bidAndAcceptA(h, "00000001");
+    await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0);
     await expect(h.buyerFlow.lockLegA()).rejects.toThrow(/before leg B verifies/);
   });
 
@@ -339,8 +404,8 @@ describe("BuyerFlow.lockLegA — refusals never touch the network", () => {
 
   it("refuses before the Seller's account line resolves (D-08)", async () => {
     const h = harness(36, 37);
-    const { offerB, acceptARecord } = await bidAndAcceptA(h, "00000001");
-    const { acceptBRecord } = await h.buyerFlow.acceptLegB(offerB, acceptARecord, T0);
+    const { offerBRecord, acceptARecord } = await bidAndAcceptA(h, "00000001");
+    const { acceptBRecord } = await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0);
     await h.sellerFlow.lockLegB(acceptBRecord);
     await h.buyerFlow.verifyLegBLocked();
     // Deliberately never call sellerFlow.postAccountLineA.
@@ -412,5 +477,87 @@ describe("SellerFlow.claimLegA — B2", () => {
     });
     void acceptARecord;
     await expect(h.sellerFlow.claimLegA(hashLock.hash)).rejects.toThrow(/claim-inclusion margin.*remains before refundAfterMs/);
+  });
+});
+
+describe("SellerFlow.claimLegA — C3 (chain time that cannot freeze)", () => {
+  it("refuses at/after claimByMs once wall-clock has passed it, even though the chain's own last block has not", async () => {
+    const rpc = mockRpc({
+      eth_chainId: () => ({ result: "0x7a69" }),
+      // The chain is stalled: its last mined block is comfortably before claimByMs (T0 + 60min).
+      eth_getBlockByNumber: () => ({ result: { timestamp: numberToHex(Math.floor((T0 + 10 * 60_000) / 1000)) } }),
+    });
+    const h = harness(66, 67, { sellerRpc: rpc });
+    await bidAndAcceptA(h, "00000001");
+    // Wall-clock has moved on past claimByMs even though the chain itself is stalled at T0+10min
+    // — before C3 this guard read chain time alone and would have missed it.
+    h.clockRef.ms = legADeadlines(T0).claimByMs + 1_000;
+    await expect(h.sellerFlow.claimLegA(h.sellerFlow.statement!)).rejects.toThrow(/at\/after its claimByMs \(chain time\)/);
+  });
+
+  it("refuses when less than the claim-inclusion margin remains by wall-clock, even though the chain's own last block shows plenty", async () => {
+    // A tight 2-minute claimByMs..refundAfterMs gap (below the 5-minute margin) so there is a
+    // chainNow window — [refundAfterMs - margin, claimByMs) — where the margin guard is
+    // reachable at all without first tripping the claimByMs guard (see the B2 test above: with
+    // a gap at or above the margin, the two guards can never disagree, since a chain time still
+    // short of claimByMs would leave more than the margin's worth of room by construction).
+    const claimByMs = T0 + 61 * 60_000;
+    const refundAfterMs = T0 + 63 * 60_000; // 2-minute gap: below the 5-minute margin.
+    const rpc = mockRpc({
+      eth_chainId: () => ({ result: "0x7a69" }),
+      // The chain's own last block is stalled 13 minutes before refundAfterMs — comfortably
+      // above the margin, and short of claimByMs too: chain time alone says this is entirely safe.
+      eth_getBlockByNumber: () => ({ result: { timestamp: numberToHex(Math.floor((T0 + 50 * 60_000) / 1000)) } }),
+    });
+    const h = harness(68, 69, { sellerRpc: rpc });
+    const { offerA } = await bidAndAcceptA(h, "00000001");
+    const hashLock = generateHashLock();
+    const acceptA = makeAccept(offerA, { from: h.seller.did, statement: hashLock.hash });
+    const tamperedOfferA: OfferFrame = { ...offerA, claimByMs, refundAfterMs };
+    Object.assign(h.sellerFlow as unknown as Record<string, unknown>, {
+      offerA: tamperedOfferA,
+      acceptA: { ...acceptA, ref: tamperedOfferA.id },
+      hashLock,
+    });
+    // Wall-clock has moved to T0+59min: still short of claimByMs (T0+61min), but only 4 minutes
+    // before refundAfterMs — below the 5-minute margin.
+    h.clockRef.ms = T0 + 59 * 60_000;
+    await expect(h.sellerFlow.claimLegA(hashLock.hash)).rejects.toThrow(/claim-inclusion margin.*remains before refundAfterMs/);
+  });
+});
+
+describe("SellerFlow.lockLegB — C1 (one leg-B lock per swap)", () => {
+  it("refuses a second lock for the same swap, even from a second, independently genuine accept", async () => {
+    const h = harness(70, 71);
+    const { offerB, acceptARecord, offerBRecord } = await bidAndAcceptA(h, "00000001");
+    const { acceptBRecord: firstAcceptBRecord } = await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0);
+    await h.sellerFlow.lockLegB(firstAcceptBRecord);
+
+    // A second, independently genuine accept for the same leg B offer — a fresh nonce, so a
+    // different tclk contract id from the first. Before C1, `lockLegB` had no guard against
+    // this at all and would have locked a second time under this second contract.
+    const secondAccept = makeAccept(offerB, { from: h.buyer.did, statement: h.sellerFlow.statement! });
+    const secondRecord = await h.venue.post(OFFER_ROOM, encodeFrame(secondAccept), h.buyer);
+    await expect(h.sellerFlow.lockLegB(secondRecord)).rejects.toThrow(/already locked, or a lock is already in flight/);
+  });
+
+  it("refuses a concurrent second lock attempt while the first is still in flight", async () => {
+    const h = harness(72, 73);
+    const { offerB, acceptARecord, offerBRecord } = await bidAndAcceptA(h, "00000001");
+    const { acceptBRecord: firstRecord } = await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0);
+    const secondAccept = makeAccept(offerB, { from: h.buyer.did, statement: h.sellerFlow.statement! });
+    const secondRecord = await h.venue.post(OFFER_ROOM, encodeFrame(secondAccept), h.buyer);
+
+    // Both calls issued back to back, neither awaited first: the in-flight flag (set
+    // synchronously, before either call's own first `await`) must still let only one through.
+    const [firstResult, secondResult] = await Promise.allSettled([
+      h.sellerFlow.lockLegB(firstRecord),
+      h.sellerFlow.lockLegB(secondRecord),
+    ]);
+    expect(firstResult.status).toBe("fulfilled");
+    expect(secondResult.status).toBe("rejected");
+    if (secondResult.status === "rejected") {
+      expect(String(secondResult.reason)).toMatch(/already locked, or a lock is already in flight/);
+    }
   });
 });

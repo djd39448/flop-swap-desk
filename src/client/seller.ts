@@ -40,7 +40,16 @@
 // (`src/client/bundle.ts`) can persist them into `raw/rpc/`, making every sha256 in
 // `WriteEvidence.raw` resolve to real bytes on disk.
 //
-// Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3, B5.
+// P22-P24-EVM-FIXES-R2.md C1: `lockLegB` refuses a second lock attempt for this flow's own leg
+// B — already locked, or another call already in flight — before doing anything else, closing a
+// gap where two independently genuine accepts (each under its own fresh nonce, hence its own
+// tclk contract id) could otherwise both reach `paperRail.lock`. C3: `claimLegA`'s claimByMs and
+// claim-inclusion-margin guards now judge against `max(chain time, wall clock)`, never chain
+// time alone — an idle chain's own last block can lag real time indefinitely, which chain time
+// alone would otherwise read as more safety margin than actually remains.
+//
+// Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
+// B5; P22-P24-EVM-FIXES-R2.md C1, C3.
 
 import type { Address, Hex } from "viem";
 import {
@@ -107,6 +116,10 @@ export interface AcceptLegAResult {
    *  `BuyerFlow.acceptLegB` (B3: it requires the authenticated record, not the bare frame). */
   acceptARecord: TranscriptRecord;
   offerB: OfferFrame;
+  /** P22-P24-EVM-FIXES-R2.md C2: the signed record `offerB` was actually posted as — a runner
+   *  hands this, not the bare frame, straight to `BuyerFlow.acceptLegB` (it now requires the
+   *  authenticated record, the same way B3 already required one for leg A's accept). */
+  offerBRecord: TranscriptRecord;
 }
 
 /** Leg B's deadlines (SPEC §3.5 rules 2-3 sized against whatever `lockTimeMs` the runner
@@ -140,6 +153,14 @@ export class SellerFlow {
   private offerB?: OfferFrame;
   private hashLock?: HashLock;
   private lockedLegBContract?: string;
+  /** P22-P24-EVM-FIXES-R2.md C1: set synchronously, before `lockLegB`'s first `await`, so a
+   *  second call that starts while the first is still in flight sees it already set — the same
+   *  re-entry pattern `acceptLegA` gets for free by checking `this.offerA` as its very first
+   *  statement. `lockedLegBContract` alone is not enough: two independently genuine accepts for
+   *  the same leg B offer (different nonces, tclk#contract ids) would otherwise both be free to
+   *  race `paperRail.lock` under two different contracts before either sets
+   *  `lockedLegBContract`. */
+  private legBLockPending = false;
   /** B5: every EVM write's own raw `Exchange`s, in call order, so a bundle writer can persist
    *  them into `raw/rpc/` (every sha256 a `WriteEvidence.raw` names must resolve to real
    *  bytes). Paper-rail writes (`lockLegB`, `refundLegB`) never touch `this.rpc`, so nothing is
@@ -244,7 +265,7 @@ export class SellerFlow {
     }
 
     const acceptARecord = await this.venue.post("tclk-offers", encodeFrame(acceptA), this.identity);
-    await this.venue.post("tclk-offers", encodeFrame(offerB), this.identity);
+    const offerBRecord = await this.venue.post("tclk-offers", encodeFrame(offerB), this.identity);
 
     // Only now, after both posts succeeded, does this flow consider leg A accepted — a post
     // failure must not leave `this.hashLock` set with nothing on the venue to back it.
@@ -252,7 +273,7 @@ export class SellerFlow {
     this.acceptA = acceptA;
     this.hashLock = hashLock;
     this.offerB = offerB;
-    return { acceptA, acceptARecord, offerB };
+    return { acceptA, acceptARecord, offerB, offerBRecord };
   }
 
   /** Post this Seller's own EVM account (D-08) into leg A's deal room, as the payee — required
@@ -281,46 +302,60 @@ export class SellerFlow {
    * its `ref` names this flow's own `offerB`; and its `contract` is exactly the id tclk itself
    * derives for that offer/accept pair (`contractId`, recomputed — never merely trusted from
    * the frame).
+   *
+   * P22-P24-EVM-FIXES-R2.md C1: refuses outright when leg B is already locked, or another call
+   * is already in flight — checked, and the in-flight flag set, before anything else runs
+   * (including before this method's first `await`), so two calls issued back to back (even two
+   * independently genuine accepts for the same leg B offer, each under its own fresh nonce and
+   * therefore its own tclk contract id) can never both reach `paperRail.lock`.
    */
   async lockLegB(acceptBRecord: TranscriptRecord): Promise<TranscriptRecord> {
-    if (this.offerB === undefined) throw new Error("seller: leg B has not been opened yet");
-    if (this.hashLock === undefined) throw new Error("seller: no secret minted for this flow");
-    const { offerA } = this.requireAcceptedA();
-    const offerB = this.offerB;
+    if (this.lockedLegBContract !== undefined || this.legBLockPending) {
+      throw new Error("seller: refusing to lock leg B — already locked, or a lock is already in flight (C1)");
+    }
+    this.legBLockPending = true;
+    try {
+      if (this.offerB === undefined) throw new Error("seller: leg B has not been opened yet");
+      if (this.hashLock === undefined) throw new Error("seller: no secret minted for this flow");
+      const { offerA } = this.requireAcceptedA();
+      const offerB = this.offerB;
 
-    if (acceptBRecord.room !== OFFER_ROOM || !verifyTranscriptRecord(acceptBRecord).ok) {
-      throw new Error("seller: refusing to lock leg B — accept record does not authenticate (B1)");
-    }
-    const frame = tryDecodeFrame(acceptBRecord.line);
-    if (frame === null || frame.type !== "accept" || frame.from !== acceptBRecord.sender) {
-      throw new Error("seller: refusing to lock leg B — record is not an authenticated accept frame (B1)");
-    }
-    if (frame.statement !== this.hashLock.hash) {
-      throw new Error("seller: refusing to lock leg B — accept statement is not this flow's own minted statement (B1)");
-    }
-    if (frame.from !== offerA.from) {
-      throw new Error("seller: refusing to lock leg B — accept is not from the Buyer who opened leg A (B1)");
-    }
-    if (frame.ref !== offerB.id) {
-      throw new Error("seller: refusing to lock leg B — accept does not reference this flow's leg B offer (B1)");
-    }
-    const expectedContract = contractId(offerB, {
-      from: frame.from,
-      ref: frame.ref,
-      statement: frame.statement,
-      ...(frame.paymentKey === undefined ? {} : { paymentKey: frame.paymentKey }),
-      nonce: frame.nonce,
-    });
-    if (frame.contract !== expectedContract) {
-      throw new Error("seller: refusing to lock leg B — accept contract id does not match this offer/accept pair (B1)");
-    }
+      if (acceptBRecord.room !== OFFER_ROOM || !verifyTranscriptRecord(acceptBRecord).ok) {
+        throw new Error("seller: refusing to lock leg B — accept record does not authenticate (B1)");
+      }
+      const frame = tryDecodeFrame(acceptBRecord.line);
+      if (frame === null || frame.type !== "accept" || frame.from !== acceptBRecord.sender) {
+        throw new Error("seller: refusing to lock leg B — record is not an authenticated accept frame (B1)");
+      }
+      if (frame.statement !== this.hashLock.hash) {
+        throw new Error("seller: refusing to lock leg B — accept statement is not this flow's own minted statement (B1)");
+      }
+      if (frame.from !== offerA.from) {
+        throw new Error("seller: refusing to lock leg B — accept is not from the Buyer who opened leg A (B1)");
+      }
+      if (frame.ref !== offerB.id) {
+        throw new Error("seller: refusing to lock leg B — accept does not reference this flow's leg B offer (B1)");
+      }
+      const expectedContract = contractId(offerB, {
+        from: frame.from,
+        ref: frame.ref,
+        statement: frame.statement,
+        ...(frame.paymentKey === undefined ? {} : { paymentKey: frame.paymentKey }),
+        nonce: frame.nonce,
+      });
+      if (frame.contract !== expectedContract) {
+        throw new Error("seller: refusing to lock leg B — accept contract id does not match this offer/accept pair (B1)");
+      }
 
-    const acceptB = frame;
-    const termsB = offerAcceptLockTerms(offerB, acceptB);
-    await this.paperRail.lock(termsB);
-    this.lockedLegBContract = acceptB.contract;
-    const lockFrame: LockFrame = { type: "lock", from: this.identity.did, contract: acceptB.contract, rail: "paper", ref: acceptB.contract };
-    return this.venue.post(dealRoom(acceptB.contract), encodeFrame(lockFrame), this.identity);
+      const acceptB = frame;
+      const termsB = offerAcceptLockTerms(offerB, acceptB);
+      await this.paperRail.lock(termsB);
+      this.lockedLegBContract = acceptB.contract;
+      const lockFrame: LockFrame = { type: "lock", from: this.identity.did, contract: acceptB.contract, rail: "paper", ref: acceptB.contract };
+      return await this.venue.post(dealRoom(acceptB.contract), encodeFrame(lockFrame), this.identity);
+    } finally {
+      this.legBLockPending = false;
+    }
   }
 
   /**
@@ -368,16 +403,25 @@ export class SellerFlow {
       clock: this.clock,
     });
 
-    // B2: chain time, not wall-clock — read before verifyLockFinal (whose own capture drains
-    // this rail's exchange log when it finishes).
+    // B2/C3: read before verifyLockFinal (whose own capture drains this rail's exchange log
+    // when it finishes). Neither the chain's own last block nor wall-clock alone is safe to
+    // judge this against: an idle chain's `latest` block can lag real time indefinitely
+    // (nothing forces a new block just because time passes), so trusting it alone risks a stale
+    // "still safe" reading for a claim that will actually land well after `refundAfterMs` once
+    // it is finally mined; trusting wall-clock alone was the pre-B2 bug (this process's own
+    // clock lagging a chain that has already moved past the deadline). `chainNow` takes
+    // whichever of the two already reports the more dangerous (later) time — it is never
+    // earlier than either one alone, so it can only make this guard more conservative, never
+    // less.
     const chainTimeMs = await rail.latestBlockTimestampMs();
-    if (chainTimeMs >= offerA.claimByMs) {
-      throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time) (B2)");
+    const chainNow = Math.max(chainTimeMs, this.clock());
+    if (chainNow >= offerA.claimByMs) {
+      throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time) (B2/C3)");
     }
-    if (offerA.refundAfterMs - chainTimeMs < EVM_LOCAL_POLICY.claimInclusionMarginMs) {
+    if (offerA.refundAfterMs - chainNow < EVM_LOCAL_POLICY.claimInclusionMarginMs) {
       throw new Error(
         `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
-          `(${EVM_LOCAL_POLICY.claimInclusionMarginMs} ms) remains before refundAfterMs (chain time) (B2)`,
+          `(${EVM_LOCAL_POLICY.claimInclusionMarginMs} ms) remains before refundAfterMs (chain time) (B2/C3)`,
       );
     }
 
