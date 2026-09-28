@@ -68,7 +68,14 @@ export const ANVIL_LOCAL_PIN: EvmChainPin = {
   finality: { mode: "tag", tag: "finalized" },
 };
 
-/** Refused by name even if someone pins one of these — never live traffic in this build. */
+/** P22-P24-EVM-FIXES.md A3: only these two chain ids are accepted anywhere in this build — an
+ *  allow list, not a deny list, so an id nobody thought to name (a testnet nobody's heard of,
+ *  a typo, a future mainnet) is refused by default instead of silently let through. */
+const ALLOWED_CHAIN_IDS: ReadonlySet<number> = new Set([31337, 84532]);
+
+/** Kept only to name a well-known mainnet in the refusal message when the offending chain id
+ *  happens to be one of these — the allow list above is what actually gates a chain id now,
+ *  never this map (A3: "the old named list stays only to give a better error message"). */
 const MAINNET_DENY_LIST: ReadonlyMap<number, string> = new Map([
   [1, "ethereum mainnet"],
   [8453, "base mainnet"],
@@ -98,13 +105,19 @@ function validateFinality(finality: EvmFinality): void {
   }
 }
 
-/** Static checks on a config that don't need a live chain: the pin itself isn't deny-listed,
- *  no asset resolves to Base mainnet USDC, and the finality knobs are sane. `connect()` runs
- *  this before ever touching the network. */
+/** Static checks on a config that don't need a live chain: the pin's chain id is on the A3
+ *  allow list (31337 anvil-local, 84532 base-sepolia — nothing else), no asset resolves to
+ *  Base mainnet USDC, and the finality knobs are sane. `connect()` runs this before ever
+ *  touching the network. Throws with a reason; `checkEvmRailConfig` below wraps it (plus a
+ *  runtime shape check) for callers that take a config as untyped data (a `--rails` file, a
+ *  captured `rails.json`) rather than as a compiler-checked `EvmRailConfig`. */
 export function validateEvmRailConfig(config: EvmRailConfig): void {
-  const pinDenyName = MAINNET_DENY_LIST.get(config.pin.chainId);
-  if (pinDenyName !== undefined) {
-    throw new Error(`evm-htlc: chain id ${config.pin.chainId} is deny-listed as ${pinDenyName}; refusing to pin it`);
+  if (!ALLOWED_CHAIN_IDS.has(config.pin.chainId)) {
+    const denyName = MAINNET_DENY_LIST.get(config.pin.chainId);
+    throw new Error(
+      `evm-htlc: chain id ${config.pin.chainId} is not on the allow list (31337 anvil-local, 84532 base-sepolia only)` +
+        (denyName !== undefined ? `; ${config.pin.chainId} is ${denyName}` : ""),
+    );
   }
   for (const [asset, address] of Object.entries(config.assets)) {
     if (isAddressEqual(address, BASE_MAINNET_USDC)) {
@@ -114,6 +127,88 @@ export function validateEvmRailConfig(config: EvmRailConfig): void {
     }
   }
   validateFinality(config.pin.finality);
+}
+
+const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+
+/**
+ * P22-P24-EVM-FIXES.md A3: whether `value` even has the shape of an `EvmRailConfig` — every
+ * field present and typed, and `pin.caip2` actually derived from `pin.chainId` (`"eip155:" +
+ * chainId`, never a value that could disagree with the chain id everything else here trusts).
+ * `null` when the shape checks out; otherwise the first reason it doesn't. This runs before
+ * `validateEvmRailConfig` (which assumes a well-typed `EvmRailConfig` already) at every place
+ * a rail config enters this build as untrusted data rather than compiler-checked source: a
+ * live sweep's `--rails` file, an offline replay's `rails.json`/`--rails` file, and a folded
+ * replay's own `rails.evm` input.
+ */
+export function evmRailConfigShapeReason(value: unknown): string | null {
+  if (value === null || typeof value !== "object") return "evm rail config is not an object";
+  const v = value as Record<string, unknown>;
+
+  if (v.pin === null || typeof v.pin !== "object") return "evm rail config: pin is not an object";
+  const pin = v.pin as Record<string, unknown>;
+  if (typeof pin.chainId !== "number" || !Number.isInteger(pin.chainId) || pin.chainId <= 0) {
+    return "evm rail config: pin.chainId must be a positive integer";
+  }
+  if (typeof pin.name !== "string" || pin.name === "") return "evm rail config: pin.name must be a non-empty string";
+  if (typeof pin.caip2 !== "string") return "evm rail config: pin.caip2 must be a string";
+  if (pin.caip2 !== `eip155:${pin.chainId}`) {
+    return `evm rail config: pin.caip2 "${pin.caip2}" does not match pin.chainId ${pin.chainId} (expected "eip155:${pin.chainId}")`;
+  }
+  if (pin.finality === null || typeof pin.finality !== "object") return "evm rail config: pin.finality is not an object";
+  const finality = pin.finality as Record<string, unknown>;
+  if (finality.mode === "tag") {
+    if (finality.tag !== "finalized") return 'evm rail config: pin.finality.tag must be "finalized"';
+    if (
+      finality.fallbackConfirmations !== undefined &&
+      (typeof finality.fallbackConfirmations !== "number" || !Number.isInteger(finality.fallbackConfirmations) || finality.fallbackConfirmations <= 0)
+    ) {
+      return "evm rail config: pin.finality.fallbackConfirmations must be a positive integer";
+    }
+  } else if (finality.mode === "confirmations") {
+    if (typeof finality.confirmations !== "number" || !Number.isInteger(finality.confirmations) || finality.confirmations <= 0) {
+      return "evm rail config: pin.finality.confirmations must be a positive integer";
+    }
+  } else {
+    return 'evm rail config: pin.finality.mode must be "tag" or "confirmations"';
+  }
+
+  if (typeof v.endpoint !== "string" || v.endpoint === "") return "evm rail config: endpoint must be a non-empty string";
+  if (typeof v.contract !== "string" || !HEX_ADDRESS.test(v.contract)) {
+    return "evm rail config: contract must be a 0x-address";
+  }
+  if (v.assets === null || typeof v.assets !== "object" || Array.isArray(v.assets)) {
+    return "evm rail config: assets must be an object";
+  }
+  for (const [asset, address] of Object.entries(v.assets as Record<string, unknown>)) {
+    if (typeof address !== "string" || !HEX_ADDRESS.test(address)) {
+      return `evm rail config: assets["${asset}"] must be a 0x-address`;
+    }
+  }
+  return null;
+}
+
+export type EvmRailConfigCheck = { ok: true; config: EvmRailConfig } | { ok: false; reason: string };
+
+/**
+ * P22-P24-EVM-FIXES.md A3: the one check every entry point runs on a rail config it did not
+ * itself construct from compiler-checked source — `src/watcher.ts`'s `runSweep` (a `--rails`
+ * file), `src/replay.ts`'s `foldCaptured` (the same, or a captured `rails.json`), and
+ * `examples/audit-export.mjs`'s own rails loading. Never throws: a shape problem or an
+ * `validateEvmRailConfig` refusal (chain id off the allow list, D-09 asset, bad finality
+ * knobs) both come back as `{ ok: false, reason }`, so every caller can fail closed with a
+ * clear, specific message instead of an uncaught exception.
+ */
+export function checkEvmRailConfig(value: unknown): EvmRailConfigCheck {
+  const shapeReason = evmRailConfigShapeReason(value);
+  if (shapeReason !== null) return { ok: false, reason: shapeReason };
+  const config = value as EvmRailConfig;
+  try {
+    validateEvmRailConfig(config);
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+  return { ok: true, config };
 }
 
 function chainFromPin(pin: EvmChainPin): Chain {

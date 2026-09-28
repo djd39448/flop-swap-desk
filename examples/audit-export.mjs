@@ -28,6 +28,7 @@ import { OFFER_ROOM, paperNote, transcriptRecord } from "@flop-labs/tclk";
 import { quoteBigNonces } from "../dist/watcher.js";
 import { findSwapLegCandidates, foldCaptured } from "../dist/replay.js";
 import { loadEvmCapture } from "../dist/rails/evm-evidence.js";
+import { checkEvmRailConfig } from "../dist/rails/evm-htlc.js";
 
 const USAGE = `Usage: node examples/audit-export.mjs --root DIR [--expect <swapId>=<status>] [--rails FILE] [--json]
 
@@ -293,14 +294,18 @@ function loadNotes(root, offers) {
   return notes;
 }
 
-/** Every `raw/evm/<hashLock>/*.json` capture index (P22-P24-EVM-SPEC.md §4/§5), latest per
- *  hashLock — `loadEvmCapture` (src/rails/evm-evidence.ts, P22-P24-EVM-FIXES.md A11) does the
- *  actual file I/O: picks the latest index, and pre-loads + re-verifies its raw bytes from
+/** Every `raw/evm/<hashLock>/*.json` capture index (P22-P24-EVM-SPEC.md §4/§5), latest valid
+ *  one per hashLock — `loadEvmCapture` (src/rails/evm-evidence.ts, P22-P24-EVM-FIXES.md A11/
+ *  A5) does the actual file I/O: tries each candidate index newest first, skipping any that
+ *  is not `*.json`, a `*.tmp-*` write-in-progress leftover, unparseable, or malformed, falling
+ *  back to the newest one that does validate; and pre-loads + re-verifies its raw bytes from
  *  `raw/rpc/<sha256>.json` through `readCapture`, so a tampered or missing response file fails
- *  only that hashLock's evidence, never the replay itself. No network: every byte comes from
- *  `--root`. Async only for this file-reading step — `foldCaptured` itself stays synchronous
- *  (A11). */
-async function loadEvmCaptures(root) {
+ *  only that hashLock's evidence, never the replay itself. `notes` (pushed onto the array a
+ *  caller supplies, A5's "with a note") names every skipped file; when every hashLock's
+ *  candidates were all invalid the leg simply gets no evidence, the same as an uncaptured one.
+ *  No network: every byte comes from `--root`. Async only for this file-reading step —
+ *  `foldCaptured` itself stays synchronous (A11). */
+async function loadEvmCaptures(root, notes = []) {
   const evmDir = join(root, "raw", "evm");
   const chain = new Map();
   let entries;
@@ -312,8 +317,11 @@ async function loadEvmCaptures(root) {
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const hashLock = entry.name;
-    const capture = await loadEvmCapture(root, hashLock);
+    const { capture, skipped } = await loadEvmCapture(root, hashLock);
     if (capture !== null) chain.set(hashLock, capture);
+    for (const name of skipped) {
+      notes.push(`raw/evm/${hashLock}/${name}: invalid capture index, skipped (A5)`);
+    }
   }
   return chain;
 }
@@ -321,9 +329,12 @@ async function loadEvmCaptures(root) {
 /** `{ "evm": EvmRailConfig }` for the fold's `rails` input (P22-P24-EVM-SPEC.md §5):
  *  `railsFileOverride` (`--rails FILE`) when given, else `DIR/rails.json`. `undefined` when
  *  neither exists — a watch root a chain rail was never configured for, folded exactly as
- *  before this option existed. Throws only when `--rails` named a file that could not be
- *  read or parsed (a bad argument, per `main`'s exit code 2) — `DIR/rails.json` being absent
- *  is not an error, since most watch roots never had one. */
+ *  before this option existed. Throws (a bad argument, per `main`'s exit code 2) when
+ *  `--rails` named a file that could not be read or parsed, or when either file's own `evm`
+ *  config fails `checkEvmRailConfig` (P22-P24-EVM-FIXES.md A3: shape check plus the allow
+ *  list/D-09/finality checks) — a captured `rails.json` is just as untrusted as any other file
+ *  under `--root`, so it gets validated the same way a live sweep's own `--rails` file does.
+ *  `DIR/rails.json` being absent is not an error, since most watch roots never had one. */
 function loadRails(root, railsFileOverride) {
   const path = railsFileOverride ?? join(root, "rails.json");
   let raw;
@@ -333,11 +344,19 @@ function loadRails(root, railsFileOverride) {
     if (railsFileOverride === undefined) return undefined; // DIR/rails.json is optional
     throw new Error(`cannot read --rails file ${path}: ${error.message}`);
   }
+  let parsed;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch (error) {
     throw new Error(`--rails file ${path} is not valid JSON: ${error.message}`);
   }
+  if (parsed !== null && typeof parsed === "object" && parsed.evm !== undefined) {
+    const check = checkEvmRailConfig(parsed.evm);
+    if (!check.ok) {
+      throw new Error(`${path}: evm rail config is invalid: ${check.reason}`);
+    }
+  }
+  return parsed;
 }
 
 function collectSeqs(steps, offerRoomSeqs, dealRoomSeqs) {
@@ -435,14 +454,16 @@ async function main() {
   // P22-P24-EVM-SPEC.md §5: chain-read captures and their pinned config, both optional and
   // both absent from a watch root that never configured a chain rail — foldCaptured then
   // folds exactly as it always did. Still no network: readCapture only ever reads --root.
-  const chain = await loadEvmCaptures(args.root);
+  // A5: `evmCaptureNotes` collects one line per skipped-and-fallen-back-from capture index.
+  const evmCaptureNotes = [];
+  const chain = await loadEvmCaptures(args.root, evmCaptureNotes);
   const board = foldCaptured({ offers, dealRooms, notes, chain, rails, nowMs: Date.now() });
   const swaps = board.swaps.map(describeSwap);
 
   if (args.json) {
     process.stdout.write(
       `${JSON.stringify(
-        { swaps, unpaired: board.unpaired, malformedOfferLines: malformedLines, archivedOfferLines },
+        { swaps, unpaired: board.unpaired, malformedOfferLines: malformedLines, archivedOfferLines, evmCaptureNotes },
         null,
         2,
       )}\n`,
@@ -454,6 +475,7 @@ async function main() {
     if (archivedOfferLines > 0) {
       process.stdout.write(`offers: recovered ${archivedOfferLines} line(s) from raw/swaps/*/offer-room/ (ring rolled)\n`);
     }
+    for (const note of evmCaptureNotes) process.stdout.write(`${note}\n`);
     printReport(swaps, board.unpaired);
   }
 

@@ -728,41 +728,102 @@ export async function captureEvmLeg(
   return finish(finalityRecord, chainId);
 }
 
+const SHA256_HEX_LOWER = /^[0-9a-f]{64}$/;
+
+/** P22-P24-EVM-FIXES.md A5: whether a parsed `raw/evm/<hashLock>/*.json` file actually looks
+ *  like an index this build wrote — `v === 1`, `rail === "evm-htlc"`, `hashLock` equal to the
+ *  directory name it was found under and hash-shaped, and `exchanges` an array of well-formed
+ *  entries (each with the fields `bindExchange`/`resolveFinalizedBlock` above dereference).
+ *  Deliberately narrower than `looksLikeEvmRailConfig`'s check on `index.config` (A4's job,
+ *  run later by `evmEvidence` itself once a candidate index has passed this gate) — this is
+ *  only "is this file even a capture index for this hashLock", not "is its config any good". */
+function looksLikeCaptureIndexFile(value: unknown, hashLock: string): value is EvmCaptureIndex {
+  if (value === null || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  if (v.v !== 1 || v.rail !== "evm-htlc") return false;
+  if (typeof v.hashLock !== "string" || v.hashLock !== hashLock || !HASH_LOCK_SHAPE.test(v.hashLock)) return false;
+  if (!Array.isArray(v.exchanges)) return false;
+  for (const exchange of v.exchanges) {
+    if (exchange === null || typeof exchange !== "object") return false;
+    const e = exchange as Record<string, unknown>;
+    if (typeof e.method !== "string") return false;
+    if (typeof e.requestBody !== "string") return false;
+    if (typeof e.responseSha256 !== "string" || !SHA256_HEX_LOWER.test(e.responseSha256)) return false;
+    if (typeof e.atMs !== "number") return false;
+  }
+  return true;
+}
+
+/** A5: only real capture-index files are candidates — `*.json`, never a `*.tmp-*` leftover
+ *  from an atomic write (`writeFileAtomic` in `src/watcher.ts`/`rpc-capture.ts`) interrupted
+ *  mid-write, which would otherwise sort after a real (ISO-stamped) name and get mistaken for
+ *  "the newest" one. */
+function isCaptureIndexCandidate(name: string): boolean {
+  return name.endsWith(".json") && !name.includes(".tmp-");
+}
+
+export interface LoadEvmCaptureResult {
+  capture: EvmCapture | null;
+  /** A5: candidate filenames (newest first) that were skipped because they failed to read,
+   *  parse, or validate as a capture index for this hashLock — empty in the common case where
+   *  every candidate file was fine. The caller decides how (or whether) to surface these; a
+   *  bad file here fails only this hashLock's evidence closed, never the whole replay. */
+  skipped: string[];
+}
+
 /**
- * A11: the one place a replay does file I/O for an EVM capture — everything downstream
- * (`evmEvidence`, `foldCaptured`) is pure and synchronous over the result. Reads the latest
- * `raw/evm/<hashLock>/*.json` index under `root` (ISO-stamped names sort chronologically),
- * then pre-loads and re-verifies (via `readCapture`'s own re-hashing) every exchange's
- * response bytes it names, encoded as UTF-8 `Uint8Array`s — the same shape a live capture's
- * in-memory bytes are given, so `evmEvidence` never needs to know which source it came from.
- * `null` when the hashLock has no capture directory, or no readable/parseable index file at
- * all — the caller (`examples/audit-export.mjs`) treats that exactly like "not captured"
- * evidence-wise, never a thrown exception.
+ * A11/A5: the one place a replay does file I/O for an EVM capture — everything downstream
+ * (`evmEvidence`, `foldCaptured`) is pure and synchronous over the result. Tries every
+ * `raw/evm/<hashLock>/*.json` candidate under `root`, newest first (ISO-stamped names sort
+ * chronologically; `.tmp-*` leftovers and non-`.json` entries are never candidates at all),
+ * and returns the first one that actually parses and validates as this hashLock's capture
+ * index — so a corrupted or interrupted *latest* write falls back to the newest still-good
+ * one instead of failing the leg outright. Once a valid index is found, its exchanges' bytes
+ * are pre-loaded and re-verified (via `readCapture`'s own re-hashing), the same shape a live
+ * capture's in-memory bytes are given, so `evmEvidence` never needs to know which source it
+ * came from. `capture: null` when the hashLock has no capture directory, or no candidate file
+ * ever validates — the caller (`examples/audit-export.mjs`) treats that exactly like "not
+ * captured" evidence-wise, never a thrown exception.
  */
-export async function loadEvmCapture(root: string, hashLock: string): Promise<EvmCapture | null> {
+export async function loadEvmCapture(root: string, hashLock: string): Promise<LoadEvmCaptureResult> {
   const dir = join(root, "raw", "evm", hashLock);
-  let entries: string[];
+  let allEntries: string[];
   try {
-    entries = (await readdir(dir)).filter((name) => !name.startsWith(".")).sort();
+    allEntries = await readdir(dir);
   } catch {
-    return null;
+    return { capture: null, skipped: [] };
   }
-  const latest = entries[entries.length - 1];
-  if (latest === undefined) return null;
+  const candidates = allEntries.filter(isCaptureIndexCandidate).sort().reverse(); // newest first
 
-  let index: EvmCaptureIndex;
-  try {
-    index = JSON.parse(await readFile(join(dir, latest), "utf8")) as EvmCaptureIndex;
-  } catch {
-    return null;
-  }
-  if (index === null || typeof index !== "object" || !Array.isArray(index.exchanges)) return null;
+  const skipped: string[] = [];
+  for (const name of candidates) {
+    let raw: string;
+    try {
+      raw = await readFile(join(dir, name), "utf8");
+    } catch {
+      skipped.push(name);
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      skipped.push(name);
+      continue;
+    }
+    if (!looksLikeCaptureIndexFile(parsed, hashLock)) {
+      skipped.push(name);
+      continue;
+    }
 
-  const bytes = new Map<string, Uint8Array | null>();
-  for (const exchange of index.exchanges) {
-    if (bytes.has(exchange.responseSha256)) continue;
-    const body = await readCapture(root, exchange.responseSha256);
-    bytes.set(exchange.responseSha256, body === null ? null : new TextEncoder().encode(body));
+    const index = parsed;
+    const bytes = new Map<string, Uint8Array | null>();
+    for (const exchange of index.exchanges) {
+      if (bytes.has(exchange.responseSha256)) continue;
+      const body = await readCapture(root, exchange.responseSha256);
+      bytes.set(exchange.responseSha256, body === null ? null : new TextEncoder().encode(body));
+    }
+    return { capture: { index, bytes }, skipped };
   }
-  return { index, bytes };
+  return { capture: null, skipped };
 }

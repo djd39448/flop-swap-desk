@@ -541,4 +541,121 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     expect(view!.evidence.b?.railVerified).toBe(true);
     expect(view!.status).toBe("b-locked");
   });
+
+  // P22-P24-EVM-FIXES.md A6 (deliberate behaviour change): foldCaptured dispatches on the lock
+  // rail/ref the tclk contract machine actually *accepted* (`foldAcceptedLock`), never merely
+  // the first authenticated-looking lock frame in room order (`findAuthenticatedLock`, this
+  // file's own comment above still documents why a forged-sender frame is ignored — that part
+  // is unchanged; these two pin the *new* ground the fix covers).
+  describe("A6: dispatch on the tclk-accepted lock, not the first authenticated frame", () => {
+    it("a rejected paper frame (rail never offered for this leg) followed by an accepted evm-htlc frame yields no paper evidence, only evm-htlc", async () => {
+      const s = buildMixedSwapBase("a001a001a001a001"); // legA offers only ["evm-htlc"] (buildMixedSwapBase)
+      const rejectedPaperLockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "paper", ref: s.legAAccept.contract };
+      const acceptedEvmLockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: s.lock.hash };
+      const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+      const dealRoomsA = [
+        record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(rejectedPaperLockA)),
+        record(s.dealRoomA, 2, T0 + 4.2 * MIN, buyer, encodeFrame(acceptedEvmLockA)),
+        ...accountLineRecords(s.dealRoomA, 3, T0 + 4.5 * MIN),
+      ];
+      const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+
+      // A paper note IS captured for leg A's own contract too — the old first-authenticated-
+      // frame dispatch would have matched `rejectedPaperLockA.ref === candidate.contract` and
+      // reported (bogus) paper evidence from it instead of ever reaching the evm-htlc branch.
+      const noteAValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legAOffer.refundAfterMs });
+      const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+      const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
+
+      const board = foldCaptured({
+        offers: s.offers,
+        dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+        notes: new Map([
+          [s.legAAccept.contract, { body: `!! rehearsal\n\n${noteAValue}\n`, endpoint: "kv:test" }],
+          [s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }],
+        ]),
+        chain: new Map([[s.lock.hash, capture]]),
+        rails: { evm: EVM_CONFIG },
+        nowMs: T0 + 6 * MIN,
+      });
+
+      const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+      expect(view).toBeDefined();
+      expect(view!.evidence.a?.rail).toBe("evm-htlc");
+      expect(view!.evidence.a?.railVerified).toBe(true);
+      expect(view!.status).toBe("a-locked");
+    });
+
+    it("a payer's earlier malformed frame (posted after the refund window had already opened) does not shadow the later accepted lock", async () => {
+      const s = buildMixedSwapBase("a002a002a002a002");
+      const wrongRef = "0x" + "88".repeat(32);
+      // tclk's machine rejects this one on its own timestamp ("refund window is already
+      // open") regardless of its contract/sender/rail otherwise checking out —
+      // findAuthenticatedLock has no notion of a deadline at all, so the old dispatch would
+      // have picked this up as "the" lock frame for leg A (and, since its ref does not equal
+      // terms.statement, reported no evm-htlc evidence for leg A at all — never even reaching
+      // the frame the payer actually meant).
+      const malformedLockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: wrongRef };
+      const acceptedLockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: s.lock.hash };
+      const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+      const dealRoomsA = [
+        record(s.dealRoomA, 1, T0 + 65 * MIN /* after legAOffer.refundAfterMs (60 min) */, buyer, encodeFrame(malformedLockA)),
+        record(s.dealRoomA, 2, T0 + 4 * MIN, buyer, encodeFrame(acceptedLockA)),
+        ...accountLineRecords(s.dealRoomA, 3, T0 + 4.5 * MIN),
+      ];
+      const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+
+      const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+      const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
+
+      const board = foldCaptured({
+        offers: s.offers,
+        dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+        notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
+        chain: new Map([[s.lock.hash, capture]]),
+        rails: { evm: EVM_CONFIG },
+        nowMs: T0 + 6 * MIN,
+      });
+
+      const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+      expect(view).toBeDefined();
+      expect(view!.evidence.a?.rail).toBe("evm-htlc");
+      expect(view!.evidence.a?.ref).toBe(s.lock.hash);
+      expect(view!.evidence.a?.railVerified).toBe(true);
+      expect(view!.status).toBe("a-locked");
+    });
+  });
+
+  // P22-P24-EVM-FIXES.md A3: foldCaptured itself refuses to reach the decoder with a malformed
+  // `rails.evm` — every evm-htlc leg fails closed with the specific reason, distinguishable
+  // from "not captured yet" (an absent `evidence.a` entirely).
+  it("A3: a malformed rails.evm config fails every evm-htlc leg closed with a specific reason, never reaching evmEvidence", async () => {
+    const s = buildMixedSwapBase("a003a003a003a003");
+    const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: s.lock.hash };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const dealRoomsA = [
+      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
+      ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+    ];
+    const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+
+    const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+    // A config with a chain id off the A3 allow list — never even reaches `evmEvidence`.
+    const badConfig = { ...EVM_CONFIG, pin: { ...EVM_CONFIG.pin, chainId: 8453, caip2: "eip155:8453" } };
+
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal\n\n${noteBValue}\n`, endpoint: "kv:test" }]]),
+      chain: new Map(), // deliberately empty: if the bad config were ever ignored this would
+      // also read "not captured", so the assertion below on `.reason` is what actually pins A3.
+      rails: { evm: badConfig },
+      nowMs: T0 + 6 * MIN,
+    });
+
+    const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+    expect(view).toBeDefined();
+    expect(view!.evidence.a?.railVerified).toBeNull();
+    expect(view!.evidence.a?.reason).toMatch(/rail config invalid.*not on the allow list/);
+  });
 });

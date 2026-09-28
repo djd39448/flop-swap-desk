@@ -1004,5 +1004,82 @@ describe("runSweep", () => {
       expect(view.evidence.aRail).toBeUndefined();
       expect(view.evidence.a).toBeUndefined();
     });
+
+    // P22-P24-EVM-FIXES.md A6 (deliberate behaviour change): the fetch decision (whether to
+    // spend a live RPC round trip capturing a leg) is driven by the lock the tclk contract
+    // machine actually accepted, never merely the first authenticated-looking payer frame.
+    it("A6: a rejected lock frame (wrong rail for this leg) followed by the accepted evm-htlc one is what gets captured live", async () => {
+      const swap = buildEvmSwap("aaaa1005", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+
+      // buildEvmSwap's legA offers only ["evm-htlc"] — a "paper" lock is never an offered
+      // rail, so tclk's own machine rejects it; the payer's later evm-htlc lock is accepted.
+      const rejectedPaperLockA: LockFrame = { type: "lock", from: buyer.did, contract: swap.legAAccept.contract, rail: "paper", ref: swap.legAAccept.contract };
+      const acceptedEvmLockA: LockFrame = { type: "lock", from: buyer.did, contract: swap.legAAccept.contract, rail: "evm-htlc", ref: swap.lock.hash };
+      const sellerLine = formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: SELLER_ADDR });
+      const buyerLine = formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: BUYER_ADDR });
+      const dealARows = [
+        rowFromRecord(record(swap.dealRoomA, 1, NOW - 50_000, buyer, encodeFrame(rejectedPaperLockA))),
+        rowFromRecord(record(swap.dealRoomA, 2, NOW - 49_000, buyer, encodeFrame(acceptedEvmLockA))),
+        rowFromRecord(record(swap.dealRoomA, 3, NOW - 48_000, seller, sellerLine)),
+        rowFromRecord(record(swap.dealRoomA, 4, NOW - 47_000, buyer, buyerLine)),
+      ];
+      const callResult = encodeLockedResult(swap.legATerms);
+
+      const fetchImpl = makeEvmFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: EVM_CONFIG.endpoint,
+        rpcResult: evmRpcResponder(callResult),
+        calls: [],
+      });
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { evm: EVM_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.chainReads).toBe(1);
+      expect(report.chainReadsSkipped).toEqual([]);
+
+      const evmDir = join(root, "raw", "evm", swap.lock.hash);
+      const evmFiles = await readdir(evmDir);
+      expect(evmFiles.length).toBe(1);
+      const index = JSON.parse(await readFile(join(evmDir, evmFiles[0]!), "utf8"));
+      expect(index.hashLock).toBe(swap.lock.hash);
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(view).toBeDefined();
+      expect(view.evidence.a.rail).toBe("evm-htlc");
+      expect(view.evidence.a.railVerified).toBe(true);
+    });
+
+    // P22-P24-EVM-FIXES.md A3: a malformed `options.rails.evm` fails the whole sweep closed,
+    // before Step 1 (the offer-room fetch) ever runs — not merely "chain reads skipped".
+    it("A3: a malformed options.rails.evm fails the sweep closed, before any fetch at all", async () => {
+      const swap = buildEvmSwap("aaaa1006", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const calls: Array<{ url: string; body?: string }> = [];
+      const fetchImpl = makeEvmFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          return { status: 200, body: dealRoomBody([]) };
+        },
+        rpcEndpoint: EVM_CONFIG.endpoint,
+        rpcResult: () => "throw", // would fail the test with an unrelated message if ever reached
+        calls,
+      });
+
+      // Ethereum mainnet (1) is off the A3 allow list (31337/84532 only).
+      const badConfig: EvmRailConfig = { ...EVM_CONFIG, pin: { ...EVM_CONFIG.pin, chainId: 1, caip2: "eip155:1" } };
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { evm: badConfig } }), fetch: fetchImpl });
+
+      expect(report.ok).toBe(false);
+      expect(report.railsConfigError).toMatch(/not on the allow list/);
+      expect(calls).toEqual([]); // nothing was ever fetched — not even the offer-room export
+      expect(existsSync(join(root, "board.json"))).toBe(false);
+    });
   });
 });

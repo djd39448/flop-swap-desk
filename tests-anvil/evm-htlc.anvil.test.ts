@@ -101,7 +101,7 @@ describe("EvmHtlcRail against a real anvil node", () => {
     ).rejects.toThrow(/connected chain id 31337 does not match pin "base-sepolia"/);
   });
 
-  it("an anvil started with --chain-id 8453 is refused by name even when pinned as 8453", async () => {
+  it("an anvil started with --chain-id 8453 is refused (not on the A3 allow list), by name, even when pinned as 8453", async () => {
     const deniedAnvil = await startAnvil({ chainId: 8453 });
     try {
       expect(deniedAnvil.chainId).toBe(8453);
@@ -118,7 +118,7 @@ describe("EvmHtlcRail against a real anvil node", () => {
           account: payer,
           addressBook,
         }),
-      ).rejects.toThrow(/chain id 8453 is deny-listed as base mainnet/);
+      ).rejects.toThrow(/chain id 8453 is not on the allow list.*8453 is base mainnet/);
     } finally {
       await deniedAnvil.stop();
     }

@@ -6,9 +6,26 @@
 // over already-collected bytes: no fetch, no clock read. `findSwapLegCandidates` is also
 // reused by the watcher itself, to decide which deal rooms and paper notes are worth
 // fetching in the first place.
+//
+// P22-P24-EVM-FIXES.md A6 (deliberate behaviour change, 2026-09-28): `foldCaptured` dispatches
+// on the lock rail/ref the tclk contract machine actually *accepted* for a leg
+// (`foldAcceptedLock` below: `foldTranscript` of the leg's own offer → accept → deal room, the
+// same records `src/board.ts`'s `buildLegRecords`/`src/swap.ts`'s `foldSwap` already fold) —
+// never "the first structurally-authenticated lock frame from the leg's payer", which is all
+// `findAuthenticatedLock` checks. A frame the machine itself rejected (its declared rail was
+// never offered, its sender isn't this leg's own payer, the refund window was already open
+// when it arrived, a duplicate lock attempt after the first one already succeeded, …) can no
+// longer be picked up as evidence just because it happened to be authenticated and came first
+// in room order, and a payer's later, corrected frame is never shadowed by an earlier bad one.
+// This changes the no-rails-configured board in the edge case where the previous code let a
+// frame the machine would have rejected stand in as "the" lock (a latent false `a-locked`);
+// every other behaviour (the paper-only fold with no `evm-htlc` involved, and the whole
+// dispatch when `input.rails`/`input.chain` are absent) is unchanged and still pinned by
+// `tests/replay.test.ts`'s "no rails configured" case and the 2026-09-18 rehearsal fixture.
 
 import {
   dealRoom,
+  foldTranscript,
   paperNote,
   tryDecodeFrame,
   verifyTranscriptRecord,
@@ -25,7 +42,7 @@ import { paperEvidence, stripNoteBanner, PAPER_RAIL_ID } from "./paper-evidence.
 import { classifySwapOffer } from "./profile.js";
 import { resolveAccounts } from "./rails/account-line.js";
 import { evmEvidence, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
-import type { EvmRailConfig } from "./rails/evm-htlc.js";
+import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
 import { offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, LockEvidence, RailObservation, SwapEvidence, SwapLeg } from "./types.js";
 
@@ -45,7 +62,7 @@ function authenticatedFrame(record: TranscriptRecord): TclkFrame | null {
   return frame !== null && frame.from === record.sender ? frame : null;
 }
 
-interface SwapLegOffer { seq: number; swapId: string; leg: SwapLeg; offer: OfferFrame }
+interface SwapLegOffer { seq: number; swapId: string; leg: SwapLeg; offer: OfferFrame; record: TranscriptRecord }
 
 export interface SwapLegCandidate {
   contract: string;
@@ -58,6 +75,12 @@ export interface SwapLegCandidate {
   leg: SwapLeg;
   offer: OfferFrame;
   accept: AcceptFrame;
+  /** A6: the raw signed records behind `offer`/`accept` — needed to re-fold this leg's own
+   *  transcript (offer → accept → its deal room) through tclk's `foldTranscript` and learn
+   *  which lock frame the contract machine actually accepted (`foldAcceptedLock` below), never
+   *  merely "the first structurally-authenticated one" `findAuthenticatedLock` would find. */
+  offerRecord: TranscriptRecord;
+  acceptRecord: TranscriptRecord;
 }
 
 /**
@@ -98,6 +121,7 @@ export function findSwapLegCandidates(offerRoomRecords: readonly TranscriptRecor
         swapId: classification.swapId,
         leg: classification.context.leg,
         offer: frame,
+        record,
       });
       continue;
     }
@@ -115,6 +139,8 @@ export function findSwapLegCandidates(offerRoomRecords: readonly TranscriptRecor
           leg: legOffer.leg,
           offer: legOffer.offer,
           accept: frame,
+          offerRecord: legOffer.record,
+          acceptRecord: record,
         });
       }
     }
@@ -151,9 +177,15 @@ export function hasAuthenticatedPaperLock(records: readonly TranscriptRecord[], 
  * who actually escrows a leg's funds can post the frame that says it is locked, so a
  * `verifyTranscriptRecord`-clean frame signed by anyone else (the payee, a stranger who
  * guessed the deal room) is not evidence of anything and must not be picked up as one.
- * `null` when no such record exists. Dispatching on the frame's own `.rail`/`.ref` is the
- * caller's job — `foldCaptured` below (paper vs `evm-htlc` vs anything else) and
- * `src/watcher.ts`'s own use of this to decide whether an EVM leg is worth capturing live.
+ * `null` when no such record exists.
+ *
+ * P22-P24-EVM-FIXES.md A6: this only checks that a frame is *authenticated* — signed, right
+ * contract, right sender — never whether tclk's own contract machine actually accepted it as
+ * the lock (the declared rail may never have been offered, the refund window may already have
+ * been open, a duplicate attempt may have arrived after the first lock already succeeded, …).
+ * `foldCaptured` below and `src/watcher.ts`'s fetch decision no longer use this for evidence
+ * dispatch — see `foldAcceptedLock` — but it is kept, and still exported, as the lower-level
+ * "is there any authenticated lock frame at all" primitive a caller might still want.
  */
 export function findAuthenticatedLock(
   records: readonly TranscriptRecord[],
@@ -167,6 +199,40 @@ export function findAuthenticatedLock(
     }
   }
   return null;
+}
+
+/** The lock rail/ref `foldAcceptedLock` found the tclk contract machine actually accepted for
+ *  a leg. */
+export interface AcceptedLock {
+  rail: string;
+  railRef: string;
+}
+
+/**
+ * P22-P24-EVM-FIXES.md A6: the lock rail/ref the tclk contract machine *actually accepted* for
+ * this leg — never merely "the first frame that looks authenticated for the right contract
+ * from the right payer" (`findAuthenticatedLock`'s only check). Folds the leg's own transcript
+ * exactly the way `src/board.ts`'s `buildLegRecords`/`src/swap.ts`'s `foldSwap` already do for
+ * the board's own choreography view — offer, then accept, then every deal-room record, in
+ * venue order — through tclk's own `foldTranscript`/`applyFrame` (`vendor/tclk/src/machine.ts`
+ * sets `state.rail`/`state.railRef` only on a lock transition it actually accepts, and never
+ * clears them on any later valid transition). A frame the machine rejected — its declared rail
+ * was never offered, its sender isn't this leg's own payer, the refund window was already open
+ * when it arrived, a duplicate lock attempt after the first one already succeeded — leaves
+ * `state.rail` exactly as it was, so it can never be picked up here just because it happened to
+ * come first in room order; a payer's later, corrected frame is never shadowed by an earlier
+ * bad one, since the machine only advances past `"accepted"` on the first frame it actually
+ * takes. `null` when the leg's own offer/accept never even fold to a contract (a forged/
+ * mismatched accept), or no lock was ever accepted.
+ */
+export function foldAcceptedLock(
+  offerRecord: TranscriptRecord,
+  acceptRecord: TranscriptRecord,
+  dealRoomRecords: readonly TranscriptRecord[],
+): AcceptedLock | null {
+  const { state } = foldTranscript([offerRecord, acceptRecord, ...dealRoomRecords]);
+  if (state === null || state.rail === undefined || state.railRef === undefined) return null;
+  return { rail: state.rail, railRef: state.railRef };
 }
 
 /** One captured paper-rail note: its raw `/kv` body (banner included) and the endpoint it
@@ -207,22 +273,29 @@ export interface FoldCapturedInput {
  * (`src/watcher.ts`) and an offline replay (`examples/audit-export.mjs`) both call this after
  * collecting their own bytes, so they can never fold differently.
  *
- * For each candidate, `findAuthenticatedLock` finds the (at most one first-seen) `lock` frame
- * its own leg's payer posted in its own deal room, and this dispatches on that frame's `.rail`
- * (P22-P24-EVM-SPEC.md §5): `paper` (`ref === contract`, tclk's convention) → today's paper
- * path, reading the captured note the same way it always has; `evm-htlc` (`ref ===
- * terms.statement`, the hashLock) → `evmEvidence`, but only when a chain rail is configured
- * (`input.rails.evm`) AND a capture exists for that hashLock (`input.chain`) — accounts are
- * resolved fresh from the same deal room with `resolveAccounts`, never cached across
- * candidates, since each leg's own deal room is the only room its account lines can be posted
- * in; anything else (an unrecognised rail, or a rail/ref combination this build has no reader
- * for) gets no evidence, exactly like an absent lock frame does today.
+ * For each candidate, `foldAcceptedLock` (A6) folds the leg's own offer → accept → deal room
+ * through tclk's contract machine and dispatches on the lock rail/ref it actually *accepted* —
+ * never merely the first authenticated-looking lock frame in room order (P22-P24-EVM-SPEC.md
+ * §5, as tightened by P22-P24-EVM-FIXES.md A6): `paper` (`railRef === contract`, tclk's
+ * convention) → today's paper path, reading the captured note the same way it always has;
+ * `evm-htlc` (`railRef === terms.statement`, the hashLock) → `evmEvidence`, but only when a
+ * chain rail is configured (`input.rails.evm`, itself validated once per fold — A3 — so a
+ * malformed config never silently reaches the decoder) AND a capture exists for that hashLock
+ * (`input.chain`) — accounts are resolved fresh from the same deal room with `resolveAccounts`,
+ * never cached across candidates, since each leg's own deal room is the only room its account
+ * lines can be posted in; anything else (an unrecognised rail, or a rail/ref combination this
+ * build has no reader for) gets no evidence, exactly like no lock having been accepted at all.
  */
 export function foldCaptured(input: FoldCapturedInput): Board {
   const buildBoardFn = input.board ?? defaultBuildBoard;
   const { candidates } = findSwapLegCandidates(input.offers);
   const evidenceBySwap = new Map<string, SwapEvidence>();
   const evmConfig = input.rails?.evm;
+  // A3: validated once per fold, not once per candidate — every entry point a rail config can
+  // reach this from (a live sweep's `--rails` file, a replayed `rails.json`) is untrusted data,
+  // so a malformed config never silently reaches `evmEvidence`; it fails every `evm-htlc` leg
+  // closed instead, each with the same specific reason.
+  const evmConfigCheck = evmConfig === undefined ? null : checkEvmRailConfig(evmConfig);
 
   for (const candidate of candidates) {
     const room = dealRoom(candidate.contract);
@@ -230,28 +303,43 @@ export function foldCaptured(input: FoldCapturedInput): Board {
     // Full nine-field LockTerms (H1, tclk#180), from the authenticated offer/accept pair
     // itself — never from the deal room or a rail's own record, both world-writable.
     const terms = offerAcceptLockTerms(candidate.offer, candidate.accept);
-    const lockFrame = findAuthenticatedLock(dealRoomRecords, candidate.contract, terms.payer);
-    if (lockFrame === null) continue;
+    const accepted = foldAcceptedLock(candidate.offerRecord, candidate.acceptRecord, dealRoomRecords);
+    if (accepted === null) continue; // no lock the tclk machine actually accepted: no evidence
 
     let result: { lock: LockEvidence; rail?: RailObservation } | undefined;
 
-    if (lockFrame.rail === PAPER_RAIL_ID && lockFrame.ref === candidate.contract) {
+    if (accepted.rail === PAPER_RAIL_ID && accepted.railRef === candidate.contract) {
       const captured = input.notes.get(candidate.contract);
       if (captured === undefined) continue; // not fetched/not found: evidence absent
       const noteValue = stripNoteBanner(captured.body);
       result = paperEvidence(terms, noteValue, input.nowMs, captured.endpoint);
-    } else if (lockFrame.rail === EVM_RAIL_ID && lockFrame.ref === terms.statement) {
-      if (evmConfig === undefined) continue; // no chain rail configured: no evidence at all
-      const capture = input.chain?.get(lockFrame.ref);
-      if (capture === undefined) continue; // not captured (yet, or ever): evidence absent
-      const accounts = resolveAccounts(dealRoomRecords, {
-        contract: candidate.contract,
-        payerDid: terms.payer,
-        payeeDid: terms.payee,
-        rail: EVM_RAIL_ID,
-        caip2: evmConfig.pin.caip2,
-      });
-      result = evmEvidence({ terms, config: evmConfig, accounts, capture });
+    } else if (accepted.rail === EVM_RAIL_ID && accepted.railRef === terms.statement) {
+      if (evmConfigCheck === null) continue; // no chain rail configured: no evidence at all
+      if (!evmConfigCheck.ok) {
+        // A3: a bad config fails every evm-htlc leg closed, with the specific reason — never
+        // silently "no evidence" (which would look identical to "nothing captured yet").
+        result = {
+          lock: {
+            rail: EVM_RAIL_ID,
+            ref: accepted.railRef,
+            terms,
+            railVerified: null,
+            checkedAtMs: input.nowMs,
+            reason: `evm-htlc: rail config invalid: ${evmConfigCheck.reason}`,
+          },
+        };
+      } else {
+        const capture = input.chain?.get(accepted.railRef);
+        if (capture === undefined) continue; // not captured (yet, or ever): evidence absent
+        const accounts = resolveAccounts(dealRoomRecords, {
+          contract: candidate.contract,
+          payerDid: terms.payer,
+          payeeDid: terms.payee,
+          rail: EVM_RAIL_ID,
+          caip2: evmConfigCheck.config.pin.caip2,
+        });
+        result = evmEvidence({ terms, config: evmConfigCheck.config, accounts, capture });
+      }
     } else {
       continue; // an unrecognised rail, or a rail this build has no evidence reader for
     }

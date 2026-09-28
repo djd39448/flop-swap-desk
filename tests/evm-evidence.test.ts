@@ -5,7 +5,7 @@
 // live-vs-replay equivalence: the same bytes, captured live and reloaded from disk, must
 // produce byte-identical evidence.
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,6 +21,7 @@ import type { EvmChainPin, EvmRailConfig } from "../src/rails/evm-htlc.js";
 import {
   captureEvmLeg,
   evmEvidence,
+  loadEvmCapture,
   type EvmAccounts,
   type EvmCapture,
   type EvmCaptureIndex,
@@ -693,5 +694,116 @@ describe("evmEvidence — A4: the capture's own config must match the auditor's"
     const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/finality config is malformed/);
+  });
+});
+
+// P22-P24-EVM-FIXES.md A5: `loadEvmCapture` (the one place a replay reads `raw/evm/<hashLock>/
+// *.json` off disk) must never trust "the lexicographically last filename" blindly — only
+// `*.json` files are candidates (never a `*.tmp-*` write-in-progress leftover), each candidate
+// is parsed and shape-checked before use, and a bad *latest* file falls back to the newest one
+// that actually validates rather than failing the whole hashLock closed.
+describe("loadEvmCapture — A5: defensive index loading", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "flop-swap-desk-load-evm-capture-"));
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  async function writeIndexFile(name: string, index: unknown): Promise<void> {
+    const dir = join(root, "raw", "evm", HASH_LOCK);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, name), typeof index === "string" ? index : JSON.stringify(index));
+  }
+
+  async function writeRawRpc(bytes: ReadonlyMap<string, Uint8Array>): Promise<void> {
+    const dir = join(root, "raw", "rpc");
+    await mkdir(dir, { recursive: true });
+    for (const [sha, body] of bytes) await writeFile(join(dir, `${sha}.json`), body);
+  }
+
+  it("no capture directory at all -> capture null, nothing skipped", async () => {
+    await expect(loadEvmCapture(root, HASH_LOCK)).resolves.toEqual({ capture: null, skipped: [] });
+  });
+
+  it("a real, valid index loads with pre-verified bytes and nothing skipped", async () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    await writeRawRpc(capture.bytes);
+    await writeIndexFile("2026-09-28T00-00-00.000Z.json", capture.index);
+
+    const result = await loadEvmCapture(root, HASH_LOCK);
+    expect(result.skipped).toEqual([]);
+    expect(result.capture?.index.hashLock).toBe(HASH_LOCK);
+  });
+
+  it("ignores a *.tmp-* write-in-progress leftover from an interrupted atomic write (never even a candidate)", async () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    await writeRawRpc(capture.bytes);
+    await writeIndexFile("2026-09-28T00-00-00.000Z.json", capture.index);
+    // The exact shape `writeFileAtomic` (src/watcher.ts / rpc-capture.ts) leaves behind if a
+    // process dies between its write() and its rename() — lexically after the real file, but
+    // never a candidate.
+    await writeIndexFile("2026-09-28T00-00-01.000Z.json.tmp-4242-xy1", "{{{ not even close to json");
+
+    const result = await loadEvmCapture(root, HASH_LOCK);
+    expect(result.skipped).toEqual([]);
+    expect(result.capture?.index.hashLock).toBe(HASH_LOCK);
+  });
+
+  it("ignores a non-.json file in the directory entirely (never counted as skipped)", async () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    await writeRawRpc(capture.bytes);
+    await writeIndexFile("2026-09-28T00-00-00.000Z.json", capture.index);
+    await writeIndexFile("README.txt", "not an index at all");
+
+    const result = await loadEvmCapture(root, HASH_LOCK);
+    expect(result.skipped).toEqual([]);
+    expect(result.capture).not.toBeNull();
+  });
+
+  it("falls back to the newest *valid* file when the newest one is corrupted JSON, with a note", async () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    await writeRawRpc(capture.bytes);
+    await writeIndexFile("2026-09-28T00-00-00.000Z.json", capture.index); // older, valid
+    await writeIndexFile("2026-09-28T00-00-01.000Z.json", "{ this is not valid json"); // newer, corrupt
+
+    const result = await loadEvmCapture(root, HASH_LOCK);
+    expect(result.skipped).toEqual(["2026-09-28T00-00-01.000Z.json"]);
+    expect(result.capture?.index.hashLock).toBe(HASH_LOCK);
+  });
+
+  it("falls back to the newest valid file when the newest one fails shape validation (wrong hashLock)", async () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    await writeRawRpc(capture.bytes);
+    await writeIndexFile("2026-09-28T00-00-00.000Z.json", capture.index); // older, valid
+    await writeIndexFile("2026-09-28T00-00-01.000Z.json", { ...capture.index, hashLock: "0x" + "ff".repeat(32) }); // newer: wrong hashLock
+
+    const result = await loadEvmCapture(root, HASH_LOCK);
+    expect(result.skipped).toEqual(["2026-09-28T00-00-01.000Z.json"]);
+    expect(result.capture?.index.hashLock).toBe(HASH_LOCK);
+  });
+
+  it("falls back to the newest valid file when the newest one fails shape validation (wrong v/rail, malformed exchanges)", async () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
+    await writeRawRpc(capture.bytes);
+    await writeIndexFile("2026-09-28T00-00-00.000Z.json", capture.index); // older, valid
+    await writeIndexFile("2026-09-28T00-00-01.000Z.json", { ...capture.index, v: 2 }); // newer: wrong version
+    await writeIndexFile("2026-09-28T00-00-02.000Z.json", { ...capture.index, exchanges: "not an array" }); // newest: malformed
+
+    const result = await loadEvmCapture(root, HASH_LOCK);
+    expect(result.skipped).toEqual(["2026-09-28T00-00-02.000Z.json", "2026-09-28T00-00-01.000Z.json"]);
+    expect(result.capture?.index.hashLock).toBe(HASH_LOCK);
+  });
+
+  it("capture null and every candidate skipped when none validate -- fails this leg closed, never thrown", async () => {
+    await writeIndexFile("2026-09-28T00-00-00.000Z.json", { v: 2, rail: "evm-htlc", hashLock: HASH_LOCK, exchanges: [] });
+    await writeIndexFile("2026-09-28T00-00-01.000Z.json", "not even json");
+
+    const result = await loadEvmCapture(root, HASH_LOCK);
+    expect(result.capture).toBeNull();
+    expect(result.skipped.sort()).toEqual(["2026-09-28T00-00-00.000Z.json", "2026-09-28T00-00-01.000Z.json"]);
   });
 });

@@ -28,6 +28,7 @@ import {
   BASE_MAINNET_USDC,
   BASE_SEPOLIA_PIN,
   EvmHtlcRail,
+  checkEvmRailConfig,
   validateEvmRailConfig,
   type EvmChainPin,
   type EvmRailConfig,
@@ -149,15 +150,30 @@ function configFor(pin: EvmChainPin): EvmRailConfig {
 }
 
 describe("validateEvmRailConfig / connect — chain pin and asset book", () => {
-  it("refuses a deny-listed chain id in the pin itself, by name, before ever touching the network", async () => {
+  // P22-P24-EVM-FIXES.md A3: an allow list, not a deny list — 8453 (base mainnet) is refused
+  // because it is not 31337/84532, and the old named list only makes the message friendlier.
+  it("refuses a chain id not on the allow list, by name when it is a known mainnet, before ever touching the network", async () => {
     const config: EvmRailConfig = configFor({ chainId: 8453, name: "base-mainnet-oops", caip2: "eip155:8453", finality: { mode: "tag", tag: "finalized" } });
     const { rpc } = mockCapturingRpc({
       // No handlers at all: if connect() ever called the network, this would throw and fail
       // the test with a different message than the one we assert on.
     });
     await expect(EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW })).rejects.toThrow(
-      /deny-listed as base mainnet/,
+      /chain id 8453 is not on the allow list.*8453 is base mainnet/,
     );
+  });
+
+  it("refuses a chain id not on the allow list even with no deny-list name for it (an unnamed testnet)", async () => {
+    const config: EvmRailConfig = configFor({ chainId: 5, name: "goerli", caip2: "eip155:5", finality: { mode: "tag", tag: "finalized" } });
+    const { rpc } = mockCapturingRpc({});
+    await expect(EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW })).rejects.toThrow(
+      /chain id 5 is not on the allow list \(31337 anvil-local, 84532 base-sepolia only\)$/,
+    );
+  });
+
+  it("accepts base-sepolia (84532), the one non-anvil id on the allow list, without a live chain", () => {
+    const config = configFor(BASE_SEPOLIA_PIN);
+    expect(() => validateEvmRailConfig(config)).not.toThrow();
   });
 
   it("refuses when the live chain id differs from the pin (BASE_SEPOLIA_PIN against a 31337 node)", async () => {
@@ -198,6 +214,52 @@ describe("validateEvmRailConfig / connect — chain pin and asset book", () => {
   it("rejects a non-positive-integer fallbackConfirmations", () => {
     const config = configFor({ chainId: 31337, name: "anvil-local", caip2: "eip155:31337", finality: { mode: "tag", tag: "finalized", fallbackConfirmations: -1 } });
     expect(() => validateEvmRailConfig(config)).toThrow(/fallbackConfirmations must be a positive integer/);
+  });
+});
+
+// P22-P24-EVM-FIXES.md A3: `checkEvmRailConfig` is what every entry point that takes a rail
+// config as untrusted data (a `--rails` file, a captured `rails.json`, `foldCaptured`'s own
+// `rails.evm` input) runs instead of the throwing `validateEvmRailConfig` directly — a shape
+// problem or an allow-list/D-09/finality refusal both come back as `{ ok: false, reason }`.
+describe("checkEvmRailConfig — shape check plus validateEvmRailConfig, never throwing", () => {
+  it("ok:true for a well-formed, allow-listed config", () => {
+    const config = configFor(ANVIL_LOCAL_PIN);
+    const result = checkEvmRailConfig(config);
+    expect(result).toEqual({ ok: true, config });
+  });
+
+  it("ok:false, not thrown, for a chain id off the allow list", () => {
+    const config = configFor({ chainId: 8453, name: "base-mainnet-oops", caip2: "eip155:8453", finality: { mode: "tag", tag: "finalized" } });
+    const result = checkEvmRailConfig(config);
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.reason).toMatch(/not on the allow list/);
+  });
+
+  it("ok:false for a non-object value", () => {
+    expect(checkEvmRailConfig(null).ok).toBe(false);
+    expect(checkEvmRailConfig("nope").ok).toBe(false);
+    expect(checkEvmRailConfig(undefined).ok).toBe(false);
+  });
+
+  it("ok:false when pin.caip2 does not actually derive from pin.chainId", () => {
+    const config = { ...configFor(ANVIL_LOCAL_PIN), pin: { ...ANVIL_LOCAL_PIN, caip2: "eip155:1" } };
+    const result = checkEvmRailConfig(config);
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.reason).toMatch(/does not match pin\.chainId/);
+  });
+
+  it("ok:false when a required field is missing entirely", () => {
+    const { endpoint: _endpoint, ...withoutEndpoint } = configFor(ANVIL_LOCAL_PIN);
+    const result = checkEvmRailConfig(withoutEndpoint);
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.reason).toMatch(/endpoint must be/);
+  });
+
+  it("ok:false when an asset address is not a 0x-address", () => {
+    const config = { ...configFor(ANVIL_LOCAL_PIN), assets: { USDC: "not-an-address" } };
+    const result = checkEvmRailConfig(config);
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.reason).toMatch(/assets\["USDC"\] must be a 0x-address/);
   });
 });
 

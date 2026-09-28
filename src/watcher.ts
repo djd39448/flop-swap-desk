@@ -20,7 +20,7 @@ import {
 } from "@flop-labs/tclk";
 
 import {
-  findAuthenticatedLock,
+  foldAcceptedLock,
   findSwapLegCandidates,
   foldCaptured,
   hasAuthenticatedPaperLock,
@@ -28,7 +28,7 @@ import {
   type SwapLegCandidate,
 } from "./replay.js";
 import { captureEvmLeg, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
-import type { EvmRailConfig } from "./rails/evm-htlc.js";
+import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
 import { CapturingRpc, writeCapture } from "./rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, SwapStatus } from "./types.js";
@@ -62,6 +62,12 @@ export interface SweepReport {
   baseUrl: string;
   offerRecords: number; // records folded out of the tclk-offers export this sweep
   offerParseError?: string; // set (with ok:false) when the export failed to parse
+  /** P22-P24-EVM-FIXES.md A3: set (with `ok:false`, before any capture or even the offer-room
+   *  fetch) when `options.rails.evm` fails `checkEvmRailConfig` — a shape problem, a chain id
+   *  off the allow list, a D-09 asset, or bad finality knobs. The sweep fails closed rather
+   *  than silently skip the chain rail, since a caller who configured one clearly expected it
+   *  to run. */
+  railsConfigError?: string;
   swapLegOffers: number; // authenticated offers classified as a swap leg (SPEC §3.3)
   dealRoomsFetched: number;
   dealRoomsSkipped: DealRoomSkip[];
@@ -345,6 +351,21 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   const notes: string[] = [NO_EVIDENCE_NOTE];
   const report = emptyReport(nowMs, baseUrl, notes);
 
+  // P22-P24-EVM-FIXES.md A3: validate a configured chain rail before any capture — indeed
+  // before this sweep does anything at all — so a malformed `options.rails.evm` (a shape
+  // problem, a chain id off the allow list, a D-09 asset, bad finality knobs) fails the whole
+  // sweep closed with a clear report note, rather than surfacing later as a confusing RPC
+  // failure or, worse, silently deciding "no chain rail configured".
+  const evmConfig = options.rails?.evm;
+  if (evmConfig !== undefined) {
+    const check = checkEvmRailConfig(evmConfig);
+    if (!check.ok) {
+      report.railsConfigError = check.reason;
+      notes.push(`rails.evm config is invalid, sweep aborted: ${check.reason}`);
+      return report;
+    }
+  }
+
   // Step 1: fetch and persist the offer-room export, byte-exact, before any parsing.
   const exportUrl = `${baseUrl}/r/${OFFER_ROOM}/export`;
   let exportBody: string;
@@ -481,11 +502,12 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   }
 
   // Step 2.6 (P22-P24-EVM-SPEC.md §5): for every candidate whose (successfully fetched) deal
-  // room shows an authenticated `evm-htlc` lock from its own leg's payer, capture the chain
-  // read live. Nothing in this block runs unless the caller configured `options.rails.evm` —
-  // the live watch never does — which is what keeps a by-default sweep's network calls, files
-  // and report byte-for-byte what they were before this option existed.
-  const evmConfig = options.rails?.evm;
+  // room's own folded contract state shows an accepted `evm-htlc` lock (A6: from the tclk
+  // machine's own accepted transition, not merely the first authenticated-looking payer
+  // frame), capture the chain read live. Nothing in this block runs unless the caller
+  // configured `options.rails.evm` — the live watch never does, and it was already validated
+  // (A3) before Step 1 ran — which is what keeps a by-default sweep's network calls, files and
+  // report byte-for-byte what they were before this option existed.
   const chainCaptures = new Map<string, EvmCapture>();
 
   if (evmConfig !== undefined) {
@@ -498,23 +520,25 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
 
     report.chainReads = 0;
     report.chainReadsSkipped = [];
-    const rpc = new CapturingRpc({ endpoint: evmConfig.endpoint, fetch: fetchImpl, clock: () => nowMs });
+    // A9: the same timeoutMs this sweep uses for every other fetch, so a stalled RPC endpoint
+    // cannot hang the sweep any more than a stalled technocore read can.
+    const rpc = new CapturingRpc({ endpoint: evmConfig.endpoint, fetch: fetchImpl, clock: () => nowMs, timeoutMs });
 
     for (const candidate of cappedCandidates) {
       const room = roomByContract.get(candidate.contract);
       if (room === undefined) continue; // deal room wasn't fetched this sweep (404/error)
       const dealRoomRecords = dealRooms.get(room) ?? [];
       const terms = offerAcceptLockTerms(candidate.offer, candidate.accept);
-      const lockFrame = findAuthenticatedLock(dealRoomRecords, candidate.contract, terms.payer);
+      const accepted = foldAcceptedLock(candidate.offerRecord, candidate.acceptRecord, dealRoomRecords);
       if (
-        lockFrame === null ||
-        lockFrame.rail !== EVM_RAIL_ID ||
-        lockFrame.ref !== terms.statement ||
-        !HASH_LOCK_SHAPE.test(lockFrame.ref)
+        accepted === null ||
+        accepted.rail !== EVM_RAIL_ID ||
+        accepted.railRef !== terms.statement ||
+        !HASH_LOCK_SHAPE.test(accepted.railRef)
       ) {
         continue;
       }
-      const hashLock = lockFrame.ref;
+      const hashLock = accepted.railRef;
 
       try {
         const { index, exchanges } = await captureEvmLeg(rpc, evmConfig, hashLock, nowMs);

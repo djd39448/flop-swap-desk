@@ -220,6 +220,21 @@ describe("loadRails", () => {
   it("throws when an explicit override path cannot be read", () => {
     expect(() => loadRails(root, join(root, "does-not-exist.json"))).toThrow(/cannot read --rails file/);
   });
+
+  // P22-P24-EVM-FIXES.md A3: a rails config read off disk is just as untrusted as any other
+  // file under --root, so it gets the same `checkEvmRailConfig` gate a live sweep's own
+  // `--rails` file does.
+  it("throws when DIR/rails.json's own evm config is invalid (chain id off the allow list)", async () => {
+    const badConfig = { ...EVM_CONFIG, pin: { ...EVM_CONFIG.pin, chainId: 1, caip2: "eip155:1" } };
+    await writeFile(join(root, "rails.json"), JSON.stringify({ evm: badConfig }));
+    expect(() => loadRails(root, undefined)).toThrow(/evm rail config is invalid.*not on the allow list/);
+  });
+
+  it("throws when an explicit --rails override's own evm config is invalid", async () => {
+    const overridePath = join(root, "override-rails.json");
+    await writeFile(overridePath, JSON.stringify({ evm: { ...EVM_CONFIG, contract: "not-an-address" } }));
+    expect(() => loadRails(root, overridePath)).toThrow(/evm rail config is invalid.*contract must be a 0x-address/);
+  });
 });
 
 describe("loadEvmCaptures", () => {
@@ -241,6 +256,29 @@ describe("loadEvmCaptures", () => {
     expect(new TextDecoder().decode(capture.bytes.get(goodSha))).toBe(fixture.chainIdBody);
     // A sha256 that was never written (or a tampered one) is "missing", never thrown.
     expect(capture.bytes.get("0".repeat(64)) ?? null).toBeNull();
+  });
+
+  // P22-P24-EVM-FIXES.md A5: a corrupted *latest* index file falls back to the newest one that
+  // still validates, with a note pushed onto the caller-supplied array — never failing the
+  // whole replay over one bad file.
+  it("falls back to the newest valid index and reports the skipped one via the notes array", async () => {
+    const fixture = buildEvmFixture(RAIL_CONTRACT);
+    await writeWatchRoot(root, fixture);
+    // A newer, corrupted index file alongside the good one `writeWatchRoot` already wrote.
+    await writeFile(join(root, "raw", "evm", fixture.lock.hash, "zzz-newer-but-corrupt.json"), "{ not valid json");
+
+    const notes: string[] = [];
+    const chain = await loadEvmCaptures(root, notes);
+    expect(chain.size).toBe(1);
+    expect(chain.get(fixture.lock.hash)?.index.hashLock).toBe(fixture.lock.hash);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatch(new RegExp(`raw/evm/${fixture.lock.hash}/zzz-newer-but-corrupt\\.json.*skipped`));
+  });
+
+  it("defaults to a private notes array when the caller does not supply one (backward compatible)", async () => {
+    const fixture = buildEvmFixture(RAIL_CONTRACT);
+    await writeWatchRoot(root, fixture);
+    await expect(loadEvmCaptures(root)).resolves.toBeInstanceOf(Map);
   });
 });
 
@@ -300,5 +338,37 @@ describe("examples/audit-export.mjs — evm-htlc leg end to end", () => {
     // all, fast, is the point.
     const result = run(["--root", root]);
     expect(result.status).toBe(0);
+  });
+
+  // P22-P24-EVM-FIXES.md A3: the CLI itself, not just `loadRails` in isolation, exits 2 with
+  // the reason when DIR/rails.json's own evm config is invalid.
+  it("exits 2 with the reason when DIR/rails.json's evm config is invalid", async () => {
+    const fixture = buildEvmFixture(RAIL_CONTRACT);
+    const badConfig = { ...EVM_CONFIG, pin: { ...EVM_CONFIG.pin, chainId: 1, caip2: "eip155:1" } };
+    await writeWatchRoot(root, fixture, { rails: { evm: badConfig } });
+
+    const result = run(["--root", root]);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toMatch(/evm rail config is invalid.*not on the allow list/);
+  });
+
+  // P22-P24-EVM-FIXES.md A5: a corrupted-but-fallen-back-from capture index is surfaced as a
+  // note, and the replay still completes rather than treating it as fatal.
+  it("prints an A5 note and still replays when a newer capture index is corrupted", async () => {
+    const fixture = buildEvmFixture(RAIL_CONTRACT);
+    await writeWatchRoot(root, fixture, { rails: { evm: EVM_CONFIG } });
+    await writeFile(join(root, "raw", "evm", fixture.lock.hash, "zzz-newer-but-corrupt.json"), "{ not valid json");
+
+    const result = run(["--root", root, "--json"]);
+    expect(result.status).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.evmCaptureNotes).toHaveLength(1);
+    expect(parsed.evmCaptureNotes[0]).toMatch(/zzz-newer-but-corrupt\.json.*skipped/);
+    const swap = parsed.swaps.find((s: { swapId: string }) => s.swapId === fixture.swapId);
+    expect(swap.settlementView.a).toBe("funded"); // still replays from the good, older index
+
+    const textResult = run(["--root", root]);
+    expect(textResult.status).toBe(0);
+    expect(textResult.stdout).toMatch(/zzz-newer-but-corrupt\.json.*skipped/);
   });
 });
