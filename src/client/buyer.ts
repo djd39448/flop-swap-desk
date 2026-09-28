@@ -67,7 +67,7 @@ import { checkLegBMatchesWant, checkOrientation, classifySwapOffer, legAContext 
 import type { Exchange } from "../rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "../swap.js";
 import type { CounterAssetRail, RailBlockMarker, RailWriteEvidence } from "./counter-rail.js";
-import { EVM_LOCAL_POLICY } from "./policy.js";
+import { EVM_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
 import type { Signer, Venue } from "./venue.js";
 
 export interface BuyerFlowOptions {
@@ -77,8 +77,14 @@ export interface BuyerFlowOptions {
    *  `PaperRail` instance. */
   paperRail: PaperRail;
   /** Leg A's counter-asset rail (P4-BTC-SPEC.md §7a) — `evm-htlc` today
-   *  (`src/client/evm-rail.ts`'s `createEvmCounterRail`). Only this Buyer ever locks leg A. */
+   *  (`src/client/evm-rail.ts`'s `createEvmCounterRail`), `btc-htlc` via
+   *  `src/client/btc-rail.ts`'s `createBtcCounterRail`. Only this Buyer ever locks leg A. */
   rail: CounterAssetRail;
+  /** The deadline policy every `checkSwapDeadlines`/margin guard in this flow checks against —
+   *  `EVM_LOCAL_POLICY` when omitted (P4-BTC-SPEC.md §7a: this field did not exist before the
+   *  Bitcoin leg, so every pre-existing caller that never passed one keeps its exact prior
+   *  behaviour unchanged); a `btc-htlc` rail is paired with `BTC_LOCAL_POLICY`. */
+  policy?: RailLocalPolicy;
   clock: () => number;
 }
 
@@ -104,6 +110,7 @@ export class BuyerFlow {
   private readonly venue: Venue;
   private readonly paperRail: PaperRail;
   private readonly rail: CounterAssetRail;
+  private readonly policy: RailLocalPolicy;
   private readonly clock: () => number;
 
   private offerA?: OfferFrame;
@@ -117,6 +124,13 @@ export class BuyerFlow {
   private legBPairingPending = false;
   private legBVerified = false;
   private lockedHashLock?: string;
+  /** P4-BTC-SPEC.md §7a: the leg-A rail's own write ref for this flow's lock — `hashLock` for
+   *  `evm-htlc` (`WriteEvidence.ref === terms.statement`), the funding outpoint
+   *  (`"<txid>:<vout>"`) for `btc-htlc`. `refundLegA`/`learnSecret` must use THIS, never
+   *  `lockedHashLock`, wherever the rail's own interface asks for a `ref` — the two happen to be
+   *  the same value for `evm-htlc` today, which is exactly why this distinction was invisible
+   *  before a second, outpoint-keyed rail existed. */
+  private lockedRailRef?: string;
   private lockedFromBlock?: RailBlockMarker;
   /** B5: every leg-A write this flow has made so far (`lockLegA`'s lock, `refundLegA`'s
    *  refund), in call order — see the identical field on `SellerFlow`. */
@@ -127,6 +141,7 @@ export class BuyerFlow {
     this.venue = options.venue;
     this.paperRail = options.paperRail;
     this.rail = options.rail;
+    this.policy = options.policy ?? EVM_LOCAL_POLICY;
     this.clock = options.clock;
   }
 
@@ -152,7 +167,7 @@ export class BuyerFlow {
       amount: params.amount,
       asset: params.asset,
       lock: "hash",
-      rails: ["evm-htlc"],
+      rails: [this.rail.railId],
       claimByMs: params.claimByMs,
       refundAfterMs: params.refundAfterMs,
       expiresMs: params.expiresMs,
@@ -276,7 +291,7 @@ export class BuyerFlow {
     if (!pairCheck.ok) {
       throw new Error(`buyer: refusing to accept leg B — ${pairCheck.reason} (C2)`);
     }
-    const deadlineCheck = checkSwapDeadlines(this.offerA, offerB, lockTimeMs, EVM_LOCAL_POLICY);
+    const deadlineCheck = checkSwapDeadlines(this.offerA, offerB, lockTimeMs, this.policy);
     if (!deadlineCheck.ok) {
       throw new Error(`buyer: refusing to accept leg B — unsafe deadlines: ${deadlineCheck.violations.join("; ")}`);
     }
@@ -334,7 +349,7 @@ export class BuyerFlow {
     }
     const { offerA, offerB, acceptA, acceptB } = this.requirePaired();
 
-    const deadlineCheck = checkSwapDeadlines(offerA, offerB, this.clock(), EVM_LOCAL_POLICY);
+    const deadlineCheck = checkSwapDeadlines(offerA, offerB, this.clock(), this.policy);
     if (!deadlineCheck.ok) {
       throw new Error(
         `buyer: refusing to lock leg A — deadlines are no longer safe at lock time (B3): ${deadlineCheck.violations.join("; ")}`,
@@ -390,9 +405,14 @@ export class BuyerFlow {
     const writeEvidence = await connected.lock(termsA, 0);
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
 
+    // P4-BTC-SPEC.md §7a: the rail's own write ref (an outpoint for btc-htlc, the hashLock for
+    // evm-htlc) — recorded before the lock frame that announces it is ever posted, so a failed
+    // post still leaves this flow able to recover it from `writeEvidence` alone.
+    this.lockedRailRef = writeEvidence.ref;
+
     await this.venue.post(
       dealRoom(acceptA.contract),
-      encodeFrame({ type: "lock", from: this.identity.did, contract: acceptA.contract, rail: "evm-htlc", ref: hashLock }),
+      encodeFrame({ type: "lock", from: this.identity.did, contract: acceptA.contract, rail: this.rail.railId, ref: writeEvidence.ref }),
       this.identity,
     );
 
@@ -408,6 +428,15 @@ export class BuyerFlow {
     const { offerA, acceptA } = this.requirePaired();
     if (this.lockedHashLock === undefined) throw new Error("buyer: leg A has not been locked yet");
     const hashLock = this.lockedHashLock;
+    // P22-P24-EVM-FIXES-R3.md E3's own recovery path: if `lockLegA`'s own write threw AFTER its
+    // real on-chain effect landed but BEFORE it returned a `writeEvidence` (e.g. its bounded
+    // event-log lookup found nothing), `lockedRailRef` was never set — fall back to the hashLock
+    // recorded before the write ever ran, which IS a valid `evm-htlc` ref (the two coincide by
+    // construction, `src/rails/evm-htlc.ts`'s own `lock()`). For `btc-htlc`, where the two are
+    // never the same value, this fallback cannot recover the real outpoint — a documented limit
+    // of a rail whose own write ref does not exist until the write itself returns (README
+    // "Bitcoin leg" known limits).
+    const railRef = this.lockedRailRef ?? hashLock;
 
     const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
     for (const record of dealRoomARecords) {
@@ -420,8 +449,18 @@ export class BuyerFlow {
     }
 
     const termsA = offerAcceptLockTerms(offerA, acceptA);
-    const connected = await this.rail.connect(termsA, {});
-    const preimage = await connected.findClaimedPreimage(hashLock, this.lockedFromBlock);
+    // P4-BTC-SPEC.md §6/§7a: a btc-htlc leg's `findClaimedPreimage` needs no resolved account of
+    // its own (it only scans a bounded block window for a witness item that opens the hashLock
+    // `connect()` already bound `termsA` with), but `connect()` itself is shared with the leg's
+    // other writes — resolving accounts here costs nothing for evm-htlc (never used) and is
+    // harmless for btc-htlc even though this particular call never needs them.
+    const accounts = this.rail.resolveAccounts(dealRoomARecords, {
+      contract: acceptA.contract,
+      payerDid: termsA.payer,
+      payeeDid: termsA.payee,
+    });
+    const connected = await this.rail.connect(termsA, accounts);
+    const preimage = await connected.findClaimedPreimage(railRef, this.lockedFromBlock);
     if (preimage === null) {
       throw new Error("buyer: refusing to guess the secret — no reveal frame and no Claimed log yet");
     }
@@ -458,20 +497,36 @@ export class BuyerFlow {
     if (this.clock() < offerA.refundAfterMs) {
       throw new Error("buyer: refusing to refund leg A before its refundAfterMs");
     }
-    const hashLock = this.lockedHashLock;
+    // E3's own recovery path (see the identical comment on `learnSecret`): fall back to the
+    // pre-recorded hashLock when the write itself never returned a `writeEvidence` — valid for
+    // `evm-htlc`, a documented limit for `btc-htlc`.
+    const railRef = this.lockedRailRef ?? this.lockedHashLock;
     const termsA = offerAcceptLockTerms(offerA, acceptA);
-    const connected = await this.rail.connect(termsA, {});
+    // P4-BTC-SPEC.md §6: unlike evm-htlc (whose `refund` needs no resolved account at all), a
+    // btc-htlc refund needs BOTH parties' pubkeys to rebuild its own witnessScript — resolve
+    // them from the deal room the same way `lockLegA`/`claimLegA` already do, rather than
+    // connecting with an empty `RailAccounts` and letting the rail discover the gap itself.
+    const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
+    const accounts = this.rail.resolveAccounts(dealRoomARecords, {
+      contract: acceptA.contract,
+      payerDid: termsA.payer,
+      payeeDid: termsA.payee,
+    });
+    const connected = await this.rail.connect(termsA, accounts);
     const before = connected.exchanges.length;
-    const writeEvidence = await connected.refund(hashLock);
+    const writeEvidence = await connected.refund(railRef);
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+    // tclk's own machine requires a refund/receipt frame's `ref`, when present, to equal the
+    // contract's own accepted `railRef` (vendor/tclk/src/machine.ts) — the rail's own write ref,
+    // never `lockedHashLock` (only ever true by coincidence for evm-htlc).
     await this.venue.post(
       dealRoom(acceptA.contract),
-      encodeFrame({ type: "refund", from: this.identity.did, contract: acceptA.contract, ref: hashLock }),
+      encodeFrame({ type: "refund", from: this.identity.did, contract: acceptA.contract, ref: railRef }),
       this.identity,
     );
     await this.venue.post(
       dealRoom(acceptA.contract),
-      encodeFrame({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "refunded", rail: "evm-htlc", ref: hashLock }),
+      encodeFrame({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "refunded", rail: this.rail.railId, ref: railRef }),
       this.identity,
     );
     return writeEvidence;

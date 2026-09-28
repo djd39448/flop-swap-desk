@@ -39,19 +39,39 @@ export interface RailAccounts {
 
 /**
  * What one `lock`/`claim`/`refund` write produced, bound to whatever finality-relevant
- * identity the underlying chain gives a write (an EVM event log today). `raw` lists (in call
- * order) the response sha256s of every exchange that produced it (P22-P24-EVM-SPEC.md §5). See
- * this file's own header comment: this shape is EVM's today and will need generalizing once a
- * UTXO-model rail (Bitcoin) lands behind this same interface.
+ * identity the underlying chain gives a write. `raw` lists (in call order) the response sha256s
+ * of every exchange that produced it (P22-P24-EVM-SPEC.md §5). `ref` is the only field every
+ * rail fills in: an EVM write's own hashLock (§2.2 point 2) today, a Bitcoin write's own
+ * outpoint (P4-BTC-SPEC.md §4) once that adapter lands.
+ *
+ * P4-BTC-SPEC.md §7a: this shape was EVM's alone before the Bitcoin adapter landed (see this
+ * file's own earlier header comment, which predicted exactly this) — an EVM write has an
+ * on-chain *event log* (`event`/`txHash`/`blockNumber`/`logIndex`), while a Bitcoin write has a
+ * UTXO's own transaction id and (once read back) a confirming block (`txid`/`blockHeight`); a
+ * fresh write's `blockHash`/`blockHeight` are `null` immediately after broadcast for Bitcoin
+ * (populating them is the pure evidence reader's job, `src/rails/btc-evidence.ts`, never the
+ * write path's own). Every one of these rail-specific fields is therefore optional here, so
+ * `ConnectedEvmCounterRail` (all EVM fields, always present) and `ConnectedBtcCounterRail`
+ * (`ref`/`raw`/`txid`/`blockHeight`, `event`/`txHash`/`blockNumber`/`logIndex` absent) both
+ * satisfy this one interface without either rail's own concrete `WriteEvidence` type changing
+ * shape.
  */
 export interface RailWriteEvidence {
   ref: string;
-  event: "Locked" | "Claimed" | "Refunded";
-  txHash: string;
-  blockNumber: bigint;
-  blockHash: string;
-  logIndex: number;
+  /** EVM only (`src/rails/evm-htlc.ts`'s `WriteEvidence.event`) — absent for a rail with no
+   *  on-chain event-log concept. */
+  event?: "Locked" | "Claimed" | "Refunded";
+  txHash?: string;
+  blockNumber?: bigint;
+  blockHash?: string | null;
+  logIndex?: number;
   raw: string[];
+  /** Bitcoin only (`src/rails/btc-htlc.ts`'s `WriteEvidence.txid`) — this write's own
+   *  transaction id (the funding tx for `fund`, the spending tx for `claim`/`refund`). */
+  txid?: string;
+  /** Bitcoin only — `null` immediately after broadcast (a regtest node never auto-mines); the
+   *  evidence reader, not this write, is what later confirms a height. */
+  blockHeight?: number | null;
 }
 
 /** D-11's "capture live, then decide" contract (mirrors `src/rails/evm-evidence.ts`'s

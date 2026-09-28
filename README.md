@@ -194,6 +194,142 @@ written down instead of hidden.
 - **The claim endpoint is trusted with the preimage** at the moment the claim is sent (see
   above).
 
+## Bitcoin leg (local, keyless)
+
+`src/rails/btc-script.ts` builds the P2WSH HTLC (`andor(pk(payee),sha256(H),and_v(v:pk(payer),
+after(T)))`, `@scure/btc-signer`'s `Script`/`p2wsh` coders — byte-identical to what Bitcoin Core
+31.1 itself compiles, verified against a live regtest node,
+`handoff/research/btc-regtest-probe-2026-09-28.md`), `src/rails/btc-htlc.ts` binds it into a desk
+rail with a chain pin (an allow list accepts only `regtest` and an as-yet-unverified `signet`
+pin; `main`/`test`/`testnet4` are refused by name) and keyless writes (fund/claim/refund) through
+a bitcoind wallet's own `walletprocesspsbt` — never a private key, WIF, xprv, seed or mnemonic
+anywhere in this build (P4-BTC-SPEC.md §1) — and `src/rails/btc-evidence.ts` is the fail-closed,
+"capture live then decide" finalized-view reader shared between the live path and the offline
+replay, the Bitcoin twin of `src/rails/evm-evidence.ts`. `src/client/btc-rail.ts` implements the
+same `CounterAssetRail` interface `src/client/evm-rail.ts` does (`src/client/counter-rail.ts`,
+"one client, many rails"), so `src/client/seller.ts`/`buyer.ts` drive a `btc-htlc` leg through the
+identical Seller/Buyer flow, with a P2WSH script committing to **both** parties' public keys
+(unlike an EVM EOA lock) exchanged as a D-08 pubkey line (`swap1 pubkey btc-htlc bip122:<genesis
+prefix> <pubkey>`, `src/rails/account-line.ts`) rather than an address line.
+
+Run it:
+
+```bash
+npm run test:regtest
+```
+
+This builds `dist/`, then spawns a real `bitcoind -regtest` node (found via `BITCOIND_BIN`, the
+Bitcoin Core 31.1 install path baked into `tests-regtest/helpers/bitcoind.ts`, or PATH) with two
+named descriptor wallets (`buyer`, `seller`) and drives `tests-regtest/btc-htlc.regtest.test.ts`
+(the primitive and adapter alone: the witnessScript/address matching Core's own compiler, a real
+keyless claim, the refund's non-final-until-median-time-past-reaches-`T` behaviour, a
+wrong-preimage claim rejected by `testmempoolaccept`, `findClaimPreimage` recovering the secret)
+and `tests-regtest/client-flows.regtest.test.ts` (the Seller/Buyer flows end to end: the happy
+path to `settled`; both refund paths, `refunded` and `refunded-b`; a claim refused before this
+file's own 2-confirmation finality and allowed once it is reached; the Buyer learning the secret
+from the chain alone when the Seller never posts a reveal frame; a well-formed claim — right
+secret, right script, right fee — refused by `testmempoolaccept`, and never broadcast, once its
+own outpoint has already been spent by the Buyer's refund). `npm test` never spawns `bitcoind` — a
+missing binary fails `test:regtest` loudly instead.
+
+**Fixture capture is opt-in**, identical in shape to the EVM leg's own `CAPTURE_EVM_FIXTURES`:
+every client-flow scenario writes its watch-root bundle to a fresh `mkdtemp` directory by
+default, so an ordinary `npm run test:regtest` never touches the three committed fixtures below.
+Regenerating them is a deliberate, separate step:
+
+```bash
+CAPTURE_BTC_FIXTURES=1 npm run test:regtest
+```
+
+which overwrites `fixtures/btc-regtest-2026-09-28/{settled,refunded,refunded-b}/` in place.
+Commit the result and then confirm both that `tests/btc-regtest-fixtures.test.ts` (hermetic,
+`npm test`) replays it and that a plain `npm run test:regtest` afterward leaves `git status`
+clean. An ordinary (non-capture) run removes its own `mkdtemp` bundle directories once the suite
+finishes; set `KEEP_REGTEST_BUNDLES=1` to keep them around for inspecting a scenario's exact
+written bundle by hand (and `KEEP_BITCOIND_DATADIR=1`, `tests-regtest/helpers/bitcoind.ts`, to
+keep the node's own throwaway datadir).
+
+**Keyless throughout (P4-BTC-SPEC.md §1):** every key this build ever handles is public — a
+33-byte compressed pubkey, a BIP32 master fingerprint, an HD derivation path (all read off a
+wallet's own `getaddressinfo`) — and every write goes out through that wallet's own
+`walletprocesspsbt`, which signs and finalizes a hand-built PSBT (`witness_utxo` +
+`witnessScript` + `bip32_derivation`, plus the BIP174 `sha256` preimage field for a claim) using
+whichever of its own already-owned keys the derivation names. `dumpprivkey`, `dumpwallet` and
+`listdescriptors true` are never called anywhere in this build, and the node's own RPC cookie
+(a random local credential for a throwaway node) is read from its throwaway datadir and handed to
+every call only as an HTTP Basic-auth header — never written into a rail config, a captured
+exchange, a bundle, or a log.
+
+**The real claim is checked before it is ever broadcast.** `BtcHtlcRail.claim()` verifies the
+secret actually opens the hash lock, rebuilds the expected script and checks the funding output
+against it, then runs `testmempoolaccept` on the fully-signed transaction — and only once that
+passes does `sendrawtransaction` ever run. A claim that would fail (a stale outpoint already
+spent by a refund, as scenario 6 above exercises; a policy the local mempool would otherwise
+reject) is refused with the node's own reject-reason and never sent.
+
+**What this proves, and what it does not.** The three committed fixtures
+(`fixtures/btc-regtest-2026-09-28/{settled,refunded,refunded-b}/`, replayed hermetically by
+`tests/btc-regtest-fixtures.test.ts`) show a real P2WSH HTLC funded, claimed or refunded on a
+real Bitcoin Core 31.1 node, with every verdict re-derivable from the exact captured RPC bytes —
+but on `regtest`, an ephemeral node this repo itself starts and stops, never a real network, and
+never with mainnet value at any point in this build. The signet deploy is Dave's own G1 step and
+is not built here — `BTC_SIGNET_PIN` (`src/rails/btc-htlc.ts`) is present but named
+`"btc-signet-UNVERIFIED"` and refuses to match a live node until its genesis hash has actually
+been confirmed against one.
+
+Re-deriving a verdict from the captured bytes (see "Audit replay" above, F3) detects the bytes
+being tampered with after the fact — damaged, truncated, spliced from another capture, answered
+for a different request, or taken under a different rail config — never that the capturing
+process told the truth about the chain to begin with, and never forgery: a fabricated or edited
+RPC response, saved under the sha256 of its own new bytes, replays exactly as a genuine one
+would. The independent check is each leg's own `finalizedRef`
+(`btc-regtest:confirmations-<N>:<height>:<blockHash>`): it names a real block on the chain it was
+read from, so anyone with their own RPC access to that chain can re-query the same outpoint at
+that exact block hash and compare against what this build reported, independent of this
+repository entirely.
+
+### Known limits of the Bitcoin leg
+
+None of these can move value to the wrong party or reveal the secret without payment; each is
+written down instead of hidden.
+
+- **No claim deadline on chain.** The hash branch of the HTLC script stays spendable until the
+  refund branch is spent — Bitcoin Script has nothing equivalent to `block.timestamp <
+  claimByMs` on the *claim* side, only the CLTV `after(T)` guarding the *refund* side. So after
+  `T` the Seller's claim and the Buyer's refund genuinely race for the same outpoint; whichever
+  transaction is mined first wins, and the loser's transaction simply never confirms (it is not
+  dangerous to either party — there is nothing to double-spend into, only a transaction that goes
+  nowhere). `claimByMs` is therefore enforced only by the Seller's own client
+  (`SellerFlow.claimLegA`'s chain-time guard), the same as on the EVM leg, but there it is at
+  least backed by a real on-chain deadline the contract itself enforces; here it is a courtesy the
+  chain never checks, and `BTC_LOCAL_POLICY`'s wide claim-inclusion margin (60 min) is this
+  build's only defense against losing that race to slow confirmation.
+- **The refund waits for median time past, which lags wall clock.** `T = refundAfterMs / 1000` is
+  checked against the chain's median time of its last 11 blocks (BIP113), not the tip block's own
+  timestamp or wall-clock "now" — so a refund's real, chain-observable availability lags
+  `refundAfterMs` by roughly an hour on a normally-mining chain (probe gotcha,
+  `src/rails/btc-script.ts`'s own `locktimeFromRefundAfterMs` doc comment).
+  `BTC_LOCAL_POLICY.finalityAMs` (2 h) budgets for this.
+- **The replay detects damage and splicing, not forgery.** Identical honesty limit to the EVM
+  leg's own (see above) — re-reading a capture proves internal consistency and lets anyone
+  independently re-query the named block; it does not prove the capturing node was telling the
+  truth about the chain to begin with.
+- **A lock whose evidence lookup fails is not announced.** If leg A's funding transaction
+  broadcasts but the adapter's own follow-up read (finding which output paid the HTLC address)
+  then fails, `BuyerFlow.lockLegA` throws before posting the `lock` frame. The funds stay safe
+  (`refundLegA` recovers from the pre-recorded hash lock the same way the EVM leg's own E3 fix
+  does — see its "Known limits" entry above) *for `evm-htlc`, where that pre-recorded value is
+  itself a valid rail ref*; for `btc-htlc` the rail's own ref (the funding outpoint) does not
+  exist until `fund()` returns, so this one recovery path cannot reach a real outpoint from state
+  alone in that narrow failure window. The board simply shows leg A as never funded either way —
+  fail closed, never fail silent.
+- **Fees are a fixed constant, not estimated.** `DEFAULT_FEE_SATS` (`src/rails/btc-htlc.ts`) is
+  subtracted from every claim/refund's single output; real fee estimation is out of scope for
+  this build (P4-BTC-SPEC.md §0).
+- **One node, one confirmation policy, no reorg handling.** This build's own regtest harness
+  mines on demand and never reorgs; a real deployment choosing how many confirmations count as
+  final for a given amount, and how to handle a reorg past that depth, is out of scope here.
+
 ## What this is not
 
 No AMM, no pool, no custody, no relayer (yellow paper R10.4's allowlisted relayer is

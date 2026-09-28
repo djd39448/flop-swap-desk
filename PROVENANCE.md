@@ -79,6 +79,44 @@ capture bytes from a real, local, ephemeral `anvil` node this repo itself starts
 (`tests-anvil/client-flows.anvil.test.ts`) — not from any external service, and containing no
 private key material (nothing in this build holds one to begin with).
 
+## First-party Bitcoin-leg files (P4-BTC-SPEC.md) — unaudited, testnet-only
+
+Not vendored — original to this repo, written for the local/keyless Bitcoin leg
+(`handoff/P4-BTC-SPEC.md`). Listed here per that spec's own instruction, not because anything
+below reuses outside code, except where noted: **unaudited, testnet-only**, same as the EVM leg's
+own files above — none of it has been reviewed for a real deployment, and no deployment this repo
+drives today carries mainnet value (the allow list refuses `main`/`test`/`testnet4` by name, and
+no private key, WIF, xprv, seed or mnemonic for any Bitcoin key exists anywhere in this build).
+
+- `src/rails/btc-script.ts` — the pure P2WSH HTLC witnessScript/address builder and claim/refund
+  PSBT builders (§3), reproducing Bitcoin Core 31.1's own compiled form of
+  `andor(pk(payee),sha256(H),and_v(v:pk(payer),after(T)))` byte for byte (verified against a live
+  regtest node, `handoff/research/btc-regtest-probe-2026-09-28.md`).
+- `src/rails/btc-htlc.ts` — the desk-facing `btc-htlc` adapter: chain pin (allow list: `regtest`,
+  an unverified `signet`), keyless writes via a bitcoind wallet's own `walletprocesspsbt` (§4).
+- `src/rails/btc-evidence.ts` — the pure, fail-closed finalized-view evidence decoder shared by
+  the live rail and the offline replay, the Bitcoin twin of `src/rails/evm-evidence.ts` (§5).
+- `src/rails/account-line.ts`'s pubkey-line addition (`formatPubkeyLine`/`parsePubkeyLine`/
+  `resolvePubkeys`) — the D-08 pubkey-line grammar a `btc-htlc` leg needs because its script
+  commits to both parties' public keys, not an address (§6).
+- `src/client/btc-rail.ts` — the `btc-htlc` implementation of `src/client/counter-rail.ts`'s
+  `CounterAssetRail` interface, the rail-agnostic wiring `src/client/seller.ts`/`buyer.ts` drive
+  (§7a).
+- `src/client/policy.ts`'s `BTC_LOCAL_POLICY` — the Bitcoin-local deadline policy (§7).
+- `src/client/bundle.ts`'s Bitcoin-leg addition (`BtcBundleCapture`) — writes a `btc-htlc` leg's
+  own `raw/btc/`, `rails.json` entry and `finalizedRef` into the same watch-root-shaped bundle the
+  EVM leg's own writer produces (§7).
+- `src/replay.ts`'s/`src/watcher.ts`'s/`examples/audit-export.mjs`'s `btc-htlc` branches — added
+  exactly the way the `evm-htlc` branch already existed, dispatching on the tclk contract
+  machine's own accepted lock rail/ref (§7).
+
+`fixtures/btc-regtest-2026-09-28/{settled,refunded,refunded-b}/` are also first-party: real
+capture bytes from a real, local, ephemeral `bitcoind -regtest` node this repo itself starts and
+stops (`tests-regtest/client-flows.regtest.test.ts`) — not from any external service, and
+containing no private key material (nothing in this build holds one to begin with; every key
+these captures ever name is a public pubkey/fingerprint/path, and the node's own RPC cookie is
+never captured, logged, or written into any file this repo commits).
+
 ## Settlement-view vocabulary — pinned to tclk PR #173
 
 `none | unverified | unfunded | funded | claimed | refunded` (per-leg `SwapView.settlementView`,

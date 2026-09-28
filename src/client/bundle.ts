@@ -34,9 +34,11 @@ import { dirname, join } from "node:path";
 
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { OFFER_ROOM, paperNote, type TranscriptRecord } from "@flop-labs/tclk";
+import { OFFER_ROOM, paperNote, type LockTerms, type TranscriptRecord } from "@flop-labs/tclk";
 
 import { foldCaptured, type CapturedNote } from "../replay.js";
+import { btcEvidence, captureBtcLeg, type BtcAccounts, type BtcCapture } from "../rails/btc-evidence.js";
+import type { BtcRailConfig } from "../rails/btc-htlc.js";
 import { captureEvmLeg, captureFinalizedRef, type EvmCapture } from "../rails/evm-evidence.js";
 import type { EvmRailConfig } from "../rails/evm-htlc.js";
 import { verifiedExchangeBytes, writeCapture, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
@@ -123,6 +125,19 @@ export interface EvmBundleCapture {
   hashLock: string;
 }
 
+/** The Bitcoin twin of `EvmBundleCapture` (P4-BTC-SPEC.md §7): omitted entirely for a swap whose
+ *  leg A never funded a P2WSH at all (SPEC §6 scenario 3: the Buyer never locks). Unlike EVM,
+ *  `ref` (the funding outpoint) is never derived from `terms` — it is whatever the Buyer's own
+ *  `fund()` returned — and a full evidence check needs both parties' resolved pubkeys
+ *  (`accounts`, P4-BTC-SPEC.md §6), not merely the hashLock. */
+export interface BtcBundleCapture {
+  config: BtcRailConfig;
+  rpc: CapturingRpc;
+  ref: string;
+  terms: LockTerms;
+  accounts: BtcAccounts;
+}
+
 export interface WriteBundleInput {
   root: string;
   /** Wall-clock ms this bundle is written at — every stamped filename and the live EVM
@@ -145,6 +160,7 @@ export interface WriteBundleInput {
    *  all (SPEC §6 scenario 3: the Buyer never locks). */
   writeExchanges?: readonly Exchange[];
   evm?: EvmBundleCapture;
+  btc?: BtcBundleCapture;
   evidence: BundleEvidenceSummary;
 }
 
@@ -199,11 +215,13 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
   }
 
   const chainForFold = new Map<string, EvmCapture>();
+  const btcChainForFold = new Map<string, BtcCapture>();
   let evmRailConfig: EvmRailConfig | undefined;
+  let btcRailConfig: BtcRailConfig | undefined;
+
   if (input.evm !== undefined) {
     const { config, rpc, hashLock } = input.evm;
     evmRailConfig = config;
-    await writeFileAtomic(join(input.root, "rails.json"), `${JSON.stringify({ evm: config }, null, 2)}\n`);
     const { index, exchanges } = await captureEvmLeg(rpc, config, hashLock, input.nowMs);
     await writeCapture(input.root, exchanges);
     await writeFileAtomic(join(input.root, "raw", "evm", hashLock, `${stamp}.json`), `${JSON.stringify(index, null, 2)}\n`);
@@ -215,6 +233,37 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
     if (evmRef !== null) finalizedRefs.push(evmRef);
   }
 
+  // P4-BTC-SPEC.md §7: the Bitcoin twin of the block above — `raw/btc/<txid>-<vout>/*.json`
+  // (a hyphen, never the ref's own `:`, since `:` is not a legal Windows filename character —
+  // the same convention `src/rails/btc-evidence.ts`'s own `loadBtcCapture` reads back), and this
+  // outpoint's own `finalizedRef` (from either half of `btcEvidence`'s result: `lock` when the
+  // lock verified or failed a field check, `rail` alone when it merely isn't final yet — either
+  // way, `undefined` when the capture never reached a finalized view at all, in which case there
+  // is nothing yet to add to `finalizedRefs`).
+  if (input.btc !== undefined) {
+    const { config, rpc, ref, terms, accounts } = input.btc;
+    btcRailConfig = config;
+    const { index, exchanges } = await captureBtcLeg(rpc, config, ref, input.nowMs);
+    await writeCapture(input.root, exchanges);
+    const dirName = ref.replace(":", "-");
+    await writeFileAtomic(join(input.root, "raw", "btc", dirName, `${stamp}.json`), `${JSON.stringify(index, null, 2)}\n`);
+
+    const bytes = verifiedExchangeBytes(exchanges);
+    const capture: BtcCapture = { index, bytes };
+    btcChainForFold.set(ref, capture);
+    const result = btcEvidence({ terms, config, accounts, capture });
+    const btcRef = result.lock.finalizedRef ?? result.rail?.finalizedRef;
+    if (btcRef !== undefined) finalizedRefs.push(btcRef);
+  }
+
+  if (evmRailConfig !== undefined || btcRailConfig !== undefined) {
+    const railsJson: { evm?: EvmRailConfig; btc?: BtcRailConfig } = {
+      ...(evmRailConfig === undefined ? {} : { evm: evmRailConfig }),
+      ...(btcRailConfig === undefined ? {} : { btc: btcRailConfig }),
+    };
+    await writeFileAtomic(join(input.root, "rails.json"), `${JSON.stringify(railsJson, null, 2)}\n`);
+  }
+
   // B5: derive `status` by folding the exact bytes this call just wrote — never trust the
   // caller's own idea of the final status, which could silently drift from what a later
   // `examples/audit-export.mjs` replay of this same bundle actually finds.
@@ -223,7 +272,10 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
     dealRooms: input.dealRooms,
     notes: notesForFold,
     chain: chainForFold,
-    ...(evmRailConfig === undefined ? {} : { rails: { evm: evmRailConfig } }),
+    btcChain: btcChainForFold,
+    ...(evmRailConfig === undefined && btcRailConfig === undefined
+      ? {}
+      : { rails: { ...(evmRailConfig === undefined ? {} : { evm: evmRailConfig }), ...(btcRailConfig === undefined ? {} : { btc: btcRailConfig }) } }),
     nowMs: input.nowMs,
   });
   const status = board.swaps.find((swap) => swap.swapId === input.evidence.swapId)?.status ?? "unpaired";

@@ -86,9 +86,10 @@ import {
 import { checkSwapDeadlines } from "../deadlines.js";
 import { checkOrientation, classifySwapOffer, legBContext } from "../profile.js";
 import type { Exchange } from "../rails/rpc-capture.js";
+import { findAuthenticatedLock } from "../replay.js";
 import { offerAcceptLockTerms } from "../swap.js";
 import type { CounterAssetRail, RailWriteEvidence } from "./counter-rail.js";
-import { EVM_LOCAL_POLICY } from "./policy.js";
+import { EVM_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
 import type { Signer, Venue } from "./venue.js";
 
 export interface SellerFlowOptions {
@@ -98,9 +99,14 @@ export interface SellerFlowOptions {
    *  own `PaperRail` instance over one `NoteStore` (`vendor/tclk/src/paper-rail.ts`). */
   paperRail: PaperRail;
   /** Leg A's counter-asset rail (P4-BTC-SPEC.md §7a) — `evm-htlc` today
-   *  (`src/client/evm-rail.ts`'s `createEvmCounterRail`). This Seller only ever claims or
-   *  refunds through it; only the Buyer ever locks. */
+   *  (`src/client/evm-rail.ts`'s `createEvmCounterRail`), `btc-htlc` via
+   *  `src/client/btc-rail.ts`'s `createBtcCounterRail`. This Seller only ever claims or refunds
+   *  through it; only the Buyer ever locks. */
   rail: CounterAssetRail;
+  /** The deadline policy every `checkSwapDeadlines`/margin guard in this flow checks against —
+   *  `EVM_LOCAL_POLICY` when omitted (see `BuyerFlowOptions.policy`'s identical doc); a
+   *  `btc-htlc` rail is paired with `BTC_LOCAL_POLICY`. */
+  policy?: RailLocalPolicy;
   /** Wall-clock ms, injected — never `Date.now()` inside this class (house rule). */
   clock: () => number;
 }
@@ -139,6 +145,7 @@ export class SellerFlow {
   private readonly venue: Venue;
   private readonly paperRail: PaperRail;
   private readonly rail: CounterAssetRail;
+  private readonly policy: RailLocalPolicy;
   private readonly clock: () => number;
 
   private offerA?: OfferFrame;
@@ -174,6 +181,7 @@ export class SellerFlow {
     this.venue = options.venue;
     this.paperRail = options.paperRail;
     this.rail = options.rail;
+    this.policy = options.policy ?? EVM_LOCAL_POLICY;
     this.clock = options.clock;
   }
 
@@ -225,10 +233,10 @@ export class SellerFlow {
     }
 
     const inclusionWindowMs = offerA.refundAfterMs - offerA.claimByMs;
-    if (inclusionWindowMs < EVM_LOCAL_POLICY.claimInclusionMarginMs) {
+    if (inclusionWindowMs < this.policy.claimInclusionMarginMs) {
       throw new Error(
         `seller: refusing to accept leg A — its claimByMs..refundAfterMs window (${inclusionWindowMs} ms) is ` +
-          `below the EVM claim-inclusion margin (${EVM_LOCAL_POLICY.claimInclusionMarginMs} ms) (B2)`,
+          `below the EVM claim-inclusion margin (${this.policy.claimInclusionMarginMs} ms) (B2)`,
       );
     }
 
@@ -257,7 +265,7 @@ export class SellerFlow {
     // B2: the pair this Seller is about to propose, checked before anything is posted — a
     // runner that got `legB`'s deadlines wrong should not be able to make this flow commit to
     // a hash statement (and a public offer B) that the Buyer's own check would refuse anyway.
-    const deadlineCheck = checkSwapDeadlines(offerA, offerB, lockTimeMs, EVM_LOCAL_POLICY);
+    const deadlineCheck = checkSwapDeadlines(offerA, offerB, lockTimeMs, this.policy);
     if (!deadlineCheck.ok) {
       throw new Error(
         `seller: refusing to accept leg A — the leg B deadlines it would propose are unsafe: ${deadlineCheck.violations.join("; ")}`,
@@ -444,14 +452,24 @@ export class SellerFlow {
     if (chainNow >= offerA.claimByMs) {
       throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time) (B2/C3)");
     }
-    if (offerA.refundAfterMs - chainNow < EVM_LOCAL_POLICY.claimInclusionMarginMs) {
+    if (offerA.refundAfterMs - chainNow < this.policy.claimInclusionMarginMs) {
       throw new Error(
         `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
-          `(${EVM_LOCAL_POLICY.claimInclusionMarginMs} ms) remains before refundAfterMs (chain time) (B2/C3)`,
+          `(${this.policy.claimInclusionMarginMs} ms) remains before refundAfterMs (chain time) (B2/C3)`,
       );
     }
 
-    const evidence = await connected.verifyLockFinal(termsA, hashLockHex, accounts);
+    // P4-BTC-SPEC.md §7a: the rail's own write ref for this leg's lock — the Buyer's outpoint
+    // for btc-htlc, the hashLock itself for evm-htlc (where the two happen to coincide, which is
+    // why `hashLockHex` alone used to double as both, and remains the fallback below). Read from
+    // the Buyer's own authenticated lock frame in leg A's deal room when one exists; a leg whose
+    // rail's ref is always the hashLock (evm-htlc — verified on-chain by `verifyLockFinal` alone,
+    // never by trusting this frame) has no need of one, so its absence is never itself a refusal
+    // here — only `verifyLockFinal`/`claim` below can fail this claim closed.
+    const lockFrame = findAuthenticatedLock(dealRoomARecords, acceptA.contract, termsA.payer);
+    const railRef = lockFrame !== null && lockFrame.rail === this.rail.railId ? lockFrame.ref : hashLockHex;
+
+    const evidence = await connected.verifyLockFinal(termsA, railRef, accounts);
     if (evidence.lock.railVerified !== true) {
       throw new Error(
         `seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): ${evidence.lock.reason ?? "unverified"}`,
@@ -468,10 +486,10 @@ export class SellerFlow {
     if (chainNowAfterVerify >= offerA.claimByMs) {
       throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time, re-checked after verifyLockFinal) (E4)");
     }
-    if (offerA.refundAfterMs - chainNowAfterVerify < EVM_LOCAL_POLICY.claimInclusionMarginMs) {
+    if (offerA.refundAfterMs - chainNowAfterVerify < this.policy.claimInclusionMarginMs) {
       throw new Error(
         `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
-          `(${EVM_LOCAL_POLICY.claimInclusionMarginMs} ms) remains before refundAfterMs ` +
+          `(${this.policy.claimInclusionMarginMs} ms) remains before refundAfterMs ` +
           `(chain time, re-checked after verifyLockFinal) (E4)`,
       );
     }
@@ -479,21 +497,29 @@ export class SellerFlow {
     // E4: the leg-A rail's own `claim` re-checks this same bound once more, against its own
     // freshly-read chain time, immediately before it actually broadcasts (defense in depth
     // against however long its own preimage-free pre-checks (E5) themselves take).
-    const notAfterMs = offerA.refundAfterMs - EVM_LOCAL_POLICY.claimInclusionMarginMs;
+    const notAfterMs = offerA.refundAfterMs - this.policy.claimInclusionMarginMs;
     const before = connected.exchanges.length;
-    const writeEvidence = await connected.claim(hashLockHex, this.hashLock.preimage, notAfterMs);
+    const writeEvidence = await connected.claim(railRef, this.hashLock.preimage, notAfterMs);
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
 
+    // vendor/tclk/src/machine.ts's own "reveal" transition requires the frame's `ref`, when
+    // present, to equal the contract's own accepted `railRef` (identical rule to refund/receipt
+    // above) — `railRef`, never `hashLockHex` (only ever the same value by coincidence for
+    // evm-htlc; for btc-htlc a reveal naming the hashLock instead of the outpoint is REJECTED by
+    // the machine, leaving leg A stuck at `"locked"` forever despite a real, valid claim).
     const reveal = options?.skipReveal === true
       ? undefined
       : await this.venue.post(
           dealRoom(acceptA.contract),
-          encodeFrame({ type: "reveal", from: this.identity.did, contract: acceptA.contract, ref: hashLockHex, secret: this.hashLock.preimage }),
+          encodeFrame({ type: "reveal", from: this.identity.did, contract: acceptA.contract, ref: railRef, secret: this.hashLock.preimage }),
           this.identity,
         );
+    // tclk's own machine requires a receipt frame's `ref`, when present, to equal the contract's
+    // own accepted `railRef` (vendor/tclk/src/machine.ts) — `railRef`, never `hashLockHex` (only
+    // ever the same value by coincidence for evm-htlc).
     const receipt = await this.venue.post(
       dealRoom(acceptA.contract),
-      encodeFrame({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "claimed", rail: "evm-htlc", ref: hashLockHex }),
+      encodeFrame({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "claimed", rail: this.rail.railId, ref: railRef }),
       this.identity,
     );
 

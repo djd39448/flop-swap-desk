@@ -1,0 +1,118 @@
+{
+  "v": 1,
+  "rail": "btc-htlc",
+  "ref": "a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1",
+  "pin": "btc-regtest",
+  "caip2": "bip122:0f9188f13cb7b2c71f2a335e3a4fc328",
+  "endpoint": "http://127.0.0.1:55428",
+  "checkedAtMs": 1790621592000,
+  "config": {
+    "pin": {
+      "name": "btc-regtest",
+      "network": "regtest",
+      "caip2": "bip122:0f9188f13cb7b2c71f2a335e3a4fc328",
+      "genesisHash": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+      "finality": {
+        "confirmations": 2
+      }
+    },
+    "endpoint": "http://127.0.0.1:55428"
+  },
+  "nonce": "026448d6a7f4eadf",
+  "exchanges": [
+    {
+      "method": "getblockchaininfo",
+      "params": [],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1:1790621592000:026448d6a7f4eadf:1\",\"method\":\"getblockchaininfo\",\"params\":[]}",
+      "responseSha256": "caa791ce6512008c5829943ab3c16e1f73236328bff4d11242a9f1dfe1c40fec",
+      "atMs": 1790621576953
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        0
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1:1790621592000:026448d6a7f4eadf:2\",\"method\":\"getblockhash\",\"params\":[0]}",
+      "responseSha256": "03246ff8fd9108c5789e71f94ba848c09f7562b6f2dad6ff279cfb5d1e31e632",
+      "atMs": 1790621576954
+    },
+    {
+      "method": "getrawtransaction",
+      "params": [
+        "a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2",
+        true
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1:1790621592000:026448d6a7f4eadf:3\",\"method\":\"getrawtransaction\",\"params\":[\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2\",true]}",
+      "responseSha256": "e5b56807ac9143eba013d0c384e83b19c12cb79b620e53ee63c19a06c318b9b0",
+      "atMs": 1790621576954
+    },
+    {
+      "method": "gettxout",
+      "params": [
+        "a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2",
+        1,
+        false
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1:1790621592000:026448d6a7f4eadf:4\",\"method\":\"gettxout\",\"params\":[\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2\",1,false]}",
+      "responseSha256": "bf2afa72cd7e3573d9511b491248b1890b87e418f4cec4a7c166bfa6d51a2b6e",
+      "atMs": 1790621576955
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        102
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1:1790621592000:026448d6a7f4eadf:5\",\"method\":\"getblockhash\",\"params\":[102]}",
+      "responseSha256": "367e91d2a96b6f58ad20017ce6a5eba6bcdeb62c6b387672bc73e977c3a16185",
+      "atMs": 1790621576956
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "497a17e3b36e8d41a16e615e29e38d5d6ea877b4bd54082d8fdc1d59fd8436dc",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1:1790621592000:026448d6a7f4eadf:6\",\"method\":\"getblock\",\"params\":[\"497a17e3b36e8d41a16e615e29e38d5d6ea877b4bd54082d8fdc1d59fd8436dc\",2]}",
+      "responseSha256": "c1d7887b6dd274e7eb8597e01b6f1330ef6488fc31729ff6f2a65e88cb49288b",
+      "atMs": 1790621576956
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        103
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1:1790621592000:026448d6a7f4eadf:7\",\"method\":\"getblockhash\",\"params\":[103]}",
+      "responseSha256": "4ac4a21d999e11c31eb223853ce976b23c101467cc3f0539f483b6803336bd5e",
+      "atMs": 1790621576957
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "27ec6f27c6763dd42b1f3c6ddaa5ec01105b94dc393b7181c59b182da61de189",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1:1790621592000:026448d6a7f4eadf:8\",\"method\":\"getblock\",\"params\":[\"27ec6f27c6763dd42b1f3c6ddaa5ec01105b94dc393b7181c59b182da61de189\",2]}",
+      "responseSha256": "1af3aa2d0e9766ad2cb5abaa2512a3f215967ce34b0f9a8229ea31219a750e9d",
+      "atMs": 1790621576958
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        104
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1:1790621592000:026448d6a7f4eadf:9\",\"method\":\"getblockhash\",\"params\":[104]}",
+      "responseSha256": "4240f7f3337620b5de78bf8f10fa3f50c6e5becf5591cc9be15912016b607be6",
+      "atMs": 1790621576958
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "3c26e8193d13ff66d32485cbc72aa60ec71ceb4b86d6ca27150995eabf6be1c1",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1:1790621592000:026448d6a7f4eadf:10\",\"method\":\"getblock\",\"params\":[\"3c26e8193d13ff66d32485cbc72aa60ec71ceb4b86d6ca27150995eabf6be1c1\",2]}",
+      "responseSha256": "c1aab217fd28300449c5399f304e3b0241011636a5d5944c20cdc209a884cc3a",
+      "atMs": 1790621576959
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "swapId": "0x4096f1d32d53d44c63b4554ea849511ce01895e6de56d86ab3a257f4bc1fb80e",
+  "legA": {
+    "contract": "0x54efa8d5a3afeef37bdeed4a3a688663aef0bc412f1ca5926cdc8e5c63238960",
+    "rail": "btc-htlc"
+  },
+  "legB": {
+    "contract": "0xec2c306f81f1c1d5c8d355733180326dd85932c828a0b25567681ab5cf5c8fce",
+    "rail": "paper"
+  },
+  "feeBps": 0,
+  "writes": [
+    {
+      "leg": "a",
+      "step": "lock",
+      "rail": "btc-htlc",
+      "evidence": {
+        "ref": "a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1",
+        "txid": "a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2",
+        "blockHeight": null,
+        "blockHash": null,
+        "raw": [
+          "b158bf6b33d3bf33c01c64960ba126a3fcc9163034fdfb9e4d7a1622f8ec5d73",
+          "b69e98742d2047d403d44de0db6989d5ad210b98f161e48ed03f5f0b7bc01270"
+        ]
+      }
+    },
+    {
+      "leg": "a",
+      "step": "claim",
+      "rail": "btc-htlc",
+      "evidence": {
+        "ref": "a862bb3a736a1b23511e9aadc43e07f230c87e2e0bab4a8a2ff64d1fec1e87c2:1",
+        "txid": "a4a46a7ed3b324580a8da3ee362175685b3d4fccaaf1dafa94a47cd29cd8247c",
+        "blockHeight": null,
+        "blockHash": null,
+        "raw": [
+          "0a5e2892c48a99a217a8e192c93cfe3d4c172f34eba2122b8e825f228477cffd",
+          "f230571d4c12d9d4fdd2a683cf50944cc4074914925cc971050c2af7bf4c1e54",
+          "96b1d0976d7e907d768141281af8f05b62efd9218025f328d0db30a823a9cf14",
+          "5c18ebb17e44de3a5dc6c6277918195e31ffa83214c5779b93ba9126f6c2927e",
+          "4d228c0f49b8b39820fab504d751fb57d93f1e7c3afd89bb1a260432b5c847c2"
+        ]
+      }
+    }
+  ],
+  "startedAtMs": 1790621592000,
+  "finishedAtMs": 1790621592000,
+  "status": "settled",
+  "finalizedRefs": [
+    "paper:sha256:baf85ba06f330c43ea634e95f4da8a97ce83e22629233213b87708dfabfae90d",
+    "btc-regtest:confirmations-2:104:3c26e8193d13ff66d32485cbc72aa60ec71ceb4b86d6ca27150995eabf6be1c1"
+  ]
+}
