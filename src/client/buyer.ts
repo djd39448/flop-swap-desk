@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: MIT
 //
-// P22-P24-EVM-SPEC.md §6: the Buyer's side of one swap — opens leg A (the counter-asset,
-// on `evm-htlc`), accepts leg B (FLOP, on tclk's `paper` rail) only once the deadline
-// arithmetic is safe, and refuses to lock leg A until both the Seller's chain account has
-// resolved (D-08) and leg B itself verifies. Every step is an explicit method a runner calls
-// in order; each either succeeds or throws an `Error` naming the rule it refused to break.
+// P22-P24-EVM-SPEC.md §6: the Buyer's side of one swap — opens leg A (the counter-asset, on its
+// own rail), accepts leg B (FLOP, on tclk's `paper` rail) only once the deadline arithmetic is
+// safe, and refuses to lock leg A until both the Seller's chain account has resolved (D-08) and
+// leg B itself verifies. Every step is an explicit method a runner calls in order; each either
+// succeeds or throws an `Error` naming the rule it refused to break.
+//
+// P4-BTC-SPEC.md §7a ("one client, many rails"): this class no longer imports a specific rail's
+// adapter at all — `BuyerFlowOptions.rail` is a `CounterAssetRail` (src/client/counter-rail.ts),
+// and every write/read this class makes against leg A goes through it. No behaviour change for
+// EVM: `src/client/evm-rail.ts`'s adapter makes exactly the same calls, in the same order,
+// against the same `CapturingRpc`, that this class used to make directly against `EvmHtlcRail`.
 //
 // P22-P24-EVM-FIXES.md B3: `acceptLegB` used to take a caller-supplied `DeadlinePolicy` and a
 // bare, unauthenticated `AcceptFrame` for leg A's accept — a runner (or a compromised one)
@@ -38,9 +44,8 @@
 // "locked, evidence pending" to this flow, never "never locked".
 //
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
-// P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3.
+// P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3; P4-BTC-SPEC.md §7a.
 
-import type { Address, Hex } from "viem";
 import {
   contractId,
   dealRoom,
@@ -59,26 +64,11 @@ import {
 
 import { checkSwapDeadlines } from "../deadlines.js";
 import { checkLegBMatchesWant, checkOrientation, classifySwapOffer, legAContext } from "../profile.js";
-import { formatAccountLine, resolveAccounts } from "../rails/account-line.js";
-import { EvmHtlcRail, type EvmRailConfig, type WriteEvidence } from "../rails/evm-htlc.js";
-import type { CapturingRpc, Exchange } from "../rails/rpc-capture.js";
-import type { AddressBook } from "../vendor/evm-hash-rail.js";
+import type { Exchange } from "../rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "../swap.js";
+import type { CounterAssetRail, RailBlockMarker, RailWriteEvidence } from "./counter-rail.js";
 import { EVM_LOCAL_POLICY } from "./policy.js";
 import type { Signer, Venue } from "./venue.js";
-
-/** `EvmHtlcRail.claim`/`.refund`/`.verifyLockFinal` never resolve through the address book
- *  (see the identical note in `src/client/seller.ts`); only `.lock` does, and this Buyer
- *  builds a real one for that call from `resolveAccounts`'s own resolved payee, right before
- *  using it (`lockLegA` below) — never at connect time, since the Seller's account line does
- *  not exist yet when a Buyer flow is constructed. */
-function inertAddressBook(): AddressBook {
-  return {
-    resolve(did: string): Address {
-      throw new Error(`buyer: address book has no resolution for ${did} (not needed for claim/refund/verify)`);
-    },
-  };
-}
 
 export interface BuyerFlowOptions {
   identity: Signer;
@@ -86,9 +76,9 @@ export interface BuyerFlowOptions {
   /** Backs leg B (FLOP on tclk's `paper` rail), sharing one `NoteStore` with the Seller's own
    *  `PaperRail` instance. */
   paperRail: PaperRail;
-  account: Address;
-  rpc: CapturingRpc;
-  evmConfig: EvmRailConfig;
+  /** Leg A's counter-asset rail (P4-BTC-SPEC.md §7a) — `evm-htlc` today
+   *  (`src/client/evm-rail.ts`'s `createEvmCounterRail`). Only this Buyer ever locks leg A. */
+  rail: CounterAssetRail;
   clock: () => number;
 }
 
@@ -113,9 +103,7 @@ export class BuyerFlow {
   private readonly identity: Signer;
   private readonly venue: Venue;
   private readonly paperRail: PaperRail;
-  private readonly account: Address;
-  private readonly rpc: CapturingRpc;
-  private readonly evmConfig: EvmRailConfig;
+  private readonly rail: CounterAssetRail;
   private readonly clock: () => number;
 
   private offerA?: OfferFrame;
@@ -128,9 +116,9 @@ export class BuyerFlow {
    *  second leg-B offer for the same leg A) can never both pair this flow to a leg B. */
   private legBPairingPending = false;
   private legBVerified = false;
-  private lockedHashLock?: Hex;
-  private lockedFromBlock?: bigint;
-  /** B5: every EVM write this flow has made so far (`lockLegA`'s approve+lock, `refundLegA`'s
+  private lockedHashLock?: string;
+  private lockedFromBlock?: RailBlockMarker;
+  /** B5: every leg-A write this flow has made so far (`lockLegA`'s lock, `refundLegA`'s
    *  refund), in call order — see the identical field on `SellerFlow`. */
   private readonly writeExchanges: Exchange[] = [];
 
@@ -138,13 +126,11 @@ export class BuyerFlow {
     this.identity = options.identity;
     this.venue = options.venue;
     this.paperRail = options.paperRail;
-    this.account = options.account;
-    this.rpc = options.rpc;
-    this.evmConfig = options.evmConfig;
+    this.rail = options.rail;
     this.clock = options.clock;
   }
 
-  /** B5: every EVM write this flow has made so far, in call order. */
+  /** B5: every leg-A write this flow has made so far, in call order. */
   get exchanges(): readonly Exchange[] {
     return this.writeExchanges;
   }
@@ -316,19 +302,19 @@ export class BuyerFlow {
     this.legBVerified = true;
   }
 
-  /** Post this Buyer's own EVM account (D-08) into leg A's deal room, as (optional)
+  /** Post this Buyer's own leg-A account/key line (D-08) into leg A's deal room, as (optional)
    *  corroborating payer information. */
-  async postAccountLineA(evmAddress: Address): Promise<TranscriptRecord> {
+  async postAccountLineA(address: string): Promise<TranscriptRecord> {
     const { acceptA } = this.requirePaired();
-    const line = formatAccountLine({ railId: "evm-htlc", caip2: this.evmConfig.pin.caip2, address: evmAddress });
+    const line = this.rail.formatAccountLine(address);
     return this.venue.post(dealRoom(acceptA.contract), line, this.identity);
   }
 
   /**
-   * Lock leg A on `evm-htlc` — refused until leg B has verified (`verifyLegBLocked`) and the
-   * Seller's own account line resolves in leg A's deal room (D-08: only the payee's line is
-   * required). The write path's `AddressBook` is built here, from the resolved payee, right
-   * before the one call (`EvmHashRail.lock`) that ever needs to resolve a counterparty address.
+   * Lock leg A on this flow's counter-asset rail — refused until leg B has verified
+   * (`verifyLegBLocked`) and the Seller's own account line resolves in leg A's deal room (D-08:
+   * only the payee's line is required). The rail's own connected handle resolves the payee's
+   * address/pubkey right before the one write (`lock`) that ever needs it.
    *
    * P22-P24-EVM-FIXES.md B3: re-runs `checkSwapDeadlines` (the pinned `EVM_LOCAL_POLICY`) with
    * `clock()` as the lock time before doing anything else — a pair that was safe when
@@ -337,12 +323,12 @@ export class BuyerFlow {
    * spends real value.
    *
    * P22-P24-EVM-FIXES-R3.md E1: also re-verifies leg B is *still* locked on the paper rail,
-   * immediately before approve+lock — `legBVerified` is a flag `verifyLegBLocked` set once and
+   * immediately before locking — `legBVerified` is a flag `verifyLegBLocked` set once and
    * never revisits; it is not evidence leg B is still locked right now, only that it was at some
    * earlier moment this flow chose to check. Closes the same window B3 already closes for the
    * deadline arithmetic, for leg B's own lock state instead.
    */
-  async lockLegA(): Promise<{ hashLock: Hex; writeEvidence: WriteEvidence }> {
+  async lockLegA(): Promise<{ hashLock: string; writeEvidence: RailWriteEvidence }> {
     if (!this.legBVerified) {
       throw new Error("buyer: refusing to lock leg A before leg B verifies");
     }
@@ -377,46 +363,32 @@ export class BuyerFlow {
 
     const termsA = offerAcceptLockTerms(offerA, acceptA);
     const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
-    const accounts = resolveAccounts(dealRoomARecords, {
+    const accounts = this.rail.resolveAccounts(dealRoomARecords, {
       contract: acceptA.contract,
       payerDid: termsA.payer,
       payeeDid: termsA.payee,
-      rail: "evm-htlc",
-      caip2: this.evmConfig.pin.caip2,
     });
-    const payee = accounts.payee;
-    if (payee === undefined) {
+    if (accounts.payee === undefined) {
       throw new Error("buyer: refusing to lock leg A — the Seller's account line has not resolved (D-08)");
     }
 
-    const addressBook: AddressBook = {
-      resolve: (did: string): Address => {
-        if (did === termsA.payee) return payee;
-        if (did === termsA.payer) return this.account;
-        throw new Error(`buyer: no resolved address for ${did}`);
-      },
-    };
-    const rail = await EvmHtlcRail.connect({ config: this.evmConfig, rpc: this.rpc, account: this.account, addressBook, clock: this.clock });
+    const connected = await this.rail.connect(termsA, accounts);
 
-    const fromBlock = await this.rpc
-      .request({ method: "eth_blockNumber", params: [] })
-      .then((hex) => BigInt(hex as string));
+    const fromBlock = await connected.currentBlockMarker();
 
     // P22-P24-EVM-FIXES-R3.md E3: record this flow's own lock state from what it already knows
     // — `termsA.statement` is the hash lock the Seller committed to in `acceptA`, known before
-    // this flow ever touches the chain — BEFORE approve/lock ever run, not after. `refundLegA`
-    // and `learnSecret` then read the chain itself (`locks(hashLock)`) as the truth; a failed
-    // evidence capture (`rail.lock`'s own bounded `eth_getLogs` finding zero or several matching
-    // logs) or a failed lock-frame post below must never leave this flow believing leg A was
+    // this flow ever touches the chain — BEFORE the lock write ever runs, not after.
+    // `refundLegA` and `learnSecret` then read the chain itself as the truth; a failed evidence
+    // capture or a failed lock-frame post below must never leave this flow believing leg A was
     // "never locked" when the on-chain write may already have succeeded.
-    const hashLock = termsA.statement as Hex;
+    const hashLock = termsA.statement;
     this.lockedHashLock = hashLock;
     this.lockedFromBlock = fromBlock;
 
-    const before = this.rpc.exchanges().length;
-    await rail.approve(termsA.asset, termsA.amount);
-    const writeEvidence = await rail.lock(termsA, 0);
-    this.writeExchanges.push(...this.rpc.exchanges().slice(before)); // B5
+    const before = connected.exchanges.length;
+    const writeEvidence = await connected.lock(termsA, 0);
+    this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
 
     await this.venue.post(
       dealRoom(acceptA.contract),
@@ -432,8 +404,8 @@ export class BuyerFlow {
    *  it — never guesses: a candidate preimage is only accepted once it actually opens the
    *  statement (`findClaimedPreimage` already re-checks this; `parseSwapContext`-level frame
    *  authentication covers the reveal-frame path here). */
-  async learnSecret(): Promise<Hex> {
-    const { acceptA } = this.requirePaired();
+  async learnSecret(): Promise<string> {
+    const { offerA, acceptA } = this.requirePaired();
     if (this.lockedHashLock === undefined) throw new Error("buyer: leg A has not been locked yet");
     const hashLock = this.lockedHashLock;
 
@@ -444,18 +416,12 @@ export class BuyerFlow {
       if (frame === null || frame.type !== "reveal" || frame.from !== record.sender) continue;
       if (frame.contract !== acceptA.contract) continue;
       if (frame.ref !== undefined && frame.ref !== hashLock) continue;
-      if (verifySecret("hash", hashLock, frame.secret)) return frame.secret as Hex;
+      if (verifySecret("hash", hashLock, frame.secret)) return frame.secret;
     }
 
-    const rail = await EvmHtlcRail.connect({
-      config: this.evmConfig,
-      rpc: this.rpc,
-      account: this.account,
-      addressBook: inertAddressBook(),
-      clock: this.clock,
-    });
-    const fromBlock = this.lockedFromBlock ?? 0n;
-    const preimage = await rail.findClaimedPreimage(hashLock, fromBlock);
+    const termsA = offerAcceptLockTerms(offerA, acceptA);
+    const connected = await this.rail.connect(termsA, {});
+    const preimage = await connected.findClaimedPreimage(hashLock, this.lockedFromBlock);
     if (preimage === null) {
       throw new Error("buyer: refusing to guess the secret — no reveal frame and no Claimed log yet");
     }
@@ -464,7 +430,7 @@ export class BuyerFlow {
 
   /** Claim leg B on the paper rail with the learned secret, then reveal it there too (SPEC:
    *  the Buyer's own reveal on leg B, distinct from the Seller's reveal on leg A). */
-  async claimLegB(secret: Hex): Promise<{ reveal: TranscriptRecord; receipt: TranscriptRecord }> {
+  async claimLegB(secret: string): Promise<{ reveal: TranscriptRecord; receipt: TranscriptRecord }> {
     const { offerB, acceptB } = this.requirePaired();
     const termsB = offerAcceptLockTerms(offerB, acceptB);
     if (!verifySecret(termsB.lock, termsB.statement, secret)) {
@@ -484,25 +450,20 @@ export class BuyerFlow {
     return { reveal, receipt };
   }
 
-  /** Refund leg A only at/after `A.refundAfterMs` — the vendored rail's own `refund` also
-   *  enforces this on-chain; this check exists so a caller sees this class's own reason. */
-  async refundLegA(): Promise<WriteEvidence> {
+  /** Refund leg A only at/after `A.refundAfterMs` — the leg-A rail's own `refund` also enforces
+   *  this on-chain; this check exists so a caller sees this class's own reason. */
+  async refundLegA(): Promise<RailWriteEvidence> {
     const { offerA, acceptA } = this.requirePaired();
     if (this.lockedHashLock === undefined) throw new Error("buyer: leg A was never locked, nothing to refund");
     if (this.clock() < offerA.refundAfterMs) {
       throw new Error("buyer: refusing to refund leg A before its refundAfterMs");
     }
     const hashLock = this.lockedHashLock;
-    const rail = await EvmHtlcRail.connect({
-      config: this.evmConfig,
-      rpc: this.rpc,
-      account: this.account,
-      addressBook: inertAddressBook(),
-      clock: this.clock,
-    });
-    const before = this.rpc.exchanges().length;
-    const writeEvidence = await rail.refund(hashLock);
-    this.writeExchanges.push(...this.rpc.exchanges().slice(before)); // B5
+    const termsA = offerAcceptLockTerms(offerA, acceptA);
+    const connected = await this.rail.connect(termsA, {});
+    const before = connected.exchanges.length;
+    const writeEvidence = await connected.refund(hashLock);
+    this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
     await this.venue.post(
       dealRoom(acceptA.contract),
       encodeFrame({ type: "refund", from: this.identity.did, contract: acceptA.contract, ref: hashLock }),

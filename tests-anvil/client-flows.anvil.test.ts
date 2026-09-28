@@ -26,6 +26,7 @@ import { MemoryNoteStore, OFFER_ROOM, PaperRail, dealRoom, paperNote, verifyHash
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
+import { createEvmCounterRail } from "../src/client/evm-rail.js";
 import { SellerFlow } from "../src/client/seller.js";
 import { MemoryVenue } from "../src/client/venue.js";
 import { writeBundle, type BundleEvidenceSummary } from "../src/client/bundle.js";
@@ -148,18 +149,14 @@ function setupSwap(anvil: AnvilHandle, config: EvmRailConfig, buyer: Party, sell
     identity: buyer.identity,
     venue,
     paperRail: new PaperRail(noteStore, clock),
-    account: buyer.account,
-    rpc: buyer.rpc,
-    evmConfig: config,
+    rail: createEvmCounterRail({ config, rpc: buyer.rpc, account: buyer.account, clock }),
     clock,
   });
   const sellerFlow = new SellerFlow({
     identity: seller.identity,
     venue,
     paperRail: new PaperRail(noteStore, clock),
-    account: seller.account,
-    rpc: seller.rpc,
-    evmConfig: config,
+    rail: createEvmCounterRail({ config, rpc: seller.rpc, account: seller.account, clock }),
     clock,
   });
 

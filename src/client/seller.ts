@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: MIT
 //
-// P22-P24-EVM-SPEC.md §6: the Seller's side of one swap — accepts leg A (the counter-asset,
-// on `evm-htlc`), mints the hash statement, opens leg B (FLOP, on tclk's `paper` rail), and
-// only ever claims leg A once the chain itself says the lock is final. Every step is an
-// explicit method a runner calls in order (no hidden timers, no background polling); each one
-// either succeeds or throws an `Error` naming the rule it refused to break — never a silent
-// no-op. The secret is minted with tclk's own CSPRNG-backed `generateHashLock()`
-// (vendor/tclk/src/hex.ts's `randomU8a`, Web Crypto) and lives only in a private field of this
-// class: no step here ever logs it, returns it, or writes it to a frame before `claimLegA`
-// reveals it on purpose.
+// P22-P24-EVM-SPEC.md §6: the Seller's side of one swap — accepts leg A (the counter-asset, on
+// its own rail), mints the hash statement, opens leg B (FLOP, on tclk's `paper` rail), and only
+// ever claims leg A once the chain itself says the lock is final. Every step is an explicit
+// method a runner calls in order (no hidden timers, no background polling); each one either
+// succeeds or throws an `Error` naming the rule it refused to break — never a silent no-op. The
+// secret is minted with tclk's own CSPRNG-backed `generateHashLock()` (vendor/tclk/src/hex.ts's
+// `randomU8a`, Web Crypto) and lives only in a private field of this class: no step here ever
+// logs it, returns it, or writes it to a frame before `claimLegA` reveals it on purpose.
 //
-// Money-moving calls (`paperRail.lock/refund`, `evmRail.claim`) are delegated to the rails
-// themselves, which enforce their own predicates independently (tclk's `PaperRail`, the
-// vendored `EvmHashRail` via `src/rails/evm-htlc.ts`'s `EvmHtlcRail`) — this module adds the
-// cross-leg and D-11 finality checks the rails have no way to know about on their own.
+// Money-moving calls (`paperRail.lock/refund`, the leg-A rail's `claim`) are delegated to the
+// rails themselves, which enforce their own predicates independently (tclk's `PaperRail`, and
+// whatever `CounterAssetRail` (src/client/counter-rail.ts) this flow was built with — `evm-htlc`
+// today, via `src/client/evm-rail.ts`'s adapter around the vendored `EvmHashRail`) — this module
+// adds the cross-leg and D-11 finality checks the rails have no way to know about on their own.
+//
+// P4-BTC-SPEC.md §7a ("one client, many rails"): this class no longer imports a specific rail's
+// adapter at all — `SellerFlowOptions.rail` is a `CounterAssetRail`, and every write/read this
+// class makes against leg A goes through it. No behaviour change for EVM: `src/client/evm-rail
+// .ts`'s adapter makes exactly the same calls, in the same order, against the same
+// `CapturingRpc`, that this class used to make directly against `EvmHtlcRail`.
 //
 // P22-P24-EVM-FIXES.md B1 (CRITICAL): `lockLegB` used to trust a caller-supplied `AcceptFrame`
 // object outright — any DID could hand this flow an accept naming its own hash statement, and
@@ -33,10 +39,10 @@
 // EVM claim-inclusion margin, and checks the leg B deadlines it is about to propose the same
 // way `BuyerFlow.acceptLegB` will. `claimLegA` reads the chain's own clock (never wall-clock)
 // for the claimByMs/margin guard, since that is what the contract will see when the claim
-// lands; `EvmHtlcRail.claim` itself now simulates before ever broadcasting (P22-P24-EVM-FIXES
-// .md B2, `src/rails/evm-htlc.ts`).
+// lands; the leg-A rail's own `claim` itself simulates before ever broadcasting
+// (P22-P24-EVM-FIXES.md B2, `src/rails/evm-htlc.ts`).
 //
-// B5: this flow keeps every EVM write's raw `Exchange`s (`this.exchanges`) so a bundle writer
+// B5: this flow keeps every leg-A write's raw `Exchange`s (`this.exchanges`) so a bundle writer
 // (`src/client/bundle.ts`) can persist them into `raw/rpc/`, making every sha256 in
 // `WriteEvidence.raw` resolve to real bytes on disk.
 //
@@ -54,12 +60,11 @@
 // landed, and it only ever checks the same contract, never a different one. E4: `claimLegA`
 // re-reads chain time and re-applies its own claimByMs/margin guards a second time immediately
 // after `verifyLockFinal` returns (which can itself take a long time on a slow RPC), and passes
-// `EvmHtlcRail.claim` a `notAfterMs` bound for its own last-moment check.
+// the leg-A rail's `claim` a `notAfterMs` bound for its own last-moment check.
 //
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
-// B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4.
+// B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a.
 
-import type { Address, Hex } from "viem";
 import {
   contractId,
   dealRoom,
@@ -80,27 +85,11 @@ import {
 
 import { checkSwapDeadlines } from "../deadlines.js";
 import { checkOrientation, classifySwapOffer, legBContext } from "../profile.js";
-import { formatAccountLine, resolveAccounts } from "../rails/account-line.js";
-import { EvmHtlcRail, type EvmRailConfig, type WriteEvidence } from "../rails/evm-htlc.js";
-import type { CapturingRpc, Exchange } from "../rails/rpc-capture.js";
-import type { AddressBook } from "../vendor/evm-hash-rail.js";
+import type { Exchange } from "../rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "../swap.js";
+import type { CounterAssetRail, RailWriteEvidence } from "./counter-rail.js";
 import { EVM_LOCAL_POLICY } from "./policy.js";
 import type { Signer, Venue } from "./venue.js";
-
-/** Leg B never calls a write path that needs to resolve a counterparty's chain address (the
- *  paper rail has no such notion); only `EvmHtlcRail.lock` does. A Seller never locks leg A
- *  (the Buyer does), so every `EvmHtlcRail` this class connects only ever calls `claim` —
- *  which the vendored rail (`src/vendor/evm-hash-rail.ts`) never resolves through the address
- *  book at all. This inert book exists only so `EvmHtlcRail.connect`'s type has something to
- *  hold; a call into it would be this module's own bug, not a real address gap. */
-function inertAddressBook(): AddressBook {
-  return {
-    resolve(did: string): Address {
-      throw new Error(`seller: address book has no resolution for ${did} (not needed for claim/refund)`);
-    },
-  };
-}
 
 export interface SellerFlowOptions {
   identity: Signer;
@@ -108,12 +97,10 @@ export interface SellerFlowOptions {
   /** Backs leg B (FLOP on tclk's `paper` rail) — a rehearsal surface, shared with the Buyer's
    *  own `PaperRail` instance over one `NoteStore` (`vendor/tclk/src/paper-rail.ts`). */
   paperRail: PaperRail;
-  /** This party's own EVM account and the JSON-RPC transport leg A's writes go through — no
-   *  private key anywhere (D-10): `EvmHtlcRail.connect` builds a viem `WalletClient` on the
-   *  plain address alone. */
-  account: Address;
-  rpc: CapturingRpc;
-  evmConfig: EvmRailConfig;
+  /** Leg A's counter-asset rail (P4-BTC-SPEC.md §7a) — `evm-htlc` today
+   *  (`src/client/evm-rail.ts`'s `createEvmCounterRail`). This Seller only ever claims or
+   *  refunds through it; only the Buyer ever locks. */
+  rail: CounterAssetRail;
   /** Wall-clock ms, injected — never `Date.now()` inside this class (house rule). */
   clock: () => number;
 }
@@ -151,9 +138,7 @@ export class SellerFlow {
   private readonly identity: Signer;
   private readonly venue: Venue;
   private readonly paperRail: PaperRail;
-  private readonly account: Address;
-  private readonly rpc: CapturingRpc;
-  private readonly evmConfig: EvmRailConfig;
+  private readonly rail: CounterAssetRail;
   private readonly clock: () => number;
 
   private offerA?: OfferFrame;
@@ -178,23 +163,21 @@ export class SellerFlow {
    *  race `paperRail.lock` under two different contracts before either sets
    *  `lockedLegBContract`. */
   private legBLockPending = false;
-  /** B5: every EVM write's own raw `Exchange`s, in call order, so a bundle writer can persist
+  /** B5: every leg-A write's own raw `Exchange`s, in call order, so a bundle writer can persist
    *  them into `raw/rpc/` (every sha256 a `WriteEvidence.raw` names must resolve to real
-   *  bytes). Paper-rail writes (`lockLegB`, `refundLegB`) never touch `this.rpc`, so nothing is
-   *  added for them. */
+   *  bytes). Paper-rail writes (`lockLegB`, `refundLegB`) never touch leg A's rail, so nothing
+   *  is added for them. */
   private readonly writeExchanges: Exchange[] = [];
 
   constructor(options: SellerFlowOptions) {
     this.identity = options.identity;
     this.venue = options.venue;
     this.paperRail = options.paperRail;
-    this.account = options.account;
-    this.rpc = options.rpc;
-    this.evmConfig = options.evmConfig;
+    this.rail = options.rail;
     this.clock = options.clock;
   }
 
-  /** B5: every EVM write this flow has made so far, in call order. */
+  /** B5: every leg-A write this flow has made so far, in call order. */
   get exchanges(): readonly Exchange[] {
     return this.writeExchanges;
   }
@@ -293,11 +276,11 @@ export class SellerFlow {
     return { acceptA, acceptARecord, offerB, offerBRecord };
   }
 
-  /** Post this Seller's own EVM account (D-08) into leg A's deal room, as the payee — required
-   *  before the Buyer may lock (SPEC §3, §6). */
-  async postAccountLineA(evmAddress: Address): Promise<TranscriptRecord> {
+  /** Post this Seller's own leg-A account/key line (D-08) into leg A's deal room, as the payee
+   *  — required before the Buyer may lock (SPEC §3, §6). */
+  async postAccountLineA(address: string): Promise<TranscriptRecord> {
     const { acceptA } = this.requireAcceptedA();
-    const line = formatAccountLine({ railId: "evm-htlc", caip2: this.evmConfig.pin.caip2, address: evmAddress });
+    const line = this.rail.formatAccountLine(address);
     return this.venue.post(dealRoom(acceptA.contract), line, this.identity);
   }
 
@@ -419,17 +402,17 @@ export class SellerFlow {
    *
    * P22-P24-EVM-FIXES.md B2: `EvmHashRail.sol` enforces only `refundAfterMs` on-chain —
    * `claimByMs` and the claim-inclusion margin are this client's own guard, and they must be
-   * judged against the *chain's* own clock (`rail.latestBlockTimestampMs()`), never wall-clock
-   * or `this.clock()`, since chain time is what the contract will actually see when this claim
-   * lands. `EvmHtlcRail.claim` itself additionally simulates before ever broadcasting
+   * judged against the *rail's* own clock (`rail.chainTimeMs()`), never wall-clock or
+   * `this.clock()`, since chain time is what the contract will actually see when this claim
+   * lands. The leg-A rail's own `claim` itself additionally simulates before ever broadcasting
    * (`src/rails/evm-htlc.ts`), so a claim that would revert (e.g. a blacklisted payee) is never
    * sent at all — this method's own margin check exists so a doomed-by-timing claim is refused
    * before spending a round trip finding that out via simulation.
    */
   async claimLegA(
-    hashLockHex: Hex,
+    hashLockHex: string,
     options?: { skipReveal?: boolean },
-  ): Promise<{ evidence: WriteEvidence; reveal?: TranscriptRecord; receipt: TranscriptRecord }> {
+  ): Promise<{ evidence: RailWriteEvidence; reveal?: TranscriptRecord; receipt: TranscriptRecord }> {
     const { offerA, acceptA } = this.requireAcceptedA();
     if (this.hashLock === undefined) throw new Error("seller: no secret minted for this flow");
     if (hashLockHex !== this.hashLock.hash) {
@@ -438,21 +421,13 @@ export class SellerFlow {
 
     const termsA = offerAcceptLockTerms(offerA, acceptA);
     const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
-    const accounts = resolveAccounts(dealRoomARecords, {
+    const accounts = this.rail.resolveAccounts(dealRoomARecords, {
       contract: acceptA.contract,
       payerDid: termsA.payer,
       payeeDid: termsA.payee,
-      rail: "evm-htlc",
-      caip2: this.evmConfig.pin.caip2,
     });
 
-    const rail = await EvmHtlcRail.connect({
-      config: this.evmConfig,
-      rpc: this.rpc,
-      account: this.account,
-      addressBook: inertAddressBook(),
-      clock: this.clock,
-    });
+    const connected = await this.rail.connect(termsA, accounts);
 
     // B2/C3: read before verifyLockFinal (whose own capture drains this rail's exchange log
     // when it finishes). Neither the chain's own last block nor wall-clock alone is safe to
@@ -464,7 +439,7 @@ export class SellerFlow {
     // whichever of the two already reports the more dangerous (later) time — it is never
     // earlier than either one alone, so it can only make this guard more conservative, never
     // less.
-    const chainTimeMs = await rail.latestBlockTimestampMs();
+    const chainTimeMs = await connected.chainTimeMs();
     const chainNow = Math.max(chainTimeMs, this.clock());
     if (chainNow >= offerA.claimByMs) {
       throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time) (B2/C3)");
@@ -476,7 +451,7 @@ export class SellerFlow {
       );
     }
 
-    const evidence = await rail.verifyLockFinal(termsA, hashLockHex, accounts);
+    const evidence = await connected.verifyLockFinal(termsA, hashLockHex, accounts);
     if (evidence.lock.railVerified !== true) {
       throw new Error(
         `seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): ${evidence.lock.reason ?? "unverified"}`,
@@ -488,7 +463,7 @@ export class SellerFlow {
     // checked above, before it ran, is not evidence that any margin still remains now that it
     // has returned. Re-read chain time and re-apply the identical claimByMs/margin guards
     // immediately before ever calling `claim()` — never trusting the earlier reading alone.
-    const chainTimeAfterVerifyMs = await rail.latestBlockTimestampMs();
+    const chainTimeAfterVerifyMs = await connected.chainTimeMs();
     const chainNowAfterVerify = Math.max(chainTimeAfterVerifyMs, this.clock());
     if (chainNowAfterVerify >= offerA.claimByMs) {
       throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time, re-checked after verifyLockFinal) (E4)");
@@ -501,13 +476,13 @@ export class SellerFlow {
       );
     }
 
-    // E4: `EvmHtlcRail.claim` re-checks this same bound once more, against its own freshly-read
-    // `pending` chain time, immediately before it actually broadcasts (defense in depth against
-    // however long its own two preimage-free pre-checks (E5) themselves take).
+    // E4: the leg-A rail's own `claim` re-checks this same bound once more, against its own
+    // freshly-read chain time, immediately before it actually broadcasts (defense in depth
+    // against however long its own preimage-free pre-checks (E5) themselves take).
     const notAfterMs = offerA.refundAfterMs - EVM_LOCAL_POLICY.claimInclusionMarginMs;
-    const before = this.rpc.exchanges().length;
-    const writeEvidence = await rail.claim(hashLockHex, this.hashLock.preimage as Hex, notAfterMs);
-    this.writeExchanges.push(...this.rpc.exchanges().slice(before)); // B5
+    const before = connected.exchanges.length;
+    const writeEvidence = await connected.claim(hashLockHex, this.hashLock.preimage, notAfterMs);
+    this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
 
     const reveal = options?.skipReveal === true
       ? undefined

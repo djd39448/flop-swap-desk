@@ -45,6 +45,7 @@ import { encodeEventTopics, encodeFunctionData, encodeFunctionResult, getAddress
 import { describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
+import { createEvmCounterRail } from "../src/client/evm-rail.js";
 import { SellerFlow } from "../src/client/seller.js";
 import { MemoryVenue } from "../src/client/venue.js";
 import { EVM_LOCAL_POLICY } from "../src/client/policy.js";
@@ -181,18 +182,14 @@ function harness(buyerTag: number, sellerTag: number, opts?: { buyerRpc?: Captur
     identity: buyer,
     venue,
     paperRail: new PaperRail(noteStore, clock),
-    account: BUYER_ACCOUNT,
-    rpc: opts?.buyerRpc ?? unreachableRpc(),
-    evmConfig: config,
+    rail: createEvmCounterRail({ config, rpc: opts?.buyerRpc ?? unreachableRpc(), account: BUYER_ACCOUNT, clock }),
     clock,
   });
   const sellerFlow = new SellerFlow({
     identity: seller,
     venue,
     paperRail: new PaperRail(noteStore, clock),
-    account: SELLER_ACCOUNT,
-    rpc: opts?.sellerRpc ?? unreachableRpc(),
-    evmConfig: config,
+    rail: createEvmCounterRail({ config, rpc: opts?.sellerRpc ?? unreachableRpc(), account: SELLER_ACCOUNT, clock }),
     clock,
   });
   return { buyer, seller, venue, clockRef, clock, buyerFlow, sellerFlow };
@@ -627,9 +624,12 @@ function secondSellerFlow(h: Harness, tag: number): SellerFlow {
     identity: ident(tag),
     venue: h.venue,
     paperRail: new PaperRail(new MemoryNoteStore(), h.clock),
-    account: addr(`client-flows-seller2-account-${tag}`),
-    rpc: unreachableRpc(),
-    evmConfig: evmConfig(),
+    rail: createEvmCounterRail({
+      config: evmConfig(),
+      rpc: unreachableRpc(),
+      account: addr(`client-flows-seller2-account-${tag}`),
+      clock: h.clock,
+    }),
     clock: h.clock,
   });
 }
@@ -755,18 +755,14 @@ describe("SellerFlow.lockLegB / reconcileLegB — E2 (leg-B latch never reopens)
       identity: buyer,
       venue,
       paperRail: new PaperRail(new MemoryNoteStore(), clock),
-      account: BUYER_ACCOUNT,
-      rpc: unreachableRpc(),
-      evmConfig: config,
+      rail: createEvmCounterRail({ config, rpc: unreachableRpc(), account: BUYER_ACCOUNT, clock }),
       clock,
     });
     const sellerFlow = new SellerFlow({
       identity: seller,
       venue,
       paperRail: new PaperRail(flakyStore, clock),
-      account: SELLER_ACCOUNT,
-      rpc: unreachableRpc(),
-      evmConfig: config,
+      rail: createEvmCounterRail({ config, rpc: unreachableRpc(), account: SELLER_ACCOUNT, clock }),
       clock,
     });
     void buyerFlow;
