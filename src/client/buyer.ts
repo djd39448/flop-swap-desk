@@ -177,6 +177,15 @@ export class BuyerFlow {
    *  with `rails: ["evm-htlc"]` and `feeBps` 0 (every deployment we operate). */
   async bid(params: BidParams): Promise<OfferFrame> {
     if (this.offerA !== undefined) throw new Error("buyer: already bid for this flow");
+    // P4-BTC-FIXES-R3.md K3: refuse a bid whose declared asset does not match this rail's own
+    // single settled asset (a rail that declares one at all — evm-htlc's own asset book already
+    // fails closed on an unconfigured asset, so it never sets `assetId` and this never fires for
+    // EVM: no behaviour change there).
+    if (this.rail.assetId !== undefined && params.asset !== this.rail.assetId) {
+      throw new Error(
+        `buyer: refusing to bid asset "${params.asset}" — this rail only ever settles "${this.rail.assetId}" (K3)`,
+      );
+    }
     // G6: refuse an amount this rail could never actually lock (below the fixed spend fee plus
     // the worst-case dust limit, with margin) before ever posting a public offer for it.
     if (belowMinLockable(this.rail, params.amount)) {
@@ -394,6 +403,15 @@ export class BuyerFlow {
     if (!deadlineCheck.ok) {
       throw new Error(
         `buyer: refusing to lock leg A — deadlines are no longer safe at lock time (B3): ${deadlineCheck.violations.join("; ")}`,
+      );
+    }
+
+    // K3: re-check the asset at lock time too — defense in depth, since `offerA.asset` cannot
+    // have changed since `bid()` already checked it, but spending real value is exactly the
+    // place to check "should never" rather than assume it.
+    if (this.rail.assetId !== undefined && offerA.asset !== this.rail.assetId) {
+      throw new Error(
+        `buyer: refusing to lock leg A — asset "${offerA.asset}" does not match this rail's own asset "${this.rail.assetId}" (K3)`,
       );
     }
 

@@ -122,13 +122,16 @@ class FakeCounterAssetRail implements CounterAssetRail {
   readonly caip2 = "bip122:0f9188f13cb7b2c71f2a335e3a4fc328";
   readonly policy = BTC_LOCAL_POLICY;
   readonly minLockableAmount: string | undefined;
+  readonly assetId: string | undefined;
   connectCalls = 0;
 
   constructor(
     private readonly script: FakeRailScript,
     minLockableAmount?: string,
+    assetId?: string,
   ) {
     this.minLockableAmount = minLockableAmount;
+    this.assetId = assetId;
   }
 
   formatAccountLine(pubkey: string): string {
@@ -241,6 +244,61 @@ describe("G6 — the Bitcoin rail's amount floor", () => {
     await expect(h.sellerFlow.acceptLegA(offerA, legBDeadlines(), legADeadlines(6 * 60 * 60_000).lockTimeMs)).rejects.toThrow(
       /below this rail's minimum lockable amount/,
     );
+  });
+});
+
+// ── K3: the Bitcoin leg checks its asset ─────────────────────────────────────────────────────
+
+describe("K3 — the Bitcoin rail checks its asset", () => {
+  it("BuyerFlow.bid refuses a 'USDC'-labelled leg against a btc-htlc rail, before ever touching it", async () => {
+    const rail = new FakeCounterAssetRail({}, undefined, "BTC");
+    const h = harness(rail, new FakeCounterAssetRail({}));
+    await expect(
+      h.buyerFlow.bid({
+        swapId: computeSwapId(h.buyer.did, "00000001"),
+        wantAsset: "FLOP",
+        wantAmount: "1",
+        wantRail: "flop-htlc",
+        asset: "USDC", // the reviewer's mislabelled leg
+        amount: "1000000",
+        ...legADeadlines(6 * 60 * 60_000),
+      }),
+    ).rejects.toThrow(/asset "USDC".*only ever settles "BTC"/);
+    expect(rail.connectCalls).toBe(0);
+  });
+
+  it("SellerFlow.acceptLegA refuses a 'USDC'-labelled leg even though the Buyer's own rail let it through", async () => {
+    // A Buyer whose own rail declares no asset restriction (simulating a careless/malicious
+    // Buyer, or a differently-configured rail) successfully bids a mislabelled leg; the Seller's
+    // own rail DOES check, and must refuse to accept it — never trusting the Buyer.
+    const h = harness(new FakeCounterAssetRail({}), new FakeCounterAssetRail({}, undefined, "BTC"));
+    const offerA = await h.buyerFlow.bid({
+      swapId: computeSwapId(h.buyer.did, "00000001"),
+      wantAsset: "FLOP",
+      wantAmount: "1",
+      wantRail: "flop-htlc",
+      asset: "USDC",
+      amount: "1000000",
+      ...legADeadlines(6 * 60 * 60_000),
+    });
+    await expect(h.sellerFlow.acceptLegA(offerA, legBDeadlines(), legADeadlines(6 * 60 * 60_000).lockTimeMs)).rejects.toThrow(
+      /asset "USDC".*does not match this rail's own asset "BTC"/,
+    );
+  });
+
+  it("a rail with no declared assetId (evm-htlc-shaped) never triggers the check, matching pre-K3 behaviour", async () => {
+    const rail = new FakeCounterAssetRail({}); // assetId left undefined, like evm-rail.ts's real adapter
+    const h = harness(rail, new FakeCounterAssetRail({}));
+    const offerA = await h.buyerFlow.bid({
+      swapId: computeSwapId(h.buyer.did, "00000001"),
+      wantAsset: "FLOP",
+      wantAmount: "1",
+      wantRail: "flop-htlc",
+      asset: "USDC",
+      amount: "1000000",
+      ...legADeadlines(6 * 60 * 60_000),
+    });
+    expect(offerA.asset).toBe("USDC");
   });
 });
 

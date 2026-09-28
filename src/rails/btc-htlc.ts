@@ -56,6 +56,21 @@ export interface BtcRailConfig {
    *  chain's own tip. Recorded verbatim in every capture's own `config` (A4) so a replay applies
    *  the exact bound the live sweep used. Defaults to `DEFAULT_SCAN_WINDOW_BLOCKS` when omitted. */
   scanWindowBlocks?: number;
+  /** P4-BTC-FIXES-R3.md K3: the asset id this rail's own satoshis settle — an offer's declared
+   *  `LockTerms.asset` must equal this before the Bitcoin rail ever locks/verifies/claims/refunds
+   *  it (the reviewer's exploit: an offer labelled "USDC" against a `btc-htlc` leg, which this
+   *  rail happily locked/verified before this fix, since nothing here ever checked the label
+   *  against what it actually settles). Defaults to `BTC_ASSET_ID` when omitted. */
+  asset?: string;
+}
+
+/** P4-BTC-FIXES-R3.md K3: this build's own single settled asset — see `BtcRailConfig.asset`. */
+export const BTC_ASSET_ID = "BTC";
+
+/** `config.asset`, defaulted to `BTC_ASSET_ID` — the one place every asset check in this file
+ *  (and `btc-evidence.ts`) reads the configured asset id from. */
+export function assetIdFor(config: BtcRailConfig): string {
+  return config.asset ?? BTC_ASSET_ID;
 }
 
 /** P4-BTC-FIXES.md H4: ~2 weeks of mainnet blocks (10-minute spacing) — generous for regtest,
@@ -153,6 +168,11 @@ export function btcRailConfigShapeReason(value: unknown): string | null {
   if (typeof v.endpoint !== "string" || v.endpoint === "") return "btc rail config: endpoint must be a non-empty string";
   if (v.scanWindowBlocks !== undefined && (typeof v.scanWindowBlocks !== "number" || !Number.isInteger(v.scanWindowBlocks) || v.scanWindowBlocks <= 0)) {
     return "btc rail config: scanWindowBlocks must be a positive integer when present";
+  }
+  // K3: optional here (defaults to BTC_ASSET_ID via assetIdFor) — only its shape is checked;
+  // btcEvidence/the client flows are what compare it against a leg's own declared asset.
+  if (v.asset !== undefined && (typeof v.asset !== "string" || v.asset === "")) {
+    return "btc rail config: asset must be a non-empty string when present";
   }
   return null;
 }

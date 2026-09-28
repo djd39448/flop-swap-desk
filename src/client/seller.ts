@@ -240,6 +240,15 @@ export class SellerFlow {
       throw new Error(`seller: refusing to accept an unsafe leg A offer: ${orientation.reason}`);
     }
 
+    // P4-BTC-FIXES-R3.md K3: refuse an offer whose declared asset does not match this rail's own
+    // single settled asset — before ever minting a statement or posting anything for it (a rail
+    // that declares no single asset, e.g. evm-htlc, never triggers this: no behaviour change).
+    if (this.rail.assetId !== undefined && offerA.asset !== this.rail.assetId) {
+      throw new Error(
+        `seller: refusing to accept leg A — asset "${offerA.asset}" does not match this rail's own asset "${this.rail.assetId}" (K3)`,
+      );
+    }
+
     // P4-BTC-FIXES.md G6: refuse an amount this rail could never actually lock (below the fixed
     // spend fee plus the worst-case dust limit, with margin) before ever minting a statement or
     // posting anything for it.

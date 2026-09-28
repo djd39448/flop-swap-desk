@@ -269,6 +269,18 @@ describe("btcEvidence — locked", () => {
     expect(result.rail).toEqual({ status: "locked", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: `btc-regtest:confirmations-2:108:${FUNDING_BLOCK_HASH}` });
   });
 
+  // P4-BTC-FIXES-R3.md K3: the reviewer's "USDC"-labelled leg against a real, genuinely-matching
+  // BTC escrow must never verify — this rail only ever settles ONE asset, and the leg's own
+  // declared asset must equal it before anything else is even checked.
+  it("K3: a genuinely-matching escrow never verifies when terms.asset names a different asset", () => {
+    const capture = buildCapture({ exchanges: unspentExchanges(3) });
+    const mislabelledTerms: LockTerms = { ...TERMS, asset: "USDC" };
+    const result = btcEvidence({ terms: mislabelledTerms, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBe(false);
+    expect(result.lock.reason).toMatch(/leg asset "USDC" does not match this rail's own asset "BTC"/);
+    expect(result.rail).toBeUndefined();
+  });
+
   // P4-BTC-FIXES-R2.md R2-6: every OTHER test in this file passes `unspentExchanges(confirmations)`
   // with its default `fundingHeight` (`TIP_HEIGHT - confirmations + 1`) — the exact formula H6
   // banned — so none of them can tell "btcEvidence trusts the real getblockheader read" apart from

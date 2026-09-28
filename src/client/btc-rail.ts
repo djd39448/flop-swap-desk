@@ -26,6 +26,7 @@ import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 import { formatPubkeyLine, resolvePubkeys } from "../rails/account-line.js";
 import { btcEvidence, captureBtcLeg, BTC_RAIL_ID, type BtcAccounts, type BtcCapture } from "../rails/btc-evidence.js";
 import {
+  assetIdFor,
   BTC_MIN_LOCKABLE_SATS,
   BtcHtlcRail,
   type BtcHtlcTerms,
@@ -227,11 +228,14 @@ class BtcCounterRail implements CounterAssetRail {
   /** G6: the fixed fee plus the worst-case dust limit, with margin — see
    *  `BTC_MIN_LOCKABLE_SATS`'s own doc. */
   readonly minLockableAmount: string = BTC_MIN_LOCKABLE_SATS.toString();
+  /** K3: the asset id this configured rail settles (`config.asset`, defaulted to `BTC_ASSET_ID`). */
+  readonly assetId: string;
   private readonly options: BtcCounterRailOptions;
 
   constructor(options: BtcCounterRailOptions) {
     this.options = options;
     this.caip2 = options.config.pin.caip2;
+    this.assetId = assetIdFor(options.config);
   }
 
   /** D-08/§6: a `btc-htlc` leg posts a *pubkey* line, not an account/address line — the P2WSH

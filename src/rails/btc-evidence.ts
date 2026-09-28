@@ -60,7 +60,7 @@ import {
   bytesEqual,
   locktimeFromRefundAfterMs,
 } from "./btc-script.js";
-import { checkBtcRailConfig, scanWindowFor, type BtcChainPin, type BtcRailConfig } from "./btc-htlc.js";
+import { assetIdFor, checkBtcRailConfig, scanWindowFor, type BtcChainPin, type BtcRailConfig } from "./btc-htlc.js";
 import { readCapture, RpcCaptureError, type CapturingRpc, type Exchange } from "./rpc-capture.js";
 import type { LockEvidence, RailObservation } from "../types.js";
 
@@ -360,6 +360,20 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
         ...base,
         railVerified: false,
         reason: 'btc-htlc: ref/lock mismatch (ref must look like "<64-hex txid>:<vout>", lock must be "hash", and statement must be a sha256 hash lock)',
+      },
+    };
+  }
+  // P4-BTC-FIXES-R3.md K3: this rail only ever settles ONE asset (its own satoshis) — a leg
+  // whose declared `terms.asset` names anything else (the reviewer's "USDC"-labelled leg against
+  // a real btc-htlc escrow) must never verify, no matter how genuine the underlying chain state
+  // is. Checked before any network-bound field, exactly like the ref/lock shape check above.
+  const expectedAsset = assetIdFor(config);
+  if (terms.asset !== expectedAsset) {
+    return {
+      lock: {
+        ...base,
+        railVerified: false,
+        reason: `btc-htlc: leg asset "${terms.asset}" does not match this rail's own asset "${expectedAsset}" (K3)`,
       },
     };
   }

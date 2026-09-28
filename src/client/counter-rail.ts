@@ -213,6 +213,14 @@ export interface CounterAssetRail {
    *  ERC20 balance has no dust concept). `BuyerFlow.bid`/`lockLegA` and `SellerFlow.acceptLegA`
    *  refuse an amount below this before ever touching the network. */
   readonly minLockableAmount?: string;
+
+  /** P4-BTC-FIXES-R3.md K3: the one asset id this rail ever settles (`"BTC"` for `btc-htlc`) —
+   *  `undefined` for a rail that settles more than one (`evm-htlc`'s own asset book already fails
+   *  closed on an unconfigured asset at write time, so it declares no single id here: no
+   *  behaviour change for EVM). `BuyerFlow.bid`/`lockLegA` and `SellerFlow.acceptLegA` refuse an
+   *  offer whose declared asset differs from this, before ever touching the network, whenever a
+   *  rail declares one. */
+  readonly assetId?: string;
 }
 
 /** P4-BTC-FIXES.md G6: `true` iff `amount` (a decimal-integer string, this rail's own smallest
