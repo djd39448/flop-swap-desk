@@ -549,7 +549,9 @@ describe("captureEvmLeg + evmEvidence — live vs replay equivalence", () => {
       const body = JSON.parse(String(init?.body)) as { method: string; id: number };
       nextId += 1;
       const template = JSON.parse(responses[body.method] ?? "{}") as { result: unknown };
-      return { text: async () => jsonRpcResult(body.id, template.result) } as Response;
+      const text = jsonRpcResult(body.id, template.result);
+      const bytes = new TextEncoder().encode(text);
+      return { text: async () => text, arrayBuffer: async () => bytes.buffer } as Response;
     }) as typeof fetch;
 
     const rpc = new CapturingRpc({ endpoint: "http://127.0.0.1:9999", fetch: fetchImpl, clock: () => CHECKED_AT_MS });

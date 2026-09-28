@@ -29,7 +29,8 @@ function fakeFetch(bodies: string[]): { fetch: typeof fetch; calls: Array<{ url:
     const body = bodies[i];
     i += 1;
     if (body === undefined) throw new Error("fakeFetch: ran out of canned responses");
-    return { text: async () => body } as Response;
+    const bytes = new TextEncoder().encode(body);
+    return { text: async () => body, arrayBuffer: async () => bytes.buffer } as Response;
   }) as typeof fetch;
   return { fetch: fetchImpl, calls };
 }
@@ -95,6 +96,63 @@ describe("CapturingRpc.request", () => {
     await expect(rpc.request({ method: "eth_chainId", params: [] })).rejects.toThrow();
     expect(rpc.exchanges()).toHaveLength(1);
     expect(rpc.exchanges()[0]?.responseBody).toBe("not json at all");
+  });
+
+  // P22-P24-EVM-FIXES.md A9: hash the wire bytes via arrayBuffer(), never a `.text()`
+  // decode/re-encode round trip, and abort a stalled call instead of hanging forever.
+  it("hashes the exact wire bytes from arrayBuffer(), never calling text() to do it", async () => {
+    const trueBytes = new TextEncoder().encode('{"jsonrpc":"2.0","id":1,"result":"0x1"}');
+    const fetchImpl = (async () => ({
+      text: async () => {
+        throw new Error("must not call text() to hash the response");
+      },
+      arrayBuffer: async () => trueBytes.buffer,
+    })) as unknown as typeof fetch;
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl });
+
+    await rpc.request({ method: "eth_chainId", params: [] });
+
+    const [exchange] = rpc.exchanges();
+    expect(exchange?.responseSha256).toBe(sha256Hex(new TextDecoder().decode(trueBytes)));
+    expect(exchange?.responseBody).toBe(new TextDecoder().decode(trueBytes));
+  });
+
+  it("passes an AbortSignal to fetch on every call", async () => {
+    let sawSignal: AbortSignal | undefined;
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      sawSignal = init?.signal ?? undefined;
+      const body = '{"jsonrpc":"2.0","id":1,"result":"0x1"}';
+      const bytes = new TextEncoder().encode(body);
+      return { text: async () => body, arrayBuffer: async () => bytes.buffer } as Response;
+    }) as typeof fetch;
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl, timeoutMs: 5_000 });
+
+    await rpc.request({ method: "eth_chainId", params: [] });
+
+    expect(sawSignal).toBeInstanceOf(AbortSignal);
+    expect(sawSignal?.aborted).toBe(false);
+  });
+
+  it("aborts a stalled request after timeoutMs, so a dead RPC endpoint cannot hang a sweep", async () => {
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      });
+    }) as typeof fetch;
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl, timeoutMs: 20 });
+
+    await expect(rpc.request({ method: "eth_chainId", params: [] })).rejects.toThrow(/abort/i);
+  });
+
+  it("never aborts when timeoutMs is not configured (the default)", async () => {
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      const body = '{"jsonrpc":"2.0","id":1,"result":"0x1"}';
+      const bytes = new TextEncoder().encode(body);
+      expect(init?.signal?.aborted).toBe(false);
+      return { text: async () => body, arrayBuffer: async () => bytes.buffer } as Response;
+    }) as typeof fetch;
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl });
+    await expect(rpc.request({ method: "eth_chainId", params: [] })).resolves.toBe("0x1");
   });
 
   it("exchanges() peeks without clearing; drain() takes and clears", async () => {

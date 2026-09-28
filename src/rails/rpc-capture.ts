@@ -59,6 +59,12 @@ export interface CapturingRpcOptions {
   fetch?: typeof fetch;
   /** Defaults to `Date.now`. Injected per the house rule: no clock in an untested corner. */
   clock?: () => number;
+  /** P22-P24-EVM-FIXES.md A9: aborts a call that has not answered within this many ms, so one
+   *  stalled/unreachable RPC endpoint can never hang a sweep forever. `undefined` (the
+   *  default) never aborts on its own — a caller that wants this protection passes its own
+   *  `timeoutMs` (`src/watcher.ts`'s sweep passes the same `timeoutMs` it uses for every other
+   *  fetch). */
+  timeoutMs?: number;
 }
 
 /**
@@ -77,6 +83,7 @@ export class CapturingRpc implements CaptureSink {
   readonly endpoint: string;
   private readonly fetchImpl: typeof fetch;
   private readonly clock: () => number;
+  private readonly timeoutMs: number | undefined;
   private readonly log: Exchange[] = [];
   private nextId = 1;
 
@@ -84,6 +91,7 @@ export class CapturingRpc implements CaptureSink {
     this.endpoint = options.endpoint;
     this.fetchImpl = options.fetch ?? fetch;
     this.clock = options.clock ?? Date.now;
+    this.timeoutMs = options.timeoutMs;
   }
 
   async request({ method, params }: { method: string; params?: unknown }): Promise<unknown> {
@@ -92,13 +100,32 @@ export class CapturingRpc implements CaptureSink {
     const requestBody = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? [] });
     const atMs = this.clock();
 
-    const response = await this.fetchImpl(this.endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: requestBody,
-    });
-    const responseBody = await response.text();
-    const responseSha256 = bytesToHex(sha256(new TextEncoder().encode(responseBody)));
+    // A9: a stalled/unreachable endpoint must not be able to hang a sweep forever — abort
+    // after `timeoutMs` (when the caller configured one) exactly like `src/watcher.ts`'s own
+    // `fetchWithTimeout` does for its technocore reads.
+    const controller = new AbortController();
+    const timer = this.timeoutMs === undefined ? undefined : setTimeout(() => controller.abort(), this.timeoutMs);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(this.endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: requestBody,
+        signal: controller.signal,
+      });
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+
+    // A9: hash and store the exact wire bytes (`arrayBuffer()`), never a UTF-8 decode/re-encode
+    // round trip through `.text()` — a response containing bytes that are not valid UTF-8
+    // would decode with lossy replacement characters, so hashing the *decoded* string could
+    // never reproduce the sha256 of what the server actually sent. `responseBody` (used for
+    // JSON parsing below and for whatever a caller does with the exchange afterward) is
+    // decoded from that same byte buffer, once, as a separate copy.
+    const responseBytes = new Uint8Array(await response.arrayBuffer());
+    const responseSha256 = bytesToHex(sha256(responseBytes));
+    const responseBody = new TextDecoder("utf-8").decode(responseBytes);
     this.log.push({ method, params: params ?? [], requestBody, responseBody, responseSha256, atMs });
 
     let parsed: unknown;

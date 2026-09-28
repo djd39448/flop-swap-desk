@@ -864,7 +864,9 @@ describe("runSweep", () => {
             "errorMessage" in outcome
               ? { jsonrpc: "2.0", id: parsed.id, error: { code: -32000, message: outcome.errorMessage } }
               : { jsonrpc: "2.0", id: parsed.id, result: outcome.result };
-          return { status: 200, text: async () => JSON.stringify(envelope) } as Response;
+          const text = JSON.stringify(envelope);
+          const bytes = new TextEncoder().encode(text);
+          return { status: 200, text: async () => text, arrayBuffer: async () => bytes.buffer } as Response;
         }
         const outcome = opts.technocore(url);
         return { status: outcome.status, text: async () => outcome.body } as Response;

@@ -114,7 +114,9 @@ function mockCapturingRpc(handlers: Record<string, Responder>): { rpc: Capturing
       response.error !== undefined
         ? { jsonrpc: "2.0", id: body.id, error: response.error }
         : { jsonrpc: "2.0", id: body.id, result: response.result };
-    return { text: async () => JSON.stringify(envelope) } as Response;
+    const text = JSON.stringify(envelope);
+    const bytes = new TextEncoder().encode(text);
+    return { text: async () => text, arrayBuffer: async () => bytes.buffer } as Response;
   }) as typeof fetch;
   const rpc = new CapturingRpc({ endpoint: "http://mock-anvil", fetch: fetchImpl, clock: () => 1_700_000_500_000 });
   return { rpc, calls };
