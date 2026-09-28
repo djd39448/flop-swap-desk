@@ -73,6 +73,20 @@ export const ANVIL_LOCAL_PIN: EvmChainPin = {
  *  a typo, a future mainnet) is refused by default instead of silently let through. */
 const ALLOWED_CHAIN_IDS: ReadonlySet<number> = new Set([31337, 84532]);
 
+/** P22-P24-EVM-FIXES-R2.md C5: the one canonical name each allow-listed chain id may be pinned
+ *  under — checked in `validateEvmRailConfig` alongside the allow list itself, so a config
+ *  cannot pin a legitimate chain id (31337, 84532) under some other name. Without this, a
+ *  config's `pin.name` (which ends up inside every `finalizedRef` this build writes, and in
+ *  `MAINNET_DENY_LIST` lookups) could disagree with the chain id it is actually numerically
+ *  pinned to — e.g. claiming "base-sepolia" for a config actually pinned to 31337 — letting a
+ *  captured or replayed config's own provenance strings lie about which deployment produced
+ *  them, even though `pin.caip2 === "eip155:" + pin.chainId` (checked separately, in
+ *  `evmRailConfigShapeReason`) already held. */
+const CANONICAL_PIN_NAMES: ReadonlyMap<number, string> = new Map([
+  [31337, "anvil-local"],
+  [84532, "base-sepolia"],
+]);
+
 /** Kept only to name a well-known mainnet in the refusal message when the offending chain id
  *  happens to be one of these — the allow list above is what actually gates a chain id now,
  *  never this map (A3: "the old named list stays only to give a better error message"). */
@@ -117,6 +131,14 @@ export function validateEvmRailConfig(config: EvmRailConfig): void {
     throw new Error(
       `evm-htlc: chain id ${config.pin.chainId} is not on the allow list (31337 anvil-local, 84532 base-sepolia only)` +
         (denyName !== undefined ? `; ${config.pin.chainId} is ${denyName}` : ""),
+    );
+  }
+  // C5: the chain id is on the allow list, but is it pinned under *its* canonical name? A
+  // config that got chainId right and name wrong would otherwise pass every other check here.
+  const canonicalName = CANONICAL_PIN_NAMES.get(config.pin.chainId);
+  if (canonicalName !== undefined && config.pin.name !== canonicalName) {
+    throw new Error(
+      `evm-htlc: chain id ${config.pin.chainId} must be pinned as "${canonicalName}", got "${config.pin.name}"`,
     );
   }
   for (const [asset, address] of Object.entries(config.assets)) {
@@ -354,14 +376,26 @@ export class EvmHtlcRail {
   }
 
   /**
-   * Async factory (§2.2 point 1): validates the config statically (deny list, D-09 asset
-   * check, finality knobs), then calls `eth_chainId` and refuses — throws — when it differs
-   * from `options.config.pin`, naming both ids and the deny-list name for whichever one is
-   * denied (the pin itself was already cleared by the static check, so only a connected chain
-   * that turns out to be a denied one can still name itself here).
+   * Async factory (§2.2 point 1): validates the config statically, then calls `eth_chainId` and
+   * refuses — throws — when it differs from `options.config.pin`, naming both ids and the
+   * deny-list name for whichever one is denied (the pin itself was already cleared by the
+   * static check, so only a connected chain that turns out to be a denied one can still name
+   * itself here).
+   *
+   * P22-P24-EVM-FIXES-R2.md C5: runs the *full* `checkEvmRailConfig` (shape — including
+   * `pin.caip2 === "eip155:" + pin.chainId` — plus the A3 allow list, the D-09 asset check, the
+   * new C5 pin-name-tied-to-chain-id check, and finality knob sanity), never just the "config is
+   * already well-typed" half `validateEvmRailConfig` alone used to run here. `options.config` is
+   * compiler-checked at this call site today, but this constructor is not the only path a config
+   * can reach it through — a client flow's `evmConfig` can just as easily have come from a parsed
+   * file as a watcher's or replay's config can, and TypeScript offers no protection once JS
+   * actually runs. Every entry point now runs the same one rule.
    */
   static async connect(options: EvmHtlcRailOptions): Promise<EvmHtlcRail> {
-    validateEvmRailConfig(options.config);
+    const configCheck = checkEvmRailConfig(options.config);
+    if (!configCheck.ok) {
+      throw new Error(`evm-htlc: refusing to connect — ${configCheck.reason}`);
+    }
 
     const chain = chainFromPin(options.config.pin);
     const transport = custom(options.rpc);
@@ -499,9 +533,21 @@ export class EvmHtlcRail {
     }
   }
 
-  /** B2: `eth_call` the vendored contract's own `claim(hashLock, preimage)` at `latest` through
-   *  this rail's `walletClient.account` — never broadcasts. Throws (never broadcasts) when the
-   *  simulation reverts, for any reason. */
+  /** `eth_call` the vendored contract's own `claim(hashLock, preimage)` through this rail's
+   *  `walletClient.account` — never broadcasts. Throws (never broadcasts) when the simulation
+   *  reverts, for any reason.
+   *
+   *  P22-P24-EVM-FIXES-R2.md C3: judged at the `pending` block, never `latest`. An idle chain's
+   *  `latest` block can lag real time indefinitely — nothing forces a new block just because
+   *  time passes — so simulating against it can see a stale "still within `refundAfterMs`"
+   *  reading for a claim that will actually land well after `refundAfterMs` once it is finally
+   *  mined (the contract's own `claim()` also enforces `block.timestamp * 1000 <
+   *  refundAfterMs`, and a claim that reverts on-chain still publishes the secret in its own
+   *  calldata the moment it is broadcast — USD-COIN-FIT-2026-09-28). `pending` is every EVM
+   *  node's own best-effort next-block timestamp (`max(parent + 1, wall clock)` on anvil,
+   *  empirically verified 2026-09-28 against anvil 1.8.3 — it visibly tracks real elapsed time
+   *  during an idle gap where `latest` does not move), so it never reports a time earlier than
+   *  the one this claim will actually be evaluated at once sent. */
   private async simulateClaimOrThrow(hashLock: Hex, secret: Hex): Promise<void> {
     try {
       await this.publicClient.simulateContract({
@@ -510,6 +556,7 @@ export class EvmHtlcRail {
         functionName: "claim",
         args: [hashLock, secret],
         account: this.walletClient.account,
+        blockTag: "pending",
       });
     } catch (err) {
       throw new Error(`evm-htlc: refusing to broadcast claim — it simulates to a revert (${extractShortMessage(err)})`);

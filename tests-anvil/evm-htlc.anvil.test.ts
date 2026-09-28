@@ -226,4 +226,50 @@ describe("EvmHtlcRail against a real anvil node", () => {
     const refundEvidence = await rail.refund(hashLock.hash as Hex);
     expect(refundEvidence.event).toBe("Refunded");
   }, 30_000);
+
+  // P22-P24-EVM-FIXES-R2.md C3: the pre-claim simulation must never judge a claim against a
+  // stale `latest` block. This test pushes anvil's own *pending* block timestamp (via
+  // `evm_setNextBlockTimestamp`, never mining) past `refundAfterMs` while `latest` stays
+  // exactly where the lock left it, comfortably before `refundAfterMs` — proving the simulation
+  // is judged at `pending`, not `latest` (a `latest`-only simulation would see no problem and
+  // let this claim broadcast, exactly the leak USD-COIN-FIT-2026-09-28 describes). Left last in
+  // this file: `evm_setNextBlockTimestamp` leaves its override queued for whatever block mines
+  // next, which would otherwise contaminate a later test's own deadline arithmetic.
+  it("C3: claim refuses to broadcast when the pending block is already past refundAfterMs, even though latest is not", async () => {
+    const hashLock = generateHashLock();
+    const rail = await EvmHtlcRail.connect({ config, rpc: freshRpc(), account: payer, addressBook, clock: RAIL_CLOCK });
+
+    const latestBlock = await anvil.rpcCall<{ timestamp: Hex }>("eth_getBlockByNumber", ["latest", false]);
+    const nowMs = Number.parseInt(latestBlock.timestamp, 16) * 1000;
+
+    const terms: LockTerms = {
+      contract: "0x" + "33".repeat(32),
+      lock: "hash",
+      statement: hashLock.hash,
+      amount: "250000",
+      asset: "USDC",
+      payer: PAYER_DID,
+      payee: PAYEE_DID,
+      claimByMs: nowMs + 5 * 60_000,
+      refundAfterMs: nowMs + 10 * 60_000,
+    };
+
+    await rail.approve("USDC", terms.amount);
+    await rail.lock(terms, 0);
+
+    // Push the *pending* block's timestamp past refundAfterMs without mining a new block —
+    // "latest" stays exactly at the lock's own block, well before refundAfterMs.
+    const pastRefundSeconds = Math.ceil(terms.refundAfterMs / 1000) + 1;
+    await anvil.rpcCall("evm_setNextBlockTimestamp", [pastRefundSeconds]);
+
+    const blockNumberBefore = await anvil.rpcCall<Hex>("eth_blockNumber", []);
+
+    await expect(rail.claim(hashLock.hash as Hex, hashLock.preimage as Hex)).rejects.toThrow(
+      /refusing to broadcast claim — it simulates to a revert/,
+    );
+
+    // Never broadcast: no new block was ever mined for this attempt.
+    const blockNumberAfter = await anvil.rpcCall<Hex>("eth_blockNumber", []);
+    expect(blockNumberAfter).toBe(blockNumberBefore);
+  }, 30_000);
 });

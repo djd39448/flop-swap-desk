@@ -1036,13 +1036,20 @@ describe("evmEvidence — D3: a captured finality can never be weaker than the a
   });
 
   it("the captured config's own endpoint and pin name are what LockEvidence reports, not the auditor's", () => {
-    const capturedConfig: EvmRailConfig = { ...CONFIG, endpoint: "http://captured-endpoint:1234", pin: { ...PIN, name: "captured-pin-name" } };
-    const auditorConfig: EvmRailConfig = { ...CONFIG, endpoint: "http://auditor-endpoint:5678" };
+    // P22-P24-EVM-FIXES-R2.md C5: the captured config is the one `checkEvmRailConfig` actually
+    // validates here (A4/D3, above), so its own `pin.name` must be the canonical one for its
+    // chain id ("anvil-local" for 31337) — unlike `endpoint`, a free-form string no C5 rule
+    // constrains. The auditor's own config is the trust anchor an *upstream* caller (watcher.ts,
+    // audit-export.mjs) already ran through `checkEvmRailConfig` before ever reaching this pure
+    // function, so this test is free to give it a distinguishing (if fictitious) pin name to
+    // prove which one wins.
+    const capturedConfig: EvmRailConfig = { ...CONFIG, endpoint: "http://captured-endpoint:1234" };
+    const auditorConfig: EvmRailConfig = { ...CONFIG, endpoint: "http://auditor-endpoint:5678", pin: { ...PIN, name: "auditor-pin-name" } };
     const capture = buildCapture({ config: capturedConfig, exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
     const result = evmEvidence({ terms: TERMS, config: auditorConfig, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(true);
     expect(result.lock.endpoint).toBe("http://captured-endpoint:1234");
-    expect(result.lock.finalizedRef).toBe(`captured-pin-name:finalized:5:${BLOCK_HASH}`);
+    expect(result.lock.finalizedRef).toBe(`anvil-local:finalized:5:${BLOCK_HASH}`);
   });
 });
 

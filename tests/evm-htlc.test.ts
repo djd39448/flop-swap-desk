@@ -215,6 +215,30 @@ describe("validateEvmRailConfig / connect — chain pin and asset book", () => {
     const config = configFor({ chainId: 31337, name: "anvil-local", caip2: "eip155:31337", finality: { mode: "tag", tag: "finalized", fallbackConfirmations: -1 } });
     expect(() => validateEvmRailConfig(config)).toThrow(/fallbackConfirmations must be a positive integer/);
   });
+
+  // P22-P24-EVM-FIXES-R2.md C5: "one config rule for every entry point" — a chain id that is
+  // otherwise allow-listed and shape-valid, pinned under the *wrong* canonical name.
+  it("C5: refuses a chain id pinned under the wrong canonical name (31337 claimed as base-sepolia)", () => {
+    const config = configFor({ chainId: 31337, name: "base-sepolia", caip2: "eip155:31337", finality: { mode: "tag", tag: "finalized" } });
+    expect(() => validateEvmRailConfig(config)).toThrow(/chain id 31337 must be pinned as "anvil-local", got "base-sepolia"/);
+  });
+
+  it("C5: refuses a chain id pinned under the wrong canonical name (84532 claimed as anvil-local)", () => {
+    const config = configFor({ chainId: 84532, name: "anvil-local", caip2: "eip155:84532", finality: { mode: "tag", tag: "finalized" } });
+    expect(() => validateEvmRailConfig(config)).toThrow(/chain id 84532 must be pinned as "base-sepolia", got "anvil-local"/);
+  });
+
+  // C5: `connect()` used to run only `validateEvmRailConfig` (the allow list, the D-09 asset
+  // check, the finality knobs) — never the shape check (`pin.caip2 === "eip155:" + pin.chainId`)
+  // that `checkEvmRailConfig` also runs. A config whose numeric chain id is fine but whose
+  // `caip2` disagrees with it would have connected without complaint before this fix.
+  it("C5: connect() itself now refuses a config whose pin.caip2 does not match pin.chainId, before ever touching the network", async () => {
+    const config = configFor({ chainId: 31337, name: "anvil-local", caip2: "eip155:1", finality: { mode: "tag", tag: "finalized" } });
+    const { rpc } = mockCapturingRpc({}); // no handlers: connect() must refuse before any RPC call
+    await expect(EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW })).rejects.toThrow(
+      /pin\.caip2 "eip155:1" does not match pin\.chainId 31337/,
+    );
+  });
 });
 
 // P22-P24-EVM-FIXES.md A3: `checkEvmRailConfig` is what every entry point that takes a rail
