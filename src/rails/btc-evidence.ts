@@ -60,8 +60,8 @@ import {
   bytesEqual,
   locktimeFromRefundAfterMs,
 } from "./btc-script.js";
-import { checkBtcRailConfig, type BtcChainPin, type BtcRailConfig } from "./btc-htlc.js";
-import { readCapture, type CapturingRpc, type Exchange } from "./rpc-capture.js";
+import { checkBtcRailConfig, scanWindowFor, type BtcChainPin, type BtcRailConfig } from "./btc-htlc.js";
+import { readCapture, RpcCaptureError, type CapturingRpc, type Exchange } from "./rpc-capture.js";
 import type { LockEvidence, RailObservation } from "../types.js";
 
 export const BTC_RAIL_ID = "btc-htlc";
@@ -279,6 +279,16 @@ function rawTxBlockHash(rawTxResult: unknown): string | null {
   return typeof h === "string" && BLOCK_HASH_SHAPE.test(h) ? h.toLowerCase() : null;
 }
 
+/** H6: the funding (or spending) block's own real height, read directly from `getblockheader` —
+ *  never derived as `tip − confirmations + 1`, which is fragile against any inconsistency between
+ *  two separately-timed reads (a block mined between `getblockchaininfo` and
+ *  `getrawtransaction`, for instance, would silently shift a subtraction-based height by one). */
+function blockHeaderHeight(result: unknown): number | null {
+  if (result === null || typeof result !== "object") return null;
+  const h = (result as { height?: unknown }).height;
+  return typeof h === "number" && Number.isInteger(h) && h >= 0 ? h : null;
+}
+
 function findSpendWitness(blockResult: unknown, txid: string, vout: number): readonly string[] | null {
   if (blockResult === null || typeof blockResult !== "object") return null;
   const txs = (blockResult as { tx?: unknown }).tx;
@@ -369,13 +379,23 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
   const capturedConfig = capturedConfigCheck.config;
   if (
     capturedConfig.pin.network !== config.pin.network ||
-    capturedConfig.pin.genesisHash.toLowerCase() !== config.pin.genesisHash.toLowerCase()
+    capturedConfig.pin.genesisHash.toLowerCase() !== config.pin.genesisHash.toLowerCase() ||
+    capturedConfig.pin.name !== config.pin.name
   ) {
     return { lock: { ...base, railVerified: null, reason: "btc-htlc: capture was taken under a different rail config" } };
   }
   if (capturedConfig.pin.finality.confirmations < config.pin.finality.confirmations) {
     return {
       lock: { ...base, railVerified: null, reason: "btc-htlc: capture's own finality is weaker than the auditor's configured finality (D3)" },
+    };
+  }
+  // H4: a capture cannot silently narrow the auditor's own bounded-scan window either — the same
+  // "cannot claim a weaker check than what was asked for" rule D3 already applies to finality.
+  const capturedScanWindow = scanWindowFor(capturedConfig);
+  const auditorScanWindow = scanWindowFor(config);
+  if (capturedScanWindow < auditorScanWindow) {
+    return {
+      lock: { ...base, railVerified: null, reason: "btc-htlc: capture's own scan window is narrower than the auditor's configured scan window (H4/D3)" },
     };
   }
   const n = config.pin.finality.confirmations;
@@ -430,10 +450,6 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
   if (fundingConfirmations === null || fundingConfirmations < 1 || fundingBlockHash === null) {
     return { lock: { ...base2, railVerified: null, reason: "btc-htlc: funding transaction is not yet confirmed" } };
   }
-  const fundingHeight = tipHeight - fundingConfirmations + 1;
-  if (!Number.isInteger(fundingHeight) || fundingHeight < 1 || fundingHeight > tipHeight) {
-    return { lock: { ...base2, railVerified: null, reason: "btc-htlc: malformed confirmations/height accounting (tampered capture)" } };
-  }
 
   // Position 3: gettxout(txid, vout, false) — confirmed-UTXO-set-only read.
   const txoutBound = bindExchange(capture, exchangeAt(exchanges, 3, "gettxout"), "gettxout");
@@ -443,6 +459,21 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
     return { lock: { ...base2, railVerified: null, reason: "btc-htlc: the gettxout read does not target this ref (tampered)" } };
   }
   if (txoutBound.outcome.kind === "error") return { lock: { ...base2, railVerified: null, reason: "rpc rejected gettxout" } };
+
+  // Position 4: getblockheader(fundingBlockHash) — H6's real height, read directly rather than
+  // derived as tip − confirmations + 1; needed whether the output is still locked (finalizedRef)
+  // or has since been spent (the scan's own starting height).
+  const headerBound = bindExchange(capture, exchangeAt(exchanges, 4, "getblockheader"), "getblockheader");
+  if (headerBound.kind === "missing") return { lock: { ...base2, railVerified: null, reason: headerBound.reason } };
+  const headerParams = requestParams(headerBound.request);
+  if (headerParams === null || headerParams.length < 1 || headerParams[0] !== fundingBlockHash) {
+    return { lock: { ...base2, railVerified: null, reason: "btc-htlc: the getblockheader read does not target the funding block (tampered)" } };
+  }
+  if (headerBound.outcome.kind === "error") return { lock: { ...base2, railVerified: null, reason: "rpc rejected getblockheader" } };
+  const fundingHeight = blockHeaderHeight(headerBound.outcome.value);
+  if (fundingHeight === null || fundingHeight < 1 || fundingHeight > tipHeight) {
+    return { lock: { ...base2, railVerified: null, reason: "btc-htlc: malformed/out-of-range getblockheader result (tampered capture)" } };
+  }
 
   let rail: RailObservation;
   if (txoutBound.outcome.value !== null) {
@@ -455,9 +486,13 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
     rail = { status: "locked", final: true, checkedAtMs, finalizedRef: finalizedRefFor(capturedConfig.pin.name, n, fundingHeight, fundingBlockHash) };
   } else {
     // Confirmed but no longer unspent — spent. Find it with the bounded getblock(hash, 2) scan
-    // starting at the funding height, in strict (height, hash) pairs from position 4 on.
+    // starting at the funding height, in strict (height, hash) pairs from position 5 on, never
+    // walking past H4's own configured window (past the cap: fail closed, never an unbounded
+    // scan to the chain's own tip).
+    const scanWindow = scanWindowFor(capturedConfig);
+    const scanEnd = Math.min(tipHeight, fundingHeight + scanWindow - 1);
     let found: { height: number; blockHash: string; witness: readonly string[] } | null = null;
-    for (let i = 4, height = fundingHeight; height <= tipHeight; i += 2, height += 1) {
+    for (let i = 5, height = fundingHeight; height <= scanEnd; i += 2, height += 1) {
       const hashBound = bindExchange(capture, exchangeAt(exchanges, i, "getblockhash"), `getblockhash(${height})`);
       if (hashBound.kind === "missing") return { lock: { ...base2, railVerified: null, reason: hashBound.reason } };
       if (hashBound.outcome.kind === "error") return { lock: { ...base2, railVerified: null, reason: `rpc rejected getblockhash(${height})` } };
@@ -485,9 +520,11 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
       }
     }
     if (found === null) {
-      return {
-        lock: { ...base2, railVerified: null, reason: "btc-htlc: gettxout reports the output spent but the bounded scan did not find the spending transaction" },
-      };
+      const reason =
+        scanEnd < tipHeight
+          ? `btc-htlc: gettxout reports the output spent but the spend was not found within the configured scan window (${scanWindow} blocks past the funding height); refusing to scan further (H4)`
+          : "btc-htlc: gettxout reports the output spent but the bounded scan did not find the spending transaction";
+      return { lock: { ...base2, railVerified: null, reason } };
     }
     const spendConfirmations = tipHeight - found.height + 1;
     if (spendConfirmations < n) {
@@ -505,13 +542,21 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
 
   const baseAtFinalizedView = { ...base2, finalizedRef: rail.finalizedRef as string };
 
+  // H1: `rail` (locked/claimed/refunded) is attached to the result ONLY once the funding
+  // output's own scriptPubKey and value are confirmed to match the script/amount these exact
+  // `terms`/`accounts` rebuild — never before. `src/swap.ts` reads `rail` ahead of
+  // `railVerified`, so an escrow that merely happens to sit at this txid:vout (a plain P2WPKH
+  // output, someone else's unrelated HTLC, …) must never be reported as this swap's own
+  // locked/claimed/refunded state, no matter what railVerified separately says. Every return
+  // below this point that has NOT yet confirmed script+amount match omits `rail` entirely.
+  //
   // Field checks — always against the FUNDING output (the funding scriptPubKey/value never
   // change once mined, whether the outpoint is still locked or has since been spent).
   if (accounts.payeePubkey === undefined || accounts.payerPubkey === undefined) {
-    return { lock: { ...baseAtFinalizedView, railVerified: null, reason: "btc-htlc: payee and/or payer has no pubkey line (P4-BTC-SPEC.md §6)" }, rail };
+    return { lock: { ...baseAtFinalizedView, railVerified: null, reason: "btc-htlc: payee and/or payer has no pubkey line (P4-BTC-SPEC.md §6)" } };
   }
   if (!PUBKEY_SHAPE.test(accounts.payeePubkey) || !PUBKEY_SHAPE.test(accounts.payerPubkey)) {
-    return { lock: { ...baseAtFinalizedView, railVerified: null, reason: "btc-htlc: a resolved pubkey line is not a 33-byte compressed pubkey" }, rail };
+    return { lock: { ...baseAtFinalizedView, railVerified: null, reason: "btc-htlc: a resolved pubkey line is not a 33-byte compressed pubkey" } };
   }
   let expected: { scriptPubKey: Uint8Array };
   let expectedAmount: bigint;
@@ -530,7 +575,6 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
   } catch (error) {
     return {
       lock: { ...baseAtFinalizedView, railVerified: null, reason: `btc-htlc: could not rebuild the expected HTLC script/amount from terms: ${error instanceof Error ? error.message : String(error)}` },
-      rail,
     };
   }
 
@@ -539,10 +583,10 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
 
   if (rail.status === "locked") {
     if (!scriptMatches) {
-      return { lock: { ...baseAtFinalizedView, railVerified: false, reason: "btc-htlc: on-chain funding scriptPubKey does not match the expected HTLC script for these terms" }, rail };
+      return { lock: { ...baseAtFinalizedView, railVerified: false, reason: "btc-htlc: on-chain funding scriptPubKey does not match the expected HTLC script for these terms" } };
     }
     if (!amountMatches) {
-      return { lock: { ...baseAtFinalizedView, railVerified: false, reason: `btc-htlc: on-chain funding value ${funding.amountSats} does not match terms.amount ${terms.amount}` }, rail };
+      return { lock: { ...baseAtFinalizedView, railVerified: false, reason: `btc-htlc: on-chain funding value ${funding.amountSats} does not match terms.amount ${terms.amount}` } };
     }
     return { lock: { ...baseAtFinalizedView, railVerified: true, reason: "btc-htlc: locked and on-chain state matches terms" }, rail };
   }
@@ -554,13 +598,14 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
   // for a lock it does not actually describe.
   const label = rail.status;
   if (!scriptMatches || !amountMatches) {
+    // H1: a script/value mismatch means this outpoint is NOT this swap's own escrow, no matter
+    // what it was spent by — `rail` must be omitted here exactly as in the locked branch above.
     return {
       lock: {
         ...baseAtFinalizedView,
         railVerified: null,
         reason: `btc-htlc: ${label} on-chain, but the funding output does not match this swap's terms/accounts — refusing to trust it as this swap's own lock`,
       },
-      rail,
     };
   }
   return { lock: { ...baseAtFinalizedView, railVerified: false, reason: `btc-htlc: ${capture.index.ref} is ${label} on-chain, not locked` }, rail };
@@ -591,12 +636,14 @@ function buildIndex(config: BtcRailConfig, ref: string, checkedAtMs: number, non
 /**
  * The live half of "capture live, then decode" (mirrors `captureEvmLeg` exactly): reads
  * `getblockchaininfo`, `getblockhash(0)`, `getrawtransaction(txid, true)`, `gettxout(txid, vout,
- * false)` and, only if the output turns out to be spent, the bounded `getblock(hash, 2)` scan —
- * every call through `rpc`, so every byte is captured, and every id namespaced
- * `"<ref>:<nowMs>:<nonce>:<n>"`. Never throws for a chain-state reason (a missing tx, an
- * unconfirmed one, a spend the scan could not find within its own window) — those are recorded
- * as whatever was captured, with no `error` set, and `btcEvidence` reports the specific reason on
- * replay; only a genuine transport-level failure (the node unreachable, a rejected fetch) sets
+ * false)`, once confirmed `getblockheader(blockhash)` (H6: the real funding height) and, only if
+ * the output turns out to be spent, the bounded `getblock(hash, 2)` scan (H4: capped at
+ * `scanWindowFor(config)` blocks past the funding height) — every call through `rpc`, so every
+ * byte is captured, and every id namespaced `"<ref>:<nowMs>:<nonce>:<n>"`. Never throws for a
+ * chain-state reason (a missing tx, an unconfirmed one, a spend the scan could not find within
+ * its own window) — those are recorded as whatever was captured, with no `error` set, and
+ * `btcEvidence` reports the specific reason on replay; only a genuine transport-level failure
+ * (H5: the node unreachable, a rejected fetch — never a legitimate JSON-RPC error envelope) sets
  * `index.error` (F1's rule) so a later replay's "newest capture" is this sweep's own (failed)
  * attempt, never a stale earlier one's success.
  */
@@ -612,6 +659,7 @@ export async function captureBtcLeg(
     return { index: buildIndex(config, ref, nowMs, nonce, []), exchanges: [] };
   }
   const { txid, vout } = parsed;
+  const scanWindow = scanWindowFor(config);
 
   const before = rpc.exchanges().length;
   const finish = (error?: string) => {
@@ -639,10 +687,14 @@ export async function captureBtcLeg(
     let rawTxResult: unknown = null;
     try {
       rawTxResult = await rpc.request({ method: "getrawtransaction", params: [txid, true] });
-    } catch {
-      // A legitimate negative answer ("no such funding transaction") — recorded as a JSON-RPC
-      // error envelope; btcEvidence reads that outcome directly. Nothing else to usefully read.
-      return finish();
+    } catch (error) {
+      // H5: only a genuine JSON-RPC error envelope (bitcoind's own "no such transaction" answer)
+      // is a legitimate negative result, recorded with no `index.error` set so btcEvidence reads
+      // that outcome directly; any OTHER error (a transport/network failure) must be recorded as
+      // a genuine capture failure, so the watcher counts it under btcChainReadsSkipped instead of
+      // silently treating "the node is unreachable" the same as "this transaction never existed".
+      if (error instanceof RpcCaptureError) return finish();
+      return finish(error instanceof Error ? error.message : String(error));
     }
 
     let txoutResult: unknown;
@@ -652,23 +704,35 @@ export async function captureBtcLeg(
       return finish(error instanceof Error ? error.message : String(error));
     }
 
+    const confirmations = rawTxConfirmations(rawTxResult);
+    const fundingBlockHashLive = rawTxBlockHash(rawTxResult);
+    if (confirmations === null || confirmations < 1 || fundingBlockHashLive === null) {
+      // Still unconfirmed (mempool-only): gettxout's null result (if any) reflects that, not a
+      // spend, and there is no mined block yet to ask a header for.
+      return finish();
+    }
+
+    // H6: the funding block's own real height, read directly — needed below whether the output
+    // is still locked (finalizedRef) or has since been spent (the scan's own starting height).
+    let headerResult: unknown;
+    try {
+      headerResult = await rpc.request({ method: "getblockheader", params: [fundingBlockHashLive] });
+    } catch (error) {
+      return finish(error instanceof Error ? error.message : String(error));
+    }
+    const fundingHeight = blockHeaderHeight(headerResult);
+    if (fundingHeight === null) return finish();
+
     if (txoutResult !== null) {
       // Unspent (and therefore confirmed, since gettxout's third argument excludes the mempool).
       return finish();
     }
 
-    const confirmations = rawTxConfirmations(rawTxResult);
-    if (confirmations === null || confirmations < 1) {
-      // Still unconfirmed (mempool-only): gettxout's null result reflects that, not a spend.
-      return finish();
-    }
-
-    const fundingHeight = tipHeight - confirmations + 1;
-    if (!Number.isInteger(fundingHeight) || fundingHeight < 1 || fundingHeight > tipHeight) {
-      return finish();
-    }
-
-    for (let height = fundingHeight; height <= tipHeight; height += 1) {
+    // H4: bounded spend scan — never walk further than `scanWindow` blocks past the funding
+    // height, so a funding output Core reports as spent, whose spend lies far beyond a sane
+    // window, can never turn one evidence read into an unbounded number of RPC calls.
+    const scanEnd = Math.min(tipHeight, fundingHeight + scanWindow - 1);
+    for (let height = fundingHeight; height <= scanEnd; height += 1) {
       let hash: unknown;
       try {
         hash = await rpc.request({ method: "getblockhash", params: [height] });
