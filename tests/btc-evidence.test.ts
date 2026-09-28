@@ -269,6 +269,27 @@ describe("btcEvidence — locked", () => {
     expect(result.rail).toEqual({ status: "locked", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: `btc-regtest:confirmations-2:108:${FUNDING_BLOCK_HASH}` });
   });
 
+  // P4-BTC-FIXES-R2.md R2-6: every OTHER test in this file passes `unspentExchanges(confirmations)`
+  // with its default `fundingHeight` (`TIP_HEIGHT - confirmations + 1`) — the exact formula H6
+  // banned — so none of them can tell "btcEvidence trusts the real getblockheader read" apart from
+  // "btcEvidence silently re-derives the old formula and it happens to agree here". This test picks
+  // a `fundingHeight` that DISAGREES with that formula (as a block mined between the
+  // `getblockchaininfo` and `getrawtransaction` reads would cause in real life), so only a genuine
+  // reliance on the getblockheader read can pass it.
+  it("R2-6: trusts the real getblockheader height even when it disagrees with tip - confirmations + 1 (a block mined between the reads)", () => {
+    const staleFormulaHeight = TIP_HEIGHT - 3 + 1; // 108 — what the banned formula would compute
+    const realFundingHeight = staleFormulaHeight + 1; // 109 — what getblockheader actually reports
+    const capture = buildCapture({ exchanges: unspentExchanges(3, realFundingHeight) });
+    const result = btcEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBe(true);
+    expect(result.rail).toEqual({
+      status: "locked",
+      final: true,
+      checkedAtMs: CHECKED_AT_MS,
+      finalizedRef: `btc-regtest:confirmations-2:${realFundingHeight}:${FUNDING_BLOCK_HASH}`,
+    });
+  });
+
   it("reports null, no rail, below the auditor's required confirmations", () => {
     const capture = buildCapture({ exchanges: unspentExchanges(1) });
     const result = btcEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
@@ -797,6 +818,34 @@ describe("captureBtcLeg — never throws on bad live chain data", () => {
     const { index, exchanges } = await captureBtcLeg(rpc, CONFIG, "not-an-outpoint", CHECKED_AT_MS);
     expect(exchanges).toHaveLength(0);
     expect(index.exchanges).toHaveLength(0);
+  });
+
+  // P4-BTC-FIXES-R2.md R2-4: always record the EFFECTIVE scan window (the default too) — never
+  // leave it implicit, so a later change to DEFAULT_SCAN_WINDOW_BLOCKS can never silently
+  // reinterpret an OLD capture under a different bound than the one the live sweep actually used.
+  it("R2-4: records the default scan window explicitly, even though the caller's own config never set one", async () => {
+    const fetchImpl = ((): never => {
+      throw new Error("must not be called");
+    }) as unknown as typeof fetch;
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl, clock: () => CHECKED_AT_MS });
+    expect(CONFIG.scanWindowBlocks).toBeUndefined(); // the premise: CONFIG never sets one
+    const { index } = await captureBtcLeg(rpc, CONFIG, "not-an-outpoint", CHECKED_AT_MS);
+    expect(index.config.scanWindowBlocks).toBe(DEFAULT_SCAN_WINDOW_BLOCKS);
+  });
+
+  it("R2-4: records a custom scan window verbatim, for a real (non-malformed) capture too", async () => {
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { id: number | string; method: string };
+      let text: string;
+      if (body.method === "getblockchaininfo") text = jsonRpcResult(body.id, { chain: "regtest", blocks: TIP_HEIGHT });
+      else if (body.method === "getblockhash") text = jsonRpcResult(body.id, GENESIS_HASH);
+      else text = jsonRpcError(body.id, -5, "No such mempool or blockchain transaction");
+      const bytes = new TextEncoder().encode(text);
+      return { text: async () => text, arrayBuffer: async () => bytes.buffer } as Response;
+    }) as typeof fetch;
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl, clock: () => CHECKED_AT_MS });
+    const { index } = await captureBtcLeg(rpc, { ...CONFIG, scanWindowBlocks: 5 }, REF, CHECKED_AT_MS);
+    expect(index.config.scanWindowBlocks).toBe(5);
   });
 
   it("a genuine transport failure sets index.error (F1)", async () => {
