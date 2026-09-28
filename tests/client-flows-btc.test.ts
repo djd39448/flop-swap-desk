@@ -75,6 +75,13 @@ interface FakeRailScript {
   resendRefundIfDropped?: () => Promise<RailWriteEvidence>;
   verifyLockFinal?: () => Promise<RailEvidenceResult>;
   findClaimedPreimage?: () => Promise<string | null>;
+  /** K2: only set on a fake that wants to stand in for a rail implementing the OPTIONAL
+   *  `checkPendingClaim` — a script that omits this leaves the field entirely absent on the
+   *  connected handle (never merely `undefined` via `unimplemented`), exactly like
+   *  `resendRefundIfDropped` above, so `BuyerFlow.refundLegA`'s own
+   *  `connected.checkPendingClaim !== undefined` check sees the same thing it would against real
+   *  EVM/Bitcoin adapters. */
+  checkPendingClaim?: () => Promise<string | null>;
   chainTimeMs?: () => Promise<number>;
   currentBlockMarker?: () => Promise<RailBlockMarker>;
 }
@@ -82,10 +89,15 @@ interface FakeRailScript {
 class FakeConnectedRail implements ConnectedCounterAssetRail {
   readonly exchanges: readonly Exchange[] = [];
   readonly resendRefundIfDropped?: (ref: string, priorEvidence: RailWriteEvidence) => Promise<RailWriteEvidence>;
+  readonly checkPendingClaim?: (ref: string, fromMarker?: RailBlockMarker) => Promise<string | null>;
   constructor(private readonly script: FakeRailScript) {
     if (script.resendRefundIfDropped !== undefined) {
       const resend = script.resendRefundIfDropped;
       this.resendRefundIfDropped = async () => resend();
+    }
+    if (script.checkPendingClaim !== undefined) {
+      const check = script.checkPendingClaim;
+      this.checkPendingClaim = async () => check();
     }
   }
   async prepareLock(): Promise<PreparedLock> {
@@ -544,6 +556,49 @@ describe("G7 — a refund counts only when confirmed", () => {
 
     await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/claimed instead/);
     await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/learnSecret\(\) then claimLegB\(\)/);
+  });
+
+  it("K2: reads the outpoint's state before ever building a refund, and routes a pending claim to learnSecret()/claimLegB() without ever broadcasting", async () => {
+    let refundCalls = 0;
+    let checkCalls = 0;
+    const { h, rail } = await lockedFlow();
+    (rail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
+      new FakeConnectedRail({
+        checkPendingClaim: async () => {
+          checkCalls += 1;
+          return `0x${"11".repeat(32)}`;
+        },
+        refund: async () => {
+          refundCalls += 1; // must never be reached — checkPendingClaim already found a claim
+          return { ref: REF, raw: [] };
+        },
+      });
+
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/claimed/);
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/learnSecret\(\) then claimLegB\(\)/);
+    expect(checkCalls).toBe(2);
+    expect(refundCalls).toBe(0); // never even attempted a doomed broadcast
+  });
+
+  it("K2: a rail with no checkPendingClaim concept (evm-htlc-shaped) never has it called, and refund proceeds as before", async () => {
+    let refundCalls = 0;
+    const { h, rail } = await lockedFlow();
+    (rail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
+      new FakeConnectedRail({
+        // No `checkPendingClaim` in this script at all — the connected handle's own field stays
+        // absent, exactly like evm-rail.ts's real adapter.
+        refund: async () => {
+          refundCalls += 1;
+          return { ref: REF, raw: [] };
+        },
+        verifyLockFinal: async () => ({
+          lock: { rail: "btc-htlc", ref: REF, terms: {} as never, railVerified: true, checkedAtMs: 0 },
+          rail: { status: "refunded", final: true, checkedAtMs: 0 },
+        }),
+      });
+
+    await h.buyerFlow.refundLegA();
+    expect(refundCalls).toBe(1);
   });
 
   it("R2-1: a retry checks resendRefundIfDropped (never re-broadcasts through refund() itself) and can recover a dropped refund", async () => {

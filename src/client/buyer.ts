@@ -667,6 +667,19 @@ export class BuyerFlow {
     const connected = await this.rail.connect(termsA, this.lockedAccounts);
 
     if (this.legARefundEvidence === undefined) {
+      // P4-BTC-FIXES-R3.md K2: read the outpoint's own state — including a claim that has only
+      // been broadcast, not yet mined (K1) — BEFORE ever building a refund against it. Building
+      // one anyway and letting the rail's own broadcast-time check discover the missing input is
+      // too late to route anywhere useful (a raw rejection, never this class's own clear reason).
+      if (connected.checkPendingClaim !== undefined) {
+        const pendingSecret = await connected.checkPendingClaim(railRef, this.lockedFromBlock);
+        if (pendingSecret !== null) {
+          throw new Error(
+            "buyer: refusing to refund leg A — the lock has been claimed (on chain or already broadcast); " +
+              "call learnSecret() then claimLegB() instead of refundLegA() (K2)",
+          );
+        }
+      }
       const before = connected.exchanges.length;
       this.legARefundEvidence = await connected.refund(railRef);
       this.writeExchanges.push(...connected.exchanges.slice(before)); // B5

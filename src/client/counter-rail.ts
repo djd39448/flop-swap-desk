@@ -146,6 +146,14 @@ export interface ConnectedCounterAssetRail {
    *  only calls this when the connected handle actually implements it, and otherwise treats
    *  `priorEvidence` as still the live truth. */
   resendRefundIfDropped?(ref: string, priorEvidence: RailWriteEvidence): Promise<RailWriteEvidence>;
+  /** P4-BTC-FIXES-R3.md K2: read the outpoint's own present state — including a claim that has
+   *  only been broadcast, not yet mined (K1) — BEFORE a caller ever builds a refund against it.
+   *  Returns the learned secret once the outpoint has been (or is being) claimed, `null` when it
+   *  has not. Optional, like `resendRefundIfDropped`: a rail with no such concept (`evm-htlc`,
+   *  whose own `refund()` already simulates before ever broadcasting and so discovers a lost race
+   *  on its own, with no behaviour change here) simply omits it — `BuyerFlow.refundLegA` only
+   *  calls this when the connected handle actually implements it. */
+  checkPendingClaim?(ref: string, fromMarker?: RailBlockMarker): Promise<string | null>;
   /** D-11: capture live, then decide — never throws for a chain-state reason, only a genuine
    *  transport failure. */
   verifyLockFinal(terms: LockTerms, ref: string, accounts: RailAccounts): Promise<RailEvidenceResult>;

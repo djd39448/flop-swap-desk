@@ -199,6 +199,15 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
     return this.btcRail.findClaimPreimage(ref, this.terms.statement, fromHeight);
   }
 
+  /** P4-BTC-FIXES-R3.md K2: the same mempool-and-chain-aware search `findClaimedPreimage` already
+   *  does (K1) — exposed under its own name so `BuyerFlow.refundLegA` can check for a claimed or
+   *  claim-pending outpoint BEFORE ever building a refund against it, rather than discovering the
+   *  same fact only once `testmempoolaccept` rejects the doomed transaction it just built and
+   *  signed. */
+  async checkPendingClaim(ref: string, fromMarker?: RailBlockMarker): Promise<string | null> {
+    return this.findClaimedPreimage(ref, fromMarker);
+  }
+
   /** The chain's own tip block time — the Bitcoin twin of `evm-rail.ts`'s
    *  `latestBlockTimestampMs()`; every `claimByMs`/margin guard in the shared flow judges
    *  against this, never wall-clock alone. */

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 //
-// tests-regtest/client-flows-k.regtest.test.ts — P4-BTC-FIXES-R3.md K1 (and, appended
-// alongside it, K2): the scenarios that need a real bitcoind mempool (a genuine, unmined
-// broadcast) and so cannot be driven hermetically. K1: the Buyer's own learnSecret finds a claim
-// that has been broadcast but never mined. Mirrors tests-regtest/client-flows-g.regtest.test.ts's
-// own harness shape.
+// tests-regtest/client-flows-k.regtest.test.ts — P4-BTC-FIXES-R3.md K1/K2: the scenarios that
+// need a real bitcoind mempool (a genuine, unmined broadcast) and so cannot be driven
+// hermetically: K1 (the Buyer's own learnSecret finds a claim that has been broadcast but never
+// mined), and K2 (refundLegA reads that same pending-claim state BEFORE ever building a refund,
+// and routes to learnSecret()/claimLegB() instead of racing a doomed broadcast). Mirrors
+// tests-regtest/client-flows-g.regtest.test.ts's own harness shape.
 //
-// Design source: flop-contrib/handoff/P4-BTC-FIXES-R3.md K1.
+// Design source: flop-contrib/handoff/P4-BTC-FIXES-R3.md K1, K2.
 
 import { MemoryNoteStore, PaperRail } from "@flop-labs/tclk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -108,7 +109,7 @@ async function pairAndVerify(nonceHex: string, buyer: Identity, h: Swap, t0: num
   return { swapId, offerA, offerB, acceptA, acceptB };
 }
 
-describe("K1 — a pending (unmined) claim, on a real bitcoind mempool", () => {
+describe("K1/K2 — a pending (unmined) claim, on a real bitcoind mempool", () => {
   let node: BitcoindHandle;
   let config: BtcRailConfig;
 
@@ -150,6 +151,40 @@ describe("K1 — a pending (unmined) claim, on a real bitcoind mempool", () => {
     expect(secret).toBe((h.sellerFlow as unknown as { hashLock: { preimage: string } }).hashLock.preimage);
 
     // And the secret genuinely settles leg B (SPEC's own promise: a learned secret always works).
+    const claimed = await h.buyerFlow.claimLegB(secret);
+    expect(claimed.receipt).toBeDefined();
+  }, 120_000);
+
+  it("K2: refundLegA reads the pending claim before ever building a refund, and routes to learnSecret()/claimLegB() with a clear message", async () => {
+    const buyer = ident(123);
+    const seller = ident(124);
+    const t0 = await currentMediantimeMs(node);
+    const h = setupSwap(node, config, freshParty(buyer), freshParty(seller), t0);
+
+    const { offerA } = await pairAndVerify("00000122", buyer, h, t0, node);
+    const lockA = await h.buyerFlow.lockLegA();
+    await h.mineBlocks(2);
+
+    // The Seller claims (no reveal frame, no block mined) — exactly the race K1/K2 describe: a
+    // claim the Buyer would otherwise not know about until (and unless) a block confirms it.
+    await h.sellerFlow.claimLegA(lockA.hashLock, { skipReveal: true });
+
+    // Past refundAfterMs now, so a Buyer that never learned about the claim would normally reach
+    // for refundLegA — K2 requires it to check the outpoint's own state FIRST and refuse with a
+    // clear, actionable reason instead of racing a doomed broadcast (or, worse, actually managing
+    // to double-spend the mempool before the claim mines). This advances only the FLOW's own
+    // clock (never the chain's real median-time-past, which `warpTo` would also mine 11 blocks
+    // to advance) — the claim must stay genuinely UNMINED for this to test the pending-claim
+    // check rather than the already-confirmed one.
+    h.clockRef.ms = offerA.refundAfterMs + 5 * 60_000;
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/claimed/);
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/learnSecret\(\) then claimLegB\(\)/);
+
+    // The chain never gained a second (refund) transaction from that refusal.
+    const mempool = await node.rpcCall<string[]>("getrawmempool", []);
+    expect(mempool).toHaveLength(1); // still just the Seller's own claim
+
+    const secret = await h.buyerFlow.learnSecret();
     const claimed = await h.buyerFlow.claimLegB(secret);
     expect(claimed.receipt).toBeDefined();
   }, 120_000);

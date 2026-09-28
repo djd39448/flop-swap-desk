@@ -497,13 +497,28 @@ export class BtcHtlcRail {
     return { scriptPubKey: output.script, amountSats: output.amount };
   }
 
-  private async broadcastOrThrow(rawHex: string): Promise<string> {
+  /**
+   * P4-BTC-FIXES-R3.md K2: `expectedTxid`, when given, is the txid this EXACT `rawHex` already
+   * deterministically hashes to (computed locally before ever calling this — "sign-and-record,
+   * then broadcast"). Core's own `"txn-already-known"` `testmempoolaccept` rejection is then
+   * recognized as success, not a fresh failure: it is the practical shape a RETRY of an
+   * already-broadcast write takes after a lost reply (the node accepted the original
+   * `sendrawtransaction` and this process simply never saw the response; a byte-identical
+   * rebuild, thanks to deterministic signing, reproduces the identical bytes and hits this exact
+   * rejection on retry). Every other rejection reason still throws, exactly as before; a caller
+   * with no `expectedTxid` to offer gets today's behaviour unchanged for every reason, "already
+   * known" included.
+   */
+  private async broadcastOrThrow(rawHex: string, expectedTxid?: string): Promise<string> {
     const acceptance = await this.request<Array<{ txid: string; allowed: boolean; "reject-reason"?: string }>>("testmempoolaccept", [
       [rawHex],
     ]);
     const result = acceptance[0];
     if (result === undefined) throw new Error("btc-htlc: testmempoolaccept returned no result");
     if (!result.allowed) {
+      if (expectedTxid !== undefined && result["reject-reason"] === "txn-already-known") {
+        return expectedTxid;
+      }
       throw new Error(`btc-htlc: refusing to broadcast — testmempoolaccept rejected it (${result["reject-reason"] ?? "no reason given"})`);
     }
     return await this.request<string>("sendrawtransaction", [rawHex]);
@@ -696,7 +711,7 @@ export class BtcHtlcRail {
       return done(false, refundTxid);
     }
 
-    const sentTxid = await this.broadcastOrThrow(refundRawTx);
+    const sentTxid = await this.broadcastOrThrow(refundRawTx, refundTxid);
     if (sentTxid !== refundTxid) {
       // Unreachable given identical bytes hash deterministically to the identical txid — kept as
       // a loud sanity check rather than silently returning a mismatched ref/txid pair.
@@ -791,7 +806,14 @@ export class BtcHtlcRail {
     // the broadcast itself follow.
     await this.assertChainTimeBeforeOrThrow(notAfterMs);
 
-    const txid = await this.broadcastOrThrow(processed.hex);
+    // P4-BTC-FIXES-R3.md K2: "sign-and-record, then broadcast" — this transaction's own txid is
+    // already fully determined by its own signed bytes (a hash of them), knowable before ever
+    // broadcasting. Recording it here (a local decode, no RPC of its own) means a caller retrying
+    // after a lost broadcast reply reproduces the IDENTICAL bytes (deterministic signing) and this
+    // same txid, so `broadcastOrThrow` recognizes Core's own "already known" answer as success.
+    const claimTxid = Transaction.fromRaw(hexToBytes(processed.hex), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
+
+    const txid = await this.broadcastOrThrow(processed.hex, claimTxid);
     return this.finishWriteEvidence(ref, txid, before);
   }
 
@@ -843,7 +865,11 @@ export class BtcHtlcRail {
       throw new Error("btc-htlc: walletprocesspsbt did not produce a complete, finalized refund transaction");
     }
 
-    const txid = await this.broadcastOrThrow(processed.hex);
+    // P4-BTC-FIXES-R3.md K2: same "sign-and-record, then broadcast" rule as `claim()` above — the
+    // deterministic txid, known from the signed bytes alone, before ever broadcasting.
+    const refundTxid = Transaction.fromRaw(hexToBytes(processed.hex), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
+
+    const txid = await this.broadcastOrThrow(processed.hex, refundTxid);
     // R2-1: record the exact signed bytes broadcast, so a later retry can re-send the IDENTICAL
     // transaction if it drops out of the mempool without confirming (`resendRefundIfDropped`).
     return this.finishWriteEvidence(ref, txid, before, processed.hex);
