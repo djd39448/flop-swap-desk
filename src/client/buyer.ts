@@ -6,7 +6,18 @@
 // resolved (D-08) and leg B itself verifies. Every step is an explicit method a runner calls
 // in order; each either succeeds or throws an `Error` naming the rule it refused to break.
 //
-// Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6.
+// P22-P24-EVM-FIXES.md B3: `acceptLegB` used to take a caller-supplied `DeadlinePolicy` and a
+// bare, unauthenticated `AcceptFrame` for leg A's accept — a runner (or a compromised one)
+// could hand this flow a slack policy, or an accept frame nobody ever actually signed and
+// posted, and `acceptLegB` would check its own safety against fiction. It now uses the pinned
+// `EVM_LOCAL_POLICY` (src/client/policy.ts) and takes `acceptA` as the actual signed record it
+// must have arrived as, requiring it to authenticate, to be from the same Seller who posted
+// `offerB` (`offerB.from`), and to reference this flow's own leg A offer. `lockLegA` re-runs
+// `checkSwapDeadlines` at the real lock time (`clock()`) before ever touching the chain — a
+// pair that was safe at accept time is not guaranteed to still be safe by the time this Buyer
+// actually locks.
+//
+// Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5.
 
 import type { Address, Hex } from "viem";
 import {
@@ -18,6 +29,7 @@ import {
   tryDecodeFrame,
   verifySecret,
   verifyTranscriptRecord,
+  OFFER_ROOM,
   type AcceptFrame,
   type OfferFrame,
   type TranscriptRecord,
@@ -27,10 +39,10 @@ import { checkSwapDeadlines } from "../deadlines.js";
 import { checkOrientation, classifySwapOffer, legAContext } from "../profile.js";
 import { formatAccountLine, resolveAccounts } from "../rails/account-line.js";
 import { EvmHtlcRail, type EvmRailConfig, type WriteEvidence } from "../rails/evm-htlc.js";
-import type { CapturingRpc } from "../rails/rpc-capture.js";
-import type { DeadlinePolicy } from "../types.js";
+import type { CapturingRpc, Exchange } from "../rails/rpc-capture.js";
 import type { AddressBook } from "../vendor/evm-hash-rail.js";
 import { offerAcceptLockTerms } from "../swap.js";
+import { EVM_LOCAL_POLICY } from "./policy.js";
 import type { Signer, Venue } from "./venue.js";
 
 /** `EvmHtlcRail.claim`/`.refund`/`.verifyLockFinal` never resolve through the address book
@@ -91,6 +103,9 @@ export class BuyerFlow {
   private legBVerified = false;
   private lockedHashLock?: Hex;
   private lockedFromBlock?: bigint;
+  /** B5: every EVM write this flow has made so far (`lockLegA`'s approve+lock, `refundLegA`'s
+   *  refund), in call order — see the identical field on `SellerFlow`. */
+  private readonly writeExchanges: Exchange[] = [];
 
   constructor(options: BuyerFlowOptions) {
     this.identity = options.identity;
@@ -100,6 +115,11 @@ export class BuyerFlow {
     this.rpc = options.rpc;
     this.evmConfig = options.evmConfig;
     this.clock = options.clock;
+  }
+
+  /** B5: every EVM write this flow has made so far, in call order. */
+  get exchanges(): readonly Exchange[] {
+    return this.writeExchanges;
   }
 
   private requirePaired(): { offerA: OfferFrame; offerB: OfferFrame; acceptA: AcceptFrame; acceptB: AcceptFrame } {
@@ -135,14 +155,38 @@ export class BuyerFlow {
   }
 
   /**
-   * Accept leg B — but only after `checkSwapDeadlines` (SPEC §3.5 rules 1-3) passes for the
-   * pair at the runner's declared `lockTimeMs`; a bad Seller offer (or a bad policy) is refused
-   * here, before this Buyer commits to the countdown by posting a signed accept.
+   * Accept leg B — but only after `checkSwapDeadlines` (SPEC §3.5 rules 1-3, the pinned
+   * `EVM_LOCAL_POLICY`) passes for the pair at the runner's declared `lockTimeMs`; a bad Seller
+   * offer is refused here, before this Buyer commits to the countdown by posting a signed
+   * accept.
+   *
+   * P22-P24-EVM-FIXES.md B3: `acceptARecord` must be the actual signed record leg A's accept
+   * arrived as (`OFFER_ROOM`) — authenticated (`verifyTranscriptRecord` + `frame.from ===
+   * record.sender`), an `accept` frame, referencing this flow's own leg A offer, and *from the
+   * Seller who posted `offerB`* (`acceptAFrame.from === offerB.from`) — never a bare `AcceptFrame`
+   * object a caller merely asserts came from somewhere. `acceptB.statement` is copied straight
+   * from the authenticated frame's own `statement`, so `acceptA.statement === acceptB.statement`
+   * holds by construction, never by a separate check that could be skipped.
    */
-  async acceptLegB(offerB: OfferFrame, acceptA: AcceptFrame, policy: DeadlinePolicy, lockTimeMs: number): Promise<AcceptFrame> {
+  async acceptLegB(
+    offerB: OfferFrame,
+    acceptARecord: TranscriptRecord,
+    lockTimeMs: number,
+  ): Promise<{ acceptB: AcceptFrame; acceptBRecord: TranscriptRecord }> {
     if (this.offerA === undefined) throw new Error("buyer: no leg A offer to pair leg B against");
-    if (acceptA.ref !== this.offerA.id) {
+
+    if (acceptARecord.room !== OFFER_ROOM || !verifyTranscriptRecord(acceptARecord).ok) {
+      throw new Error("buyer: refusing to accept leg B — leg A accept record does not authenticate (B3)");
+    }
+    const acceptAFrame = tryDecodeFrame(acceptARecord.line);
+    if (acceptAFrame === null || acceptAFrame.type !== "accept" || acceptAFrame.from !== acceptARecord.sender) {
+      throw new Error("buyer: refusing to accept leg B — leg A accept record is not an authenticated accept frame (B3)");
+    }
+    if (acceptAFrame.ref !== this.offerA.id) {
       throw new Error("buyer: refusing to accept — the leg A accept does not reference this flow's own offer");
+    }
+    if (acceptAFrame.from !== offerB.from) {
+      throw new Error("buyer: refusing to accept leg B — leg A accept is not from the Seller who posted leg B's offer (B3)");
     }
     const classification = classifySwapOffer(offerB);
     if (classification === null || classification.context.leg !== "b" || classification.context.legAOfferId !== this.offerA.id) {
@@ -152,18 +196,18 @@ export class BuyerFlow {
     if (!orientation.ok) {
       throw new Error(`buyer: refusing to accept an unsafe leg B offer: ${orientation.reason}`);
     }
-    const deadlineCheck = checkSwapDeadlines(this.offerA, offerB, lockTimeMs, policy);
+    const deadlineCheck = checkSwapDeadlines(this.offerA, offerB, lockTimeMs, EVM_LOCAL_POLICY);
     if (!deadlineCheck.ok) {
       throw new Error(`buyer: refusing to accept leg B — unsafe deadlines: ${deadlineCheck.violations.join("; ")}`);
     }
 
-    const acceptB = makeAccept(offerB, { from: this.identity.did, statement: acceptA.statement });
-    await this.venue.post("tclk-offers", encodeFrame(acceptB), this.identity);
+    const acceptB = makeAccept(offerB, { from: this.identity.did, statement: acceptAFrame.statement });
+    const acceptBRecord = await this.venue.post("tclk-offers", encodeFrame(acceptB), this.identity);
 
     this.offerB = offerB;
-    this.acceptA = acceptA;
+    this.acceptA = acceptAFrame;
     this.acceptB = acceptB;
-    return acceptB;
+    return { acceptB, acceptBRecord };
   }
 
   /** Verify leg B is actually locked on the paper rail before trusting it as cover for locking
@@ -191,12 +235,26 @@ export class BuyerFlow {
    * Seller's own account line resolves in leg A's deal room (D-08: only the payee's line is
    * required). The write path's `AddressBook` is built here, from the resolved payee, right
    * before the one call (`EvmHashRail.lock`) that ever needs to resolve a counterparty address.
+   *
+   * P22-P24-EVM-FIXES.md B3: re-runs `checkSwapDeadlines` (the pinned `EVM_LOCAL_POLICY`) with
+   * `clock()` as the lock time before doing anything else — a pair that was safe when
+   * `acceptLegB` checked it is not guaranteed to still be safe by the time this method actually
+   * runs (a slow runner, a delayed leg B lock), and this is the last check before this Buyer
+   * spends real value.
    */
   async lockLegA(): Promise<{ hashLock: Hex; writeEvidence: WriteEvidence }> {
     if (!this.legBVerified) {
       throw new Error("buyer: refusing to lock leg A before leg B verifies");
     }
-    const { offerA, acceptA } = this.requirePaired();
+    const { offerA, offerB, acceptA } = this.requirePaired();
+
+    const deadlineCheck = checkSwapDeadlines(offerA, offerB, this.clock(), EVM_LOCAL_POLICY);
+    if (!deadlineCheck.ok) {
+      throw new Error(
+        `buyer: refusing to lock leg A — deadlines are no longer safe at lock time (B3): ${deadlineCheck.violations.join("; ")}`,
+      );
+    }
+
     const termsA = offerAcceptLockTerms(offerA, acceptA);
     const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
     const accounts = resolveAccounts(dealRoomARecords, {
@@ -223,8 +281,10 @@ export class BuyerFlow {
     const fromBlock = await this.rpc
       .request({ method: "eth_blockNumber", params: [] })
       .then((hex) => BigInt(hex as string));
+    const before = this.rpc.exchanges().length;
     await rail.approve(termsA.asset, termsA.amount);
     const writeEvidence = await rail.lock(termsA, 0);
+    this.writeExchanges.push(...this.rpc.exchanges().slice(before)); // B5
     const hashLock = writeEvidence.ref;
 
     await this.venue.post(
@@ -311,7 +371,9 @@ export class BuyerFlow {
       addressBook: inertAddressBook(),
       clock: this.clock,
     });
+    const before = this.rpc.exchanges().length;
     const writeEvidence = await rail.refund(hashLock);
+    this.writeExchanges.push(...this.rpc.exchanges().slice(before)); // B5
     await this.venue.post(
       dealRoom(acceptA.contract),
       encodeFrame({ type: "refund", from: this.identity.did, contract: acceptA.contract, ref: hashLock }),
