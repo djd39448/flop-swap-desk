@@ -64,7 +64,7 @@ today carries mainnet value (D-09/D-10: a mainnet chain-id deny list, no private
 
 - `src/rails/rpc-capture.ts` — byte-exact JSON-RPC capture (§2.1).
 - `src/rails/evm-htlc.ts` — the desk-facing `evm-htlc` adapter over the vendored binding, chain
-  pin, mainnet deny list, write evidence (§2.2).
+  pin (allow list: anvil-local 31337, base-sepolia 84532), write evidence (§2.2).
 - `src/rails/evm-evidence.ts` — the pure, fail-closed finalized-view evidence decoder shared by
   the live rail and the offline replay (§2.2 point 3, §4).
 - `src/rails/account-line.ts` — the D-08 account-line grammar and `resolveAccounts` (§3).

@@ -68,11 +68,12 @@ configured — see "EVM leg" below) any captured EVM chain reads are read straig
 folded through the same `foldCaptured` (`src/replay.ts`) the live watcher uses.
 
 **What this replay proves, and what it does not (P22-P24-EVM-FIXES-R3.md F3).** Re-reading a
-capture this way independently detects a capture that was *corrupted, spliced, edited, or
-taken under a different rail config* after the fact, and fails that leg closed. It does
-**not** prove the capturing process told the truth about the chain to begin with: a wholesale
-*fabricated* RPC response, named honestly by its own hash, replays exactly as a genuine one
-would — this build adds no signing keys to close that gap. For a chain leg, the independent
+capture this way detects a capture file that was *damaged, truncated, spliced from another
+capture, answered for a different request, or taken under a different rail config*, and fails
+that leg closed. It does **not** detect forgery: a fabricated or edited RPC response, saved
+under the sha256 of its own new bytes, replays exactly as a genuine one would, and nothing
+proves the capturing process told the truth about the chain to begin with — this build adds no
+signing keys to close that gap. For a chain leg, the independent
 check is its own `finalizedRef`: it names a real block hash, so anyone with their own RPC
 access to that chain can re-query `locks(hashLock)` at that exact block and compare, without
 trusting this repository or whoever ran the sweep.
@@ -89,9 +90,9 @@ node examples/audit-export.mjs --root fixtures/rehearsal-2026-09-18 \
 ## EVM leg (local, keyless)
 
 `src/rails/evm-htlc.ts` binds the vendored `EvmHashRail` (`src/vendor/evm-hash-rail.ts`,
-`contracts/EvmHashRail.sol`) into a desk rail with a chain pin (a mainnet deny list refuses
-Ethereum/Base/Optimism/Arbitrum/Polygon/BNB/Avalanche mainnet by name even if someone pins
-them), byte-exact JSON-RPC capture (`src/rails/rpc-capture.ts`) so every verdict can be
+`contracts/EvmHashRail.sol`) into a desk rail with a chain pin (an allow list accepts only
+`anvil-local` 31337 and `base-sepolia` 84532, each tied to its one pin name; everything else is
+refused, mainnets by name), byte-exact JSON-RPC capture (`src/rails/rpc-capture.ts`) so every verdict can be
 re-derived from the exact bytes it rested on, and a fail-closed finalized-view read
 (`src/rails/evm-evidence.ts`) shared between the live path and the offline replay. `src/client/`
 (`venue.ts`, `seller.ts`, `buyer.ts`, `bundle.ts`) drives both parties of one swap end to end —
@@ -166,6 +167,32 @@ chain to begin with. The independent check is each leg's own `finalizedRef`
 real block on the chain it was read from, so anyone with their own RPC access to that chain can
 re-query `locks(hashLock)` at that exact block hash and compare against what this build
 reported, independent of this repository entirely.
+
+### Known limits of the EVM leg (recorded 2026-09-28 after three review rounds)
+
+None of these can move value to the wrong party or reveal the secret without payment; each is
+written down instead of hidden.
+
+- **The FLOP leg is paper.** tclk's `paper` rail records only the lock kind, statement,
+  refund time and status (tclk#180: four of nine terms), so the Buyer's check that leg B is
+  locked cannot confirm leg B's amount or payee on a rail; the desk checks them from the signed
+  offers instead. A real FLOP rail replaces this in Phase 3.
+- **The replay shows the newest capture per input, not each sweep's view.** A sweep that could
+  not read a leg's deal room (a fetch failure, or the `maxDealRooms` cap) writes no marker, so
+  the offline replay can show that leg's older evidence while that sweep's live board showed
+  none. This is staleness, never fabrication: every chain verdict names its own
+  `finalizedRef` block. (A failed chain read or an unreadable newest capture index does fail
+  the leg closed in both places.)
+- **A lock whose evidence lookup fails is not announced.** If leg A's lock transaction mines but
+  the adapter's bounded event lookup then fails, `BuyerFlow.lockLegA` throws before posting the
+  `lock` frame. The funds stay safe (`refundLegA` works from the recorded hash lock and the chain
+  itself after `refundAfterMs`), but the board shows leg A as never funded.
+- **A claim's last guard still has two round trips after it.** viem's chain-id assertion and
+  `eth_sendTransaction` follow the final deadline check, each a single attempt (transport retries
+  are off) bounded by the RPC timeout (45 s by default), well inside the 5-minute
+  claim-inclusion margin.
+- **The claim endpoint is trusted with the preimage** at the moment the claim is sent (see
+  above).
 
 ## What this is not
 
