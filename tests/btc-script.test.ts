@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 import {
   BIP65_THRESHOLD,
   BTC_REGTEST_NETWORK,
+  MAX_LOCKTIME,
   bytesEqual,
   buildClaimPsbt,
   buildHtlcScript,
@@ -75,6 +76,18 @@ describe("buildHtlcScript", () => {
     ).toThrow(/BIP65/);
   });
 
+  it("H7: refuses a locktime above the maximum 32-bit nLockTime value", () => {
+    expect(() =>
+      buildHtlcScript({ hashLock: hexToBytes(H_HEX), payeePubkey: hexToBytes(PAYEE_HEX), payerPubkey: hexToBytes(PAYER_HEX), locktime: MAX_LOCKTIME + 1 }),
+    ).toThrow(/at most|32-bit/);
+  });
+
+  it("H7: accepts the maximum 32-bit nLockTime value itself", () => {
+    expect(() =>
+      buildHtlcScript({ hashLock: hexToBytes(H_HEX), payeePubkey: hexToBytes(PAYEE_HEX), payerPubkey: hexToBytes(PAYER_HEX), locktime: MAX_LOCKTIME }),
+    ).not.toThrow();
+  });
+
   it("refuses a hashLock that is not 32 bytes", () => {
     expect(() =>
       buildHtlcScript({ hashLock: hexToBytes(H_HEX).slice(0, 31), payeePubkey: hexToBytes(PAYEE_HEX), payerPubkey: hexToBytes(PAYER_HEX), locktime: T }),
@@ -97,6 +110,14 @@ describe("locktimeFromRefundAfterMs", () => {
   it("refuses a value at or below the BIP65 threshold", () => {
     expect(() => locktimeFromRefundAfterMs(BIP65_THRESHOLD * 1000)).toThrow(/BIP65/);
     expect(() => locktimeFromRefundAfterMs(1000)).toThrow(/BIP65/);
+  });
+
+  it("H7: refuses a value above the maximum 32-bit nLockTime value", () => {
+    expect(() => locktimeFromRefundAfterMs((MAX_LOCKTIME + 1) * 1000)).toThrow(/32-bit/);
+  });
+
+  it("H7: accepts the maximum 32-bit nLockTime value itself", () => {
+    expect(locktimeFromRefundAfterMs(MAX_LOCKTIME * 1000)).toBe(MAX_LOCKTIME);
   });
 
   it("refuses a non-integer or non-finite input", () => {

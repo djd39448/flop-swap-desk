@@ -29,6 +29,11 @@ import type { BTC_NETWORK } from "@scure/btc-signer/utils.js";
  *  checkable against the signed terms byte for byte. */
 export const BIP65_THRESHOLD = 500_000_000;
 
+/** P4-BTC-FIXES.md H7: `nLockTime`/CLTV is a 32-bit unsigned consensus field — a value above this
+ *  can never be encoded on chain at all, so both the locktime deriver and the script builder
+ *  refuse it up front rather than let it silently truncate or fail deep inside a PSBT encoder. */
+export const MAX_LOCKTIME = 0xffffffff;
+
 /** `@scure/btc-signer` ships only mainnet (`bc`) and testnet (`tb`) bech32 HRPs (its own
  *  `NETWORK`/`TEST_NETWORK`) — regtest needs its own network params defined by hand. Probe
  *  gotcha: regtest's base58 version bytes (`pubKeyHash`/`scriptHash`/`wif`) are IDENTICAL to
@@ -71,6 +76,9 @@ export function locktimeFromRefundAfterMs(refundAfterMs: number): number {
       `btc-script: locktime ${t} is at or below the BIP65 height/time threshold (${BIP65_THRESHOLD}); refusing an ambiguous CLTV value`,
     );
   }
+  if (t > MAX_LOCKTIME) {
+    throw new Error(`btc-script: locktime ${t} exceeds the maximum 32-bit nLockTime value (${MAX_LOCKTIME})`);
+  }
   return t;
 }
 
@@ -112,9 +120,9 @@ export function buildHtlcScript(params: HtlcScriptParams, network: BTC_NETWORK =
   if (params.hashLock.length !== HASH_LENGTH) {
     throw new Error("btc-script: hashLock must be 32 bytes (sha256 of the preimage)");
   }
-  if (!Number.isInteger(params.locktime) || !(params.locktime > BIP65_THRESHOLD)) {
+  if (!Number.isInteger(params.locktime) || !(params.locktime > BIP65_THRESHOLD) || params.locktime > MAX_LOCKTIME) {
     throw new Error(
-      `btc-script: locktime must be an integer strictly above the BIP65 threshold (${BIP65_THRESHOLD}); use locktimeFromRefundAfterMs`,
+      `btc-script: locktime must be an integer strictly above the BIP65 threshold (${BIP65_THRESHOLD}) and at most ${MAX_LOCKTIME}; use locktimeFromRefundAfterMs`,
     );
   }
 
@@ -254,8 +262,8 @@ export interface RefundPsbtParams {
  */
 export function buildRefundPsbt(params: RefundPsbtParams): Uint8Array {
   assertCompressedPubkey("payerPubkey", params.payerPubkey);
-  if (!Number.isInteger(params.locktime) || !(params.locktime > BIP65_THRESHOLD)) {
-    throw new Error(`btc-script: locktime must be an integer strictly above the BIP65 threshold (${BIP65_THRESHOLD})`);
+  if (!Number.isInteger(params.locktime) || !(params.locktime > BIP65_THRESHOLD) || params.locktime > MAX_LOCKTIME) {
+    throw new Error(`btc-script: locktime must be an integer strictly above the BIP65 threshold (${BIP65_THRESHOLD}) and at most ${MAX_LOCKTIME}`);
   }
   if (params.feeSats <= 0n) throw new Error("btc-script: feeSats must be positive");
   if (params.feeSats >= params.utxo.amountSats) {
