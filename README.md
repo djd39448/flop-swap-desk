@@ -306,10 +306,17 @@ party or reveal the secret without payment.
   fee-bumps): the Seller's client claims only while `max(chain time, clock)` leaves at least 60
   minutes before `A.refundAfterMs` (`BTC_LOCAL_POLICY.claimInclusionMarginMs`), re-checked as the
   last step before broadcast; the Buyer's rule-2 margin (`finalityAMs`, 3 h) keeps `B.claimBy`
-  open long enough after `T` to learn the secret from a late claim; `BuyerFlow.refundLegA`
-  reports a refund only once it confirms, re-sends the same recorded refund if it dropped out of
-  the mempool, and routes the Buyer to `learnSecret()`/`claimLegB()` when the outpoint was claimed
-  instead. `claimByMs` itself is enforced only by the Seller's own client.
+  open long enough after `T` to learn the secret from a late claim — including one the Seller has
+  only broadcast, not yet mined: `learnSecret` (via `findClaimedPreimage`) checks the mempool
+  first (`gettxspendingprevout`, then the spender's own witness), never only the bounded block scan
+  (P4-BTC-FIXES-R3.md K1). `BuyerFlow.refundLegA` reads the outpoint's own state — a pending or
+  already-mined claim included — *before* ever building a refund, and routes to
+  `learnSecret()`/`claimLegB()` with a clear reason the moment one is found, rather than racing a
+  doomed broadcast (K2); once it does build one, it reports a refund only once it confirms, and
+  re-sends the same recorded refund if it dropped out of the mempool. `claimByMs` itself is
+  enforced only by the Seller's own client, and none of this removes the underlying race after
+  `T` — it only ensures each side's own client sees the same chain/mempool state the other one
+  does, as early as its own next read.
 - **The refund waits for median time past, which lags wall clock.** `T = refundAfterMs / 1000` is
   checked against the chain's median time of its last 11 blocks (BIP113), not the tip block's own
   timestamp or wall-clock "now" — so a refund's real, chain-observable availability lags
