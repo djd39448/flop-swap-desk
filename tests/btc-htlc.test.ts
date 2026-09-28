@@ -536,17 +536,22 @@ describe("BtcHtlcRail.claim", () => {
     expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
   });
 
-  // P4-BTC-FIXES-R3.md K2: "txn-already-known" is the practical shape a RETRY of an
-  // already-broadcast claim takes after a lost reply (the node accepted the original broadcast;
-  // this process just never saw the response) — treated as success, never a fresh failure.
-  it("K2: 'txn-already-known' (a lost broadcast reply on an earlier, identical attempt) succeeds with the deterministic txid, and never calls sendrawtransaction", async () => {
-    const { rail, calls } = await connectRail(
-      baseHandlers({ testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: false, "reject-reason": "txn-already-known" }] }),
-    );
-    const evidence = await rail.claim(REF, TERMS, `0x${PREIMAGE_HEX}`, SELLER, DESTINATION_ADDRESS, notAfterMs);
-    expect(evidence.txid).toBe(FUNDING_TXID); // the txid these exact (mocked) signed bytes hash to
-    expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
-  });
+  // P4-BTC-FIXES-R3.md K2: "txn-already-in-mempool" (confirmed live against Core 31.1 — see the
+  // regtest suite) is the practical shape a RETRY of an already-broadcast claim takes after a
+  // lost reply (the node accepted the original broadcast; this process just never saw the
+  // response) — treated as success, never a fresh failure. "txn-already-known" is kept as an
+  // accepted synonym for other Core versions/paths.
+  it.each(["txn-already-in-mempool", "txn-already-known"])(
+    "K2: '%s' (a lost broadcast reply on an earlier, identical attempt) succeeds with the deterministic txid, and never calls sendrawtransaction",
+    async (reason) => {
+      const { rail, calls } = await connectRail(
+        baseHandlers({ testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: false, "reject-reason": reason }] }),
+      );
+      const evidence = await rail.claim(REF, TERMS, `0x${PREIMAGE_HEX}`, SELLER, DESTINATION_ADDRESS, notAfterMs);
+      expect(evidence.txid).toBe(FUNDING_TXID); // the txid these exact (mocked) signed bytes hash to
+      expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
+    },
+  );
 });
 
 // ── refund() ─────────────────────────────────────────────────────────────────────────────────
@@ -577,14 +582,17 @@ describe("BtcHtlcRail.refund", () => {
   // own broadcast — a lost reply from an earlier, identical broadcast must not turn a retry (a
   // fresh `refund()` call, before any resend-path evidence was ever recorded) into a fresh
   // failure.
-  it("K2: 'txn-already-known' (a lost broadcast reply on an earlier, identical attempt) succeeds with the deterministic txid, and never calls sendrawtransaction", async () => {
-    const { rail, calls } = await connectRail(
-      baseHandlers({ testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: false, "reject-reason": "txn-already-known" }] }),
-    );
-    const evidence = await rail.refund(REF, TERMS, BUYER, DESTINATION_ADDRESS);
-    expect(evidence.txid).toBe(FUNDING_TXID); // the txid these exact (mocked) signed bytes hash to
-    expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
-  });
+  it.each(["txn-already-in-mempool", "txn-already-known"])(
+    "K2: '%s' (a lost broadcast reply on an earlier, identical attempt) succeeds with the deterministic txid, and never calls sendrawtransaction",
+    async (reason) => {
+      const { rail, calls } = await connectRail(
+        baseHandlers({ testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: false, "reject-reason": reason }] }),
+      );
+      const evidence = await rail.refund(REF, TERMS, BUYER, DESTINATION_ADDRESS);
+      expect(evidence.txid).toBe(FUNDING_TXID); // the txid these exact (mocked) signed bytes hash to
+      expect(calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
+    },
+  );
 });
 
 // ── findClaimPreimage() ──────────────────────────────────────────────────────────────────────

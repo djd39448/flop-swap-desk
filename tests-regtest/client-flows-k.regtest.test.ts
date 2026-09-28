@@ -189,3 +189,83 @@ describe("K1/K2 — a pending (unmined) claim, on a real bitcoind mempool", () =
     expect(claimed.receipt).toBeDefined();
   }, 120_000);
 });
+
+// P4-BTC-FIXES-R3.md K2: "Do the same for the Seller's claim, so a lost claim reply still lets
+// the Seller post its reveal and receipt (and confirm the claim through the evidence reader)."
+describe("K2 — a lost claim reply still lets the Seller post its reveal and receipt", () => {
+  let node: BitcoindHandle;
+  let config: BtcRailConfig;
+
+  beforeAll(async () => {
+    node = await startBitcoind();
+    config = { pin: { ...BTC_REGTEST_PIN, finality: { confirmations: 2 } }, endpoint: node.endpoint };
+  }, 120_000);
+
+  afterAll(async () => {
+    await node?.stop();
+  });
+
+  function ident(tag: number): Identity {
+    return identity(tag.toString(16).padStart(2, "0").repeat(32));
+  }
+
+  it("a lost sendrawtransaction reply on the Seller's own claim is recovered on retry (K2's 'already known' success), and reveal/receipt post", async () => {
+    const buyer = ident(125);
+    const seller = ident(126);
+    const t0 = await currentMediantimeMs(node);
+
+    // A fetch that lets the Seller's OWN `sendrawtransaction` (the claim) genuinely reach the
+    // node, but then throws before the caller ever sees the response — mirrors
+    // client-flows-g.regtest.test.ts's own G3 flaky-transport probe, applied to a claim instead
+    // of a funding.
+    let brokenOnce = false;
+    const flakyFetch: typeof fetch = async (url, init) => {
+      let method = "";
+      try {
+        method = (JSON.parse(String(init?.body ?? "{}")) as { method?: string }).method ?? "";
+      } catch {
+        /* not JSON: let it through unmodified below */
+      }
+      const response = await fetch(url, init);
+      if (method === "sendrawtransaction" && !brokenOnce) {
+        brokenOnce = true;
+        await response.arrayBuffer(); // let the real bytes land before "losing" them
+        throw new Error("client-flows-k.regtest.test.ts: simulated lost read after the Seller's own claim broadcast (K2)");
+      }
+      return response;
+    };
+
+    const buyerParty: Party = { identity: buyer, rpc: node.createCapturingRpc() };
+    const sellerParty: Party = { identity: seller, rpc: node.createCapturingRpc({ fetch: flakyFetch }) };
+    const h = setupSwap(node, config, buyerParty, sellerParty, t0);
+
+    await pairAndVerify("00000125", buyer, h, t0, node);
+    const lockA = await h.buyerFlow.lockLegA();
+    await h.mineBlocks(2);
+
+    // The claim genuinely reaches the node, but this flow's own `claimLegA` never sees a
+    // successful return — no reveal/receipt frame is posted yet.
+    await expect(h.sellerFlow.claimLegA(lockA.hashLock)).rejects.toThrow(/simulated lost read after the Seller's own claim broadcast/);
+
+    const mempool = await node.rpcCall<string[]>("getrawmempool", []);
+    expect(mempool).toHaveLength(1); // the claim really did land, just unseen by this flow
+
+    // K2: retrying `claimLegA` rebuilds the IDENTICAL, deterministic claim transaction; Core's own
+    // "txn-already-known" answer is now recognized as success (rather than a fresh failure), so
+    // this reports the SAME txid and — for the first time — posts the reveal and receipt frames.
+    const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
+    expect(claimed.evidence.txid).toMatch(/^[0-9a-f]{64}$/);
+    expect(claimed.reveal).toBeDefined();
+    expect(claimed.receipt).toBeDefined();
+
+    // Never a second, separately-broadcast claim transaction.
+    const mempoolAfter = await node.rpcCall<string[]>("getrawmempool", []);
+    expect(mempoolAfter).toEqual(mempool);
+
+    // The evidence reader itself confirms the claim once mined — the money side of this, not
+    // merely the two frames.
+    await h.mineBlocks(2);
+    const secret = await h.buyerFlow.learnSecret();
+    expect(secret).toBe((h.sellerFlow as unknown as { hashLock: { preimage: string } }).hashLock.preimage);
+  }, 120_000);
+});

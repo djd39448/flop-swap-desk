@@ -497,17 +497,23 @@ export class BtcHtlcRail {
     return { scriptPubKey: output.script, amountSats: output.amount };
   }
 
+  /** P4-BTC-FIXES-R3.md K2: Core's own `testmempoolaccept` rejection reasons for "this exact
+   *  transaction has already reached the node" — confirmed live against Core 31.1:
+   *  `"txn-already-in-mempool"` (still sitting in the mempool); `"txn-already-known"` is kept too
+   *  since other Core versions/paths (e.g. a since-CONFIRMED repeat) are documented to use it.
+   *  Never any OTHER rejection reason (a genuine policy/consensus failure must still throw). */
+  private static readonly ALREADY_KNOWN_REJECT_REASONS: ReadonlySet<string> = new Set(["txn-already-in-mempool", "txn-already-known"]);
+
   /**
-   * P4-BTC-FIXES-R3.md K2: `expectedTxid`, when given, is the txid this EXACT `rawHex` already
-   * deterministically hashes to (computed locally before ever calling this — "sign-and-record,
-   * then broadcast"). Core's own `"txn-already-known"` `testmempoolaccept` rejection is then
-   * recognized as success, not a fresh failure: it is the practical shape a RETRY of an
-   * already-broadcast write takes after a lost reply (the node accepted the original
-   * `sendrawtransaction` and this process simply never saw the response; a byte-identical
-   * rebuild, thanks to deterministic signing, reproduces the identical bytes and hits this exact
-   * rejection on retry). Every other rejection reason still throws, exactly as before; a caller
-   * with no `expectedTxid` to offer gets today's behaviour unchanged for every reason, "already
-   * known" included.
+   * `expectedTxid`, when given, is the txid this EXACT `rawHex` already deterministically hashes
+   * to (computed locally before ever calling this — "sign-and-record, then broadcast"). One of
+   * `ALREADY_KNOWN_REJECT_REASONS` is then recognized as success, not a fresh failure: it is the
+   * practical shape a RETRY of an already-broadcast write takes after a lost reply (the node
+   * accepted the original `sendrawtransaction` and this process simply never saw the response; a
+   * byte-identical rebuild, thanks to deterministic signing, reproduces the identical bytes and
+   * hits this exact rejection on retry). Every other rejection reason still throws, exactly as
+   * before; a caller with no `expectedTxid` to offer gets today's behaviour unchanged for every
+   * reason, "already known" included.
    */
   private async broadcastOrThrow(rawHex: string, expectedTxid?: string): Promise<string> {
     const acceptance = await this.request<Array<{ txid: string; allowed: boolean; "reject-reason"?: string }>>("testmempoolaccept", [
@@ -516,10 +522,11 @@ export class BtcHtlcRail {
     const result = acceptance[0];
     if (result === undefined) throw new Error("btc-htlc: testmempoolaccept returned no result");
     if (!result.allowed) {
-      if (expectedTxid !== undefined && result["reject-reason"] === "txn-already-known") {
+      const reason = result["reject-reason"];
+      if (expectedTxid !== undefined && reason !== undefined && BtcHtlcRail.ALREADY_KNOWN_REJECT_REASONS.has(reason)) {
         return expectedTxid;
       }
-      throw new Error(`btc-htlc: refusing to broadcast — testmempoolaccept rejected it (${result["reject-reason"] ?? "no reason given"})`);
+      throw new Error(`btc-htlc: refusing to broadcast — testmempoolaccept rejected it (${reason ?? "no reason given"})`);
     }
     return await this.request<string>("sendrawtransaction", [rawHex]);
   }
