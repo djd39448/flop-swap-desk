@@ -177,6 +177,254 @@ export function parseAccountLine(line: string): ParsedAccountLine | null {
   return { railId, caip2: `${ns}:${reference}`, address: normalizedAddress };
 }
 
+// ── the pubkey line (P4-BTC-SPEC.md §6) ─────────────────────────────────────────────────────
+//
+// A P2WSH script commits to PUBLIC KEYS, not addresses — and the refund branch commits to the
+// PAYER's key too, unlike the account line's address (which only ever needs to name where a
+// payout should land). A payee resolving `btc-htlc`'s witnessScript therefore needs both
+// parties' pubkeys, not just an address for its own counterparty, so this is a second, separate
+// line form next to the account line above:
+//
+//   swap1 pubkey <rail-id> <caip-2 (namespace:reference)> <33-byte compressed pubkey hex>
+//
+// Same rules as the account line: single ASCII spaces, no trailing space, a non-canonical rail
+// id rejected outright, the binding DID is `record.sender` (never a field inside the line), and
+// `resolvePubkeys` folds a room's lines to at most one pubkey per party under the identical
+// sender-binding/room-scoping/other-rail-or-chain-ignored/conflict-means-unresolved rules
+// `resolveAccounts` already applies. Unlike the account line (only the payee's is required),
+// P4-BTC-SPEC.md §6 requires BOTH parties to post one for a `btc-htlc` leg — that requirement is
+// the caller's own job (e.g. `src/rails/btc-evidence.ts` refusing to verify a lock when either
+// pubkey is missing), not something `resolvePubkeys` enforces itself (it only ever reports what
+// it can resolve, exactly like `resolveAccounts`).
+//
+// Only `btc-htlc` has a pubkey-line rule today; another rail that later needs one (`near-htlc`
+// commits to a public key too, in principle) reuses this same grammar under its own rail id and
+// CAIP-2 namespace.
+
+/** Rail → CAIP-2 namespace, for the pubkey line only (a separate map from `RAIL_NAMESPACES`
+ *  above, since a rail can have an account-line rule, a pubkey-line rule, both, or neither —
+ *  `evm-htlc`'s P2SH-free EOA commitment never needs the payer's pubkey, so it has no entry
+ *  here). */
+export const PUBKEY_RAIL_NAMESPACES: Readonly<Record<string, string>> = {
+  "btc-htlc": "bip122",
+};
+
+/** bip122's own CAIP-2 reference grammar (CAIP-2: "bip122" = Bitcoin/blockchain-based chains):
+ *  32 lowercase hex characters — the chain's genesis block hash prefix, exactly what
+ *  `BtcChainPin.caip2` (`src/rails/btc-htlc.ts`) carries. Deliberately narrower than
+ *  `CAIP2_REFERENCE` (the generic `[-a-zA-Z0-9]{1,32}` used above for a namespace with no
+ *  chain-specific rule yet): a bip122 reference is *always* hex, so accepting anything looser
+ *  would let a malformed or mixed-case reference through this grammar even though it could never
+ *  be a real bip122 chain id. This also rejects CAIP-10's legacy (pre-2021) `<address>@<caip-2
+ *  id>` account form outright — that form has no `namespace:reference` shape at all (there is no
+ *  `@` in a bare CAIP-2 token to begin with), so it can never match this pattern, or the pubkey
+ *  line's own three-token grammar below, no matter how it's spliced in. */
+const BIP122_REFERENCE = /^[0-9a-f]{32}$/;
+
+/** 33-byte compressed secp256k1 point, bare lowercase hex (Bitcoin convention) — the same shape
+ *  `src/rails/btc-htlc.ts`'s own `PUBKEY_SHAPE` checks. */
+const PUBKEY_SHAPE = /^0[23][0-9a-f]{64}$/;
+
+/** Shared core of `formatPubkeyLine`/`parsePubkeyLine`: validate one namespace's reference+pubkey
+ *  grammar. Only `bip122` has a rule today; any other namespace (including one with an
+ *  account-line rule) has none, so it always refuses — a pubkey line for a rail this module maps
+ *  to a namespace without a pubkey-line rule of its own is not a line this function can ever
+ *  produce or accept. */
+function validatePubkeyForNamespace(namespace: string, reference: string, pubkey: string): string | null {
+  if (namespace !== "bip122") return null;
+  if (!BIP122_REFERENCE.test(reference)) return null;
+  if (!PUBKEY_SHAPE.test(pubkey)) return null;
+  return pubkey;
+}
+
+/** `swap1 pubkey <rail-id> <caip-2> <pubkey>` — four tokens (unlike the account line's three):
+ *  the CAIP-2 chain id and the pubkey are separate tokens here, since a CAIP-2 id
+ *  (`namespace:reference`) has no address segment to share a token with in the first place. */
+const PUBKEY_LINE_PATTERN = /^swap1 pubkey (\S+) (\S+) (\S+)$/;
+
+export interface ParsedPubkeyLine {
+  /** Canonical per tclk's registry, exactly like `ParsedAccountLine.railId`. */
+  railId: string;
+  /** `namespace:reference` — compare against a chain pin's own `caip2` field. */
+  caip2: string;
+  /** The 33-byte compressed pubkey, lowercase hex (already normalized by `PUBKEY_SHAPE`). */
+  pubkey: string;
+}
+
+/**
+ * Build the pubkey line to post. Throws (never a silent guess) on a non-canonical or unmapped
+ * rail id, a `caip2` whose namespace does not match that rail, or a pubkey that fails the
+ * namespace's grammar — same fail-loud-on-write rule `formatAccountLine` follows.
+ */
+export function formatPubkeyLine(input: { railId: string; caip2: string; pubkey: string }): string {
+  const railId = normalizeRailId(input.railId);
+  if (railId !== input.railId) {
+    throw new Error(`pubkey-line: non-canonical rail id: ${input.railId}; use ${railId}`);
+  }
+  const namespace = PUBKEY_RAIL_NAMESPACES[railId];
+  if (namespace === undefined) {
+    throw new Error(`pubkey-line: rail "${railId}" has no pubkey-line namespace (P4-BTC-SPEC.md §6)`);
+  }
+  const caip2Parts = input.caip2.split(":");
+  const ns = caip2Parts[0];
+  const reference = caip2Parts[1];
+  if (caip2Parts.length !== 2 || ns === undefined || reference === undefined || ns === "" || reference === "") {
+    throw new Error(`pubkey-line: malformed caip2 "${input.caip2}" (expected namespace:reference)`);
+  }
+  if (ns !== namespace) {
+    throw new Error(`pubkey-line: caip2 namespace "${ns}" does not match rail "${railId}" (expected "${namespace}")`);
+  }
+  const normalizedPubkey = validatePubkeyForNamespace(namespace, reference, input.pubkey);
+  if (normalizedPubkey === null) {
+    throw new Error(`pubkey-line: "${input.pubkey}" is not a valid ${namespace} pubkey for reference "${reference}"`);
+  }
+  return `swap1 pubkey ${railId} ${ns}:${reference} ${normalizedPubkey}`;
+}
+
+/**
+ * Parse one deal-room pubkey line. Strict, never throws — `null` for anything that is not
+ * exactly the documented grammar: a non-canonical or unregistered rail id, a rail with no
+ * pubkey-line rule, a caip-2 token that isn't exactly two non-empty `:`-separated parts, a
+ * namespace that doesn't match the rail, or a pubkey that fails that namespace's grammar
+ * (bip122: a reference that isn't 32 lowercase hex chars, or a pubkey that isn't a 33-byte
+ * compressed point). This also refuses CAIP-10's legacy `<address>@<caip-2 id>` form: that form
+ * cannot appear as this line's third token at all (there is no room for an `@`-joined address in
+ * a bare `namespace:reference` token), so it simply never matches `LINE_PATTERN`'s three-token
+ * shape or `BIP122_REFERENCE`'s hex-only grammar.
+ */
+export function parsePubkeyLine(line: string): ParsedPubkeyLine | null {
+  if (typeof line !== "string") return null;
+  const match = PUBKEY_LINE_PATTERN.exec(line);
+  if (match === null) return null;
+  const railToken = match[1];
+  const caipToken = match[2];
+  const pubkeyToken = match[3];
+  if (railToken === undefined || caipToken === undefined || pubkeyToken === undefined) return null;
+
+  let railId: string;
+  try {
+    railId = normalizeRailId(railToken);
+  } catch {
+    return null;
+  }
+  if (railId !== railToken) return null; // must already be canonical on the wire
+
+  const namespace = PUBKEY_RAIL_NAMESPACES[railId];
+  if (namespace === undefined) return null; // this rail has no pubkey-line rule
+
+  const parts = caipToken.split(":");
+  if (parts.length !== 2) return null;
+  const ns = parts[0];
+  const reference = parts[1];
+  if (ns === undefined || reference === undefined || ns === "" || reference === "") return null;
+  if (ns !== namespace) return null; // wrong namespace for this rail
+
+  const normalizedPubkey = validatePubkeyForNamespace(namespace, reference, pubkeyToken);
+  if (normalizedPubkey === null) return null;
+
+  return { railId, caip2: `${ns}:${reference}`, pubkey: normalizedPubkey };
+}
+
+export interface ResolvePubkeysInput {
+  /** The tclk contract id whose own deal room is the only room a pubkey line for this leg may be
+   *  posted in — identical scoping rule to `ResolveAccountsInput.contract`. */
+  contract: string;
+  payerDid: string;
+  payeeDid: string;
+  /** Canonical rail id this resolution is for (e.g. `"btc-htlc"`). */
+  rail: string;
+  /** The chain pin's own `caip2` (e.g. `BtcChainPin.caip2`). */
+  caip2: string;
+}
+
+export interface ResolvedPubkeys {
+  payer?: string;
+  payee?: string;
+  /** Identical purpose to `ResolvedAccounts.reasons` — every line this fold ignored or refused,
+   *  or a conflict among one party's own lines. Empty when nothing did. */
+  reasons: string[];
+}
+
+/**
+ * Fold one leg's deal-room records into at most one resolved pubkey per party — the pubkey-line
+ * twin of `resolveAccounts`, with the identical rules: only a record that both verifies
+ * (`verifyTranscriptRecord(record).ok`) and sits in `dealRoom(contract)` counts; the binding DID
+ * is `record.sender`; a line for a different rail or chain is ignored (with a reason); a sender
+ * that is neither `payerDid` nor `payeeDid` is ignored silently; and disagreement among one
+ * party's own (otherwise valid, matching) lines makes that party's pubkey **unresolved**, never
+ * "first wins". Unlike `resolveAccounts` (only the payee's line is required by D-08), a
+ * `btc-htlc` leg's own lock verification (P4-BTC-SPEC.md §6) needs BOTH parties' pubkeys — this
+ * function still resolves each independently and leaves enforcing "both must be present" to its
+ * caller, exactly the same split `resolveAccounts` already draws between "what resolved" and
+ * "what a lock check requires".
+ */
+export function resolvePubkeys(records: readonly TranscriptRecord[], input: ResolvePubkeysInput): ResolvedPubkeys {
+  const reasons: string[] = [];
+
+  let rail: string;
+  try {
+    rail = normalizeRailId(input.rail);
+  } catch {
+    return { reasons: [`pubkey-line: "${input.rail}" is not a registered rail id`] };
+  }
+
+  let room: string;
+  try {
+    room = dealRoom(input.contract);
+  } catch {
+    return { reasons: [`pubkey-line: "${input.contract}" is not a valid contract id`] };
+  }
+
+  const pubkeysByDid = new Map<string, Set<string>>();
+
+  for (const candidate of records) {
+    if (!verifyTranscriptRecord(candidate).ok) continue; // unsigned or forged: not authenticated
+    if (candidate.room !== room) continue; // not this leg's own deal room
+
+    const parsed = parsePubkeyLine(candidate.line);
+    if (parsed === null) continue; // not a pubkey line at all (some other frame/line)
+
+    if (parsed.railId !== rail) {
+      reasons.push(
+        `pubkey-line: ${candidate.sender} posted a pubkey line for rail "${parsed.railId}", not "${rail}" (ignored)`,
+      );
+      continue;
+    }
+    if (parsed.caip2 !== input.caip2) {
+      reasons.push(
+        `pubkey-line: ${candidate.sender} posted a pubkey line for chain "${parsed.caip2}", not "${input.caip2}" (ignored)`,
+      );
+      continue;
+    }
+
+    if (candidate.sender !== input.payerDid && candidate.sender !== input.payeeDid) continue; // not a party to this swap
+
+    const seen = pubkeysByDid.get(candidate.sender) ?? new Set<string>();
+    seen.add(parsed.pubkey);
+    pubkeysByDid.set(candidate.sender, seen);
+  }
+
+  function resolve(did: string, role: "payer" | "payee"): string | undefined {
+    const seen = pubkeysByDid.get(did);
+    if (seen === undefined || seen.size === 0) return undefined;
+    if (seen.size > 1) {
+      reasons.push(`pubkey-line: conflicting pubkey lines for the ${role} (${did})`);
+      return undefined;
+    }
+    const [pubkey] = seen;
+    return pubkey;
+  }
+
+  const payer = resolve(input.payerDid, "payer");
+  const payee = resolve(input.payeeDid, "payee");
+
+  return {
+    reasons,
+    ...(payer === undefined ? {} : { payer }),
+    ...(payee === undefined ? {} : { payee }),
+  };
+}
+
 export interface ResolveAccountsInput {
   /** The tclk contract id whose own deal room (`dealRoom(contract)`) is the only room an
    *  account line for this leg may be posted in. */

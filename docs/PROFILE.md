@@ -221,9 +221,33 @@ already applies to a frame's own `rail`/`rails` fields. `<caip-10 account>` is C
 | rail | CAIP-2 namespace | status |
 |---|---|---|
 | `evm-htlc` | `eip155` | implemented now — `reference` is a decimal chain id, no leading zeros; `address` is `0x` + 40 hex, all-lowercase or a valid EIP-55 checksum (a mixed-case address that fails the checksum is rejected) |
-| `btc-htlc` | `bip122` | reserved for a later phase (§8 of the SPEC) — `reference`/`address` parse under the generic CAIP-2/CAIP-10 wire grammar only; that chain's own address rules (bech32, …) are that rail's own build's job |
-| `near-htlc` | `near` | reserved for a later phase — same generic-grammar-only status as `btc-htlc` |
+| `btc-htlc` | `bip122` | implemented now (P4-BTC-SPEC.md §6) — the account line's own generic CAIP-2/CAIP-10 wire grammar still applies (a `btc-htlc` line names a payout address, each party's own choice at spend time, and is never itself part of lock verification); the pubkey line below is the one that actually gates verification |
+| `near-htlc` | `near` | reserved for a later phase — same generic-grammar-only status the account line gives `btc-htlc` today |
 | (Solana) | — | no `tclk/1` rail id exists for it yet, so it has no account-line form at all |
+
+A P2WSH script commits to **public keys**, not addresses, and its refund branch commits to the
+*payer's* key too (unlike EVM's `Locked` struct, which never needs to store the payer's address
+to check anything) — so a `btc-htlc` leg's payee cannot rebuild and check the witnessScript from
+an address alone. P4-BTC-SPEC.md §6 adds a second, separate line form next to the account line,
+same authentication, sender binding, room check and conflict rule, but posted by **both** parties
+(unlike the account line, where only the payee's is required):
+
+```
+swap1 pubkey <rail-id> <caip-2 (namespace:reference)> <33-byte compressed pubkey, lowercase hex>
+```
+
+Four tokens, not three: the CAIP-2 chain id and the pubkey are separate tokens here, since a bare
+CAIP-2 id (`namespace:reference`) has no address segment to share one with. Only `btc-htlc` has a
+pubkey-line rule today (`PUBKEY_RAIL_NAMESPACES`, `src/rails/account-line.ts`), under `bip122`;
+`bip122`'s own reference grammar is stricter than the generic CAIP-2 rule the account line uses
+for a namespace with no chain-specific rule of its own — exactly 32 lowercase hex characters (the
+genesis-hash prefix a `BtcChainPin.caip2` carries), which also means CAIP-10's legacy (pre-2021)
+`<address>@<caip-2 id>` account form can never satisfy this line's grammar at all: there is no
+room for an `@`-joined address inside a bare `namespace:reference` token, so `resolvePubkeys`
+(the pubkey-line twin of `resolveAccounts`, same fold, same rules) never has to specifically
+detect and reject it — it simply never parses as anything. `src/rails/btc-evidence.ts`'s
+`btcEvidence` refuses to verify a `btc-htlc` lock at all (`railVerified: null`) until **both**
+`accounts.payeePubkey` and `accounts.payerPubkey` have resolved.
 
 A line carries no field naming whose account it is — the binding is `record.sender`, the DID that
 signed the transcript record it rides in, exactly as every other `tclk/1` frame is bound. **Who

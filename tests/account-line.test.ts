@@ -12,8 +12,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   formatAccountLine,
+  formatPubkeyLine,
   parseAccountLine,
+  parsePubkeyLine,
   resolveAccounts,
+  resolvePubkeys,
+  PUBKEY_RAIL_NAMESPACES,
   RAIL_NAMESPACES,
 } from "../src/rails/account-line.js";
 import { identity, record, recordSignedBy, unsignedRecord } from "./helpers/identity.js";
@@ -320,6 +324,262 @@ describe("resolveAccounts", () => {
 
   it("returns everyone unresolved, with a reason, for a malformed contract id", () => {
     const result = resolveAccounts([], { ...input, contract: "not-a-contract-id" });
+    expect(result.payer).toBeUndefined();
+    expect(result.payee).toBeUndefined();
+    expect(result.reasons.length).toBeGreaterThan(0);
+  });
+});
+
+// ── the pubkey line (P4-BTC-SPEC.md §6) ─────────────────────────────────────────────────────
+
+const BTC_RAIL = "btc-htlc";
+const BTC_CAIP2 = "bip122:0f9188f13cb7b2c71f2a335e3a4fc328"; // BTC_REGTEST_PIN.caip2
+const PAYEE_PUBKEY = "0361c6efa7529b0f113fe6ea467248133aba7f14927a7163d6333048ebbf01318a";
+const PAYER_PUBKEY = "0372320de1e3ad1abed6a51d6c435cd1312657a62d6b3545cfca062bc8fd08a627";
+
+function fakePubkey(tag: string, prefix: "02" | "03" = "02"): string {
+  const hex = Buffer.from(tag, "utf8").toString("hex").padEnd(64, "0").slice(0, 64);
+  return `${prefix}${hex}`;
+}
+
+describe("pubkey-line grammar", () => {
+  describe("parsePubkeyLine", () => {
+    it("accepts a well-formed btc-htlc/bip122 line", () => {
+      const line = `swap1 pubkey btc-htlc ${BTC_CAIP2} ${PAYEE_PUBKEY}`;
+      expect(parsePubkeyLine(line)).toEqual({ railId: "btc-htlc", caip2: BTC_CAIP2, pubkey: PAYEE_PUBKEY });
+    });
+
+    it("accepts a 0x03-prefixed pubkey", () => {
+      const line = `swap1 pubkey btc-htlc ${BTC_CAIP2} ${PAYER_PUBKEY}`;
+      expect(parsePubkeyLine(line)?.pubkey).toBe(PAYER_PUBKEY);
+    });
+
+    it("rejects an uppercase pubkey (never normalized — must already be lowercase)", () => {
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc ${BTC_CAIP2} ${PAYEE_PUBKEY.toUpperCase()}`)).toBeNull();
+    });
+
+    it("rejects a pubkey that is the wrong length", () => {
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc ${BTC_CAIP2} ${PAYEE_PUBKEY}ab`)).toBeNull();
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc ${BTC_CAIP2} ${PAYEE_PUBKEY.slice(0, -2)}`)).toBeNull();
+    });
+
+    it("rejects a pubkey with a bad prefix byte (not 02/03)", () => {
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc ${BTC_CAIP2} 04${PAYEE_PUBKEY.slice(2)}`)).toBeNull();
+    });
+
+    it("rejects a mixed-case (non-hex-lowercase) reference", () => {
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc bip122:0F9188F13CB7B2C71F2A335E3A4FC328 ${PAYEE_PUBKEY}`)).toBeNull();
+    });
+
+    it("rejects a reference that is not 32 hex chars (bip122's own grammar)", () => {
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc bip122:abcd ${PAYEE_PUBKEY}`)).toBeNull();
+    });
+
+    it("rejects the wrong namespace for the rail (btc-htlc wants bip122, not eip155)", () => {
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc eip155:31337 ${PAYEE_PUBKEY}`)).toBeNull();
+    });
+
+    it("rejects a rail with no pubkey-line rule (evm-htlc)", () => {
+      expect(parsePubkeyLine(`swap1 pubkey evm-htlc ${BTC_CAIP2} ${PAYEE_PUBKEY}`)).toBeNull();
+    });
+
+    it("rejects a rail tclk has never registered", () => {
+      expect(parsePubkeyLine(`swap1 pubkey sol-htlc ${BTC_CAIP2} ${PAYEE_PUBKEY}`)).toBeNull();
+    });
+
+    it("rejects a non-canonical rail spelling", () => {
+      expect(parsePubkeyLine(`swap1 pubkey BTC-HTLC ${BTC_CAIP2} ${PAYEE_PUBKEY}`)).toBeNull();
+    });
+
+    it("rejects CAIP-10's legacy <address>@<caip-2> account form spliced into the caip-2 token", () => {
+      // The legacy (pre-2021) CAIP-10 form has no room in a bare `namespace:reference` token —
+      // it fails on the namespace check (the token before the first ":" is not "bip122" at all).
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc somebtcaddress@bip122:0f9188f13cb7b2c71f2a335e3a4fc328 ${PAYEE_PUBKEY}`)).toBeNull();
+    });
+
+    it("rejects a caip-2 token with three colon-separated parts (a full caip-10 triplet, not a bare caip-2 id)", () => {
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc ${BTC_CAIP2}:someaddress ${PAYEE_PUBKEY}`)).toBeNull();
+    });
+
+    it("rejects an extra space anywhere in the line", () => {
+      expect(parsePubkeyLine(`swap1 pubkey  btc-htlc ${BTC_CAIP2} ${PAYEE_PUBKEY}`)).toBeNull();
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc  ${BTC_CAIP2} ${PAYEE_PUBKEY}`)).toBeNull();
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc ${BTC_CAIP2}  ${PAYEE_PUBKEY}`)).toBeNull();
+      expect(parsePubkeyLine(`swap1 pubkey btc-htlc ${BTC_CAIP2} ${PAYEE_PUBKEY} `)).toBeNull();
+    });
+
+    it("is never thrown at by malformed input", () => {
+      expect(() => parsePubkeyLine("")).not.toThrow();
+      expect(() => parsePubkeyLine("not a pubkey line at all")).not.toThrow();
+      expect(() => parsePubkeyLine("swap1 pubkey")).not.toThrow();
+      expect(parsePubkeyLine("")).toBeNull();
+      expect(parsePubkeyLine("swap1 pubkey")).toBeNull();
+    });
+
+    it("does not accept an account-line-shaped line (different grammar, different token count)", () => {
+      expect(parsePubkeyLine(`swap1 account btc-htlc ${BTC_CAIP2}:${PAYEE_PUBKEY}`)).toBeNull();
+    });
+  });
+
+  describe("formatPubkeyLine", () => {
+    it("round-trips through parsePubkeyLine", () => {
+      const line = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_CAIP2, pubkey: PAYEE_PUBKEY });
+      expect(line).toBe(`swap1 pubkey btc-htlc ${BTC_CAIP2} ${PAYEE_PUBKEY}`);
+      expect(parsePubkeyLine(line)).toEqual({ railId: "btc-htlc", caip2: BTC_CAIP2, pubkey: PAYEE_PUBKEY });
+    });
+
+    it("throws on a non-canonical rail id", () => {
+      expect(() => formatPubkeyLine({ railId: "BTC-HTLC", caip2: BTC_CAIP2, pubkey: PAYEE_PUBKEY })).toThrow(/non-canonical rail id/);
+    });
+
+    it("throws on a rail with no pubkey-line rule", () => {
+      expect(() => formatPubkeyLine({ railId: "evm-htlc", caip2: "eip155:31337", pubkey: PAYEE_PUBKEY })).toThrow(
+        /no pubkey-line namespace/,
+      );
+    });
+
+    it("throws on a rail tclk has never registered", () => {
+      expect(() => formatPubkeyLine({ railId: "sol-htlc", caip2: "solana:1", pubkey: PAYEE_PUBKEY })).toThrow();
+    });
+
+    it("throws when the caip2 namespace does not match the rail", () => {
+      expect(() => formatPubkeyLine({ railId: "btc-htlc", caip2: "eip155:31337", pubkey: PAYEE_PUBKEY })).toThrow(
+        /does not match rail/,
+      );
+    });
+
+    it("throws on a malformed pubkey", () => {
+      expect(() => formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_CAIP2, pubkey: "not-hex" })).toThrow();
+      expect(() => formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_CAIP2, pubkey: PAYEE_PUBKEY.toUpperCase() })).toThrow();
+    });
+
+    it("throws on a malformed caip2 (not namespace:reference)", () => {
+      expect(() => formatPubkeyLine({ railId: "btc-htlc", caip2: "bip122", pubkey: PAYEE_PUBKEY })).toThrow(/malformed caip2/);
+    });
+  });
+
+  it("PUBKEY_RAIL_NAMESPACES documents only btc-htlc today (P4-BTC-SPEC.md §6)", () => {
+    expect(PUBKEY_RAIL_NAMESPACES).toEqual({ "btc-htlc": "bip122" });
+  });
+});
+
+describe("resolvePubkeys", () => {
+  const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, rail: BTC_RAIL, caip2: BTC_CAIP2 };
+
+  function pubkeyLineRecord(seq: number, signer: typeof buyer, pubkey: string, room: string = ROOM): ReturnType<typeof record> {
+    return record(room, seq, T0 + seq * 60_000, signer, formatPubkeyLine({ railId: BTC_RAIL, caip2: BTC_CAIP2, pubkey }));
+  }
+
+  it("resolves the payer's line to `payer`, never `payee` (sender binding)", () => {
+    const records = [pubkeyLineRecord(1, buyer, PAYER_PUBKEY)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payer).toBe(PAYER_PUBKEY);
+    expect(result.payee).toBeUndefined();
+  });
+
+  it("resolves the payee's line to `payee`, never `payer` (the other way)", () => {
+    const records = [pubkeyLineRecord(1, seller, PAYEE_PUBKEY)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payee).toBe(PAYEE_PUBKEY);
+    expect(result.payer).toBeUndefined();
+  });
+
+  it("resolves both independently when both parties post — required for a btc-htlc leg (P4-BTC-SPEC.md §6)", () => {
+    const records = [pubkeyLineRecord(1, buyer, PAYER_PUBKEY), pubkeyLineRecord(2, seller, PAYEE_PUBKEY)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payer).toBe(PAYER_PUBKEY);
+    expect(result.payee).toBe(PAYEE_PUBKEY);
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("ignores an unsigned record even if its line is a well-formed pubkey line", () => {
+    const line = formatPubkeyLine({ railId: BTC_RAIL, caip2: BTC_CAIP2, pubkey: PAYEE_PUBKEY });
+    const records = [unsignedRecord(ROOM, 1, T0, line)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payer).toBeUndefined();
+    expect(result.payee).toBeUndefined();
+  });
+
+  it("ignores a forged record (signature does not match the claimed sender)", () => {
+    const line = formatPubkeyLine({ railId: BTC_RAIL, caip2: BTC_CAIP2, pubkey: PAYER_PUBKEY });
+    const records = [recordSignedBy(ROOM, 1, T0, seller, buyer.did, line)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payer).toBeUndefined();
+    expect(result.payee).toBeUndefined();
+  });
+
+  it("a conflict (two disagreeing lines from the same party) leaves that party unresolved, not first-wins", () => {
+    const records = [pubkeyLineRecord(1, buyer, PAYER_PUBKEY), pubkeyLineRecord(2, buyer, fakePubkey("second-claim"))];
+    const result = resolvePubkeys(records, input);
+    expect(result.payer).toBeUndefined();
+    expect(result.reasons.some((r) => r.includes("conflicting pubkey lines") && r.includes(buyer.did))).toBe(true);
+  });
+
+  it("repeating the same pubkey twice is not a conflict", () => {
+    const records = [pubkeyLineRecord(1, buyer, PAYER_PUBKEY), pubkeyLineRecord(2, buyer, PAYER_PUBKEY)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payer).toBe(PAYER_PUBKEY);
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("ignores a line for a different chain (same rail, different caip2) and says why", () => {
+    const otherChain = "bip122:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // any other well-formed 32-hex bip122 reference
+    const otherChainLine = formatPubkeyLine({ railId: BTC_RAIL, caip2: otherChain, pubkey: PAYEE_PUBKEY });
+    const records = [record(ROOM, 1, T0, seller, otherChainLine)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payee).toBeUndefined();
+    expect(result.reasons.some((r) => r.includes(otherChain))).toBe(true);
+  });
+
+  it("ignores a line for a different rail and says why", () => {
+    const otherRailLine = formatAccountLine({ railId: "evm-htlc", caip2: "eip155:31337", address: getAddress("0xd8da6bf26964af9d7eed9e03e53415d37aa96045") });
+    const records = [record(ROOM, 1, T0, seller, otherRailLine)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payee).toBeUndefined();
+  });
+
+  it("ignores a record posted in a different room, even byte-identical otherwise", () => {
+    const line = formatPubkeyLine({ railId: BTC_RAIL, caip2: BTC_CAIP2, pubkey: PAYEE_PUBKEY });
+    const otherRoom = dealRoom(OTHER_CONTRACT);
+    const records = [record(otherRoom, 1, T0, seller, line)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payee).toBeUndefined();
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("ignores a record posted in the shared offer room, not the swap's own deal room", () => {
+    const line = formatPubkeyLine({ railId: BTC_RAIL, caip2: BTC_CAIP2, pubkey: PAYEE_PUBKEY });
+    const records = [record(OFFER_ROOM, 1, T0, seller, line)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payee).toBeUndefined();
+  });
+
+  it("ignores a line from a DID that is neither party to this swap", () => {
+    const stranger = identity("f6".repeat(32));
+    const line = formatPubkeyLine({ railId: BTC_RAIL, caip2: BTC_CAIP2, pubkey: PAYEE_PUBKEY });
+    const records = [record(ROOM, 1, T0, stranger, line)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payer).toBeUndefined();
+    expect(result.payee).toBeUndefined();
+  });
+
+  it("an account line in the same room does not satisfy the pubkey-line requirement", () => {
+    const accountLine = formatAccountLine({ railId: "evm-htlc", caip2: "eip155:31337", address: getAddress("0xd8da6bf26964af9d7eed9e03e53415d37aa96045") });
+    const records = [record(ROOM, 1, T0, seller, accountLine)];
+    const result = resolvePubkeys(records, input);
+    expect(result.payee).toBeUndefined();
+    expect(result.reasons).toEqual([]); // not a pubkey line at all — silently not counted, same as any other unrelated line
+  });
+
+  it("returns everyone unresolved, with a reason, for an unregistered rail", () => {
+    const result = resolvePubkeys([], { ...input, rail: "sol-htlc" });
+    expect(result.payer).toBeUndefined();
+    expect(result.payee).toBeUndefined();
+    expect(result.reasons.length).toBeGreaterThan(0);
+  });
+
+  it("returns everyone unresolved, with a reason, for a malformed contract id", () => {
+    const result = resolvePubkeys([], { ...input, contract: "not-a-contract-id" });
     expect(result.payer).toBeUndefined();
     expect(result.payee).toBeUndefined();
     expect(result.reasons.length).toBeGreaterThan(0);
