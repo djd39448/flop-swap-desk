@@ -30,7 +30,7 @@ import {
 import type { LockTerms } from "@flop-labs/tclk";
 import { verifyHashPreimage } from "@flop-labs/tclk";
 
-import { EvmHashRail, type AddressBook, type AssetBook } from "../vendor/evm-hash-rail.js";
+import { EVM_HASH_RAIL_ABI, EvmHashRail, type AddressBook, type AssetBook } from "../vendor/evm-hash-rail.js";
 import { captureEvmLeg, evmEvidence, EVM_RAIL_ID, hashLockRefMismatch, type EvmAccounts, type EvmEvidenceResult } from "./evm-evidence.js";
 import type { CapturingRpc } from "./rpc-capture.js";
 
@@ -209,6 +209,18 @@ export function checkEvmRailConfig(value: unknown): EvmRailConfigCheck {
     return { ok: false, reason: error instanceof Error ? error.message : String(error) };
   }
   return { ok: true, config };
+}
+
+/** B2: pull the short revert reason out of a viem simulate/call error the same way
+ *  `src/vendor/evm-hash-rail.ts`'s (private, unexported) `extractRevertReason` does for a
+ *  mined-but-reverted write — never throws itself, never the raw ABI-encoding dump. */
+function extractShortMessage(err: unknown): string {
+  if (err && typeof err === "object") {
+    const withMessage = err as { shortMessage?: unknown; message?: unknown };
+    if (typeof withMessage.shortMessage === "string") return withMessage.shortMessage;
+    if (typeof withMessage.message === "string") return withMessage.message;
+  }
+  return String(err);
 }
 
 function chainFromPin(pin: EvmChainPin): Chain {
@@ -448,12 +460,52 @@ export class EvmHtlcRail {
     return this.captureWriteEvidence("Locked", terms.statement as Hex, fromBlock, before);
   }
 
+  /**
+   * P22-P24-EVM-FIXES.md B2 (USD-COIN-FIT-2026-09-28.md: "a reverted claim still leaks the
+   * secret"): a claim against a blacklisted (or otherwise refusing) payee still reverts
+   * on-chain, but the preimage is already public in the reverted transaction's own calldata the
+   * moment it is broadcast — mined or not, the leak already happened. Simulating first
+   * (`eth_call` at `latest`, never a real transaction) means a doomed claim is never sent at
+   * all; any revert cause refuses it, not only a blacklist.
+   */
   async claim(hashLock: Hex, secret: Hex): Promise<WriteEvidence> {
     await this.assertPinnedChainId();
+    await this.simulateClaimOrThrow(hashLock, secret);
     const before = this.rpc.exchanges().length;
     const fromBlock = await this.publicClient.getBlockNumber();
     await this.rail.claim(hashLock, secret);
     return this.captureWriteEvidence("Claimed", hashLock, fromBlock, before);
+  }
+
+  /** B2: `eth_call` the vendored contract's own `claim(hashLock, preimage)` at `latest` through
+   *  this rail's `walletClient.account` — never broadcasts. Throws (never broadcasts) when the
+   *  simulation reverts, for any reason. */
+  private async simulateClaimOrThrow(hashLock: Hex, secret: Hex): Promise<void> {
+    try {
+      await this.publicClient.simulateContract({
+        address: this.config.contract,
+        abi: EVM_HASH_RAIL_ABI,
+        functionName: "claim",
+        args: [hashLock, secret],
+        account: this.walletClient.account,
+      });
+    } catch (err) {
+      throw new Error(`evm-htlc: refusing to broadcast claim — it simulates to a revert (${extractShortMessage(err)})`);
+    }
+  }
+
+  /** B2: the contract's only clock is `block.timestamp`; this reads the chain's own current
+   *  time (the latest block), never wall-clock or an injected `clock()` — `claimByMs` and the
+   *  claim-inclusion margin must be judged against what the contract itself will see when a
+   *  claim transaction actually lands, not against a client's local notion of "now". */
+  async latestBlockTimestampMs(): Promise<number> {
+    const result = (await this.rpc.request({ method: "eth_getBlockByNumber", params: ["latest", false] })) as {
+      timestamp?: Hex;
+    } | null;
+    if (result === null || typeof result.timestamp !== "string") {
+      throw new Error("evm-htlc: eth_getBlockByNumber(latest) returned no usable timestamp");
+    }
+    return hexToNumber(result.timestamp) * 1000;
   }
 
   async refund(hashLock: Hex): Promise<WriteEvidence> {

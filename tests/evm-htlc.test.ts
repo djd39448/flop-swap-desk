@@ -284,6 +284,10 @@ describe("EvmHtlcRail write path — bounded eth_getLogs -> WriteEvidence", () =
     return {
       eth_chainId: () => ({ result: "0x7a69" }),
       eth_blockNumber: () => ({ result: "0x5" }),
+      // B2: EvmHtlcRail.claim() simulates via `eth_call` before ever broadcasting — every
+      // fixture in this describe block that calls claim() needs a non-reverting simulation
+      // result (an empty return, `claim`'s own ABI declares no outputs).
+      eth_call: () => ({ result: "0x" }),
       eth_sendTransaction: () => ({ result: TX_HASH }),
       eth_getTransactionReceipt: () => ({
         result: {
@@ -373,6 +377,22 @@ describe("EvmHtlcRail write path — bounded eth_getLogs -> WriteEvidence", () =
     const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
     const evidence = await rail.claim(TERMS.statement as Hex, secret);
     expect(evidence.event).toBe("Claimed");
+  });
+
+  // P22-P24-EVM-FIXES.md B2 (USD-COIN-FIT-2026-09-28.md).
+  it("claim() never broadcasts when the simulation reverts", async () => {
+    const secret = ("0x" + "cd".repeat(32)) as Hex;
+    const config = configFor(ANVIL_LOCAL_PIN);
+    const { rpc, calls } = mockCapturingRpc({
+      eth_chainId: () => ({ result: "0x7a69" }),
+      eth_call: () => ({ error: { code: 3, message: "execution reverted: EvmHashRail: blacklisted" } }),
+      // No eth_sendTransaction/eth_getTransactionReceipt/eth_blockNumber handlers at all: if
+      // claim() ever broadcast past the simulation, this mock would throw "unexpected method"
+      // instead of failing with the assertion below.
+    });
+    const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
+    await expect(rail.claim(TERMS.statement as Hex, secret)).rejects.toThrow(/simulates to a revert/);
+    expect(calls.some((call) => call.method === "eth_sendTransaction")).toBe(false);
   });
 
   it("refund() resolves against the Refunded event", async () => {
