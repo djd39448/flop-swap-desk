@@ -103,6 +103,11 @@ export interface LockEvidence {
   finalizedRef?: string;
   endpoint?: string;
   reason?: string;
+  /** P22-P24-EVM-SPEC.md §5: sha256 (lowercase hex) of each byte-exact raw input the verdict
+   *  rests on, in call order — a chain rail's `raw/rpc/<sha256>.json` captures (see
+   *  `src/rails/rpc-capture.ts`). Absent for rails (e.g. `paper`) that don't capture raw
+   *  bytes this way. */
+  raw?: string[];
 }
 
 /**
