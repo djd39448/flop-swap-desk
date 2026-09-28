@@ -1,0 +1,336 @@
+{
+  "v": 1,
+  "rail": "btc-htlc",
+  "ref": "d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0",
+  "pin": "btc-regtest",
+  "caip2": "bip122:0f9188f13cb7b2c71f2a335e3a4fc328",
+  "endpoint": "http://127.0.0.1:52816",
+  "checkedAtMs": 1790697209000,
+  "config": {
+    "pin": {
+      "name": "btc-regtest",
+      "network": "regtest",
+      "caip2": "bip122:0f9188f13cb7b2c71f2a335e3a4fc328",
+      "genesisHash": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+      "finality": {
+        "confirmations": 2
+      }
+    },
+    "endpoint": "http://127.0.0.1:52816"
+  },
+  "nonce": "d06ae50c9038dd4f",
+  "exchanges": [
+    {
+      "method": "getblockchaininfo",
+      "params": [],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:1\",\"method\":\"getblockchaininfo\",\"params\":[]}",
+      "responseSha256": "b3ee80f87a1866abdc58fbc115b08e901a5fd4fe069fd599b93d1ff40bb9f706",
+      "atMs": 1790625133941
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        0
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:2\",\"method\":\"getblockhash\",\"params\":[0]}",
+      "responseSha256": "99b668625fdba4d95da162e5e32d787d060acd10dc5a03b93150ad9cd7697c58",
+      "atMs": 1790625133942
+    },
+    {
+      "method": "getrawtransaction",
+      "params": [
+        "d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8",
+        true
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:3\",\"method\":\"getrawtransaction\",\"params\":[\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8\",true]}",
+      "responseSha256": "68831b48fb402b0f5cb8e0008f4d87a6b80375115d79edf066771a7be350cfa4",
+      "atMs": 1790625133942
+    },
+    {
+      "method": "gettxout",
+      "params": [
+        "d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8",
+        0,
+        false
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:4\",\"method\":\"gettxout\",\"params\":[\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8\",0,false]}",
+      "responseSha256": "bdf741e597f67ec5c46464fe67a0d12ac56ed1079fe9b2807e679461f719af3c",
+      "atMs": 1790625133943
+    },
+    {
+      "method": "getblockheader",
+      "params": [
+        "4c9fbb36bedbd12049a62513a638ae70d2c84e359a7ed140da22271a61c191eb"
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:5\",\"method\":\"getblockheader\",\"params\":[\"4c9fbb36bedbd12049a62513a638ae70d2c84e359a7ed140da22271a61c191eb\"]}",
+      "responseSha256": "4b8ced9bf477548afca00e994864a30dac10ff6056825bac827871959c1803e2",
+      "atMs": 1790625133944
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        106
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:6\",\"method\":\"getblockhash\",\"params\":[106]}",
+      "responseSha256": "2f98af3a5968ac7dd9869e94b6be475bcb9c71adb391ceec96587880e72e2db0",
+      "atMs": 1790625133944
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "4c9fbb36bedbd12049a62513a638ae70d2c84e359a7ed140da22271a61c191eb",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:7\",\"method\":\"getblock\",\"params\":[\"4c9fbb36bedbd12049a62513a638ae70d2c84e359a7ed140da22271a61c191eb\",2]}",
+      "responseSha256": "691d07dde4b895fc652d5235f8ef7974e5b03e68942350346f903ecdf5d983a8",
+      "atMs": 1790625133945
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        107
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:8\",\"method\":\"getblockhash\",\"params\":[107]}",
+      "responseSha256": "99f6f644c689fd6df5c3b7f86128e7da22635fc354cc8f76cf38729200af9b19",
+      "atMs": 1790625133946
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "5f1e94488f54dbbb32debb19a9b81593a83f66b9a633cd1e9174f0270cda7a67",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:9\",\"method\":\"getblock\",\"params\":[\"5f1e94488f54dbbb32debb19a9b81593a83f66b9a633cd1e9174f0270cda7a67\",2]}",
+      "responseSha256": "9490f35986da30f8341a7a6f73f35e3249312096a34f6a89f0856b7fe1cdacfd",
+      "atMs": 1790625133946
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        108
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:10\",\"method\":\"getblockhash\",\"params\":[108]}",
+      "responseSha256": "756c4a723eff8d5a50f3c702e49f7cb531809ebc0296e5007672fe8e00978ba7",
+      "atMs": 1790625133947
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "03d4b7b313bf7c9da906613a4725acaaa5f0725b6f26f962ed55d16c13dc5a6a",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:11\",\"method\":\"getblock\",\"params\":[\"03d4b7b313bf7c9da906613a4725acaaa5f0725b6f26f962ed55d16c13dc5a6a\",2]}",
+      "responseSha256": "0f11c3ca7c48860334a422e43b2233c03c98ab063dfb483151140f70766d998d",
+      "atMs": 1790625133948
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        109
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:12\",\"method\":\"getblockhash\",\"params\":[109]}",
+      "responseSha256": "a9062da99f40dd3408254fb070afb549b551985aa1e8723e771548ba0d575200",
+      "atMs": 1790625133949
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "483f14f42ac5dc8501a67b6e36e27f314665cbdbc1a984a7e73a664d2973e2dc",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:13\",\"method\":\"getblock\",\"params\":[\"483f14f42ac5dc8501a67b6e36e27f314665cbdbc1a984a7e73a664d2973e2dc\",2]}",
+      "responseSha256": "3263f52aa9837f238710c48d292a48f66a6ab433f976592fd920a00fd270926c",
+      "atMs": 1790625133950
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        110
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:14\",\"method\":\"getblockhash\",\"params\":[110]}",
+      "responseSha256": "d283d0b1ce2a65e1dadb0a653506491a4f9829983c8c10ef058b20ee380204b0",
+      "atMs": 1790625133950
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "27225c5fcc92294beaae973b72eafedf0d0624a6d2cff8edc276faed8874cdcf",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:15\",\"method\":\"getblock\",\"params\":[\"27225c5fcc92294beaae973b72eafedf0d0624a6d2cff8edc276faed8874cdcf\",2]}",
+      "responseSha256": "f6e4b51939ba951baaceb9f32639bea49c56098308c585b9f812635a4026db95",
+      "atMs": 1790625133951
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        111
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:16\",\"method\":\"getblockhash\",\"params\":[111]}",
+      "responseSha256": "57ef364be7de90e663808cff92b673778cfe43363919962e0ced43a26e66aec4",
+      "atMs": 1790625133952
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "4c28e607267f4c049ffbe875c868e99bf208de4e4a823751fb180c7281e9f0da",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:17\",\"method\":\"getblock\",\"params\":[\"4c28e607267f4c049ffbe875c868e99bf208de4e4a823751fb180c7281e9f0da\",2]}",
+      "responseSha256": "b833d134dcc4ae5ff1370d499c5ae8172da7b42eb00dcc8103e5768904c97944",
+      "atMs": 1790625133952
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        112
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:18\",\"method\":\"getblockhash\",\"params\":[112]}",
+      "responseSha256": "def2481ad2d9462b8c3bb0fba6f508ba1ec19480b4f97654f08f141f7d0dd3e2",
+      "atMs": 1790625133953
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "12c1aeb1ab04f88cad923195dca2a574793f28560688d008095846022a892d3d",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:19\",\"method\":\"getblock\",\"params\":[\"12c1aeb1ab04f88cad923195dca2a574793f28560688d008095846022a892d3d\",2]}",
+      "responseSha256": "38be536876b809062deaf7da4ebd91f6da7d417025f06d911a8fa17165e9e3dc",
+      "atMs": 1790625133954
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        113
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:20\",\"method\":\"getblockhash\",\"params\":[113]}",
+      "responseSha256": "a2dec058a07b3bd88855489055b43b99ff2079538103dfe19ccfbc878151817f",
+      "atMs": 1790625133955
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "79b477a2a5bc99fd55b2c158c779ef2f29486a2e1ea4d81f7f3a8e64384cb653",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:21\",\"method\":\"getblock\",\"params\":[\"79b477a2a5bc99fd55b2c158c779ef2f29486a2e1ea4d81f7f3a8e64384cb653\",2]}",
+      "responseSha256": "908e3eac2bb8d00853a29e29eef59ef8857dfaacc79da94cb2c1f5fc57979199",
+      "atMs": 1790625133955
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        114
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:22\",\"method\":\"getblockhash\",\"params\":[114]}",
+      "responseSha256": "9a3300dbbf6a4ded4093af2912905f92c2078402e3a2a381bb63d102087cceb5",
+      "atMs": 1790625133956
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "311b47167cc87566f4629f291f7623795b4549a97619c92280540688c621f8b1",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:23\",\"method\":\"getblock\",\"params\":[\"311b47167cc87566f4629f291f7623795b4549a97619c92280540688c621f8b1\",2]}",
+      "responseSha256": "d5f955982b6c7c1899d91f5f707467fc1f4544fe55de4729adc14734b805e153",
+      "atMs": 1790625133957
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        115
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:24\",\"method\":\"getblockhash\",\"params\":[115]}",
+      "responseSha256": "8bb291e7b169b91da81a1c31370431b69370d9e74161b8c2a24274bda70f6876",
+      "atMs": 1790625133957
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "4ac6c8829bbf142920a41a6bbe61f81c7ae222fa3e629bbea146e626c6c9b0b3",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:25\",\"method\":\"getblock\",\"params\":[\"4ac6c8829bbf142920a41a6bbe61f81c7ae222fa3e629bbea146e626c6c9b0b3\",2]}",
+      "responseSha256": "0685695d3e80b622a4f624219117b55f4f33f492a12b798a09694fe913621063",
+      "atMs": 1790625133958
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        116
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:26\",\"method\":\"getblockhash\",\"params\":[116]}",
+      "responseSha256": "7a68d1c35dc84ff666f4691df6c6b749244b676f3cedfc8fa59f10631f3fc23c",
+      "atMs": 1790625133959
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "0f82ae587cbbfb51020005cfdbd65ce74dde36aece19f8367ab2de5c943318c3",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:27\",\"method\":\"getblock\",\"params\":[\"0f82ae587cbbfb51020005cfdbd65ce74dde36aece19f8367ab2de5c943318c3\",2]}",
+      "responseSha256": "2e6c5a8636fa1b541d2612699c02b3a169d0c0496eebdfd51ca58ba6d4439304",
+      "atMs": 1790625133959
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        117
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:28\",\"method\":\"getblockhash\",\"params\":[117]}",
+      "responseSha256": "d4438312f25390dc939d55ee5263c32b1a1735214e88973a936983b7402422f0",
+      "atMs": 1790625133960
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "5ce522fba64d76e1999f666f6403741b655c531b872ddb61fc3e14af5f4c75a9",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:29\",\"method\":\"getblock\",\"params\":[\"5ce522fba64d76e1999f666f6403741b655c531b872ddb61fc3e14af5f4c75a9\",2]}",
+      "responseSha256": "d2db69d644bb34ed5a8eb163a806c512aee61ddd8d6691037c9618888053f260",
+      "atMs": 1790625133961
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        118
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:30\",\"method\":\"getblockhash\",\"params\":[118]}",
+      "responseSha256": "bf1ec06a36e5fd4a90bbafe8f7700a07db1a20a5d5f3471cb17ec65e13cdb6a3",
+      "atMs": 1790625133962
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "45eb54883f8e1aabf77051a39d9eb22f84102e7adebdd5332711591c63dd1c7d",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:31\",\"method\":\"getblock\",\"params\":[\"45eb54883f8e1aabf77051a39d9eb22f84102e7adebdd5332711591c63dd1c7d\",2]}",
+      "responseSha256": "f0cd6888cf337f58f563b2a50db5b89771ee6477df4f259a95cba6ccd46d5e49",
+      "atMs": 1790625133963
+    },
+    {
+      "method": "getblockhash",
+      "params": [
+        119
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:32\",\"method\":\"getblockhash\",\"params\":[119]}",
+      "responseSha256": "308c3aad06e147fa6e0f826ed7710aace3121842f9ac770e920575fa3c6f0740",
+      "atMs": 1790625133964
+    },
+    {
+      "method": "getblock",
+      "params": [
+        "77011beafb5c20de7d27974746ca1d6ea70440de64a6cecba5c70cc5d58c383a",
+        2
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8:0:1790697209000:d06ae50c9038dd4f:33\",\"method\":\"getblock\",\"params\":[\"77011beafb5c20de7d27974746ca1d6ea70440de64a6cecba5c70cc5d58c383a\",2]}",
+      "responseSha256": "a65cdeecc5ceebc51bccacb95d7bd7a5fb85a766ccc6e76fb0a90e5a9d5e37a1",
+      "atMs": 1790625133965
+    }
+  ]
+}

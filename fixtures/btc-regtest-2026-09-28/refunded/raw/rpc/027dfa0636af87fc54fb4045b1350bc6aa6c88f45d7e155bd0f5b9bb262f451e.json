@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":[{"txid":"d48c730e600535785aa0872abb2926bb5a2c1ea007eaf6d946520269fb46d6f8","wtxid":"520c0b6568820a92af1018b0271d90363e215b09119b6ad6bede314650874510","allowed":true,"vsize":154,"fees":{"base":0.00003100,"effective-feerate":0.00020129,"effective-includes":["520c0b6568820a92af1018b0271d90363e215b09119b6ad6bede314650874510"]}}],"id":8}
