@@ -200,6 +200,53 @@ before it reports anything about a leg's money:
 `src/watcher.ts` and `examples/audit-export.mjs`. This subsection states the policy; that code is
 the fold §3.2 calls "the board's job."
 
+### 3.5 Chain accounts: the account line (D-08)
+
+`tclk/1` has no field for a chain address: a DID is an Ed25519 key, an EVM/BTC/NEAR account is
+unrelated key material, and the protocol layer has no business bridging the two (the same reason
+`src/vendor/evm-hash-rail.ts`'s `AddressBook` is a caller-supplied mapping, not part of
+`LockTerms`). D-08 (option A) answers this outside `tclk/1` entirely: one plain, non-`tclk/1`
+line, posted by a party in the leg's **own** deal room (`dealRoom(contract)`, never the shared
+`tclk-offers` room):
+
+```
+swap1 account <rail-id> <caip-10 account>
+```
+
+Single ASCII spaces, no trailing space. `<rail-id>` is canonical per `tclk/1`'s own closed rail
+registry (`CANONICAL_RAIL_IDS`) — a non-canonical spelling is rejected, the same rule `tclk/1`
+already applies to a frame's own `rail`/`rails` fields. `<caip-10 account>` is CAIP-10's
+`namespace:reference:address`, and the namespace is fixed by the rail, never chosen freely:
+
+| rail | CAIP-2 namespace | status |
+|---|---|---|
+| `evm-htlc` | `eip155` | implemented now — `reference` is a decimal chain id, no leading zeros; `address` is `0x` + 40 hex, all-lowercase or a valid EIP-55 checksum (a mixed-case address that fails the checksum is rejected) |
+| `btc-htlc` | `bip122` | reserved for a later phase (§8 of the SPEC) — `reference`/`address` parse under the generic CAIP-2/CAIP-10 wire grammar only; that chain's own address rules (bech32, …) are that rail's own build's job |
+| `near-htlc` | `near` | reserved for a later phase — same generic-grammar-only status as `btc-htlc` |
+| (Solana) | — | no `tclk/1` rail id exists for it yet, so it has no account-line form at all |
+
+A line carries no field naming whose account it is — the binding is `record.sender`, the DID that
+signed the transcript record it rides in, exactly as every other `tclk/1` frame is bound. **Who
+posts what:** on leg A (the counter-asset chain rail), the Seller — leg A's payee — posts its
+chain account in leg A's deal room before the Buyer locks; the Buyer should also post its own
+paying account there, as corroboration. The same rule applies to any future leg that settles on a
+chain rail rather than `flop-htlc`: that leg's payee posts its account in that leg's own deal
+room before its payer locks, and its payer should also post its own. Only the **payee's** line is
+required for a lock to verify at all (D-08); the payer's is optional corroboration, useful for a
+`verifyLockFinal`-style check that also wants to confirm who paid.
+
+**Resolving a room's lines to an address per party** (`resolveAccounts`, `src/rails/
+account-line.ts`) only ever counts a record that both verifies (`verifyTranscriptRecord(record)
+.ok`) and sits in that leg's own deal room; a line for a different rail id or a different chain
+(the pin's own `caip2`) is ignored, not coerced. **Disagreement is unresolved, not "first
+wins":** if one party's own lines (after the namespace's own address normalization) name more
+than one address, that party's account does not resolve at all — a caller sees no address and a
+reason naming the conflict, never a guess about which of two signed claims to believe. Room
+ordering is venue-controlled (H4, `tclk#175`), so it is never used to break a tie between a
+party's own conflicting claims. A payer refuses to lock its own leg until the payee's account
+line resolves to exactly one address; nothing here relaxes that into "lock anyway and hope the
+right account existed."
+
 ## 4. Sequence
 
 ```
