@@ -1,11 +1,11 @@
 {
   "swapId": "0xf30e56dca89c02760ab6f230bf2934255841ee0d14cac8d58625601a948b99b0",
   "legA": {
-    "contract": "0x7d4efa6807b33dc43bf6218ed204f144a9e0b737b047591d93ed61fbe553e230",
+    "contract": "0x85d008591e6fe97063fce66c1f078340eff8fd71a224b5398b58fecb51bb36fd",
     "rail": "evm-htlc"
   },
   "legB": {
-    "contract": "0x46d82ac1f529124999dc02faa4d4c0b319445ccfc7e4f414ff405a41a893dc0f",
+    "contract": "0x9c7729fd0854ac85d8d8310bed40d9c2d457d3c875ceb2eaf82967d3bc9a38ae",
     "rail": "paper"
   },
   "feeBps": 0,
@@ -21,6 +21,6 @@
   "finishedAtMs": 1700021733000,
   "status": "refunded-b",
   "finalizedRefs": [
-    "paper:sha256:6704cb7539ee28a1fa2e26258998298dc3a2aca362daa14b7eee652c9b501f16"
+    "paper:sha256:445937ddab23eaa0b2fdd001b75e83839733e6e27084d3a2a30aa60bb109d1df"
   ]
 }

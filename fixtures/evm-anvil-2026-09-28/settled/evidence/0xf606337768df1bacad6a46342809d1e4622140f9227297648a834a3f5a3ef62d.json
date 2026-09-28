@@ -1,11 +1,11 @@
 {
   "swapId": "0xf606337768df1bacad6a46342809d1e4622140f9227297648a834a3f5a3ef62d",
   "legA": {
-    "contract": "0x20450f2ed79e45a2134aeb22e9163a1ae579d4f765bb9337d07ca93a5ed04e7a",
+    "contract": "0xfb4bddf2e83f7351edadbca7c29ac8e47788eb807df78e4e0a678d8ecd688011",
     "rail": "evm-htlc"
   },
   "legB": {
-    "contract": "0xaa607397eda44ecfc47a7bfc4792728430da2d89b96623dcabe239bc3ae32234",
+    "contract": "0x4d4877c7ec98330213e0b094073cfb5166fee3b75d6b698316f43bc1a9536d8f",
     "rail": "paper"
   },
   "feeBps": 0,
@@ -15,23 +15,23 @@
       "step": "lock",
       "rail": "evm-htlc",
       "evidence": {
-        "ref": "0x1144d54e5f06fd81ecf9775f08ad694252f2d22febcdaf6befe2e49deb42887f",
+        "ref": "0xcd3c3515712028ec3d02b38db42008ec4f007ed929824b9747221164c212db45",
         "event": "Locked",
-        "txHash": "0x04b31d6aca7d8ac48e14b128c73c626adaacab4fa61a2203e734144ef144c553",
+        "txHash": "0xb0b7a5a59511a92bbf2cf352612388b8fbfcaf82509ce81030ef52456fabd6d7",
         "blockNumber": "5",
-        "blockHash": "0x86ad065106d38fd7e4b1497897ee3dcbc9ea2744c450ff1c07c2ee03915d96dc",
+        "blockHash": "0x2b27dbf87dcae9553918ec8dcb0f9fe5f306af72c0f3858db24f5e93f4967d88",
         "logIndex": 0,
         "raw": [
-          "f317ef3f4ce1db1909677f5856fe6643f9cfba9e497e7f33293f77a58ea95360",
-          "9d611246b700c78ede68f1ff9ea8a4e2ce053270ab0282b298959783b84c5ce2",
-          "264ef3f69ab55b17c38df4cd691369895d8787d788fef153052bbc2f5af70f4f",
-          "0d71a889d0a6180a9bed2a527b96f2ad41da4945488f5b37bf708fb8795d0e23",
-          "c806cdc5d702b531f597d9bb9ec5badb6fb7b30e868f9865b76cf466dcf78919",
-          "9d1d55676826c69b0a677480f27531ef62bc7ec4a7514dde8b8b9b528fbd060e",
-          "d4cbae2ac46cdf130a93ce259287e6816d338579190caf0a5899decb48a18ede",
-          "0b63571059d47b82e57f7ec303e4c176182f03194908edb2405553e39c766d7c",
-          "be88918c4fde66a818fa55d47a865a8dfae8ceafa8ffec8589668049ff03b333",
-          "eee937bd02cb94623ac2773e7df563e2b5b62c735734f16e90c96c1824c8b84d"
+          "dda78dd6f4ab20a82fdd12ec60057a9e0132503ec896a055df92b496f5c910f4",
+          "5b7698fafd9f2ed461e42100ede1755eec856eaa34fe1648e7a4e6e2325e3ce2",
+          "c15634df0f770c4f6c543c4112601d056f75c2eede48db865bfa2f2c0a39990f",
+          "fd0c1730d7fc01ab4bb046da726c79ca74902937ae756d12e8930db3e40e3352",
+          "ee433db023f736725e22a15e0b58724d3c42763198509ea51736be3cea1b0328",
+          "bbfba2a393a122f09d6d9244663aeec9a86d529fe6dff2ded97c97f10468051b",
+          "3e461d55372c6cd2f78a446a87231c297288c6ac8e96a487d2f287492a0aaf4b",
+          "ab22e39ef938094a2a247fbbb82fdbf0c92640ffc92e4008d4f6060ae55f379f",
+          "e96938bbecfbb162cc4074a771c94bea2158c9322895ba6271fdb96581c8991e",
+          "3cf9f479f496ec3f7f4416e0d3e66546ce95fdf6e0e2a786352723fcc1aaf249"
         ]
       }
     },
@@ -40,24 +40,24 @@
       "step": "claim",
       "rail": "evm-htlc",
       "evidence": {
-        "ref": "0x1144d54e5f06fd81ecf9775f08ad694252f2d22febcdaf6befe2e49deb42887f",
+        "ref": "0xcd3c3515712028ec3d02b38db42008ec4f007ed929824b9747221164c212db45",
         "event": "Claimed",
-        "txHash": "0x2b7494b2496f5dc480ab3c05288c40d2908f67cb89c1d15b3513b5467ea31b80",
+        "txHash": "0xd882cfa74c14f6c23259fec9038382fa12f4bb0a73370eee48377d6c3d134b15",
         "blockNumber": "8",
-        "blockHash": "0x22ad51bddc4cab1805f67a1ebe8db95b173b62703627b3b6ddd3425aca88c2f2",
+        "blockHash": "0x94d8a1bcc2a1b6ed825d2dcbfca1c684d940e9f81dbd39e6237a4ca68c06cd56",
         "logIndex": 0,
         "raw": [
-          "ab1fdfab9713858b316d81d2e93b1c5415d231385082be785731165890c30d0d",
-          "70336c6645688210ca6185f3d6e61d4a400b0873f4b5e6cb4c9b6f2490cb8271",
-          "63b9b9198c1cb59cd8c2e95bbfcd3705664552b1dd430cf5ee1891fb4dc72f0f",
-          "0a8ea4a787dc544645abc51ca533867f5151743f2644301ccf92c835c3d91c9c",
-          "3b8ca8fe34c50bfe5e64888725ba93deb931c778edb6ee933432c491b9a2573c",
-          "2fbb6f0a072f001aeb2ea259044f87c960fd70d8fcc17ed9355ff421b1515f5a",
-          "2decc11f20465d4fce83c3eff0b1b6cf22d0924460722d1cb736b2527717b31a",
-          "e34c3c6cf9571a4d9cf5ec6365f76ab7ff268e979fb20aae2263c7ddf8def02f",
-          "f0b7a096aa6f0327ef864625a50678693dfaeccb3d6c3edafef7428f1abec308",
-          "dd46f542b192b2c8ed9ae4a92cbc3b603e786ce1f5aeb248c580f2fedce986e9",
-          "b90080cc9bbc459d6a47420691dea544151945b96955c7c5302a599fb01a1448"
+          "af5007bad11e0c58de221ad15cb94f01f95f8ce5d5f88e97b10961894d2b5e28",
+          "c3f0a6191dd5e80d86af19ed548087ea7a35bcc78d5367f7e0e8903b1be56a83",
+          "dff8fdf104bad0080129cda70d0c810907f649c6080b24bf1632a40a44e12abf",
+          "f9cdc81dd979d66f45895864a5ff385d39376c934f3d26e6ec0b61f1e6944056",
+          "ac30e0c3dbbeb750cafb3e9c99c4149db23a17684a7eb5479c90f4a0a654c9b6",
+          "7618f6d574d0b8716de2e0bb31b1cf8b14784af5b3851efbf85f449d3ce7d2f9",
+          "a39fcfe69ba37345a4e5a968012a512664897799b6bf7d7c87f2f580262cb2b3",
+          "be7ade96bfd42ae4c9aea60940c1007e67f179912472eb4ce58563d90fda1ce6",
+          "357fd7083cfd854e7654bc75f6ad1336318c8601d1e3a1ad395eb264c1f45cf6",
+          "0b4a94a7b80a562978b9c60f9870bd25bb9dab52c584d78c46c3a80773cf5697",
+          "4e1a8e9953e933f24c7f3d301cd87f75b464717d22d79ff18a32352c64832c95"
         ]
       }
     }
@@ -66,7 +66,7 @@
   "finishedAtMs": 1700000000000,
   "status": "settled",
   "finalizedRefs": [
-    "paper:sha256:b885f44c063543ae10278e2ef21ecc6a23b967a7a95c0d44032e652b53c6984b",
-    "anvil-local:finalized:8:0x22ad51bddc4cab1805f67a1ebe8db95b173b62703627b3b6ddd3425aca88c2f2"
+    "paper:sha256:fddf05070b51079847192bfa4a2d031c7226230b6a9aea5a470b37d8a10b29a6",
+    "anvil-local:finalized:8:0x94d8a1bcc2a1b6ed825d2dcbfca1c684d940e9f81dbd39e6237a4ca68c06cd56"
   ]
 }
