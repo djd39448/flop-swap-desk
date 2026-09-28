@@ -12,13 +12,14 @@
 // verifies it."
 //
 // P22-P24-EVM-FIXES-R3.md F3 — say what this proves, and no more: re-reading a capture this
-// way independently detects a capture that was *corrupted, spliced, edited, or taken under a
-// different rail config after the fact* — a tampered `raw/rpc/<sha256>.json`, a rewritten
-// request, a swapped-in genuine response from a different capture (fails closed either way,
-// A1/D1/F2 above `src/rails/evm-evidence.ts`) — and fails that leg closed. It does **not**
-// prove the capturing process told the truth about the chain to begin with: a wholesale
-// *fabricated* RPC response, named honestly by its own hash and internally consistent with
-// everything else in the capture, replays exactly as a genuine one would. This build adds no
+// way detects a capture file that was *damaged, truncated, spliced from another capture,
+// answered for a different request, or taken under a different rail config* — a
+// `raw/rpc/<sha256>.json` whose bytes no longer match its name, a rewritten request, a
+// swapped-in genuine response from a different capture (fails closed either way, A1/D1/F2 in
+// `src/rails/evm-evidence.ts`) — and fails that leg closed. It does **not** detect forgery: a
+// fabricated or edited RPC response, saved under the sha256 of its own new bytes and internally
+// consistent with everything else in the capture, replays exactly as a genuine one would, and
+// nothing proves the capturing process told the truth about the chain to begin with. This build adds no
 // signing keys to close that gap (D-10 stays keyless). The independent check for any EVM leg
 // is its own `finalizedRef` (`<pin>:finalized:<n>:<blockHash>`): it names a real block hash on
 // the real chain, so anyone with their own RPC access to that chain can re-query
@@ -52,10 +53,11 @@ Offline: reads DIR/raw/ (and DIR/rails.json) only. Opens no network connection.
   DIR/raw/mb-p-tclk-*/*.json        one or more deal-room captures per room (latest used)
   DIR/raw/kv/<ns>/<key>/*.txt       one or more paper-rail note captures per note (latest used)
   DIR/raw/evm/<hashLock>/*.json     one or more EVM chain-read capture indexes per hashLock
-                                    (latest used); their raw bytes are re-verified from
-                                    DIR/raw/rpc/<sha256>.json through readCapture — a tampered
-                                    or missing file fails that leg's evidence closed, never
-                                    the whole replay. This detects corruption, splicing and
+                                    (newest only; an unreadable newest index gives that leg
+                                    no evidence, never an older capture); their raw bytes are
+                                    re-verified from DIR/raw/rpc/<sha256>.json through
+                                    readCapture — a damaged or missing file fails that leg's
+                                    evidence closed, never the whole replay. This detects corruption, splicing and
                                     config drift in what was captured, never forgery of the
                                     capture itself: independently re-query locks(hashLock) at
                                     the block named by the leg's own finalizedRef to check the
@@ -311,15 +313,15 @@ function loadNotes(root, offers) {
   return notes;
 }
 
-/** Every `raw/evm/<hashLock>/*.json` capture index (P22-P24-EVM-SPEC.md §4/§5), latest valid
+/** Every `raw/evm/<hashLock>/*.json` capture index (P22-P24-EVM-SPEC.md §4/§5), the newest
  *  one per hashLock — `loadEvmCapture` (src/rails/evm-evidence.ts, P22-P24-EVM-FIXES.md A11/
- *  A5) does the actual file I/O: tries each candidate index newest first, skipping any that
- *  is not `*.json`, a `*.tmp-*` write-in-progress leftover, unparseable, or malformed, falling
- *  back to the newest one that does validate; and pre-loads + re-verifies its raw bytes from
+ *  A5) does the actual file I/O: it reads only the newest `*.json` index (never a `*.tmp-*`
+ *  write-in-progress leftover), and if that file is unparseable or malformed the leg gets no
+ *  evidence at all; it never falls back to an older capture, which would replay a previous
+ *  sweep's verdict as current. It pre-loads + re-verifies the raw bytes from
  *  `raw/rpc/<sha256>.json` through `readCapture`, so a tampered or missing response file fails
  *  only that hashLock's evidence, never the replay itself. `notes` (pushed onto the array a
- *  caller supplies, A5's "with a note") names every skipped file; when every hashLock's
- *  candidates were all invalid the leg simply gets no evidence, the same as an uncaptured one.
+ *  caller supplies, A5's "with a note") names the bad newest file.
  *  No network: every byte comes from `--root`. Async only for this file-reading step —
  *  `foldCaptured` itself stays synchronous (A11). */
 async function loadEvmCaptures(root, notes = []) {
@@ -337,7 +339,7 @@ async function loadEvmCaptures(root, notes = []) {
     const { capture, skipped } = await loadEvmCapture(root, hashLock);
     if (capture !== null) chain.set(hashLock, capture);
     for (const name of skipped) {
-      notes.push(`raw/evm/${hashLock}/${name}: invalid capture index, skipped (A5)`);
+      notes.push(`raw/evm/${hashLock}/${name}: invalid newest capture index, skipped; this leg has no chain evidence (A5)`);
     }
   }
   return chain;
@@ -496,7 +498,7 @@ async function main() {
   // P22-P24-EVM-SPEC.md §5: chain-read captures and their pinned config, both optional and
   // both absent from a watch root that never configured a chain rail — foldCaptured then
   // folds exactly as it always did. Still no network: readCapture only ever reads --root.
-  // A5: `evmCaptureNotes` collects one line per skipped-and-fallen-back-from capture index.
+  // A5: `evmCaptureNotes` collects one line per invalid newest capture index (that leg fails closed).
   const evmCaptureNotes = [];
   const chain = await loadEvmCaptures(args.root, evmCaptureNotes);
   const board = foldCaptured({ offers, dealRooms, notes, chain, rails, nowMs: Date.now() });

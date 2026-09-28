@@ -1037,21 +1037,21 @@ function isCaptureIndexCandidate(name: string): boolean {
 
 export interface LoadEvmCaptureResult {
   capture: EvmCapture | null;
-  /** A5: candidate filenames (newest first) that were skipped because they failed to read,
-   *  parse, or validate as a capture index for this hashLock — empty in the common case where
-   *  every candidate file was fine. The caller decides how (or whether) to surface these; a
-   *  bad file here fails only this hashLock's evidence closed, never the whole replay. */
+  /** A5: the newest index filename when it failed to read, parse, or validate as a capture
+   *  index for this hashLock (and so failed the leg closed) — empty when it was fine. The
+   *  caller decides how to surface it; a bad file here fails only this hashLock's evidence
+   *  closed, never the whole replay. */
   skipped: string[];
 }
 
 /**
  * A11/A5: the one place a replay does file I/O for an EVM capture — everything downstream
- * (`evmEvidence`, `foldCaptured`) is pure and synchronous over the result. Tries every
- * `raw/evm/<hashLock>/*.json` candidate under `root`, newest first (ISO-stamped names sort
- * chronologically; `.tmp-*` leftovers and non-`.json` entries are never candidates at all),
- * and returns the first one that actually parses and validates as this hashLock's capture
- * index — so a corrupted or interrupted *latest* write falls back to the newest still-good
- * one instead of failing the leg outright. Once a valid index is found, its exchanges' bytes
+ * (`evmEvidence`, `foldCaptured`) is pure and synchronous over the result. Reads only the
+ * newest `raw/evm/<hashLock>/*.json` under `root` (ISO-stamped names sort chronologically;
+ * `.tmp-*` leftovers and non-`.json` entries are never candidates at all). If that newest file
+ * does not read, parse and validate as this hashLock's capture index, the leg fails closed
+ * (`capture: null`, the file named in `skipped`); it never falls back to an older capture,
+ * which would replay a previous sweep's verdict as current. Once a valid index is found, its exchanges' bytes
  * are pre-loaded and re-verified (via `readCapture`'s own re-hashing), the same shape a live
  * capture's in-memory bytes are given, so `evmEvidence` never needs to know which source it
  * came from. `capture: null` when the hashLock has no capture directory, or no candidate file
@@ -1066,38 +1066,37 @@ export async function loadEvmCapture(root: string, hashLock: string): Promise<Lo
   } catch {
     return { capture: null, skipped: [] };
   }
-  const candidates = allEntries.filter(isCaptureIndexCandidate).sort().reverse(); // newest first
+  // ISO-stamped names sort chronologically; only the newest one is ever the leg's evidence.
+  const newest = allEntries.filter(isCaptureIndexCandidate).sort().at(-1);
+  if (newest === undefined) return { capture: null, skipped: [] };
 
-  const skipped: string[] = [];
-  for (const name of candidates) {
-    let raw: string;
-    try {
-      raw = await readFile(join(dir, name), "utf8");
-    } catch {
-      skipped.push(name);
-      continue;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      skipped.push(name);
-      continue;
-    }
-    if (!looksLikeCaptureIndexFile(parsed, hashLock)) {
-      skipped.push(name);
-      continue;
-    }
-
-    const index = parsed;
-    const bytes = new Map<string, Uint8Array | null>();
-    for (const exchange of index.exchanges) {
-      if (bytes.has(exchange.responseSha256)) continue;
-      // D2: `readCapture` now hands back the exact re-verified bytes directly — never a
-      // decoded string that would need (lossy) re-encoding here.
-      bytes.set(exchange.responseSha256, await readCapture(root, exchange.responseSha256));
-    }
-    return { capture: { index, bytes }, skipped };
+  // Main-loop review 2026-09-28 (after P22-P24-EVM-FIXES-R3.md F1): an unreadable or invalid
+  // newest index fails this leg closed. It never falls back to an older capture: that older
+  // capture is a previous sweep's verdict, and serving it as current would contradict the live
+  // board, which reported no verified evidence for the sweep that wrote the bad file.
+  let raw: string;
+  try {
+    raw = await readFile(join(dir, newest), "utf8");
+  } catch {
+    return { capture: null, skipped: [newest] };
   }
-  return { capture: null, skipped };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { capture: null, skipped: [newest] };
+  }
+  if (!looksLikeCaptureIndexFile(parsed, hashLock)) {
+    return { capture: null, skipped: [newest] };
+  }
+
+  const index = parsed;
+  const bytes = new Map<string, Uint8Array | null>();
+  for (const exchange of index.exchanges) {
+    if (bytes.has(exchange.responseSha256)) continue;
+    // D2: `readCapture` now hands back the exact re-verified bytes directly — never a
+    // decoded string that would need (lossy) re-encoding here.
+    bytes.set(exchange.responseSha256, await readCapture(root, exchange.responseSha256));
+  }
+  return { capture: { index, bytes }, skipped: [] };
 }

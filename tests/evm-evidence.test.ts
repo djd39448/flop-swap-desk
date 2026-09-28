@@ -1137,8 +1137,9 @@ describe("evmEvidence — D3: a captured finality can never be weaker than the a
 // P22-P24-EVM-FIXES.md A5: `loadEvmCapture` (the one place a replay reads `raw/evm/<hashLock>/
 // *.json` off disk) must never trust "the lexicographically last filename" blindly — only
 // `*.json` files are candidates (never a `*.tmp-*` write-in-progress leftover), each candidate
-// is parsed and shape-checked before use, and a bad *latest* file falls back to the newest one
-// that actually validates rather than failing the whole hashLock closed.
+// is parsed and shape-checked before use, and a bad *latest* file fails this hashLock closed.
+// It never falls back to an older capture (main-loop review after round 3: a fallback replays a
+// previous sweep's verdict as current, contradicting the live board for the failed sweep).
 describe("loadEvmCapture — A5: defensive index loading", () => {
   let root: string;
 
@@ -1201,7 +1202,7 @@ describe("loadEvmCapture — A5: defensive index loading", () => {
     expect(result.capture).not.toBeNull();
   });
 
-  it("falls back to the newest *valid* file when the newest one is corrupted JSON, with a note", async () => {
+  it("never falls back past a newest file that is corrupted JSON: capture null, the file named", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
     await writeRawRpc(capture.bytes);
     await writeIndexFile("2026-09-28T00-00-00.000Z.json", capture.index); // older, valid
@@ -1209,10 +1210,10 @@ describe("loadEvmCapture — A5: defensive index loading", () => {
 
     const result = await loadEvmCapture(root, HASH_LOCK);
     expect(result.skipped).toEqual(["2026-09-28T00-00-01.000Z.json"]);
-    expect(result.capture?.index.hashLock).toBe(HASH_LOCK);
+    expect(result.capture).toBeNull();
   });
 
-  it("falls back to the newest valid file when the newest one fails shape validation (wrong hashLock)", async () => {
+  it("never falls back past a newest file that fails shape validation (wrong hashLock)", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
     await writeRawRpc(capture.bytes);
     await writeIndexFile("2026-09-28T00-00-00.000Z.json", capture.index); // older, valid
@@ -1220,10 +1221,10 @@ describe("loadEvmCapture — A5: defensive index loading", () => {
 
     const result = await loadEvmCapture(root, HASH_LOCK);
     expect(result.skipped).toEqual(["2026-09-28T00-00-01.000Z.json"]);
-    expect(result.capture?.index.hashLock).toBe(HASH_LOCK);
+    expect(result.capture).toBeNull();
   });
 
-  it("falls back to the newest valid file when the newest one fails shape validation (wrong v/rail, malformed exchanges)", async () => {
+  it("never falls back past a newest file with malformed exchanges, even with a valid older one", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
     await writeRawRpc(capture.bytes);
     await writeIndexFile("2026-09-28T00-00-00.000Z.json", capture.index); // older, valid
@@ -1231,8 +1232,8 @@ describe("loadEvmCapture — A5: defensive index loading", () => {
     await writeIndexFile("2026-09-28T00-00-02.000Z.json", { ...capture.index, exchanges: "not an array" }); // newest: malformed
 
     const result = await loadEvmCapture(root, HASH_LOCK);
-    expect(result.skipped).toEqual(["2026-09-28T00-00-02.000Z.json", "2026-09-28T00-00-01.000Z.json"]);
-    expect(result.capture?.index.hashLock).toBe(HASH_LOCK);
+    expect(result.skipped).toEqual(["2026-09-28T00-00-02.000Z.json"]);
+    expect(result.capture).toBeNull();
   });
 
   it("capture null and every candidate skipped when none validate -- fails this leg closed, never thrown", async () => {
@@ -1241,6 +1242,6 @@ describe("loadEvmCapture — A5: defensive index loading", () => {
 
     const result = await loadEvmCapture(root, HASH_LOCK);
     expect(result.capture).toBeNull();
-    expect(result.skipped.sort()).toEqual(["2026-09-28T00-00-00.000Z.json", "2026-09-28T00-00-01.000Z.json"]);
+    expect(result.skipped).toEqual(["2026-09-28T00-00-01.000Z.json"]);
   });
 });

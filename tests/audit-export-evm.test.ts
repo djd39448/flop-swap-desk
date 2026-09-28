@@ -277,10 +277,10 @@ describe("loadEvmCaptures", () => {
     expect(capture.bytes.get("0".repeat(64)) ?? null).toBeNull();
   });
 
-  // P22-P24-EVM-FIXES.md A5: a corrupted *latest* index file falls back to the newest one that
-  // still validates, with a note pushed onto the caller-supplied array — never failing the
-  // whole replay over one bad file.
-  it("falls back to the newest valid index and reports the skipped one via the notes array", async () => {
+  // P22-P24-EVM-FIXES.md A5, as revised by the main-loop review after round 3: a corrupted
+  // *latest* index file fails that leg closed (no capture for it, a note on the caller-supplied
+  // array) and never falls back to an older capture; the whole replay still completes.
+  it("fails the leg closed on a corrupted newest index and reports it via the notes array", async () => {
     const fixture = buildEvmFixture(RAIL_CONTRACT);
     await writeWatchRoot(root, fixture);
     // A newer, corrupted index file alongside the good one `writeWatchRoot` already wrote.
@@ -288,8 +288,7 @@ describe("loadEvmCaptures", () => {
 
     const notes: string[] = [];
     const chain = await loadEvmCaptures(root, notes);
-    expect(chain.size).toBe(1);
-    expect(chain.get(fixture.lock.hash)?.index.hashLock).toBe(fixture.lock.hash);
+    expect(chain.size).toBe(0);
     expect(notes).toHaveLength(1);
     expect(notes[0]).toMatch(new RegExp(`raw/evm/${fixture.lock.hash}/zzz-newer-but-corrupt\\.json.*skipped`));
   });
@@ -373,7 +372,7 @@ describe("examples/audit-export.mjs — evm-htlc leg end to end", () => {
 
   // P22-P24-EVM-FIXES.md A5: a corrupted-but-fallen-back-from capture index is surfaced as a
   // note, and the replay still completes rather than treating it as fatal.
-  it("prints an A5 note and still replays when a newer capture index is corrupted", async () => {
+  it("prints an A5 note, still replays, and fails the leg closed when the newest capture index is corrupted", async () => {
     const fixture = buildEvmFixture(RAIL_CONTRACT);
     await writeWatchRoot(root, fixture, { rails: { evm: EVM_CONFIG } });
     await writeFile(join(root, "raw", "evm", fixture.lock.hash, "zzz-newer-but-corrupt.json"), "{ not valid json");
@@ -384,7 +383,9 @@ describe("examples/audit-export.mjs — evm-htlc leg end to end", () => {
     expect(parsed.evmCaptureNotes).toHaveLength(1);
     expect(parsed.evmCaptureNotes[0]).toMatch(/zzz-newer-but-corrupt\.json.*skipped/);
     const swap = parsed.swaps.find((s: { swapId: string }) => s.swapId === fixture.swapId);
-    expect(swap.settlementView.a).toBe("funded"); // still replays from the good, older index
+    // Never falls back to the older, good index (main-loop review after round 3): that would
+    // replay a previous sweep's verdict as current. The leg has no chain evidence.
+    expect(swap.settlementView.a).toBe("none");
 
     const textResult = run(["--root", root]);
     expect(textResult.status).toBe(0);
