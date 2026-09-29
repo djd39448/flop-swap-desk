@@ -31,6 +31,9 @@ import { captureBtcLeg, BTC_RAIL_ID, type BtcCapture } from "./rails/btc-evidenc
 import { checkBtcRailConfig, type BtcRailConfig } from "./rails/btc-htlc.js";
 import { captureEvmLeg, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
 import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
+import { captureNearLeg, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
+import { checkNearRailConfig, type NearRailConfig } from "./rails/near-htlc.js";
+import { resolveAccounts } from "./rails/account-line.js";
 import { CapturingRpc, verifiedExchangeBytes, writeCapture } from "./rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, SwapStatus } from "./types.js";
@@ -88,6 +91,12 @@ export interface SweepReport {
    *  counts, and a sweep configuring both never conflates the two). */
   btcChainReads?: number;
   btcChainReadsSkipped?: ChainReadSkip[];
+  /** P5-NEAR-SPEC.md §4: `near-htlc` chain reads captured this sweep — present only when
+   *  `options.rails.near` is configured, mirroring `chainReads`/`chainReadsSkipped`'s own
+   *  presence rule for `options.rails.evm` (kept as its own field, not merged into the EVM/BTC
+   *  ones, so a sweep configuring only one rail reports exactly that rail's own counts). */
+  nearChainReads?: number;
+  nearChainReadsSkipped?: ChainReadSkip[];
   swapsByStatus?: Record<string, number>; // board.swaps grouped by status
   swapsWritten: number; // lines appended to swaps.jsonl this sweep (status changes only)
   hitCreated: boolean;
@@ -112,7 +121,11 @@ export interface RunSweepOptions {
   /** P4-BTC-SPEC.md §7: the `btc-htlc` twin of `rails.evm` above — same absence rule (no
    *  `btc-htlc` chain read, no `raw/btc/`/rewritten `rails.json` entry, no `btcChainReads`
    *  field on the report). */
-  rails?: { evm?: EvmRailConfig; btc?: BtcRailConfig };
+  /** P5-NEAR-SPEC.md §4: the `near-htlc` twin of `rails.evm`/`rails.btc` above — same absence
+   *  rule (no `near-htlc` chain read, no `raw/near/`/rewritten `rails.json` entry, no
+   *  `nearChainReads` field on the report). NEAR needs no out-of-band RPC auth (unlike
+   *  `btcRpcHeaders`): every read is a public JSON-RPC view call, no key or cookie involved. */
+  rails?: { evm?: EvmRailConfig; btc?: BtcRailConfig; near?: NearRailConfig };
   /** P4-BTC-SPEC.md §1/§4/§7: the bitcoind RPC's own HTTP auth headers (the node's cookie),
    *  supplied out of band by the caller (`bin/watch.mjs`'s `--btc-rpc-cookie` reads the file and
    *  builds this) and read fresh on every call — never persisted anywhere this sweep writes
@@ -400,6 +413,17 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
       return report;
     }
   }
+  // P5-NEAR-SPEC.md §4: the same A3 rule for `rails.near` — validated before this sweep does
+  // anything at all, right alongside the evm/btc checks above.
+  const nearConfig = options.rails?.near;
+  if (nearConfig !== undefined) {
+    const check = checkNearRailConfig(nearConfig);
+    if (!check.ok) {
+      report.railsConfigError = check.reason;
+      notes.push(`rails.near config is invalid, sweep aborted: ${check.reason}`);
+      return report;
+    }
+  }
 
   // Step 1: fetch and persist the offer-room export, byte-exact, before any parsing.
   const exportUrl = `${baseUrl}/r/${OFFER_ROOM}/export`;
@@ -545,16 +569,21 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   // report byte-for-byte what they were before this option existed.
   const chainCaptures = new Map<string, EvmCapture>();
   const btcChainCaptures = new Map<string, BtcCapture>();
+  const nearChainCaptures = new Map<string, NearCapture>();
 
-  if (evmConfig !== undefined || btcConfig !== undefined) {
-    // The pinned config(s) (endpoints included; nothing secret ever lives in an EvmRailConfig
-    // or a BtcRailConfig — the bitcoind RPC cookie is `options.btcRpcHeaders`, never written
-    // here) — written once per sweep, atomically, and only rewritten when it actually changed.
-    // Key order (evm first, then btc) keeps an evm-only sweep's `rails.json` byte-for-byte what
-    // it always was.
+  if (evmConfig !== undefined || btcConfig !== undefined || nearConfig !== undefined) {
+    // The pinned config(s) (endpoints included; nothing secret ever lives in an EvmRailConfig,
+    // BtcRailConfig or NearRailConfig — the bitcoind RPC cookie is `options.btcRpcHeaders`,
+    // never written here) — written once per sweep, atomically, and only rewritten when it
+    // actually changed. Key order (evm, then btc, then near) keeps an evm-only or evm+btc-only
+    // sweep's `rails.json` byte-for-byte what it always was.
     const railsPath = underRoot(root, "rails.json");
     const railsJson = `${JSON.stringify(
-      { ...(evmConfig === undefined ? {} : { evm: evmConfig }), ...(btcConfig === undefined ? {} : { btc: btcConfig }) },
+      {
+        ...(evmConfig === undefined ? {} : { evm: evmConfig }),
+        ...(btcConfig === undefined ? {} : { btc: btcConfig }),
+        ...(nearConfig === undefined ? {} : { near: nearConfig }),
+      },
       null,
       2,
     )}\n`;
@@ -680,6 +709,77 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
     }
   }
 
+  // Step 2.6c (P5-NEAR-SPEC.md §4): the `near-htlc` twin of Step 2.6 above — same A6 dispatch,
+  // same "nothing runs unless the caller configured this rail" rule. Like EVM (and unlike BTC),
+  // near-htlc's own `ref` IS the hash lock (D-N4: known before any write), so the captured index
+  // is keyed and pathed by `terms.statement` exactly like Step 2.6, never a value chosen only at
+  // fund time.
+  if (nearConfig !== undefined) {
+    report.nearChainReads = 0;
+    report.nearChainReadsSkipped = [];
+    // A9's same per-sweep timeout applies here too; NEAR's own reads need no out-of-band auth
+    // header (unlike btcRpcHeaders — every near-htlc read is a public JSON-RPC view call).
+    const nearRpc = new CapturingRpc({ endpoint: nearConfig.endpoint, fetch: fetchImpl, clock: () => nowMs, timeoutMs });
+
+    for (const candidate of cappedCandidates) {
+      const room = roomByContract.get(candidate.contract);
+      if (room === undefined) continue; // deal room wasn't fetched this sweep (404/error)
+      const dealRoomRecords = dealRooms.get(room) ?? [];
+      const terms = offerAcceptLockTerms(candidate.offer, candidate.accept);
+      const accepted = foldAcceptedLock(candidate.offerRecord, candidate.acceptRecord, dealRoomRecords);
+      if (
+        accepted === null ||
+        accepted.rail !== NEAR_RAIL_ID ||
+        accepted.railRef !== terms.statement ||
+        !HASH_LOCK_SHAPE.test(accepted.railRef)
+      ) {
+        continue;
+      }
+      const hashLock = accepted.railRef;
+      // D-N5: near-htlc posts account-id lines (mirrors evm-htlc's account resolution, not
+      // btc-htlc's pubkey resolution) — only the payee's is needed to decide whether/whom
+      // captureNearLeg reads storage_balance_of for; resolved fresh, bounded to lines posted
+      // before the accepted lock frame (the same R2-3-style rule replay.ts's own near-htlc
+      // branch applies).
+      const accounts = resolveAccounts(dealRoomRecords, {
+        contract: candidate.contract,
+        payerDid: terms.payer,
+        payeeDid: terms.payee,
+        rail: NEAR_RAIL_ID,
+        caip2: nearConfig.pin.caip2,
+        beforeSeq: accepted.seq,
+      });
+
+      try {
+        // Mirrors F1 (captureEvmLeg/captureBtcLeg): captureNearLeg never throws for a
+        // chain-state reason — only a genuine transport failure sets `index.error`, and that
+        // capture is still written and fed into this sweep's own live fold, so a later replay's
+        // "latest capture" for this hashLock is this sweep's own attempt, never a stale earlier
+        // success.
+        const { index, exchanges } = await captureNearLeg(nearRpc, nearConfig, terms, accounts, hashLock, nowMs);
+        await writeCapture(root, exchanges);
+        await writeFileAtomic(
+          underRoot(root, "raw", "near", hashLock, `${sweepIso}.json`),
+          `${JSON.stringify(index, null, 2)}\n`,
+        );
+        const bytes = verifiedExchangeBytes(exchanges);
+        nearChainCaptures.set(hashLock, { index, bytes });
+        if (index.error === undefined) {
+          report.nearChainReads += 1;
+        } else {
+          report.nearChainReadsSkipped.push({ contract: candidate.contract, reason: index.error });
+        }
+      } catch (error) {
+        // The fs-level backstop, not the common case — see the identical comment on the EVM
+        // step above.
+        report.nearChainReadsSkipped.push({
+          contract: candidate.contract,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
   // Step 3: fold the board — the same code path an offline replay uses.
   const board = foldCaptured({
     offers: offerRoomRecords,
@@ -687,11 +787,18 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
     notes: capturedNotes,
     chain: chainCaptures,
     btcChain: btcChainCaptures,
+    nearChain: nearChainCaptures,
     nowMs,
     board: buildBoard,
-    ...(evmConfig === undefined && btcConfig === undefined
+    ...(evmConfig === undefined && btcConfig === undefined && nearConfig === undefined
       ? {}
-      : { rails: { ...(evmConfig === undefined ? {} : { evm: evmConfig }), ...(btcConfig === undefined ? {} : { btc: btcConfig }) } }),
+      : {
+          rails: {
+            ...(evmConfig === undefined ? {} : { evm: evmConfig }),
+            ...(btcConfig === undefined ? {} : { btc: btcConfig }),
+            ...(nearConfig === undefined ? {} : { near: nearConfig }),
+          },
+        }),
   });
 
   const swapsByStatus: Record<string, number> = {};

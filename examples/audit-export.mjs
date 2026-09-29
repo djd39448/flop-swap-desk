@@ -45,6 +45,8 @@ import { loadBtcCapture } from "../dist/rails/btc-evidence.js";
 import { checkBtcRailConfig } from "../dist/rails/btc-htlc.js";
 import { loadEvmCapture } from "../dist/rails/evm-evidence.js";
 import { checkEvmRailConfig } from "../dist/rails/evm-htlc.js";
+import { loadNearCapture } from "../dist/rails/near-evidence.js";
+import { checkNearRailConfig } from "../dist/rails/near-htlc.js";
 
 const USAGE = `Usage: node examples/audit-export.mjs --root DIR [--expect <swapId>=<status>] [--rails FILE] [--json]
 
@@ -72,9 +74,18 @@ Offline: reads DIR/raw/ (and DIR/rails.json) only. Opens no network connection.
                                     corruption/splicing/config drift, never forgery — the
                                     independent check is a leg's own finalizedRef, which names
                                     a real block hash and height anyone can re-query.
-  DIR/rails.json                   { "evm"?: EvmRailConfig, "btc"?: BtcRailConfig } the
-                                    sweep that captured DIR used (P22-P24-EVM-SPEC.md §5;
-                                    P4-BTC-SPEC.md §7) — absent unless a chain rail was
+  DIR/raw/near/<hashLock>/*.json    one or more NEAR chain-read capture indexes per hash lock
+                                    (P5-NEAR-SPEC.md §4 — newest only, same "never falls back"
+                                    rule as raw/evm above; their raw bytes are re-verified from
+                                    DIR/raw/rpc/<sha256>.json the same way). Same honesty limit
+                                    as F3 above: this detects corruption/splicing/config drift,
+                                    never forgery — the independent check is a leg's own
+                                    finalizedRef, which names a real block hash and height
+                                    anyone with their own RPC access to that chain can re-query.
+  DIR/rails.json                   { "evm"?: EvmRailConfig, "btc"?: BtcRailConfig,
+                                    "near"?: NearRailConfig } the sweep that captured DIR used
+                                    (P22-P24-EVM-SPEC.md §5; P4-BTC-SPEC.md §7;
+                                    P5-NEAR-SPEC.md §4) — absent unless a chain rail was
                                     configured for that sweep.
 
 Options:
@@ -387,6 +398,31 @@ async function loadBtcCaptures(root, notes = []) {
   return chain;
 }
 
+/** Every `raw/near/<hashLock>/*.json` capture index (P5-NEAR-SPEC.md §4), the newest one per
+ *  hash lock — the NEAR twin of `loadEvmCaptures` above, over `loadNearCapture`
+ *  (src/rails/near-evidence.ts) instead of `loadEvmCapture`. Directory names are the hash lock
+ *  as-is (`0x` + hex, no `:`, already filename-safe — unlike Bitcoin's `<txid>-<vout>` rewrite). */
+async function loadNearCaptures(root, notes = []) {
+  const nearDir = join(root, "raw", "near");
+  const chain = new Map();
+  let entries;
+  try {
+    entries = readdirSync(nearDir, { withFileTypes: true });
+  } catch {
+    return chain;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const hashLock = entry.name;
+    const { capture, skipped } = await loadNearCapture(root, hashLock);
+    if (capture !== null) chain.set(hashLock, capture);
+    for (const name of skipped) {
+      notes.push(`raw/near/${hashLock}/${name}: invalid newest capture index, skipped; this leg has no chain evidence`);
+    }
+  }
+  return chain;
+}
+
 /** `{ "evm": EvmRailConfig }` for the fold's `rails` input (P22-P24-EVM-SPEC.md §5):
  *  `railsFileOverride` (`--rails FILE`) when given, else `DIR/rails.json`. `undefined` when
  *  neither exists — a watch root a chain rail was never configured for, folded exactly as
@@ -421,6 +457,12 @@ function loadRails(root, railsFileOverride) {
     const check = checkBtcRailConfig(parsed.btc);
     if (!check.ok) {
       throw new Error(`${path}: btc rail config is invalid: ${check.reason}`);
+    }
+  }
+  if (parsed !== null && typeof parsed === "object" && parsed.near !== undefined) {
+    const check = checkNearRailConfig(parsed.near);
+    if (!check.ok) {
+      throw new Error(`${path}: near rail config is invalid: ${check.reason}`);
     }
   }
   return parsed;
@@ -551,7 +593,9 @@ async function main() {
   const chain = await loadEvmCaptures(args.root, evmCaptureNotes);
   const btcCaptureNotes = [];
   const btcChain = await loadBtcCaptures(args.root, btcCaptureNotes);
-  const board = foldCaptured({ offers, dealRooms, notes, chain, btcChain, rails, nowMs: Date.now() });
+  const nearCaptureNotes = [];
+  const nearChain = await loadNearCaptures(args.root, nearCaptureNotes);
+  const board = foldCaptured({ offers, dealRooms, notes, chain, btcChain, nearChain, rails, nowMs: Date.now() });
   const swaps = board.swaps.map(describeSwap);
 
   if (args.json) {
@@ -564,6 +608,7 @@ async function main() {
           archivedOfferLines,
           evmCaptureNotes,
           btcCaptureNotes,
+          nearCaptureNotes,
         },
         null,
         2,
@@ -578,6 +623,7 @@ async function main() {
     }
     for (const note of evmCaptureNotes) process.stdout.write(`${note}\n`);
     for (const note of btcCaptureNotes) process.stdout.write(`${note}\n`);
+    for (const note of nearCaptureNotes) process.stdout.write(`${note}\n`);
     printReport(swaps, board.unpaired);
   }
 
@@ -605,6 +651,7 @@ export {
   loadDealRoomsFromSwapArchive,
   loadEvmCaptures,
   loadBtcCaptures,
+  loadNearCaptures,
   loadRails,
   describeSwap,
   parseArgs,

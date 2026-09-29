@@ -23,11 +23,13 @@ Options:
   --base-url URL        Venue base URL (default https://technocore.chat).
   --max-deal-rooms N     Cap on deal rooms fetched per sweep (default 50).
   --timeout SEC          Per-request timeout in seconds (default 45).
-  --rails FILE           A JSON file shaped { "evm"?: EvmRailConfig, "btc"?: BtcRailConfig }
-                          naming the chain rail(s) to capture live evidence from
-                          (P22-P24-EVM-SPEC.md §5; P4-BTC-SPEC.md §7). Absent (the default):
-                          no RPC endpoint is ever touched, unchanged from before this option
-                          existed.
+  --rails FILE           A JSON file shaped { "evm"?: EvmRailConfig, "btc"?: BtcRailConfig,
+                          "near"?: NearRailConfig } naming the chain rail(s) to capture live
+                          evidence from (P22-P24-EVM-SPEC.md §5; P4-BTC-SPEC.md §7;
+                          P5-NEAR-SPEC.md §4). Absent (the default): no RPC endpoint is ever
+                          touched, unchanged from before this option existed. A "near" config
+                          needs no out-of-band auth (unlike "btc") — every near-htlc read is a
+                          public JSON-RPC view call.
   --btc-rpc-cookie FILE  P4-BTC-SPEC.md §1/§4/§7: bitcoind's own cookie file (its regtest/
                           signet datadir's ".cookie") — read once, turned into an HTTP Basic
                           auth header, and used ONLY for the "btc" rail's own RPC calls.
@@ -104,10 +106,13 @@ function summarize(report) {
   // btcChainReads only appears when --rails named a "btc" config (P4-BTC-SPEC.md §7) —
   // identical omission rule, and a separate field from chainReads (see SweepReport's own doc).
   const btcChainPart = report.btcChainReads !== undefined ? ` btcChainReads=${report.btcChainReads}` : "";
+  // nearChainReads only appears when --rails named a "near" config (P5-NEAR-SPEC.md §4) —
+  // identical omission rule, and a separate field from chainReads/btcChainReads.
+  const nearChainPart = report.nearChainReads !== undefined ? ` nearChainReads=${report.nearChainReads}` : "";
   return (
     `offers=${report.offerRecords} swapLegs=${report.swapLegOffers} ` +
     `dealRooms=${report.dealRoomsFetched} notes=${report.noteFetches} swaps[${statusPart}] ` +
-    `swapsWritten=${report.swapsWritten} hit=${report.hitCreated} ok=${report.ok}${chainPart}${btcChainPart}`
+    `swapsWritten=${report.swapsWritten} hit=${report.hitCreated} ok=${report.ok}${chainPart}${btcChainPart}${nearChainPart}`
   );
 }
 

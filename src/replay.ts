@@ -45,6 +45,8 @@ import { btcEvidence, BTC_RAIL_ID, type BtcCapture } from "./rails/btc-evidence.
 import { checkBtcRailConfig, type BtcRailConfig } from "./rails/btc-htlc.js";
 import { evmEvidence, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
 import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
+import { nearEvidence, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
+import { checkNearRailConfig, type NearRailConfig } from "./rails/near-htlc.js";
 import { offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, LockEvidence, RailObservation, SwapEvidence, SwapLeg } from "./types.js";
 
@@ -279,11 +281,19 @@ export interface FoldCapturedInput {
    *  no entry here gets no evidence for that leg, the same treatment as every other captured-but-
    *  absent case in this file. Absent entirely behaves exactly like an empty map. */
   btcChain?: ReadonlyMap<string, BtcCapture>;
+  /** P5-NEAR-SPEC.md §4: captured NEAR chain reads, keyed by the hash lock (a `near-htlc` lock
+   *  frame's own `.ref`, which must equal the leg's `terms.statement` to be picked up at all —
+   *  D-N4, the same convention as `chain` above). A candidate whose deal room shows an accepted
+   *  `near-htlc` lock but has no entry here gets no evidence for that leg, the same treatment as
+   *  every other captured-but-absent case in this file. Absent entirely behaves exactly like an
+   *  empty map. */
+  nearChain?: ReadonlyMap<string, NearCapture>;
   /** The chain rails this fold may draw evidence from. Absent (the default — and what the
    *  live watch passes when it isn't given `RunSweepOptions.rails`): neither the `evm-htlc` nor
-   *  the `btc-htlc` branch below ever runs, so `foldCaptured` is exactly the paper-only fold it
-   *  always was, byte-for-byte (tests/replay.test.ts's "no rails configured" cases pin this). */
-  rails?: { evm?: EvmRailConfig; btc?: BtcRailConfig };
+   *  the `btc-htlc` nor the `near-htlc` branch below ever runs, so `foldCaptured` is exactly the
+   *  paper-only fold it always was, byte-for-byte (tests/replay.test.ts's "no rails configured"
+   *  cases pin this). */
+  rails?: { evm?: EvmRailConfig; btc?: BtcRailConfig; near?: NearRailConfig };
   nowMs: number;
   board?: (input: BoardInput) => Board;
 }
@@ -319,6 +329,10 @@ export function foldCaptured(input: FoldCapturedInput): Board {
   // P4-BTC-SPEC.md §7: the `btc-htlc` twin of the above — validated once per fold, same A3 rule.
   const btcConfig = input.rails?.btc;
   const btcConfigCheck = btcConfig === undefined ? null : checkBtcRailConfig(btcConfig);
+  // P5-NEAR-SPEC.md §4: the `near-htlc` twin of the above — validated once per fold, same A3
+  // rule.
+  const nearConfig = input.rails?.near;
+  const nearConfigCheck = nearConfig === undefined ? null : checkNearRailConfig(nearConfig);
 
   for (const candidate of candidates) {
     const room = dealRoom(candidate.contract);
@@ -442,6 +456,56 @@ export function foldCaptured(input: FoldCapturedInput): Board {
               railVerified: null,
               checkedAtMs: input.nowMs,
               reason: `btc-htlc: evidence check threw unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          };
+        }
+      }
+    } else if (accepted.rail === NEAR_RAIL_ID && accepted.railRef === terms.statement) {
+      // P5-NEAR-SPEC.md §4/D-N4: like evm-htlc, `accepted.railRef` is the hash lock itself
+      // (known before any write), so the same equality-to-`terms.statement` gate applies.
+      if (nearConfigCheck === null) continue; // no chain rail configured: no evidence at all
+      if (!nearConfigCheck.ok) {
+        // A3 (mirrored for NEAR): a bad config fails every near-htlc leg closed, with the
+        // specific reason — never silently "no evidence".
+        result = {
+          lock: {
+            rail: NEAR_RAIL_ID,
+            ref: accepted.railRef,
+            terms,
+            railVerified: null,
+            checkedAtMs: input.nowMs,
+            reason: `near-htlc: rail config invalid: ${nearConfigCheck.reason}`,
+          },
+        };
+      } else {
+        const capture = input.nearChain?.get(accepted.railRef);
+        if (capture === undefined) continue; // not captured (yet, or ever): evidence absent
+        // D-N5: a near-htlc leg posts account-id lines (mirrors evm-htlc's resolveAccounts, not
+        // btc-htlc's pubkey resolution) — resolved fresh from the same deal room, never cached
+        // across candidates, and bounded to lines posted before the accepted lock frame (R2-3's
+        // rule, reused here).
+        const accounts = resolveAccounts(dealRoomRecords, {
+          contract: candidate.contract,
+          payerDid: terms.payer,
+          payeeDid: terms.payee,
+          rail: NEAR_RAIL_ID,
+          caip2: nearConfigCheck.config.pin.caip2,
+          beforeSeq: accepted.seq,
+        });
+        // D4-style defense in depth (mirrors the evm-htlc/btc-htlc branches above): this call
+        // sits inside a loop that folds *every* candidate in one pass, so an unanticipated throw
+        // here must still fail only this one leg closed, never the whole replay.
+        try {
+          result = nearEvidence({ terms, config: nearConfigCheck.config, accounts, capture });
+        } catch (error) {
+          result = {
+            lock: {
+              rail: NEAR_RAIL_ID,
+              ref: accepted.railRef,
+              terms,
+              railVerified: null,
+              checkedAtMs: input.nowMs,
+              reason: `near-htlc: evidence check threw unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
             },
           };
         }

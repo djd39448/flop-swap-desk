@@ -41,6 +41,8 @@ import { btcEvidence, captureBtcLeg, type BtcAccounts, type BtcCapture } from ".
 import type { BtcRailConfig } from "../rails/btc-htlc.js";
 import { captureEvmLeg, captureFinalizedRef, type EvmCapture } from "../rails/evm-evidence.js";
 import type { EvmRailConfig } from "../rails/evm-htlc.js";
+import { nearEvidence, captureNearLeg, type NearAccounts, type NearCapture } from "../rails/near-evidence.js";
+import type { NearRailConfig } from "../rails/near-htlc.js";
 import { verifiedExchangeBytes, writeCapture, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 
 /** The exact banner text `stripNoteBanner` (src/paper-evidence.ts) strips before decoding a
@@ -138,6 +140,19 @@ export interface BtcBundleCapture {
   accounts: BtcAccounts;
 }
 
+/** The NEAR twin of `EvmBundleCapture` (P5-NEAR-SPEC.md §4): omitted entirely for a swap whose
+ *  leg A never locked on-chain at all (SPEC §6 scenario 3: the Buyer never locks). Like EVM
+ *  (and unlike Bitcoin), `ref` (the hash lock) IS `terms.statement` (D-N4: known before any
+ *  write) — but, like Bitcoin, a full evidence check also needs the leg's resolved accounts
+ *  (D-N5/D-N10: `storage_balance_of` on the payee, not merely the hashLock). */
+export interface NearBundleCapture {
+  config: NearRailConfig;
+  rpc: CapturingRpc;
+  ref: string;
+  terms: LockTerms;
+  accounts: NearAccounts;
+}
+
 export interface WriteBundleInput {
   root: string;
   /** Wall-clock ms this bundle is written at — every stamped filename and the live EVM
@@ -161,6 +176,7 @@ export interface WriteBundleInput {
   writeExchanges?: readonly Exchange[];
   evm?: EvmBundleCapture;
   btc?: BtcBundleCapture;
+  near?: NearBundleCapture;
   evidence: BundleEvidenceSummary;
 }
 
@@ -216,8 +232,10 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
 
   const chainForFold = new Map<string, EvmCapture>();
   const btcChainForFold = new Map<string, BtcCapture>();
+  const nearChainForFold = new Map<string, NearCapture>();
   let evmRailConfig: EvmRailConfig | undefined;
   let btcRailConfig: BtcRailConfig | undefined;
+  let nearRailConfig: NearRailConfig | undefined;
 
   if (input.evm !== undefined) {
     const { config, rpc, hashLock } = input.evm;
@@ -256,10 +274,30 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
     if (btcRef !== undefined) finalizedRefs.push(btcRef);
   }
 
-  if (evmRailConfig !== undefined || btcRailConfig !== undefined) {
-    const railsJson: { evm?: EvmRailConfig; btc?: BtcRailConfig } = {
+  // P5-NEAR-SPEC.md §4: the NEAR twin of the EVM block above — `raw/near/<hashLock>/*.json`
+  // (the ref is already filename-safe, no `:`/hyphen rewrite needed, unlike Bitcoin), and this
+  // lock's own `finalizedRef` (from either half of `nearEvidence`'s result, the same "undefined
+  // when the capture never reached a finalized view" rule as the BTC block above).
+  if (input.near !== undefined) {
+    const { config, rpc, ref, terms, accounts } = input.near;
+    nearRailConfig = config;
+    const { index, exchanges } = await captureNearLeg(rpc, config, terms, accounts, ref, input.nowMs);
+    await writeCapture(input.root, exchanges);
+    await writeFileAtomic(join(input.root, "raw", "near", ref, `${stamp}.json`), `${JSON.stringify(index, null, 2)}\n`);
+
+    const bytes = verifiedExchangeBytes(exchanges);
+    const capture: NearCapture = { index, bytes };
+    nearChainForFold.set(ref, capture);
+    const result = nearEvidence({ terms, config, accounts, capture });
+    const nearRef = result.lock.finalizedRef ?? result.rail?.finalizedRef;
+    if (nearRef !== undefined) finalizedRefs.push(nearRef);
+  }
+
+  if (evmRailConfig !== undefined || btcRailConfig !== undefined || nearRailConfig !== undefined) {
+    const railsJson: { evm?: EvmRailConfig; btc?: BtcRailConfig; near?: NearRailConfig } = {
       ...(evmRailConfig === undefined ? {} : { evm: evmRailConfig }),
       ...(btcRailConfig === undefined ? {} : { btc: btcRailConfig }),
+      ...(nearRailConfig === undefined ? {} : { near: nearRailConfig }),
     };
     await writeFileAtomic(join(input.root, "rails.json"), `${JSON.stringify(railsJson, null, 2)}\n`);
   }
@@ -273,9 +311,16 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
     notes: notesForFold,
     chain: chainForFold,
     btcChain: btcChainForFold,
-    ...(evmRailConfig === undefined && btcRailConfig === undefined
+    nearChain: nearChainForFold,
+    ...(evmRailConfig === undefined && btcRailConfig === undefined && nearRailConfig === undefined
       ? {}
-      : { rails: { ...(evmRailConfig === undefined ? {} : { evm: evmRailConfig }), ...(btcRailConfig === undefined ? {} : { btc: btcRailConfig }) } }),
+      : {
+          rails: {
+            ...(evmRailConfig === undefined ? {} : { evm: evmRailConfig }),
+            ...(btcRailConfig === undefined ? {} : { btc: btcRailConfig }),
+            ...(nearRailConfig === undefined ? {} : { near: nearRailConfig }),
+          },
+        }),
     nowMs: input.nowMs,
   });
   const status = board.swaps.find((swap) => swap.swapId === input.evidence.swapId)?.status ?? "unpaired";
