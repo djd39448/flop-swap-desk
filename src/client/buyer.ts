@@ -534,22 +534,34 @@ export class BuyerFlow {
    * itself failed, must not force the swap toward refunds just because tclk's own machine never
    * saw the `lock` frame despite the money genuinely being on chain.
    */
-  async reconcileLockA(): Promise<{ locked: boolean }> {
+  async reconcileLockA(): Promise<{ locked: boolean; verified: boolean; reason?: string }> {
     if (!this.legALockAttempted) {
       throw new Error("buyer: nothing to reconcile — leg A lock was never attempted (G2)");
     }
     if (this.lockedRailRef === undefined || this.lockedAccounts === undefined) {
-      return { locked: false };
+      return { locked: false, verified: false };
     }
     const { offerA, acceptA } = this.requirePaired();
     const termsA = offerAcceptLockTerms(offerA, acceptA);
     const connected = await this.rail.connect(termsA, this.lockedAccounts);
     const evidence = await connected.verifyLockFinal(termsA, this.lockedRailRef, this.lockedAccounts);
-    const locked = evidence.rail !== undefined;
-    if (locked) {
+    if (evidence.rail !== undefined) {
       await this.announceLockA(acceptA.contract, this.lockedRailRef);
+      return { locked: true, verified: true };
     }
-    return { locked };
+    // P5-NEAR-FIXES.md G4: the strict evidence pipeline withheld `rail` — for near-htlc this
+    // happens whenever ANY checked field disagrees, including the payee's own storage
+    // registration, which has nothing to do with whether THIS signer's lock genuinely exists.
+    // A rail that can cheaply confirm mere existence (`lockRecorded`) still lets this Buyer
+    // announce and report it, rather than silently treating "unverified" as "never locked".
+    if (connected.lockRecorded !== undefined) {
+      const recorded = await connected.lockRecorded(this.lockedRailRef);
+      if (recorded.exists) {
+        await this.announceLockA(acceptA.contract, this.lockedRailRef);
+        return { locked: true, verified: false, ...(evidence.lock.reason === undefined ? {} : { reason: evidence.lock.reason }) };
+      }
+    }
+    return { locked: false, verified: false, ...(evidence.lock.reason === undefined ? {} : { reason: evidence.lock.reason }) };
   }
 
   /** Learn the secret from the Seller's signed `reveal` frame when it posted one, or (SPEC
@@ -686,8 +698,25 @@ export class BuyerFlow {
 
     if (this.legARefundEvidence === undefined) {
       const before = connected.exchanges.length;
-      this.legARefundEvidence = await connected.refund(railRef);
-      this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+      try {
+        this.legARefundEvidence = await connected.refund(railRef);
+        this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+      } catch (error) {
+        this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+        // P5-NEAR-FIXES.md G2: a retry after a lost reply from an ALREADY-successful refund must
+        // recognise success from the chain rather than surface the write's own "not refundable"
+        // refusal as failure (near-htlc's own `refund()` throws exactly that once `get_lock`
+        // shows the lock is no longer `Locked` — which is also what a genuinely-succeeded-but-
+        // lost-reply refund looks like on the next read). Only ever treated as success once the
+        // evidence reader itself confirms `refunded`+final; any other outcome rethrows the
+        // original error unchanged.
+        const priorEvidence = await connected.verifyLockFinal(termsA, railRef, this.lockedAccounts);
+        if (priorEvidence.rail?.status === "refunded" && priorEvidence.rail.final) {
+          this.legARefundEvidence = { ref: railRef, raw: [] };
+        } else {
+          throw error;
+        }
+      }
     } else if (connected.resendRefundIfDropped !== undefined) {
       // R2-1: a retry — the earlier broadcast may simply still be pending, or it may have
       // genuinely dropped out of the mempool while the HTLC stays unspent. Never re-builds or
