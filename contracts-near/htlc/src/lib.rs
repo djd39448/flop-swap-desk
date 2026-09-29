@@ -345,6 +345,14 @@ impl FungibleTokenReceiver for Contract {
             Ok(v) => v,
             Err(_) => return refuse_all,
         };
+        // H5: a payee that can never receive/spend a payout -- the HTLC contract's own account
+        // (its `ft_transfer` payout would just be a transfer to itself; the lock could never be
+        // meaningfully claimed by a counterparty) or the USDC token account itself (same
+        // reasoning -- and near-contract-standards' own `ft_transfer` refuses a self-transfer
+        // from the token to itself anyway, so a lock like this could never even settle).
+        if payee == env::current_account_id() || payee == self.usdc_token {
+            return refuse_all;
+        }
         let claim_by_ms: u64 = match parse_u64_strict(&parsed.claim_by_ms) {
             Some(v) => v,
             None => return refuse_all,
@@ -714,6 +722,42 @@ mod tests {
         testing_env!(ctx(accounts(4), 0).build());
         let res = c.ft_on_transfer(accounts(4), U128(1), lock_msg(&hash, HOUR_MS, 2 * HOUR_MS));
         assert_value(res, 1);
+        assert!(c.get_lock(hash).is_none());
+    }
+
+    #[test]
+    fn payee_equal_to_the_contract_itself_refunds_full_amount() {
+        // H5: a payee that can never receive/spend a payout must be refused up front.
+        let mut c = setup();
+        let (_, hash) = preimage_and_hash();
+        testing_env!(ctx(token(), 0).build());
+        let msg = format!(
+            r#"{{"hash_lock":"{}","payee":"{}","claim_by_ms":"{}","refund_after_ms":"{}"}}"#,
+            hash,
+            contract_account(),
+            HOUR_MS,
+            2 * HOUR_MS
+        );
+        let res = c.ft_on_transfer(payer(), U128(500), msg);
+        assert_value(res, 500);
+        assert!(c.get_lock(hash).is_none());
+    }
+
+    #[test]
+    fn payee_equal_to_the_usdc_token_refunds_full_amount() {
+        // H5: same reasoning for the configured token account.
+        let mut c = setup();
+        let (_, hash) = preimage_and_hash();
+        testing_env!(ctx(token(), 0).build());
+        let msg = format!(
+            r#"{{"hash_lock":"{}","payee":"{}","claim_by_ms":"{}","refund_after_ms":"{}"}}"#,
+            hash,
+            token(),
+            HOUR_MS,
+            2 * HOUR_MS
+        );
+        let res = c.ft_on_transfer(payer(), U128(500), msg);
+        assert_value(res, 500);
         assert!(c.get_lock(hash).is_none());
     }
 
