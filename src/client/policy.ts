@@ -97,3 +97,30 @@ export const BTC_LOCAL_POLICY: BtcLocalPolicy = Object.freeze({
   finalityAMs: 3 * 60 * 60_000,
   claimInclusionMarginMs: 60 * 60_000,
 });
+
+// P5-NEAR-DECISIONS-2026-09-29.md D-N8: the NEAR-local twin of `EVM_LOCAL_POLICY`/
+// `BTC_LOCAL_POLICY`, sized for this build's own sandbox pin (`NEAR_SANDBOX_PIN`, finality
+// "final" — a gadget, not a confirmations count) rather than a real mainnet/testnet deployment.
+//
+// `minRevealWindowMs`/`finalityAMs` reuse EVM's own values (45 min / 20 min): NEAR's Doomslug
+// finality gadget finalizes in roughly two blocks (~2 s), an order of magnitude faster than even
+// anvil's near-instant EVM blocks let alone Base Sepolia's — so there is no NEAR-specific
+// slowness to budget extra margin for the way Bitcoin's mined-block cadence needed. D-N8 is
+// explicit these numbers are reused, not re-derived, pending NB-int's own live sandbox timing.
+//
+// `claimInclusionMarginMs` (D-N8): unlike Bitcoin, near-htlc's own `claim()`/`refund()` already
+// re-check `notAfterMs`/`refundAfterMs` against FRESH chain time as the very last read before
+// broadcast (this file's own `near-htlc.ts` `claim`/`refund`) — there is no mempool-inclusion lag
+// to buffer against the way EVM's 5 min buys margin for a transaction sitting unmined for a
+// while. Kept at EVM's own 5 min anyway (D-N8's explicit choice) as a client-side courtesy margin
+// for the "accept a leg A offer" check, not because NEAR needs anything wider.
+export interface NearLocalPolicy extends DeadlinePolicy {
+  claimInclusionMarginMs: number;
+}
+
+export const NEAR_LOCAL_POLICY: NearLocalPolicy = Object.freeze({
+  ...DEFAULT_POLICY_EXAMPLE,
+  minRevealWindowMs: 45 * 60_000,
+  finalityAMs: 20 * 60_000,
+  claimInclusionMarginMs: 5 * 60_000,
+});
