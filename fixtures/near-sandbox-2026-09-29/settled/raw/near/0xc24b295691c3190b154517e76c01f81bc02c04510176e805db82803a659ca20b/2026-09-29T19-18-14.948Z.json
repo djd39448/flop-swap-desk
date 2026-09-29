@@ -1,0 +1,67 @@
+{
+  "v": 1,
+  "rail": "near-htlc",
+  "ref": "0xc24b295691c3190b154517e76c01f81bc02c04510176e805db82803a659ca20b",
+  "pin": "near-sandbox",
+  "caip2": "near:near-sandbox-flop",
+  "endpoint": "http://127.0.0.1:64543",
+  "checkedAtMs": 1790709494948,
+  "config": {
+    "pin": {
+      "name": "near-sandbox",
+      "chainId": "near-sandbox-flop",
+      "caip2": "near:near-sandbox-flop",
+      "finality": "final"
+    },
+    "endpoint": "http://127.0.0.1:64543",
+    "contract": "htlc.test.near",
+    "assets": {
+      "USDC": "usdc.test.near"
+    }
+  },
+  "nonce": "1e13440038ed822a",
+  "exchanges": [
+    {
+      "method": "status",
+      "params": [],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xc24b295691c3190b154517e76c01f81bc02c04510176e805db82803a659ca20b:1790709494948:1e13440038ed822a:1\",\"method\":\"status\",\"params\":[]}",
+      "responseSha256": "2ebaa9974e14e68c2b93bf277e5c6e119c9ec1da3d133fd78c48b7967133cd40",
+      "atMs": 1790709495808
+    },
+    {
+      "method": "block",
+      "params": {
+        "finality": "final"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xc24b295691c3190b154517e76c01f81bc02c04510176e805db82803a659ca20b:1790709494948:1e13440038ed822a:2\",\"method\":\"block\",\"params\":{\"finality\":\"final\"}}",
+      "responseSha256": "0b86c724e788a851f030a92437260e8991132ae6fb85496eacaa999148a87ea3",
+      "atMs": 1790709495809
+    },
+    {
+      "method": "query",
+      "params": {
+        "request_type": "call_function",
+        "account_id": "htlc.test.near",
+        "method_name": "get_lock",
+        "args_base64": "eyJoYXNoX2xvY2siOiJjMjRiMjk1NjkxYzMxOTBiMTU0NTE3ZTc2YzAxZjgxYmMwMmMwNDUxMDE3NmU4MDVkYjgyODAzYTY1OWNhMjBiIn0=",
+        "block_id": "FDxQy3Rx2Wi8V2wsRaJqUcwvDtZhWQyRiuR5N3PN74Ny"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xc24b295691c3190b154517e76c01f81bc02c04510176e805db82803a659ca20b:1790709494948:1e13440038ed822a:3\",\"method\":\"query\",\"params\":{\"request_type\":\"call_function\",\"account_id\":\"htlc.test.near\",\"method_name\":\"get_lock\",\"args_base64\":\"eyJoYXNoX2xvY2siOiJjMjRiMjk1NjkxYzMxOTBiMTU0NTE3ZTc2YzAxZjgxYmMwMmMwNDUxMDE3NmU4MDVkYjgyODAzYTY1OWNhMjBiIn0=\",\"block_id\":\"FDxQy3Rx2Wi8V2wsRaJqUcwvDtZhWQyRiuR5N3PN74Ny\"}}",
+      "responseSha256": "fe3b3cf814ce210247b44d1c1e3e52a156cfdd6f862b98f842a48756d4c1a059",
+      "atMs": 1790709495810
+    },
+    {
+      "method": "query",
+      "params": {
+        "request_type": "call_function",
+        "account_id": "usdc.test.near",
+        "method_name": "storage_balance_of",
+        "args_base64": "eyJhY2NvdW50X2lkIjoic2VsbGVyLnRlc3QubmVhciJ9",
+        "block_id": "FDxQy3Rx2Wi8V2wsRaJqUcwvDtZhWQyRiuR5N3PN74Ny"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xc24b295691c3190b154517e76c01f81bc02c04510176e805db82803a659ca20b:1790709494948:1e13440038ed822a:4\",\"method\":\"query\",\"params\":{\"request_type\":\"call_function\",\"account_id\":\"usdc.test.near\",\"method_name\":\"storage_balance_of\",\"args_base64\":\"eyJhY2NvdW50X2lkIjoic2VsbGVyLnRlc3QubmVhciJ9\",\"block_id\":\"FDxQy3Rx2Wi8V2wsRaJqUcwvDtZhWQyRiuR5N3PN74Ny\"}}",
+      "responseSha256": "e25d1db98e2ea6f1a3a72afbfca981c087af7a9eaf6f3dfcf1abeabd9cd98cd3",
+      "atMs": 1790709495811
+    }
+  ]
+}

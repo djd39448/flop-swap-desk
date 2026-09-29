@@ -1,0 +1,51 @@
+{
+  "swapId": "0x4096f1d32d53d44c63b4554ea849511ce01895e6de56d86ab3a257f4bc1fb80e",
+  "legA": {
+    "contract": "0xdc4b16372d079ad7325523637b620489305bb623fd373dcd853a3654e6e5a83d",
+    "rail": "near-htlc"
+  },
+  "legB": {
+    "contract": "0xbbb6e929c6e73455ae1d04ab9bd53329c22ec99abd707c2e26420e75ea4a72fa",
+    "rail": "paper"
+  },
+  "feeBps": 0,
+  "writes": [
+    {
+      "leg": "a",
+      "step": "lock",
+      "rail": "near-htlc",
+      "evidence": {
+        "ref": "0xc24b295691c3190b154517e76c01f81bc02c04510176e805db82803a659ca20b",
+        "txHash": "Ff4WP9acx6U3k1rrbt2HwcUcFvAb2KRX5MJTtyQM8NTg",
+        "blockHeight": 55,
+        "blockHash": "4ErUChuhrkDU1VUQV2UW56SpBPRiQyFKKWA9GM16DQN8",
+        "raw": [
+          "df2aea5db1d3703101b4b587a41161a15329c400dd43ba52443c2fcf26b65c6b",
+          "2685cbdfff444d65bd8ec5c345bf4ceba54e10a757427f4239cad762fe34c036"
+        ]
+      }
+    },
+    {
+      "leg": "a",
+      "step": "claim",
+      "rail": "near-htlc",
+      "evidence": {
+        "ref": "0xc24b295691c3190b154517e76c01f81bc02c04510176e805db82803a659ca20b",
+        "txHash": "3RTa4sgqQWZYiuVChM7YP2LotQ1KCWTZsd6v4VsNVaHL",
+        "blockHeight": 63,
+        "blockHash": "CbeLH3j9KGV1GUcqm6gyxfqtwcViLHkqsNYii5U4kGq8",
+        "raw": [
+          "d25326e71ef7e7cc40d5fcdefb76107cdb816b8796ddc266bc50656c68b64cb2",
+          "e9480be63e07a6209011ce56c6467cc2a3c5518a4b4761fcf1b73bdff24867da"
+        ]
+      }
+    }
+  ],
+  "startedAtMs": 1790709494948,
+  "finishedAtMs": 1790709494948,
+  "status": "settled",
+  "finalizedRefs": [
+    "paper:sha256:ee5e38b37f148578a14b7eb56030be8511e09f67ba0380d42072a07c7c829b68",
+    "near-sandbox:final:67:FDxQy3Rx2Wi8V2wsRaJqUcwvDtZhWQyRiuR5N3PN74Ny"
+  ]
+}

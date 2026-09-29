@@ -1,0 +1,26 @@
+{
+  "swapId": "0x7a1e900409c90ef1a824e323ce36b20d769c37b93a1eda6e0430130054577f5b",
+  "legA": {
+    "contract": "0x73c22590dcad3cb76de714fe21367fd1a446423638e86ecc7f984314aa9feaee",
+    "rail": "near-htlc"
+  },
+  "legB": {
+    "contract": "0x60fea71c067dd6414ffb5c3878a6daef4f47bc76fab6e0af37ba7252355e7923",
+    "rail": "paper"
+  },
+  "feeBps": 0,
+  "writes": [
+    {
+      "leg": "b",
+      "step": "refund",
+      "rail": "paper",
+      "evidence": {}
+    }
+  ],
+  "startedAtMs": 1790712408795,
+  "finishedAtMs": 1790798868795,
+  "status": "refunded-b",
+  "finalizedRefs": [
+    "paper:sha256:6daebdfd0e5696a525e7ba11dc920875876d8ae8d34dfa720ae7da700a1faf2c"
+  ]
+}
