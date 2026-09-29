@@ -124,12 +124,29 @@ pub enum Exit {
 /// are required; `claim_by_ms`/`refund_after_ms` travel as decimal strings (matching near-sdk's
 /// own `U64` JSON convention) so a caller never hits the 53-bit JSON-number limit.
 #[derive(Deserialize)]
-#[serde(crate = "near_sdk::serde")]
+#[serde(crate = "near_sdk::serde", deny_unknown_fields)]
 struct LockMsg {
     hash_lock: String,
     payee: String,
     claim_by_ms: String,
     refund_after_ms: String,
+}
+
+/// F8: `str::parse::<u64>()` is looser than "validate strictly" (P5-NEAR-SPEC.md section 3)
+/// -- it accepts a leading `+` and leading zeros (e.g. `"+0003600000"`). Requires exactly
+/// `"0"` or a nonzero-leading run of ASCII digits.
+fn parse_u64_strict(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if !bytes.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if bytes[0] == b'0' && bytes.len() > 1 {
+        return None;
+    }
+    s.parse::<u64>().ok()
 }
 
 #[near(contract_state)]
@@ -328,13 +345,13 @@ impl FungibleTokenReceiver for Contract {
             Ok(v) => v,
             Err(_) => return refuse_all,
         };
-        let claim_by_ms: u64 = match parsed.claim_by_ms.parse() {
-            Ok(v) => v,
-            Err(_) => return refuse_all,
+        let claim_by_ms: u64 = match parse_u64_strict(&parsed.claim_by_ms) {
+            Some(v) => v,
+            None => return refuse_all,
         };
-        let refund_after_ms: u64 = match parsed.refund_after_ms.parse() {
-            Ok(v) => v,
-            Err(_) => return refuse_all,
+        let refund_after_ms: u64 = match parse_u64_strict(&parsed.refund_after_ms) {
+            Some(v) => v,
+            None => return refuse_all,
         };
         if claim_by_ms >= refund_after_ms {
             return refuse_all;
@@ -592,6 +609,57 @@ mod tests {
         );
         let res = c.ft_on_transfer(payer(), U128(500), msg);
         assert_value(res, 500);
+    }
+
+    #[test]
+    fn lock_msg_with_unknown_field_is_refused() {
+        let mut c = setup();
+        let (_, hash) = preimage_and_hash();
+        testing_env!(ctx(token(), 0).build());
+        let msg = format!(
+            r#"{{"hash_lock":"{}","payee":"{}","claim_by_ms":"{}","refund_after_ms":"{}","extra":1}}"#,
+            hash,
+            payee(),
+            HOUR_MS,
+            2 * HOUR_MS
+        );
+        let res = c.ft_on_transfer(payer(), U128(500), msg);
+        assert_value(res, 500);
+        assert!(c.get_lock(hash).is_none());
+    }
+
+    #[test]
+    fn lock_msg_with_leading_plus_sign_is_refused() {
+        let mut c = setup();
+        let (_, hash) = preimage_and_hash();
+        testing_env!(ctx(token(), 0).build());
+        let msg = format!(
+            r#"{{"hash_lock":"{}","payee":"{}","claim_by_ms":"+{}","refund_after_ms":"{}"}}"#,
+            hash,
+            payee(),
+            HOUR_MS,
+            2 * HOUR_MS
+        );
+        let res = c.ft_on_transfer(payer(), U128(500), msg);
+        assert_value(res, 500);
+        assert!(c.get_lock(hash).is_none());
+    }
+
+    #[test]
+    fn lock_msg_with_leading_zero_is_refused() {
+        let mut c = setup();
+        let (_, hash) = preimage_and_hash();
+        testing_env!(ctx(token(), 0).build());
+        let msg = format!(
+            r#"{{"hash_lock":"{}","payee":"{}","claim_by_ms":"0{}","refund_after_ms":"{}"}}"#,
+            hash,
+            payee(),
+            HOUR_MS,
+            2 * HOUR_MS
+        );
+        let res = c.ft_on_transfer(payer(), U128(500), msg);
+        assert_value(res, 500);
+        assert!(c.get_lock(hash).is_none());
     }
 
     #[test]
