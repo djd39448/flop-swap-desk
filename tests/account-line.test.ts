@@ -330,6 +330,156 @@ describe("resolveAccounts", () => {
   });
 });
 
+// ── near-htlc account line (D-N5) ───────────────────────────────────────────────────────────
+//
+// near-htlc uses an account line (D-N5), never a pubkey line: the contract authorises by
+// account id (`predecessor_account_id`), unlike btc-htlc's P2WSH script (P4-BTC-SPEC.md §6),
+// which commits to public keys. `swap1 account near-htlc near:<chain id>:<account id>` — the
+// account id itself uses NEAR's own grammar (`validateNearAccountId` in account-line.ts), which
+// accepts `_` as a separator — a deliberate, documented deviation from the generic CAIP-10
+// address grammar (`CAIP10_ADDRESS`, which has no `_`).
+
+const NEAR_RAIL = "near-htlc";
+const NEAR_CAIP2 = "near:near-sandbox-flop"; // NEAR_SANDBOX_PIN.caip2
+
+function nearAccountLine(seq: number, signer: typeof buyer, accountId: string, room: string = ROOM): ReturnType<typeof record> {
+  return record(room, seq, T0 + seq * 60_000, signer, formatAccountLine({ railId: NEAR_RAIL, caip2: NEAR_CAIP2, address: accountId }));
+}
+
+describe("near-htlc account line grammar (D-N5)", () => {
+  describe("parseAccountLine", () => {
+    it("accepts a plain NEAR account id", () => {
+      const line = `swap1 account near-htlc ${NEAR_CAIP2}:alice.near-sandbox-flop`;
+      expect(parseAccountLine(line)).toEqual({ railId: "near-htlc", caip2: NEAR_CAIP2, address: "alice.near-sandbox-flop" });
+    });
+
+    it("accepts an account id with an underscore separator (the documented deviation from generic CAIP-10)", () => {
+      const line = `swap1 account near-htlc ${NEAR_CAIP2}:alice_capital.near-sandbox-flop`;
+      expect(parseAccountLine(line)).toEqual({ railId: "near-htlc", caip2: NEAR_CAIP2, address: "alice_capital.near-sandbox-flop" });
+    });
+
+    it("accepts a 64-hex-char implicit account id (the maximum length)", () => {
+      const implicitId = "ab".repeat(32); // 64 chars
+      expect(implicitId).toHaveLength(64);
+      const line = `swap1 account near-htlc ${NEAR_CAIP2}:${implicitId}`;
+      expect(parseAccountLine(line)).toEqual({ railId: "near-htlc", caip2: NEAR_CAIP2, address: implicitId });
+    });
+
+    it("accepts a hyphen separator", () => {
+      const line = `swap1 account near-htlc ${NEAR_CAIP2}:my-account.near-sandbox-flop`;
+      expect(parseAccountLine(line)).toEqual({ railId: "near-htlc", caip2: NEAR_CAIP2, address: "my-account.near-sandbox-flop" });
+    });
+
+    it("rejects an uppercase account id (NEAR account ids are always lowercase)", () => {
+      expect(parseAccountLine(`swap1 account near-htlc ${NEAR_CAIP2}:Alice.near-sandbox-flop`)).toBeNull();
+    });
+
+    it("rejects a 1-character account id (below the 2-char minimum)", () => {
+      expect(parseAccountLine(`swap1 account near-htlc ${NEAR_CAIP2}:a`)).toBeNull();
+    });
+
+    it("rejects an account id over 64 characters", () => {
+      const tooLong = "a".repeat(65);
+      expect(parseAccountLine(`swap1 account near-htlc ${NEAR_CAIP2}:${tooLong}`)).toBeNull();
+    });
+
+    it("rejects a leading separator", () => {
+      expect(parseAccountLine(`swap1 account near-htlc ${NEAR_CAIP2}:.alice`)).toBeNull();
+      expect(parseAccountLine(`swap1 account near-htlc ${NEAR_CAIP2}:-alice`)).toBeNull();
+      expect(parseAccountLine(`swap1 account near-htlc ${NEAR_CAIP2}:_alice`)).toBeNull();
+    });
+
+    it("rejects a trailing separator", () => {
+      expect(parseAccountLine(`swap1 account near-htlc ${NEAR_CAIP2}:alice.`)).toBeNull();
+    });
+
+    it("rejects a doubled-up separator", () => {
+      expect(parseAccountLine(`swap1 account near-htlc ${NEAR_CAIP2}:alice..near`)).toBeNull();
+      expect(parseAccountLine(`swap1 account near-htlc ${NEAR_CAIP2}:alice__near`)).toBeNull();
+    });
+
+    it("rejects a character outside [a-z0-9._-] (e.g. a space-free but illegal symbol)", () => {
+      expect(parseAccountLine(`swap1 account near-htlc ${NEAR_CAIP2}:alice@near`)).toBeNull();
+    });
+
+    it("rejects the wrong namespace for the rail (near-htlc wants near, not eip155)", () => {
+      expect(parseAccountLine(`swap1 account near-htlc eip155:31337:${LOWER_ADDRESS}`)).toBeNull();
+    });
+  });
+
+  describe("formatAccountLine", () => {
+    it("round-trips through parseAccountLine", () => {
+      const line = formatAccountLine({ railId: "near-htlc", caip2: NEAR_CAIP2, address: "alice.near-sandbox-flop" });
+      expect(line).toBe(`swap1 account near-htlc ${NEAR_CAIP2}:alice.near-sandbox-flop`);
+      expect(parseAccountLine(line)).toEqual({ railId: "near-htlc", caip2: NEAR_CAIP2, address: "alice.near-sandbox-flop" });
+    });
+
+    it("throws on an account id that fails NEAR's own grammar", () => {
+      expect(() => formatAccountLine({ railId: "near-htlc", caip2: NEAR_CAIP2, address: "Alice.near" })).toThrow();
+      expect(() => formatAccountLine({ railId: "near-htlc", caip2: NEAR_CAIP2, address: "a" })).toThrow();
+    });
+  });
+
+  it("near-htlc is NOT in PUBKEY_RAIL_NAMESPACES — this rail uses an account line only, never a pubkey line (D-N5)", () => {
+    expect(PUBKEY_RAIL_NAMESPACES).not.toHaveProperty("near-htlc");
+  });
+});
+
+describe("resolveAccounts — near-htlc", () => {
+  const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, rail: NEAR_RAIL, caip2: NEAR_CAIP2 };
+
+  it("resolves the payee's line to `payee`, sender-bound", () => {
+    const records = [nearAccountLine(1, seller, "seller.near-sandbox-flop")];
+    const result = resolveAccounts(records, input);
+    expect(result.payee).toBe("seller.near-sandbox-flop");
+    expect(result.payer).toBeUndefined();
+  });
+
+  it("resolves both independently when both parties post", () => {
+    const records = [nearAccountLine(1, buyer, "buyer.near-sandbox-flop"), nearAccountLine(2, seller, "seller.near-sandbox-flop")];
+    const result = resolveAccounts(records, input);
+    expect(result.payer).toBe("buyer.near-sandbox-flop");
+    expect(result.payee).toBe("seller.near-sandbox-flop");
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("a conflict (two disagreeing lines from the same party) leaves that party unresolved, not first-wins", () => {
+    const records = [nearAccountLine(1, seller, "seller.near-sandbox-flop"), nearAccountLine(2, seller, "seller-two.near-sandbox-flop")];
+    const result = resolveAccounts(records, input);
+    expect(result.payee).toBeUndefined();
+    expect(result.reasons.some((r) => r.includes("conflicting account lines") && r.includes(seller.did))).toBe(true);
+  });
+
+  it("G1: a line posted after the accepted lock (beforeSeq) is ignored entirely", () => {
+    const records = [nearAccountLine(1, seller, "seller.near-sandbox-flop"), nearAccountLine(5, seller, "seller-late.near-sandbox-flop")];
+    const result = resolveAccounts(records, { ...input, beforeSeq: 3 });
+    expect(result.payee).toBe("seller.near-sandbox-flop"); // only the earlier line counts
+  });
+
+  it("ignores a line for a different chain (same rail, different caip2) and says why", () => {
+    const otherChainLine = formatAccountLine({ railId: NEAR_RAIL, caip2: "near:testnet", address: "seller.testnet" });
+    const records = [record(ROOM, 1, T0, seller, otherChainLine)];
+    const result = resolveAccounts(records, input);
+    expect(result.payee).toBeUndefined();
+    expect(result.reasons.some((r) => r.includes("near:testnet"))).toBe(true);
+  });
+
+  it("ignores an unsigned record even if its line is a well-formed account line", () => {
+    const line = formatAccountLine({ railId: NEAR_RAIL, caip2: NEAR_CAIP2, address: "seller.near-sandbox-flop" });
+    const records = [unsignedRecord(ROOM, 1, T0, line)];
+    const result = resolveAccounts(records, input);
+    expect(result.payee).toBeUndefined();
+  });
+
+  it("only the payee's line is required to resolve; the payer's stays undefined with no reasons", () => {
+    const records = [nearAccountLine(1, seller, "seller.near-sandbox-flop")];
+    const result = resolveAccounts(records, input);
+    expect(result.payee).toBe("seller.near-sandbox-flop");
+    expect(result.payer).toBeUndefined();
+    expect(result.reasons).toEqual([]);
+  });
+});
+
 // ── the pubkey line (P4-BTC-SPEC.md §6) ─────────────────────────────────────────────────────
 
 const BTC_RAIL = "btc-htlc";
