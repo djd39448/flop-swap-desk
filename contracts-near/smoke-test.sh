@@ -123,10 +123,19 @@ with open(htlc_wasm_path, "rb") as f:
 with open(ft_wasm_path, "rb") as f:
     ft_wasm = f.read()
 
-# (storage key hex, storage value hex) pairs left behind by `htlc::Contract::new()` /
-# `mock_ft::Contract::new(accounts(0))` respectively (see the comment above).
+# (storage key hex, storage value hex) pairs left behind by
+# `htlc::Contract::new(FT_ACCOUNT)` / `mock_ft::Contract::new(accounts(0))` respectively (see
+# the comment above). NB1 fix F3 added a `usdc_token: AccountId` field to htlc::Contract
+# (borsh: the LookupMap's prefix bytes, unchanged, followed by the AccountId as a borsh
+# string -- 4-byte LE length + utf8 bytes); computed below rather than hand-typed so a hex
+# mistake can't silently produce a differently-shaped-but-still-valid STATE value.
+def _borsh_string(s: str) -> bytes:
+    b = s.encode("utf-8")
+    return len(b).to_bytes(4, "little") + b
+
+_htlc_state = bytes.fromhex("010000006c") + _borsh_string(FT_ACCOUNT)
 HTLC_STORAGE_KV = [
-    ("5354415445", "010000006c"),  # "STATE" -> borsh(Contract { locks: LookupMap{prefix:"l"} })
+    ("5354415445", _htlc_state.hex()),  # "STATE" -> borsh(Contract { locks, usdc_token })
 ]
 FT_STORAGE_KV = [
     # FungibleToken::new(b"a") + internal_register_account(owner) -> owner's zero balance.

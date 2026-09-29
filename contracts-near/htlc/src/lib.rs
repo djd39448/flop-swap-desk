@@ -136,14 +136,25 @@ struct LockMsg {
 #[derive(PanicOnDefault)]
 pub struct Contract {
     locks: LookupMap<String, Lock>,
+    /// F3: the only NEP-141 token whose `ft_transfer_call` may create a lock (checked at the
+    /// top of `ft_on_transfer`). `locks` is keyed by `hash_lock` alone with first-writer-wins
+    /// semantics, and `ft_on_transfer` is otherwise a public method any account can call
+    /// directly with no real token transfer behind it (gas only) -- without this allow-list,
+    /// an attacker could read a swap's public hash_lock off the offer and pre-register a lock
+    /// under it (squatting the key) to permanently block the real payer's lock under the same
+    /// hash, or spam locks to drain the contract's storage staking (F2). This makes the
+    /// contract single-token per deployment rather than the fully asset-agnostic design in
+    /// this file's original header comment -- see README "Known limits".
+    usdc_token: AccountId,
 }
 
 #[near]
 impl Contract {
     #[init]
-    pub fn new() -> Self {
+    pub fn new(usdc_token: AccountId) -> Self {
         Self {
             locks: LookupMap::new(b"l"),
+            usdc_token,
         }
     }
 
@@ -279,6 +290,13 @@ impl FungibleTokenReceiver for Contract {
         let refuse_all = PromiseOrValue::Value(amount);
 
         if amount.0 == 0 {
+            return refuse_all;
+        }
+
+        // F3: only the configured token's own transfer may create a lock -- see the
+        // `usdc_token` field doc for why a direct call from anywhere else must be refused
+        // before it can occupy (squat) or spam a hash_lock key.
+        if env::predecessor_account_id() != self.usdc_token {
             return refuse_all;
         }
 
@@ -439,7 +457,7 @@ mod tests {
 
     fn setup() -> Contract {
         testing_env!(ctx(token(), 0).build());
-        Contract::new()
+        Contract::new(token())
     }
 
     fn preimage_and_hash() -> (String, String) {
@@ -594,6 +612,32 @@ mod tests {
         // Original lock is untouched by the rejected second attempt.
         let view = c.get_lock(hash).unwrap();
         assert_eq!(view.amount, U128(1_000));
+    }
+
+    #[test]
+    fn direct_call_from_a_non_token_account_is_refused() {
+        let mut c = setup();
+        let (_, hash) = preimage_and_hash();
+        // Not the configured token: predecessor is an ordinary account, no real transfer
+        // behind this call at all.
+        testing_env!(ctx(accounts(4), 0).build());
+        let res = c.ft_on_transfer(accounts(4), U128(1), lock_msg(&hash, HOUR_MS, 2 * HOUR_MS));
+        assert_value(res, 1);
+        assert!(c.get_lock(hash).is_none());
+    }
+
+    #[test]
+    fn hash_lock_squatter_cannot_block_the_real_lock() {
+        let mut c = setup();
+        let (_, hash) = preimage_and_hash();
+        testing_env!(ctx(accounts(4), 0).build()); // not a token: a direct call
+        let squat = c.ft_on_transfer(accounts(4), U128(1), lock_msg(&hash, HOUR_MS, u64::MAX / 2));
+        assert_value(squat, 1);
+        assert!(c.get_lock(hash.clone()).is_none(), "squat must never be stored");
+
+        let real = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
+        assert_value(real, 0);
+        assert_eq!(c.get_lock(hash).unwrap().amount, U128(1_000));
     }
 
     // ---- claim ----
