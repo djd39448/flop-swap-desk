@@ -86,6 +86,8 @@ import {
 import { checkSwapDeadlines } from "../deadlines.js";
 import { checkOrientation, classifySwapOffer, legBContext } from "../profile.js";
 import { EVM_RAIL_ID } from "../rails/evm-evidence.js";
+import { NEAR_RAIL_ID } from "../rails/near-evidence.js";
+import { NearPayoutFailedError } from "../rails/near-htlc.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
 import { offerAcceptLockTerms } from "../swap.js";
@@ -512,11 +514,23 @@ export class SellerFlow {
       const legacyLockFrame = accepted === null ? findAuthenticatedLock(dealRoomARecords, acceptA.contract, termsA.payer) : null;
 
       if (accepted !== null && accepted.rail === this.rail.railId) {
-        // For EVM the rail ref IS the hashLock this Seller already knows authoritatively — never
-        // trust the frame's own copy of it, even though the two must agree (G8: "for EVM it
-        // keeps its own hashLock"). For every other rail (btc-htlc: a funding outpoint this
-        // Seller has no other way to learn) the frame's own accepted ref is the only source.
-        railRef = this.rail.railId === EVM_RAIL_ID ? hashLockHex : accepted.railRef;
+        // For EVM (and, P5-NEAR-FIXES.md G5, near-htlc) the rail ref IS the hashLock this Seller
+        // already knows authoritatively — never trust the frame's own copy of it. For every
+        // other rail (btc-htlc: a funding outpoint this Seller has no other way to learn) the
+        // frame's own accepted ref is the only source.
+        if (this.rail.railId === EVM_RAIL_ID || this.rail.railId === NEAR_RAIL_ID) {
+          // G5: an accepted lock frame naming a DIFFERENT ref for one of these rails is not "the
+          // frame is more current" — it is wrong. Refuse rather than silently prefer this
+          // Seller's own value while ignoring the disagreement.
+          if (accepted.railRef !== hashLockHex) {
+            throw new Error(
+              `seller: refusing to claim leg A — the accepted lock frame's own ref does not match this flow's own hash lock (G5/G8, rail "${this.rail.railId}")`,
+            );
+          }
+          railRef = hashLockHex;
+        } else {
+          railRef = accepted.railRef;
+        }
       } else if (legacyLockFrame !== null && legacyLockFrame.rail === this.rail.railId) {
         railRef = legacyLockFrame.ref;
       } else {
@@ -533,67 +547,140 @@ export class SellerFlow {
 
     const connected = await this.rail.connect(termsA, accounts);
 
-    // B2/C3: read before verifyLockFinal (whose own capture drains this rail's exchange log
-    // when it finishes). Neither the chain's own last block nor wall-clock alone is safe to
-    // judge this against: an idle chain's `latest` block can lag real time indefinitely
-    // (nothing forces a new block just because time passes), so trusting it alone risks a stale
-    // "still safe" reading for a claim that will actually land well after `refundAfterMs` once
-    // it is finally mined; trusting wall-clock alone was the pre-B2 bug (this process's own
-    // clock lagging a chain that has already moved past the deadline). `chainNow` takes
-    // whichever of the two already reports the more dangerous (later) time — it is never
-    // earlier than either one alone, so it can only make this guard more conservative, never
-    // less.
-    const chainTimeMs = await connected.chainTimeMs();
-    const chainNow = Math.max(chainTimeMs, this.clock());
-    if (chainNow >= offerA.claimByMs) {
-      throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time) (B2/C3)");
-    }
-    if (offerA.refundAfterMs - chainNow < this.rail.policy.claimInclusionMarginMs) {
-      throw new Error(
-        `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
-          `(${this.rail.policy.claimInclusionMarginMs} ms) remains before refundAfterMs (chain time) (B2/C3)`,
-      );
+    // P5-NEAR-FIXES.md G2/G3: check chain state for THIS flow's own secret before ever touching
+    // a deadline guard or risking a write. A retry after a lost reply from an already-successful
+    // claim (G2) must recognise success from the chain rather than treat "unverified/expired" as
+    // a reason to refuse; a retry after a claim whose payout failed but which already revealed
+    // the preimage on chain (G3, the flow-side twin of the adapter's own H2) must skip the
+    // claimByMs/margin guards below, since the contract's own F4 rule permits exactly this retry
+    // past them. `findClaimedPreimage` returns a preimage regardless of whether it is EVM's own
+    // `Claimed` log or near-htlc's revealed-but-`Locked` state (H2's own doc) — `verifyLockFinal`
+    // is what tells the two apart.
+    //
+    // Scoped to `near-htlc` only (never EVM/BTC — P4-BTC-SPEC.md §7a's "no behaviour change"
+    // rule): this extra read has a real cost (EVM's own `findClaimedPreimage` is a bounded
+    // `eth_getLogs` scan), and neither EVM nor Bitcoin's own `claim()` has an H2-shaped
+    // revealed-retry concept for this to protect against — a lost-reply retry on those rails is
+    // already handled by their own rail-level idempotency/simulation, unchanged by this build.
+    let skipDeadlineGuards = false;
+    if (this.rail.railId === NEAR_RAIL_ID) {
+      const priorPreimage = await connected.findClaimedPreimage(railRef);
+      const revealedIsOwn = priorPreimage !== null && priorPreimage === this.hashLock.preimage;
+
+      if (revealedIsOwn) {
+        const priorEvidence = await connected.verifyLockFinal(termsA, railRef, accounts);
+        if (this.frozenLegAAccounts === undefined) {
+          this.frozenLegAAccounts = accounts;
+          this.frozenLegARailRef = railRef;
+        }
+        if (priorEvidence.rail?.status === "claimed" && priorEvidence.rail.final) {
+          // G2: the chain already agrees this claim landed — post the frames (idempotent per
+          // flow instance) and send nothing.
+          const reveal = options?.skipReveal === true
+            ? undefined
+            : await this.venue.post(
+                dealRoom(acceptA.contract),
+                encodeFrame({ type: "reveal", from: this.identity.did, contract: acceptA.contract, ref: railRef, secret: this.hashLock.preimage }),
+                this.identity,
+              );
+          const receipt = await this.venue.post(
+            dealRoom(acceptA.contract),
+            encodeFrame({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "claimed", rail: this.rail.railId, ref: railRef }),
+            this.identity,
+          );
+          return { evidence: { ref: railRef, raw: [] }, ...(reveal === undefined ? {} : { reveal }), receipt };
+        }
+        // G3: revealed, but not (or no longer) finally claimed — fall through to a claim retry
+        // below, skipping the deadline guards the adapter's own H2 rule already permits skipping.
+        skipDeadlineGuards = true;
+      }
     }
 
-    const evidence = await connected.verifyLockFinal(termsA, railRef, accounts);
-    if (evidence.lock.railVerified !== true) {
-      throw new Error(
-        `seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): ${evidence.lock.reason ?? "unverified"}`,
-      );
-    }
+    if (!skipDeadlineGuards) {
+      // B2/C3: read before verifyLockFinal (whose own capture drains this rail's exchange log
+      // when it finishes). Neither the chain's own last block nor wall-clock alone is safe to
+      // judge this against: an idle chain's `latest` block can lag real time indefinitely
+      // (nothing forces a new block just because time passes), so trusting it alone risks a stale
+      // "still safe" reading for a claim that will actually land well after `refundAfterMs` once
+      // it is finally mined; trusting wall-clock alone was the pre-B2 bug (this process's own
+      // clock lagging a chain that has already moved past the deadline). `chainNow` takes
+      // whichever of the two already reports the more dangerous (later) time — it is never
+      // earlier than either one alone, so it can only make this guard more conservative, never
+      // less.
+      const chainTimeMs = await connected.chainTimeMs();
+      const chainNow = Math.max(chainTimeMs, this.clock());
+      if (chainNow >= offerA.claimByMs) {
+        throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time) (B2/C3)");
+      }
+      if (offerA.refundAfterMs - chainNow < this.rail.policy.claimInclusionMarginMs) {
+        throw new Error(
+          `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
+            `(${this.rail.policy.claimInclusionMarginMs} ms) remains before refundAfterMs (chain time) (B2/C3)`,
+        );
+      }
 
-    // P4-BTC-FIXES.md G1: freeze the accounts/railRef this call resolved, now that the lock has
-    // verified for the first time — a later call (from a runner retrying after some other
-    // failure below) must never re-resolve them.
-    if (this.frozenLegAAccounts === undefined) {
-      this.frozenLegAAccounts = accounts;
-      this.frozenLegARailRef = railRef;
-    }
+      const evidence = await connected.verifyLockFinal(termsA, railRef, accounts);
+      if (evidence.lock.railVerified !== true) {
+        throw new Error(
+          `seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): ${evidence.lock.reason ?? "unverified"}`,
+        );
+      }
 
-    // P22-P24-EVM-FIXES-R3.md E4: `verifyLockFinal` can itself take a long time (a slow or
-    // rate-limited RPC — the reviewer's own probe was a 29-minute `locks()` read); the margin
-    // checked above, before it ran, is not evidence that any margin still remains now that it
-    // has returned. Re-read chain time and re-apply the identical claimByMs/margin guards
-    // immediately before ever calling `claim()` — never trusting the earlier reading alone.
-    const chainTimeAfterVerifyMs = await connected.chainTimeMs();
-    const chainNowAfterVerify = Math.max(chainTimeAfterVerifyMs, this.clock());
-    if (chainNowAfterVerify >= offerA.claimByMs) {
-      throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time, re-checked after verifyLockFinal) (E4)");
-    }
-    if (offerA.refundAfterMs - chainNowAfterVerify < this.rail.policy.claimInclusionMarginMs) {
-      throw new Error(
-        `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
-          `(${this.rail.policy.claimInclusionMarginMs} ms) remains before refundAfterMs ` +
-          `(chain time, re-checked after verifyLockFinal) (E4)`,
-      );
+      // P4-BTC-FIXES.md G1: freeze the accounts/railRef this call resolved, now that the lock has
+      // verified for the first time — a later call (from a runner retrying after some other
+      // failure below) must never re-resolve them.
+      if (this.frozenLegAAccounts === undefined) {
+        this.frozenLegAAccounts = accounts;
+        this.frozenLegARailRef = railRef;
+      }
+
+      // P22-P24-EVM-FIXES-R3.md E4: `verifyLockFinal` can itself take a long time (a slow or
+      // rate-limited RPC — the reviewer's own probe was a 29-minute `locks()` read); the margin
+      // checked above, before it ran, is not evidence that any margin still remains now that it
+      // has returned. Re-read chain time and re-apply the identical claimByMs/margin guards
+      // immediately before ever calling `claim()` — never trusting the earlier reading alone.
+      const chainTimeAfterVerifyMs = await connected.chainTimeMs();
+      const chainNowAfterVerify = Math.max(chainTimeAfterVerifyMs, this.clock());
+      if (chainNowAfterVerify >= offerA.claimByMs) {
+        throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time, re-checked after verifyLockFinal) (E4)");
+      }
+      if (offerA.refundAfterMs - chainNowAfterVerify < this.rail.policy.claimInclusionMarginMs) {
+        throw new Error(
+          `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
+            `(${this.rail.policy.claimInclusionMarginMs} ms) remains before refundAfterMs ` +
+            `(chain time, re-checked after verifyLockFinal) (E4)`,
+        );
+      }
     }
 
     // E4: the leg-A rail's own `claim` re-checks this same bound once more, against its own
     // freshly-read chain time, immediately before it actually broadcasts (defense in depth
-    // against however long its own preimage-free pre-checks (E5) themselves take).
+    // against however long its own preimage-free pre-checks (E5) themselves take) — skipped
+    // internally by the adapter itself on a revealed retry (H2/G3).
     const notAfterMs = offerA.refundAfterMs - this.rail.policy.claimInclusionMarginMs;
     const before = connected.exchanges.length;
-    const writeEvidence = await connected.claim(railRef, this.hashLock.preimage, notAfterMs);
+    let writeEvidence: RailWriteEvidence;
+    try {
+      writeEvidence = await connected.claim(railRef, this.hashLock.preimage, notAfterMs);
+    } catch (error) {
+      this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+      // P5-NEAR-FIXES.md G1 (the flow-side twin of the adapter's own H1): a write's own
+      // chain-level failure is never silently treated as success. `NearPayoutFailedError` means
+      // the claim call itself ran and revealed the preimage on chain (the contract's own F4
+      // rule) but the inner payout promise failed — the secret is now public regardless, so the
+      // reveal frame is safe (and useful, it helps the Buyer learn `s` sooner) to post, but there
+      // is no receipt to post: this flow does not know the payout landed, and must not claim it
+      // did. Any other failure (`NearTxFailedError`: the transaction itself never took effect,
+      // or any other rail's own claim failure) posts nothing at all.
+      if (error instanceof NearPayoutFailedError && options?.skipReveal !== true) {
+        await this.venue.post(
+          dealRoom(acceptA.contract),
+          encodeFrame({ type: "reveal", from: this.identity.did, contract: acceptA.contract, ref: railRef, secret: this.hashLock.preimage }),
+          this.identity,
+        );
+      }
+      throw error;
+    }
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
 
     // vendor/tclk/src/machine.ts's own "reveal" transition requires the frame's `ref`, when
