@@ -109,10 +109,20 @@ function summarize(report) {
   // nearChainReads only appears when --rails named a "near" config (P5-NEAR-SPEC.md §4) —
   // identical omission rule, and a separate field from chainReads/btcChainReads.
   const nearChainPart = report.nearChainReads !== undefined ? ` nearChainReads=${report.nearChainReads}` : "";
+  // P5-NEAR-FIXES.md E6: the *ReadsSkipped counts were computed on every report that has a
+  // corresponding *Reads count, but never printed anywhere — a sweep whose every chain read
+  // failed (a stalled RPC, a bad endpoint) looked identical to a healthy one at a glance, since
+  // chainReads=0 and chainReadsSkipped=3 render the exact same "chainReads=0" on their own. Same
+  // omission rule as the *Reads counts themselves: absent from the line entirely unless that
+  // rail was configured for this sweep.
+  const chainSkipPart = report.chainReadsSkipped !== undefined ? ` chainReadsSkipped=${report.chainReadsSkipped.length}` : "";
+  const btcChainSkipPart = report.btcChainReadsSkipped !== undefined ? ` btcChainReadsSkipped=${report.btcChainReadsSkipped.length}` : "";
+  const nearChainSkipPart = report.nearChainReadsSkipped !== undefined ? ` nearChainReadsSkipped=${report.nearChainReadsSkipped.length}` : "";
   return (
     `offers=${report.offerRecords} swapLegs=${report.swapLegOffers} ` +
     `dealRooms=${report.dealRoomsFetched} notes=${report.noteFetches} swaps[${statusPart}] ` +
-    `swapsWritten=${report.swapsWritten} hit=${report.hitCreated} ok=${report.ok}${chainPart}${btcChainPart}${nearChainPart}`
+    `swapsWritten=${report.swapsWritten} hit=${report.hitCreated} ok=${report.ok}` +
+    `${chainPart}${chainSkipPart}${btcChainPart}${btcChainSkipPart}${nearChainPart}${nearChainSkipPart}`
   );
 }
 
@@ -183,6 +193,15 @@ async function main() {
 
   const report = await runSweep(options);
   process.stdout.write(`${summarize(report)}\n`);
+  // P5-NEAR-FIXES.md E6: `report.railsConfigError` was already set (and the sweep already
+  // aborted) whenever --rails named an invalid evm/btc/near config — but this CLI never printed
+  // it, so a bad rails config silently produced exit code 3 with no reason on stderr at all
+  // (the same generic "sweep did not complete" outcome as a transport failure or a parse error,
+  // below).
+  if (report.railsConfigError) {
+    process.stderr.write(`rails config invalid: ${report.railsConfigError}\n`);
+    return 3;
+  }
   if (report.transport) {
     process.stderr.write(`transport failure: ${report.transport.url}: ${report.transport.error}\n`);
     return 3;
