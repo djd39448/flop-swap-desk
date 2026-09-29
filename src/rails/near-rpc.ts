@@ -84,7 +84,19 @@ export class NearFunctionCallPanicError extends Error {
 function mapNearRpcError(error: unknown): never {
   if (error instanceof RpcCaptureError) {
     const msg = error.message;
-    if (/UNKNOWN_TRANSACTION/i.test(msg) || /doesn'?t exist/i.test(msg)) {
+    // NB-int (stage this comment was confirmed live, against near-sandbox 2.13.4): `tx`/
+    // `EXPERIMENTAL_tx_status` for a genuinely unknown transaction hash does NOT answer quickly
+    // with a named "not found" error the way `query`'s view-call errors do — it long-polls
+    // waiting for the transaction to appear, then answers `{"code":-32000,"error":{"name":
+    // "HANDLER_ERROR","cause":{"name":"TIMEOUT_ERROR"}},"message":"Server error","data":
+    // "Timeout"}` once its own internal wait expires. `RpcCaptureError` only ever carries
+    // `code`/`message` (see this file's own header: `data`/`cause` are not visible past
+    // `rpc-capture.ts`'s generic contract, which this build never edits for one rail's
+    // convenience), so `code === -32000` combined with the generic `"Server error"` message is
+    // the only signal available here — confirmed empirically to be this method's own "I don't
+    // know about this transaction" answer, not a transport failure (a genuinely unreachable node
+    // fails `fetch` itself, never reaches this branch at all).
+    if (/UNKNOWN_TRANSACTION/i.test(msg) || /doesn'?t exist/i.test(msg) || (error.code === -32000 && /^server error$/i.test(msg))) {
       throw new NearUnknownTransactionError(msg, error.code);
     }
     if (/InvalidNonce/i.test(msg)) throw new NearInvalidNonceError(msg, error.code);
