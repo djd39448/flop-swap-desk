@@ -1,0 +1,15 @@
+[package]
+name = "mock-ft"
+version = "0.1.0"
+edition = "2021"
+description = "Test-only NEP-141 + NEP-145 token standing in for Circle's NEAR USDC (P5-NEAR-SPEC.md section 3)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "=5.29.1"
+near-contract-standards = "=5.29.1"
+
+[dev-dependencies]
+near-sdk = { version = "=5.29.1", features = ["unit-testing"] }
