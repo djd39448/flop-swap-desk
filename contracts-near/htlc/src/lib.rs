@@ -141,6 +141,14 @@ impl Contract {
 
         let preimage_bytes =
             decode_hex(&preimage).unwrap_or_else(|| env::panic_str("Preimage is not valid hex"));
+        // F1: every other rail in the swap (tclk's verifySecret/hashLockFromPreimage, the EVM
+        // `claim(bytes32,bytes32)`, the Bitcoin script's `SIZE 32 EQUALVERIFY`) requires a
+        // 32-byte secret. Accepting any even-length hex here let a malicious Seller publish
+        // `H = sha256(s')` for a non-32-byte `s'`: the Buyer cannot detect this from `H` alone,
+        // locks leg A under `H`, and once the Seller reveals `s'` here to take leg B, the
+        // Buyer can never satisfy the other rails' 32-byte check with the same `s'` and loses
+        // leg A after its own refund window closes.
+        require!(preimage_bytes.len() == 32, "Preimage must be 32 bytes");
         let computed = hex_encode(&env::sha256(&preimage_bytes));
         require!(computed == hash_lock, "Preimage does not match hash lock");
 
@@ -395,9 +403,12 @@ mod tests {
     fn preimage_and_hash() -> (String, String) {
         // Fixed secret; the hash is derived at test time (off-chain sha256 fallback, see
         // near-sdk-5-facts-2026-09-29.md section 3), never hardcoded, so it can never drift
-        // from `decode_hex`/`hex_encode`'s own encoding.
+        // from `decode_hex`/`hex_encode`'s own encoding. F1: exactly 32 bytes, matching the
+        // length every other rail (tclk/EVM/Bitcoin) requires -- the old 21-byte fixture was
+        // exercising the very hole F1 closes as its own happy path.
         testing_env!(ctx(token(), 0).build());
-        let preimage_bytes = b"flop-near-htlc-secret".to_vec();
+        let preimage_bytes = b"flop-near-htlc-secret-32-bytes!!".to_vec();
+        assert_eq!(preimage_bytes.len(), 32);
         let hash = hex_encode(&env::sha256(&preimage_bytes));
         (hex_encode(&preimage_bytes), hash)
     }
@@ -567,7 +578,9 @@ mod tests {
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
 
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _ = c.claim(hash, hex_encode(b"totally-wrong-secret"));
+        // 32 bytes (F1), but the wrong 32 bytes -- exercises the hash-mismatch check, not the
+        // length check.
+        let _ = c.claim(hash, hex_encode(b"totally-wrong-secret-32-bytes!!!"));
     }
 
     #[test]
@@ -579,6 +592,42 @@ mod tests {
 
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
         let _ = c.claim(hash, "not hex zz".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "Preimage must be 32 bytes")]
+    fn claim_rejects_non_32_byte_preimage() {
+        let mut c = setup();
+        testing_env!(ctx(token(), 0).build());
+        let pre = vec![7u8; 33];
+        let hash = hex_encode(&env::sha256(&pre));
+        let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
+        testing_env!(ctx(payee(), HOUR_MS / 2).build());
+        let _ = c.claim(hash, hex_encode(&pre));
+    }
+
+    #[test]
+    #[should_panic(expected = "Preimage must be 32 bytes")]
+    fn claim_rejects_empty_preimage() {
+        let mut c = setup();
+        testing_env!(ctx(token(), 0).build());
+        let pre: Vec<u8> = vec![];
+        let hash = hex_encode(&env::sha256(&pre));
+        let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
+        testing_env!(ctx(payee(), HOUR_MS / 2).build());
+        let _ = c.claim(hash, hex_encode(&pre));
+    }
+
+    #[test]
+    #[should_panic(expected = "Preimage must be 32 bytes")]
+    fn claim_rejects_31_byte_preimage() {
+        let mut c = setup();
+        testing_env!(ctx(token(), 0).build());
+        let pre = vec![9u8; 31];
+        let hash = hex_encode(&env::sha256(&pre));
+        let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
+        testing_env!(ctx(payee(), HOUR_MS / 2).build());
+        let _ = c.claim(hash, hex_encode(&pre));
     }
 
     #[test]
