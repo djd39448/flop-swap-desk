@@ -11,6 +11,19 @@
 //
 // Design source: flop-contrib/handoff/P5-NEAR-SPEC.md §1;
 // flop-contrib/handoff/P5-NEAR-DECISIONS-2026-09-29.md D-N2.
+//
+// D1 (fix list round 1, C7): the secret key is a REAL private field (an ES `#secretKey`, not
+// TypeScript's `private`, which is erased at compile time and leaves the value an ordinary
+// enumerable property on the runtime object — reachable by `JSON.stringify`, `util.inspect`,
+// `Object.keys`/`Reflect.ownKeys`, and structured-clone alike). `toJSON()` and
+// `[util.inspect.custom]()` below are the only two ways this class's own bytes ever reach a
+// string or a logged object, and both return only `accountId`/`publicKey` — never `secretKey` or
+// `publicKeyBytes`. This is the class's own answer to D-N2's "never logs or returns the secret
+// key from anywhere on this class": with a real private field, no serializer or inspector can
+// walk to it by accident, whereas the old `private readonly secretKey` was a compile-time-only
+// label that `JSON.stringify(signer)` and `util.inspect(signer)` would both have happily printed.
+
+import { inspect } from "node:util";
 
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { base58 } from "@scure/base";
@@ -28,12 +41,12 @@ import type { NearSigner } from "./near-htlc.js";
 export class InMemoryNearSigner implements NearSigner {
   readonly accountId: string;
   readonly publicKey: string;
-  private readonly secretKey: Uint8Array;
+  #secretKey: Uint8Array;
   private readonly publicKeyBytes: Uint8Array;
 
   private constructor(accountId: string, secretKey: Uint8Array, publicKeyBytes: Uint8Array) {
     this.accountId = accountId;
-    this.secretKey = secretKey;
+    this.#secretKey = secretKey;
     this.publicKeyBytes = publicKeyBytes;
     this.publicKey = `ed25519:${base58.encode(publicKeyBytes)}`;
   }
@@ -76,6 +89,18 @@ export class InMemoryNearSigner implements NearSigner {
   }
 
   sign(message: Uint8Array): Uint8Array {
-    return ed25519.sign(message, this.secretKey);
+    return ed25519.sign(message, this.#secretKey);
+  }
+
+  /** `JSON.stringify(signer)` (directly, or nested inside a rail or a sandbox handle) sees only
+   *  this — never `#secretKey` or `publicKeyBytes`. */
+  toJSON(): { accountId: string; publicKey: string } {
+    return { accountId: this.accountId, publicKey: this.publicKey };
+  }
+
+  /** `util.inspect(signer)` (directly, or nested via `console.log`/Node's own default object
+   *  formatting) sees only this — same fields as `toJSON()`, same reason. */
+  [inspect.custom](): string {
+    return `InMemoryNearSigner ${inspect({ accountId: this.accountId, publicKey: this.publicKey })}`;
   }
 }
