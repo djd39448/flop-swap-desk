@@ -31,7 +31,7 @@ import { captureBtcLeg, BTC_RAIL_ID, type BtcCapture } from "./rails/btc-evidenc
 import { checkBtcRailConfig, type BtcRailConfig } from "./rails/btc-htlc.js";
 import { captureEvmLeg, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
 import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
-import { captureNearLeg, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
+import { captureNearLeg, nearCaptureKey, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
 import { checkNearRailConfig, type NearRailConfig } from "./rails/near-htlc.js";
 import { resolveAccounts } from "./rails/account-line.js";
 import { CapturingRpc, verifiedExchangeBytes, writeCapture } from "./rails/rpc-capture.js";
@@ -720,6 +720,11 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
     // A9's same per-sweep timeout applies here too; NEAR's own reads need no out-of-band auth
     // header (unlike btcRpcHeaders — every near-htlc read is a public JSON-RPC view call).
     const nearRpc = new CapturingRpc({ endpoint: nearConfig.endpoint, fetch: fetchImpl, clock: () => nowMs, timeoutMs });
+    // E1: every hash lock this sweep captured for, mapped to the distinct leg contracts it saw
+    // that hash lock accepted under. A hash lock with more than one entry here — this sweep's
+    // own copycat-pair detector — is reported in `notes` below; it is never treated as an error
+    // (nothing here can tell which leg, if either, is the "real" one), just surfaced.
+    const nearHashLockLegContracts = new Map<string, Set<string>>();
 
     for (const candidate of cappedCandidates) {
       const room = roomByContract.get(candidate.contract);
@@ -736,6 +741,11 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
         continue;
       }
       const hashLock = accepted.railRef;
+      // E1: record which leg contract(s) this sweep saw accept this exact hash lock — the
+      // collision detector below reports it once every candidate for this sweep has been seen.
+      const legContracts = nearHashLockLegContracts.get(hashLock) ?? new Set<string>();
+      legContracts.add(candidate.contract);
+      nearHashLockLegContracts.set(hashLock, legContracts);
       // D-N5: near-htlc posts account-id lines (mirrors evm-htlc's account resolution, not
       // btc-htlc's pubkey resolution) — only the payee's is needed to decide whether/whom
       // captureNearLeg reads storage_balance_of for; resolved fresh, bounded to lines posted
@@ -758,12 +768,15 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
         // success.
         const { index, exchanges } = await captureNearLeg(nearRpc, nearConfig, terms, accounts, hashLock, nowMs);
         await writeCapture(root, exchanges);
+        // E1: pathed by (hashLock, legContract) — never by hashLock alone — so a copycat pair
+        // sharing the same hash lock writes to (and can only ever overwrite within) its own
+        // leg's own directory, never the genuine leg's.
         await writeFileAtomic(
-          underRoot(root, "raw", "near", hashLock, `${sweepIso}.json`),
+          underRoot(root, "raw", "near", hashLock, candidate.contract, `${sweepIso}.json`),
           `${JSON.stringify(index, null, 2)}\n`,
         );
         const bytes = verifiedExchangeBytes(exchanges);
-        nearChainCaptures.set(hashLock, { index, bytes });
+        nearChainCaptures.set(nearCaptureKey(hashLock, candidate.contract), { index, bytes });
         if (index.error === undefined) {
           report.nearChainReads += 1;
         } else {
@@ -776,6 +789,18 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
           contract: candidate.contract,
           reason: error instanceof Error ? error.message : String(error),
         });
+      }
+    }
+
+    // E1: report every hash lock this sweep saw more than one leg contract accept — a copycat
+    // pair (or H7's own hash-lock-squatting scenario) sharing a hash lock, surfaced for a human
+    // to look at; each leg's own capture is unaffected (isolated by directory above).
+    for (const [hashLock, legContracts] of nearHashLockLegContracts) {
+      if (legContracts.size > 1) {
+        notes.push(
+          `near-htlc: hash lock ${hashLock} was accepted by ${legContracts.size} different leg contracts this sweep ` +
+            `(${[...legContracts].sort().join(", ")}) — captures kept separate, per-leg`,
+        );
       }
     }
   }

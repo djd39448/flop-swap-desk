@@ -24,6 +24,7 @@ import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.j
 import { offerAcceptLockTerms } from "../src/swap.js";
 import { formatAccountLine } from "../src/rails/account-line.js";
 import { NEAR_SANDBOX_PIN, type NearRailConfig } from "../src/rails/near-htlc.js";
+import { nearCaptureKey } from "../src/rails/near-evidence.js";
 import { identity, record } from "./helpers/identity.js";
 // @ts-expect-error plain .mjs, no type declarations
 import { loadNearCaptures, loadRails } from "../examples/audit-export.mjs";
@@ -46,7 +47,16 @@ const BLOCK_HEIGHT = 42;
 const BLOCK_HASH = "244ZQ9cgj3CQ6bWBdytfrJMuMQ1jdXLFGnr4HhvtCTnM"; // a real 32-byte base58 value
 const TIMESTAMP_NS = "1700000500000000000";
 
-const NEAR_CONFIG: NearRailConfig = { pin: NEAR_SANDBOX_PIN, endpoint: "http://127.0.0.1:9999", contract: CONTRACT_ACCOUNT, assets: { USDC: USDC_ACCOUNT } };
+// H6: any well-formed base58 string — this file never exercises H6's own on-chain code-hash
+// check (that lives in near-htlc.ts's connect(), never reached by the offline audit-export CLI).
+const HTLC_CODE_HASH = "5CVXgVR5RfKHGYqDDXWMKcadxHTfjaEczo6zRLfBrpFT";
+const NEAR_CONFIG: NearRailConfig = {
+  pin: NEAR_SANDBOX_PIN,
+  endpoint: "http://127.0.0.1:9999",
+  contract: CONTRACT_ACCOUNT,
+  assets: { USDC: USDC_ACCOUNT },
+  htlcCodeHash: HTLC_CODE_HASH,
+};
 
 function sha256Hex(text: string): string {
   return bytesToHex(sha256(new TextEncoder().encode(text)));
@@ -187,7 +197,12 @@ function buildNearFixture() {
     ],
   };
 
-  return { swapId, hashLock, legAOffer, legAAccept, legBOffer, legBAccept, legATerms, offerRows, dealRoomA, dealRoomARows, index, statusBody, blockBody, getLockBody, storageBody };
+  // E1: `legAAccept.contract` is the leg contract id — the second half of `loadNearCapture`'s
+  // (hashLock, legContract) key, exactly the value `src/watcher.ts` passes as `candidate.contract`.
+  return {
+    swapId, hashLock, legContract: legAAccept.contract, legAOffer, legAAccept, legBOffer, legBAccept, legATerms,
+    offerRows, dealRoomA, dealRoomARows, index, statusBody, blockBody, getLockBody, storageBody,
+  };
 }
 
 async function writeWatchRoot(root: string, fixture: ReturnType<typeof buildNearFixture>, opts: { rails?: unknown } = {}) {
@@ -207,8 +222,9 @@ async function writeWatchRoot(root: string, fixture: ReturnType<typeof buildNear
     await writeFile(join(root, "raw", "rpc", `${sha}.json`), body);
   }
 
-  await mkdir(join(root, "raw", "near", fixture.hashLock), { recursive: true });
-  await writeFile(join(root, "raw", "near", fixture.hashLock, "only.json"), JSON.stringify(fixture.index, null, 2));
+  // E1: `raw/near/<hashLock>/<legContract>/*.json` — never `<hashLock>/*.json` directly.
+  await mkdir(join(root, "raw", "near", fixture.hashLock, fixture.legContract), { recursive: true });
+  await writeFile(join(root, "raw", "near", fixture.hashLock, fixture.legContract, "only.json"), JSON.stringify(fixture.index, null, 2));
 
   if (opts.rails !== undefined) {
     await writeFile(join(root, "rails.json"), JSON.stringify(opts.rails, null, 2));
@@ -260,7 +276,7 @@ describe("loadNearCaptures", () => {
 
     const chain = await loadNearCaptures(root);
     expect(chain.size).toBe(1);
-    const capture = chain.get(fixture.hashLock);
+    const capture = chain.get(nearCaptureKey(fixture.hashLock, fixture.legContract));
     expect(capture).toBeDefined();
     expect(capture.index.ref).toBe(fixture.hashLock);
 
@@ -272,13 +288,35 @@ describe("loadNearCaptures", () => {
   it("fails the leg closed on a corrupted newest index and reports it via the notes array", async () => {
     const fixture = buildNearFixture();
     await writeWatchRoot(root, fixture);
-    await writeFile(join(root, "raw", "near", fixture.hashLock, "zzz-newer-but-corrupt.json"), "{ not valid json");
+    await writeFile(join(root, "raw", "near", fixture.hashLock, fixture.legContract, "zzz-newer-but-corrupt.json"), "{ not valid json");
 
     const notes: string[] = [];
     const chain = await loadNearCaptures(root, notes);
     expect(chain.size).toBe(0);
     expect(notes).toHaveLength(1);
-    expect(notes[0]).toMatch(new RegExp(`raw/near/${fixture.hashLock}/zzz-newer-but-corrupt\\.json.*skipped`));
+    expect(notes[0]).toMatch(new RegExp(`raw/near/${fixture.hashLock}/${fixture.legContract}/zzz-newer-but-corrupt\\.json.*skipped`));
+  });
+
+  // E1: two different leg contracts captured under the same hash lock — each is loaded into its
+  // own map entry (never one overwriting the other), and the collision itself is reported.
+  it("two leg contracts sharing a hash lock each load into their own map entry; the collision is noted", async () => {
+    const fixture = buildNearFixture();
+    await writeWatchRoot(root, fixture);
+    const otherLegContract = `0x${"44".repeat(32)}`;
+    const otherIndex = { ...fixture.index, exchanges: fixture.index.exchanges };
+    await mkdir(join(root, "raw", "near", fixture.hashLock, otherLegContract), { recursive: true });
+    await writeFile(join(root, "raw", "near", fixture.hashLock, otherLegContract, "only.json"), JSON.stringify(otherIndex, null, 2));
+
+    const notes: string[] = [];
+    const chain = await loadNearCaptures(root, notes);
+    expect(chain.size).toBe(2);
+    expect(chain.get(nearCaptureKey(fixture.hashLock, fixture.legContract))).toBeDefined();
+    expect(chain.get(nearCaptureKey(fixture.hashLock, otherLegContract))).toBeDefined();
+    expect(
+      notes.some(
+        (n) => n.includes(fixture.hashLock) && n.includes("2 different leg contracts") && n.includes(fixture.legContract) && n.includes(otherLegContract),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -370,7 +408,7 @@ describe("examples/audit-export.mjs — near-htlc leg end to end", () => {
           : exchange,
       ),
     };
-    await writeFile(join(root, "raw", "near", fixture.hashLock, "only.json"), JSON.stringify(splicedIndex, null, 2));
+    await writeFile(join(root, "raw", "near", fixture.hashLock, fixture.legContract, "only.json"), JSON.stringify(splicedIndex, null, 2));
 
     const result = run(["--root", root, "--json"]);
     expect(result.status).toBe(0);
@@ -386,7 +424,7 @@ describe("examples/audit-export.mjs — near-htlc leg end to end", () => {
   it("prints a note, still replays, and fails the leg closed when the newest capture index is corrupted", async () => {
     const fixture = buildNearFixture();
     await writeWatchRoot(root, fixture, { rails: { near: NEAR_CONFIG } });
-    await writeFile(join(root, "raw", "near", fixture.hashLock, "zzz-newer-but-corrupt.json"), "{ not valid json");
+    await writeFile(join(root, "raw", "near", fixture.hashLock, fixture.legContract, "zzz-newer-but-corrupt.json"), "{ not valid json");
 
     const result = run(["--root", root, "--json"]);
     expect(result.status).toBe(0);

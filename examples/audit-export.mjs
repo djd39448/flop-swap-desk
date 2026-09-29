@@ -45,7 +45,7 @@ import { loadBtcCapture } from "../dist/rails/btc-evidence.js";
 import { checkBtcRailConfig } from "../dist/rails/btc-htlc.js";
 import { loadEvmCapture } from "../dist/rails/evm-evidence.js";
 import { checkEvmRailConfig } from "../dist/rails/evm-htlc.js";
-import { loadNearCapture } from "../dist/rails/near-evidence.js";
+import { loadNearCapture, nearCaptureKey } from "../dist/rails/near-evidence.js";
 import { checkNearRailConfig } from "../dist/rails/near-htlc.js";
 
 const USAGE = `Usage: node examples/audit-export.mjs --root DIR [--expect <swapId>=<status>] [--rails FILE] [--json]
@@ -74,14 +74,21 @@ Offline: reads DIR/raw/ (and DIR/rails.json) only. Opens no network connection.
                                     corruption/splicing/config drift, never forgery — the
                                     independent check is a leg's own finalizedRef, which names
                                     a real block hash and height anyone can re-query.
-  DIR/raw/near/<hashLock>/*.json    one or more NEAR chain-read capture indexes per hash lock
-                                    (P5-NEAR-SPEC.md §4 — newest only, same "never falls back"
-                                    rule as raw/evm above; their raw bytes are re-verified from
-                                    DIR/raw/rpc/<sha256>.json the same way). Same honesty limit
-                                    as F3 above: this detects corruption/splicing/config drift,
-                                    never forgery — the independent check is a leg's own
-                                    finalizedRef, which names a real block hash and height
-                                    anyone with their own RPC access to that chain can re-query.
+  DIR/raw/near/<hashLock>/<legContract>/*.json  one or more NEAR chain-read capture indexes per
+                                    (hash lock, leg contract) pair (P5-NEAR-FIXES.md E1 — newest
+                                    per pair only, same "never falls back" rule as raw/evm above;
+                                    their raw bytes are re-verified from DIR/raw/rpc/<sha256>.json
+                                    the same way). Keyed by the PAIR, not the hash lock alone, so
+                                    two different leg contracts that happen to share one hash
+                                    lock (a copycat pair, or H7's own hash-lock-squatting
+                                    scenario) never overwrite or fold into each other's evidence
+                                    — a hash lock directory holding more than one leg-contract
+                                    subdirectory is reported as a note, never an error. Same
+                                    honesty limit as F3 above: this detects corruption/splicing/
+                                    config drift, never forgery — the independent check is a
+                                    leg's own finalizedRef, which names a real block hash and
+                                    height anyone with their own RPC access to that chain can
+                                    re-query.
   DIR/rails.json                   { "evm"?: EvmRailConfig, "btc"?: BtcRailConfig,
                                     "near"?: NearRailConfig } the sweep that captured DIR used
                                     (P22-P24-EVM-SPEC.md §5; P4-BTC-SPEC.md §7;
@@ -398,26 +405,48 @@ async function loadBtcCaptures(root, notes = []) {
   return chain;
 }
 
-/** Every `raw/near/<hashLock>/*.json` capture index (P5-NEAR-SPEC.md §4), the newest one per
- *  hash lock — the NEAR twin of `loadEvmCaptures` above, over `loadNearCapture`
- *  (src/rails/near-evidence.ts) instead of `loadEvmCapture`. Directory names are the hash lock
- *  as-is (`0x` + hex, no `:`, already filename-safe — unlike Bitcoin's `<txid>-<vout>` rewrite). */
+/** Every `raw/near/<hashLock>/<legContract>/*.json` capture index (P5-NEAR-FIXES.md E1), the
+ *  newest one per (hashLock, legContract) pair — the NEAR twin of `loadEvmCaptures` above, over
+ *  `loadNearCapture` (src/rails/near-evidence.ts) instead of `loadEvmCapture`. Directory names
+ *  (both levels) are the hash lock / leg contract id as-is (`0x` + hex, no `:`, already
+ *  filename-safe — unlike Bitcoin's `<txid>-<vout>` rewrite). Unlike EVM/Bitcoin, this is a
+ *  TWO-level scan: a hash lock directory holding more than one leg-contract subdirectory means
+ *  more than one leg accepted that exact hash lock this watch root ever saw (a copycat pair, or
+ *  H7's own hash-lock-squatting scenario) — reported as a note, never an error; each leg's own
+ *  capture is folded from its own subdirectory, untouched by the other's. */
 async function loadNearCaptures(root, notes = []) {
   const nearDir = join(root, "raw", "near");
   const chain = new Map();
-  let entries;
+  let hashLockEntries;
   try {
-    entries = readdirSync(nearDir, { withFileTypes: true });
+    hashLockEntries = readdirSync(nearDir, { withFileTypes: true });
   } catch {
     return chain;
   }
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const hashLock = entry.name;
-    const { capture, skipped } = await loadNearCapture(root, hashLock);
-    if (capture !== null) chain.set(hashLock, capture);
-    for (const name of skipped) {
-      notes.push(`raw/near/${hashLock}/${name}: invalid newest capture index, skipped; this leg has no chain evidence`);
+  for (const hashLockEntry of hashLockEntries) {
+    if (!hashLockEntry.isDirectory()) continue;
+    const hashLock = hashLockEntry.name;
+    let legContractEntries;
+    try {
+      legContractEntries = readdirSync(join(nearDir, hashLock), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    const legContracts = legContractEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    if (legContracts.length > 1) {
+      notes.push(
+        `raw/near/${hashLock}: ${legContracts.length} different leg contracts captured under this hash lock ` +
+          `(${[...legContracts].sort().join(", ")}) — kept separate, per-leg, never folded together`,
+      );
+    }
+    for (const legContract of legContracts) {
+      const { capture, skipped } = await loadNearCapture(root, hashLock, legContract);
+      if (capture !== null) chain.set(nearCaptureKey(hashLock, legContract), capture);
+      for (const name of skipped) {
+        notes.push(
+          `raw/near/${hashLock}/${legContract}/${name}: invalid newest capture index, skipped; this leg has no chain evidence`,
+        );
+      }
     }
   }
   return chain;

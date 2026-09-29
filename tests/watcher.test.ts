@@ -29,6 +29,7 @@ import { formatAccountLine, formatPubkeyLine } from "../src/rails/account-line.j
 import { BTC_REGTEST_PIN, type BtcRailConfig } from "../src/rails/btc-htlc.js";
 import { BTC_REGTEST_NETWORK, buildHtlcScript } from "../src/rails/btc-script.js";
 import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
+import { NEAR_SANDBOX_PIN, type NearRailConfig } from "../src/rails/near-htlc.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { quoteBigNonces, runSweep, type RunSweepOptions } from "../src/watcher.js";
@@ -1555,6 +1556,420 @@ describe("runSweep", () => {
       const railsJson = JSON.parse(await readFile(join(root, "rails.json"), "utf8"));
       expect(Object.keys(railsJson)).toEqual(["evm", "btc"]);
       expect(railsJson).toEqual({ evm: EVM_CONFIG, btc: BTC_CONFIG });
+    });
+  });
+
+  // P5-NEAR-FIXES.md E7: the near-htlc twin of the evm-htlc "chain evidence" block above — same
+  // "nothing runs unless the caller configured this rail" contract, adapted for near-htlc's own
+  // D-N10 fixed read sequence (status, block(final), query/get_lock, query/storage_balance_of)
+  // and account-id (not pubkey, not eth address) accounts. E1: captures live at
+  // raw/near/<hashLock>/<legContract>/*.json, never raw/near/<hashLock>/*.json directly.
+  describe("chain evidence (near-htlc rail, P5-NEAR-SPEC.md §4)", () => {
+    const CONTRACT_ACCOUNT = "htlc.near-sandbox-flop";
+    const USDC_ACCOUNT = "usdc.near-sandbox-flop";
+    const BUYER_ACCOUNT = "buyer.near-sandbox-flop";
+    const SELLER_ACCOUNT = "seller.near-sandbox-flop";
+    const BLOCK_HEIGHT = 42;
+    const BLOCK_HASH = "244ZQ9cgj3CQ6bWBdytfrJMuMQ1jdXLFGnr4HhvtCTnM"; // a real 32-byte base58 value
+    const TIMESTAMP_NS = "1735000000000000000";
+    // H6: any well-formed base58 string — this block never exercises H6's own on-chain
+    // code-hash check (that lives in near-htlc.ts's connect(), never reached by runSweep's own
+    // read-only captureNearLeg/nearEvidence path).
+    const HTLC_CODE_HASH = "5CVXgVR5RfKHGYqDDXWMKcadxHTfjaEczo6zRLfBrpFT";
+
+    const NEAR_CONFIG: NearRailConfig = {
+      pin: NEAR_SANDBOX_PIN,
+      endpoint: "http://127.0.0.1:9999/near-rpc",
+      contract: CONTRACT_ACCOUNT,
+      assets: { USDC: USDC_ACCOUNT },
+      htlcCodeHash: HTLC_CODE_HASH,
+    };
+
+    /** Same shape as `buildSwap`, but leg A's own deal room also carries its `near-htlc` lock
+     *  frame (posted by its payer, the Buyer) and both parties' D-N5 account lines. */
+    function buildNearSwap(nonceHex: string, baseSeq: number, baseMs: number, sharedLock?: ReturnType<typeof generateHashLock>) {
+      const swapId = makeSwapId(buyer.did, nonceHex);
+      // E1: a caller building a "copycat pair" test (two different leg contracts, one shared
+      // hash lock) passes the same HashLock into two separate buildNearSwap calls.
+      const lock = sharedLock ?? generateHashLock();
+
+      const legAOffer = makeOffer({
+        from: buyer.did,
+        role: "payer",
+        amount: "1000",
+        asset: "USDC",
+        lock: "hash",
+        rails: ["near-htlc"],
+        claimByMs: baseMs + 3_600_000,
+        refundAfterMs: baseMs + 7_200_000,
+        expiresMs: baseMs + 600_000,
+        job: { proto: "swap", id: swapId, context: legAContext({ wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc" }) },
+      });
+      const legAAccept = makeAccept(legAOffer, { from: seller.did, statement: lock.hash });
+
+      const legBOffer = makeOffer({
+        from: seller.did,
+        role: "payer",
+        amount: "52070000",
+        asset: "FLOP",
+        lock: "hash",
+        rails: ["flop-htlc"],
+        claimByMs: baseMs + 10_800_000,
+        refundAfterMs: baseMs + 14_400_000,
+        expiresMs: baseMs + 600_000,
+        job: { proto: "swap", id: swapId, context: legBContext(legAOffer.id) },
+      });
+      const legBAccept = makeAccept(legBOffer, { from: buyer.did, statement: lock.hash });
+
+      const offerRows = [
+        record(OFFER_ROOM, baseSeq, baseMs, buyer, encodeFrame(legAOffer)),
+        record(OFFER_ROOM, baseSeq + 1, baseMs + 1, seller, encodeFrame(legAAccept)),
+        record(OFFER_ROOM, baseSeq + 2, baseMs + 2, seller, encodeFrame(legBOffer)),
+        record(OFFER_ROOM, baseSeq + 3, baseMs + 3, buyer, encodeFrame(legBAccept)),
+      ].map(rowFromRecord);
+
+      const dealRoomA = dealRoom(legAAccept.contract);
+      const dealRoomB = dealRoom(legBAccept.contract);
+      const legATerms = offerAcceptLockTerms(legAOffer, legAAccept);
+      const lockA: LockFrame = { type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "near-htlc", ref: lock.hash };
+
+      function dealRowsA(baseDealMs: number) {
+        const sellerLine = formatAccountLine({ railId: "near-htlc", caip2: NEAR_SANDBOX_PIN.caip2, address: SELLER_ACCOUNT });
+        const buyerLine = formatAccountLine({ railId: "near-htlc", caip2: NEAR_SANDBOX_PIN.caip2, address: BUYER_ACCOUNT });
+        // D-N5/R2-3: unlike evm-htlc (whose live capture needs no account resolution at all —
+        // `locks(hashLock)` alone), near-htlc's own live capture (`src/watcher.ts`) resolves
+        // `accounts.payee` with `beforeSeq: accepted.seq` BEFORE deciding whether to read
+        // `storage_balance_of` at all — so both account lines must be posted BEFORE the lock
+        // frame here, never after.
+        return [
+          rowFromRecord(record(dealRoomA, 1, baseDealMs, seller, sellerLine)),
+          rowFromRecord(record(dealRoomA, 2, baseDealMs + 1, buyer, buyerLine)),
+          rowFromRecord(record(dealRoomA, 3, baseDealMs + 2, buyer, encodeFrame(lockA))),
+        ];
+      }
+
+      return { swapId, lock, legAOffer, legAAccept, legBOffer, legBAccept, offerRows, dealRoomA, dealRoomB, legATerms, dealRowsA };
+    }
+
+    function resultBytesOf(payload: unknown): number[] {
+      return Array.from(new TextEncoder().encode(JSON.stringify(payload)));
+    }
+
+    /** A `Locked` `LockView` payload matching `terms`, for the synthetic `get_lock` view call. */
+    function lockedLockView(terms: { amount: string; claimByMs: number; refundAfterMs: number }) {
+      return {
+        status: "Locked",
+        payer: BUYER_ACCOUNT,
+        payee: SELLER_ACCOUNT,
+        token: USDC_ACCOUNT,
+        amount: terms.amount,
+        claim_by_ms: String(terms.claimByMs),
+        refund_after_ms: String(terms.refundAfterMs),
+        preimage: null,
+      };
+    }
+
+    const STORAGE_BALANCE = { total: "1250000", available: "1250000" };
+
+    type RpcOutcome = { result: unknown } | { errorMessage: string } | "throw";
+
+    /** A combined fetch: technocore-style GET/POST responses (via `technocore`) plus JSON-RPC
+     *  POSTs to `rpcEndpoint`, routed by the request body's own `method`/`params.method_name`
+     *  (through `rpcResult`) — the NEAR twin of `makeEvmFetch` above. */
+    function makeNearFetch(opts: {
+      technocore: (url: string) => { status: number; body: string };
+      rpcEndpoint: string;
+      rpcResult: (method: string, params: unknown) => RpcOutcome;
+      calls: Array<{ url: string; body?: string }>;
+    }): typeof fetch {
+      return (async (input: unknown, init?: unknown) => {
+        const url = String(input);
+        const body = (init as { body?: string } | undefined)?.body;
+        opts.calls.push({ url, body });
+        if (url === opts.rpcEndpoint && typeof body === "string") {
+          const parsed = JSON.parse(body) as { id: number; method: string; params: unknown };
+          const outcome = opts.rpcResult(parsed.method, parsed.params);
+          if (outcome === "throw") throw new TypeError(`rpc endpoint unreachable: ${parsed.method}`);
+          const envelope =
+            "errorMessage" in outcome
+              ? { jsonrpc: "2.0", id: parsed.id, error: { code: -32000, message: outcome.errorMessage } }
+              : { jsonrpc: "2.0", id: parsed.id, result: outcome.result };
+          const text = JSON.stringify(envelope);
+          const bytes = new TextEncoder().encode(text);
+          return { status: 200, text: async () => text, arrayBuffer: async () => bytes.buffer } as Response;
+        }
+        const outcome = opts.technocore(url);
+        return { status: outcome.status, text: async () => outcome.body } as Response;
+      }) as typeof fetch;
+    }
+
+    /** `status`/`block(final)`/`query get_lock`/`query storage_balance_of`, in D-N10's own fixed
+     *  order — `method` alone cannot tell `get_lock` apart from `storage_balance_of` (both are
+     *  NEAR's `query` method), so this reads `params.method_name` the same way the real adapter's
+     *  own request does. */
+    function nearRpcResponder(lockViewPayload: unknown): (method: string, params: unknown) => RpcOutcome {
+      return (method, params) => {
+        if (method === "status") return { result: { chain_id: NEAR_SANDBOX_PIN.chainId, protocol_version: 86, sync_info: {} } };
+        if (method === "block") {
+          return { result: { header: { height: BLOCK_HEIGHT, hash: BLOCK_HASH, timestamp_nanosec: TIMESTAMP_NS } } };
+        }
+        if (method === "query") {
+          const p = params as { method_name?: string };
+          if (p.method_name === "get_lock") return { result: { result: resultBytesOf(lockViewPayload) } };
+          if (p.method_name === "storage_balance_of") return { result: { result: resultBytesOf(STORAGE_BALANCE) } };
+        }
+        return { errorMessage: `unexpected method ${method}` };
+      };
+    }
+
+    it("captures a locked near-htlc leg live, writes raw/rpc + raw/near/<hashLock>/<legContract> + rails.json, and reports nearChainReads", async () => {
+      const swap = buildNearSwap("bbbb1001", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+
+      const calls: Array<{ url: string; body?: string }> = [];
+      const fetchImpl = makeNearFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: NEAR_CONFIG.endpoint,
+        rpcResult: nearRpcResponder(lockedLockView(swap.legATerms)),
+        calls,
+      });
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { near: NEAR_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.nearChainReads).toBe(1);
+      expect(report.nearChainReadsSkipped).toEqual([]);
+
+      const railsJson = JSON.parse(await readFile(join(root, "rails.json"), "utf8"));
+      expect(railsJson).toEqual({ near: NEAR_CONFIG });
+
+      // E1: raw/near/<hashLock>/<legContract>/*.json, never raw/near/<hashLock>/*.json directly.
+      const nearDir = join(root, "raw", "near", swap.lock.hash, swap.legAAccept.contract);
+      const nearFiles = await readdir(nearDir);
+      expect(nearFiles.length).toBe(1);
+      const index = JSON.parse(await readFile(join(nearDir, nearFiles[0]!), "utf8"));
+      expect(index.ref).toBe(swap.lock.hash);
+      expect(index.exchanges).toHaveLength(4);
+
+      const rpcFiles = await readdir(join(root, "raw", "rpc"));
+      expect(rpcFiles.length).toBe(4);
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(view).toBeDefined();
+      expect(view.evidence.aRail).toMatchObject({ status: "locked", final: true });
+      expect(view.evidence.a.railVerified).toBe(true);
+    });
+
+    // E1: a copycat pair (two different swaps, two different leg contracts) that both happen to
+    // accept the exact same hash lock this sweep — each keeps its own capture, isolated by
+    // directory, and the sweep reports the collision as a note rather than silently letting one
+    // overwrite the other.
+    it("E1: two different leg contracts sharing one hash lock each keep their own capture; the sweep notes the collision", async () => {
+      // Both swaps share the same baseMs (so their offer terms — amount, claimByMs,
+      // refundAfterMs — are identical too, not just the hash lock): the fake RPC responder
+      // below answers every get_lock read with the same LockView regardless of which leg
+      // contract asked, so both legs must expect the identical on-chain terms to both verify.
+      const sharedLock = generateHashLock();
+      const swapOne = buildNearSwap("bbbb2001", 1, NOW - 100_000, sharedLock);
+      const swapTwo = buildNearSwap("bbbb2002", 10, NOW - 100_000, sharedLock);
+      expect(swapOne.legAAccept.contract).not.toBe(swapTwo.legAAccept.contract); // genuinely two different legs
+
+      const exportBody = ndjson([...swapOne.offerRows, ...swapTwo.offerRows]);
+      const dealARowsOne = swapOne.dealRowsA(NOW - 50_000);
+      const dealARowsTwo = swapTwo.dealRowsA(NOW - 40_000);
+
+      const fetchImpl = makeNearFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swapOne.dealRoomA)) return { status: 200, body: dealRoomBody(dealARowsOne) };
+          if (url.includes(swapTwo.dealRoomA)) return { status: 200, body: dealRoomBody(dealARowsTwo) };
+          if (url.includes(swapOne.dealRoomB) || url.includes(swapTwo.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: NEAR_CONFIG.endpoint,
+        rpcResult: nearRpcResponder(lockedLockView(swapOne.legATerms)),
+        calls: [],
+      });
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { near: NEAR_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.nearChainReads).toBe(2);
+      expect(report.nearChainReadsSkipped).toEqual([]);
+
+      // Each leg's own capture lives under its own subdirectory — never one shared file that
+      // the second leg's write could clobber.
+      const hashLockDir = join(root, "raw", "near", sharedLock.hash);
+      const legDirs = await readdir(hashLockDir);
+      expect(legDirs.sort()).toEqual([swapOne.legAAccept.contract, swapTwo.legAAccept.contract].sort());
+      const oneFiles = await readdir(join(hashLockDir, swapOne.legAAccept.contract));
+      const twoFiles = await readdir(join(hashLockDir, swapTwo.legAAccept.contract));
+      expect(oneFiles).toHaveLength(1);
+      expect(twoFiles).toHaveLength(1);
+
+      // The board carries a genuine, independent verdict for both swaps' leg A.
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const viewOne = board.swaps.find((s: { swapId: string }) => s.swapId === swapOne.swapId);
+      const viewTwo = board.swaps.find((s: { swapId: string }) => s.swapId === swapTwo.swapId);
+      expect(viewOne.evidence.a.railVerified).toBe(true);
+      expect(viewTwo.evidence.a.railVerified).toBe(true);
+
+      // The collision itself is surfaced as a note, naming both leg contracts under the shared
+      // hash lock — never silently absorbed.
+      expect(report.notes.some((n) => n.includes(sharedLock.hash) && n.includes(swapOne.legAAccept.contract) && n.includes(swapTwo.legAAccept.contract))).toBe(true);
+    });
+
+    // E7: the near-htlc twin of D7 above — the real watcher's live capture, folded through the
+    // real (child-process) audit-export CLI, reaches the identical verdict.
+    it("the real watcher's own live near-htlc capture replays identically through the real audit-export CLI, at a different nowMs", async () => {
+      const swap = buildNearSwap("bbbb1099", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+
+      const fetchImpl = makeNearFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: NEAR_CONFIG.endpoint,
+        rpcResult: nearRpcResponder(lockedLockView(swap.legATerms)),
+        calls: [],
+      });
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { near: NEAR_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.nearChainReads).toBe(1);
+
+      const liveBoard = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const liveView = liveBoard.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(liveView).toBeDefined();
+      expect(liveView.evidence.a.railVerified).toBe(true);
+      expect(liveView.settlementView.a).toBe("funded");
+
+      const script = join(dirname(fileURLToPath(import.meta.url)), "..", "examples", "audit-export.mjs");
+      const result = spawnSync(process.execPath, [script, "--root", root, "--json"], { encoding: "utf8" });
+      expect(result.status).toBe(0);
+      const replayed = JSON.parse(result.stdout) as {
+        swaps: Array<{
+          swapId: string;
+          settlementView: { a: string };
+          finalizedRefs: string[];
+          evidence: { a?: { railVerified: boolean | null; reason?: string; finalizedRef?: string }; aRail?: unknown };
+        }>;
+      };
+      const replayedSwap = replayed.swaps.find((s) => s.swapId === swap.swapId);
+      expect(replayedSwap).toBeDefined();
+      expect(replayedSwap!.settlementView.a).toBe(liveView.settlementView.a);
+      expect(replayedSwap!.finalizedRefs.some((ref) => ref.startsWith(`${NEAR_SANDBOX_PIN.name}:final:${BLOCK_HEIGHT}:`))).toBe(true);
+
+      // P22-P24-EVM-FIXES-R3.md F4 (mirrored): compare the actual verdict in full.
+      expect(replayedSwap!.evidence.a?.railVerified).toBe(liveView.evidence.a.railVerified);
+      expect(replayedSwap!.evidence.a?.reason).toBe(liveView.evidence.a.reason);
+      expect(replayedSwap!.evidence.a?.finalizedRef).toBe(liveView.evidence.a.finalizedRef);
+      expect(replayedSwap!.evidence.aRail).toEqual(liveView.evidence.aRail);
+    });
+
+    it("a transport failure on the chain read is recorded under nearChainReadsSkipped AND writes this sweep's own failure index", async () => {
+      const swap = buildNearSwap("bbbb1003", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+
+      const fetchImpl = makeNearFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: NEAR_CONFIG.endpoint,
+        rpcResult: () => "throw",
+        calls: [],
+      });
+
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { near: NEAR_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.nearChainReads).toBe(0);
+      expect(report.nearChainReadsSkipped).toHaveLength(1);
+      expect(report.nearChainReadsSkipped![0]!.contract).toBe(swap.legAAccept.contract);
+
+      const nearDir = join(root, "raw", "near", swap.lock.hash, swap.legAAccept.contract);
+      const files = await readdir(nearDir);
+      expect(files).toHaveLength(1);
+      const failureIndex = JSON.parse(await readFile(join(nearDir, files[0]!), "utf8"));
+      expect(typeof failureIndex.error).toBe("string");
+      expect(failureIndex.exchanges).toEqual([]);
+      expect(report.nearChainReadsSkipped![0]!.reason).toBe(failureIndex.error);
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(view.evidence.a.railVerified).toBeNull();
+    });
+
+    it("no rails configured: no RPC endpoint is ever touched, and the report carries no near chain fields at all", async () => {
+      const swap = buildNearSwap("bbbb1004", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+      const calls: Array<{ url: string; body?: string }> = [];
+
+      const fetchImpl = makeNearFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: NEAR_CONFIG.endpoint,
+        rpcResult: () => "throw", // would blow up the sweep if ever called
+        calls,
+      });
+
+      // No `options.rails` at all — the live watch's own default.
+      const report = await runSweep({ ...baseOptions({ board: buildBoard }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.nearChainReads).toBeUndefined();
+      expect(report.nearChainReadsSkipped).toBeUndefined();
+      expect(calls.some((c) => c.url === NEAR_CONFIG.endpoint)).toBe(false);
+      expect(existsSync(join(root, "rails.json"))).toBe(false);
+      expect(existsSync(join(root, "raw", "near"))).toBe(false);
+
+      const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
+      const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
+      expect(view).toBeDefined();
+      expect(view.evidence.aRail).toBeUndefined();
+      expect(view.evidence.a).toBeUndefined();
+    });
+
+    // A3 (mirrored for NEAR): a malformed `options.rails.near` fails the whole sweep closed,
+    // before Step 1 (the offer-room fetch) ever runs — not merely "chain reads skipped".
+    it("a malformed options.rails.near fails the sweep closed, before any fetch at all", async () => {
+      const swap = buildNearSwap("bbbb1006", 1, NOW - 100_000);
+      const exportBody = ndjson(swap.offerRows);
+      const calls: Array<{ url: string; body?: string }> = [];
+      const fetchImpl = makeNearFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          return { status: 200, body: dealRoomBody([]) };
+        },
+        rpcEndpoint: NEAR_CONFIG.endpoint,
+        rpcResult: () => "throw", // would fail the test with an unrelated message if ever reached
+        calls,
+      });
+
+      // "mainnet" is off the D-N3 allow list (near-sandbox-flop/testnet only).
+      const badConfig: NearRailConfig = { ...NEAR_CONFIG, pin: { ...NEAR_CONFIG.pin, chainId: "mainnet", caip2: "near:mainnet" } };
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { near: badConfig } }), fetch: fetchImpl });
+
+      expect(report.ok).toBe(false);
+      expect(report.railsConfigError).toMatch(/not on the allow list/);
+      expect(calls).toEqual([]); // nothing was ever fetched — not even the offer-room export
+      expect(existsSync(join(root, "board.json"))).toBe(false);
     });
   });
 });

@@ -45,7 +45,7 @@ import { btcEvidence, BTC_RAIL_ID, type BtcCapture } from "./rails/btc-evidence.
 import { checkBtcRailConfig, type BtcRailConfig } from "./rails/btc-htlc.js";
 import { evmEvidence, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
 import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
-import { nearEvidence, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
+import { nearEvidence, nearCaptureKey, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
 import { checkNearRailConfig, type NearRailConfig } from "./rails/near-htlc.js";
 import { offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, LockEvidence, RailObservation, SwapEvidence, SwapLeg } from "./types.js";
@@ -281,12 +281,17 @@ export interface FoldCapturedInput {
    *  no entry here gets no evidence for that leg, the same treatment as every other captured-but-
    *  absent case in this file. Absent entirely behaves exactly like an empty map. */
   btcChain?: ReadonlyMap<string, BtcCapture>;
-  /** P5-NEAR-SPEC.md §4: captured NEAR chain reads, keyed by the hash lock (a `near-htlc` lock
-   *  frame's own `.ref`, which must equal the leg's `terms.statement` to be picked up at all —
-   *  D-N4, the same convention as `chain` above). A candidate whose deal room shows an accepted
-   *  `near-htlc` lock but has no entry here gets no evidence for that leg, the same treatment as
-   *  every other captured-but-absent case in this file. Absent entirely behaves exactly like an
-   *  empty map. */
+  /** P5-NEAR-SPEC.md §4: captured NEAR chain reads, keyed by `nearCaptureKey(hashLock,
+   *  legContract)` (E1: NOT the bare hash lock — `src/rails/near-evidence.ts`'s own doc explains
+   *  why: two different leg contracts can genuinely share one hash lock, and keying by the pair
+   *  means neither's capture can ever overwrite or be folded into the other's). The hash lock
+   *  half is a `near-htlc` lock frame's own `.ref`, which must equal the leg's `terms.statement`
+   *  to be picked up at all (D-N4, the same convention as `chain` above); the leg-contract half
+   *  is the candidate's own `.contract` (tclk's offer/deal-room contract id — not the NEAR HTLC
+   *  contract account, which is fixed per rail config). A candidate whose deal room shows an
+   *  accepted `near-htlc` lock but has no entry here gets no evidence for that leg, the same
+   *  treatment as every other captured-but-absent case in this file. Absent entirely behaves
+   *  exactly like an empty map. */
   nearChain?: ReadonlyMap<string, NearCapture>;
   /** The chain rails this fold may draw evidence from. Absent (the default — and what the
    *  live watch passes when it isn't given `RunSweepOptions.rails`): neither the `evm-htlc` nor
@@ -478,7 +483,8 @@ export function foldCaptured(input: FoldCapturedInput): Board {
           },
         };
       } else {
-        const capture = input.nearChain?.get(accepted.railRef);
+        // E1: keyed by (hashLock, legContract) — see `nearChain`'s own doc above.
+        const capture = input.nearChain?.get(nearCaptureKey(accepted.railRef, candidate.contract));
         if (capture === undefined) continue; // not captured (yet, or ever): evidence absent
         // D-N5: a near-htlc leg posts account-id lines (mirrors evm-htlc's resolveAccounts, not
         // btc-htlc's pubkey resolution) — resolved fresh from the same deal room, never cached

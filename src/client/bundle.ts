@@ -41,7 +41,7 @@ import { btcEvidence, captureBtcLeg, type BtcAccounts, type BtcCapture } from ".
 import type { BtcRailConfig } from "../rails/btc-htlc.js";
 import { captureEvmLeg, captureFinalizedRef, type EvmCapture } from "../rails/evm-evidence.js";
 import type { EvmRailConfig } from "../rails/evm-htlc.js";
-import { nearEvidence, captureNearLeg, type NearAccounts, type NearCapture } from "../rails/near-evidence.js";
+import { nearEvidence, captureNearLeg, nearCaptureKey, NEAR_RAIL_ID, type NearAccounts, type NearCapture } from "../rails/near-evidence.js";
 import type { NearRailConfig } from "../rails/near-htlc.js";
 import { verifiedExchangeBytes, writeCapture, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 
@@ -274,20 +274,23 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
     if (btcRef !== undefined) finalizedRefs.push(btcRef);
   }
 
-  // P5-NEAR-SPEC.md §4: the NEAR twin of the EVM block above — `raw/near/<hashLock>/*.json`
-  // (the ref is already filename-safe, no `:`/hyphen rewrite needed, unlike Bitcoin), and this
-  // lock's own `finalizedRef` (from either half of `nearEvidence`'s result, the same "undefined
-  // when the capture never reached a finalized view" rule as the BTC block above).
+  // P5-NEAR-SPEC.md §4/P5-NEAR-FIXES.md E1: the NEAR twin of the EVM block above —
+  // `raw/near/<hashLock>/<legContract>/*.json` (E1: keyed by the PAIR, not the hash lock alone
+  // — see `src/rails/near-evidence.ts`'s own `nearCaptureKey`/`nearCaptureDir` doc for why), and
+  // this lock's own `finalizedRef` (from either half of `nearEvidence`'s result, the same
+  // "undefined when the capture never reached a finalized view" rule as the BTC block above).
+  // The leg contract is whichever of `input.evidence`'s two legs is actually on this rail.
   if (input.near !== undefined) {
     const { config, rpc, ref, terms, accounts } = input.near;
     nearRailConfig = config;
+    const nearLegContract = input.evidence.legA.rail === NEAR_RAIL_ID ? input.evidence.legA.contract : input.evidence.legB.contract;
     const { index, exchanges } = await captureNearLeg(rpc, config, terms, accounts, ref, input.nowMs);
     await writeCapture(input.root, exchanges);
-    await writeFileAtomic(join(input.root, "raw", "near", ref, `${stamp}.json`), `${JSON.stringify(index, null, 2)}\n`);
+    await writeFileAtomic(join(input.root, "raw", "near", ref, nearLegContract, `${stamp}.json`), `${JSON.stringify(index, null, 2)}\n`);
 
     const bytes = verifiedExchangeBytes(exchanges);
     const capture: NearCapture = { index, bytes };
-    nearChainForFold.set(ref, capture);
+    nearChainForFold.set(nearCaptureKey(ref, nearLegContract), capture);
     const result = nearEvidence({ terms, config, accounts, capture });
     const nearRef = result.lock.finalizedRef ?? result.rail?.finalizedRef;
     if (nearRef !== undefined) finalizedRefs.push(nearRef);
