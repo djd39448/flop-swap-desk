@@ -66,6 +66,17 @@ export class NearExpiredTransactionError extends NearRpcError {
     this.name = "NearExpiredTransactionError";
   }
 }
+/** H4: the node's own internal wait for `wait_until` expired before the transaction reached that
+ *  level — the transaction may still land later; this is NOT "the node has never seen it" (that
+ *  is `NearUnknownTransactionError`, returned as `null` by `recoverByTxHash`). Kept as its own
+ *  type specifically so a caller can no longer have a genuine timeout silently folded into
+ *  "unknown" the way the old message-only heuristic here used to (H4's own fix: "never absent"). */
+export class NearTimeoutError extends NearRpcError {
+  constructor(message: string, code: number) {
+    super(message, code);
+    this.name = "NearTimeoutError";
+  }
+}
 
 /** A view `call_function`'s own contract panic — see the file header. Never thrown for a
  *  transport-level failure or a JSON-RPC-level error; only for a successful RPC response whose
@@ -77,28 +88,55 @@ export class NearFunctionCallPanicError extends Error {
   }
 }
 
-/** Wraps an `RpcCaptureError` into the most specific typed error its own `message` names, or a
- *  bare `NearRpcError` when none match. Any OTHER thrown value (a timeout, a network failure, a
- *  malformed-JSON error `CapturingRpc` itself throws) is rethrown completely unchanged — never
- *  folded into a NEAR-specific type it did not actually name. */
+/** The `name` of an error object's own `cause`, when `cause` is the shape NEAR's RPC actually
+ *  sends (`{ name: string, info?: unknown }`) — `undefined` for anything else (no cause at all,
+ *  or a cause this build's typed `RpcCaptureErrorExtra` never populated because the underlying
+ *  response carried none). */
+function causeName(cause: unknown): string | undefined {
+  if (cause === null || typeof cause !== "object") return undefined;
+  const name = (cause as Record<string, unknown>).name;
+  return typeof name === "string" ? name : undefined;
+}
+
+/** Wraps an `RpcCaptureError` into the most specific typed error this module recognises. H4:
+ *  reads the STRUCTURED cause (`error.errorName`/`error.errorCause`, populated by
+ *  `rpc-capture.ts`'s own `RpcCaptureErrorExtra` straight from the response's `error.name`/
+ *  `error.cause`) first — this is NEAR's own documented error taxonomy
+ *  (`HANDLER_ERROR` → `cause.name` of `UNKNOWN_TRANSACTION`/`TIMEOUT_ERROR`/
+ *  `INVALID_TRANSACTION`/...), no longer the blunt `code === -32000 && message === "Server
+ *  error"` heuristic this file used before the structured cause was ever visible past
+ *  `CapturingRpc`'s generic contract — that heuristic could not tell a genuine timeout
+ *  (`TIMEOUT_ERROR`: the tx may still land) apart from a truly unknown transaction, and silently
+ *  folded both into "unknown" (H4: "never absent"). Falls back to matching the plain `message`
+ *  text only when no structured cause is present at all (a caller/test that only ever supplies
+ *  `{code, message}`, or a node that genuinely doesn't emit the structured shape) — this keeps
+ *  every hermetic test that predates the structured cause green, and still refuses to *guess*
+ *  "unknown" for an ambiguous `-32000`/"Server error" pair with no cause attached: that case now
+ *  falls through to a bare `NearRpcError` rather than being misclassified either way. Any OTHER
+ *  thrown value (a timeout, a network failure, a malformed-JSON error `CapturingRpc` itself
+ *  throws) is rethrown completely unchanged — never folded into a NEAR-specific type it did not
+ *  actually name. */
 function mapNearRpcError(error: unknown): never {
   if (error instanceof RpcCaptureError) {
-    const msg = error.message;
-    // NB-int (stage this comment was confirmed live, against near-sandbox 2.13.4): `tx`/
-    // `EXPERIMENTAL_tx_status` for a genuinely unknown transaction hash does NOT answer quickly
-    // with a named "not found" error the way `query`'s view-call errors do — it long-polls
-    // waiting for the transaction to appear, then answers `{"code":-32000,"error":{"name":
-    // "HANDLER_ERROR","cause":{"name":"TIMEOUT_ERROR"}},"message":"Server error","data":
-    // "Timeout"}` once its own internal wait expires. `RpcCaptureError` only ever carries
-    // `code`/`message` (see this file's own header: `data`/`cause` are not visible past
-    // `rpc-capture.ts`'s generic contract, which this build never edits for one rail's
-    // convenience), so `code === -32000` combined with the generic `"Server error"` message is
-    // the only signal available here — confirmed empirically to be this method's own "I don't
-    // know about this transaction" answer, not a transport failure (a genuinely unreachable node
-    // fails `fetch` itself, never reaches this branch at all).
-    if (/UNKNOWN_TRANSACTION/i.test(msg) || /doesn'?t exist/i.test(msg) || (error.code === -32000 && /^server error$/i.test(msg))) {
-      throw new NearUnknownTransactionError(msg, error.code);
+    const outer = error.errorName; // NEAR: "HANDLER_ERROR" (uninteresting on its own)
+    const inner = causeName(error.errorCause); // NEAR: "UNKNOWN_TRANSACTION" | "TIMEOUT_ERROR" | "INVALID_TRANSACTION" | ...
+    void outer;
+    if (inner === "UNKNOWN_TRANSACTION") throw new NearUnknownTransactionError(error.message, error.code);
+    if (inner === "TIMEOUT_ERROR") throw new NearTimeoutError(error.message, error.code);
+    if (inner === "INVALID_TRANSACTION") {
+      const blob = JSON.stringify(error.errorCause ?? error.errorData ?? "");
+      if (/InvalidNonce/i.test(blob)) throw new NearInvalidNonceError(error.message, error.code);
+      if (/Expired/i.test(blob)) throw new NearExpiredTransactionError(error.message, error.code);
+      throw new NearRpcError(error.message, error.code);
     }
+    if (inner !== undefined) throw new NearRpcError(error.message, error.code);
+
+    // No structured cause at all — fall back to the message text (pre-H4 behaviour, minus the
+    // blind "-32000 + Server error => unknown" guess, which H4 identified as conflating a
+    // genuine timeout with a genuinely unknown transaction).
+    const msg = error.message;
+    if (/UNKNOWN_TRANSACTION/i.test(msg) || /doesn'?t exist/i.test(msg)) throw new NearUnknownTransactionError(msg, error.code);
+    if (/TIMEOUT_ERROR/i.test(msg) || /^timeout$/i.test(msg)) throw new NearTimeoutError(msg, error.code);
     if (/InvalidNonce/i.test(msg)) throw new NearInvalidNonceError(msg, error.code);
     if (/expired/i.test(msg)) throw new NearExpiredTransactionError(msg, error.code);
     throw new NearRpcError(msg, error.code);
@@ -242,6 +280,33 @@ export class NearRpc {
       throw new Error(`near-rpc: view_access_key for "${accountId}" did not return a usable access key view`);
     }
     return { nonce: raw.nonce, permission: raw.permission, blockHeight: raw.block_height, blockHash: raw.block_hash, raw };
+  }
+
+  /** H6: `view_access_key_list` — every access key an account currently holds. Used by
+   *  `near-htlc.ts`'s `connect()` to confirm the HTLC contract account has been locked down to
+   *  zero keys (the harness's own `DeleteKey` step, `tests-near/helpers/sandbox.ts`) before this
+   *  rail ever trusts its deployed code as immutable. */
+  async viewAccessKeyList(
+    accountId: string,
+    ref: NearBlockRef = { finality: "final" },
+  ): Promise<{ keys: readonly { publicKey: string; nonce: number; permission: unknown }[]; blockHeight: number; blockHash: string; raw: Record<string, unknown> }> {
+    const raw = await this.call<Record<string, unknown>>("query", {
+      request_type: "view_access_key_list",
+      account_id: accountId,
+      ...refParams(ref),
+    });
+    if (!Array.isArray(raw.keys) || typeof raw.block_height !== "number" || typeof raw.block_hash !== "string") {
+      throw new Error(`near-rpc: view_access_key_list for "${accountId}" did not return a usable key list`);
+    }
+    const keys = (raw.keys as unknown[]).map((entry) => {
+      const e = entry as Record<string, unknown>;
+      const accessKey = e.access_key as Record<string, unknown> | undefined;
+      if (typeof e.public_key !== "string" || accessKey === undefined || typeof accessKey.nonce !== "number") {
+        throw new Error(`near-rpc: view_access_key_list for "${accountId}" returned a malformed key entry`);
+      }
+      return { publicKey: e.public_key, nonce: accessKey.nonce, permission: accessKey.permission };
+    });
+    return { keys, blockHeight: raw.block_height, blockHash: raw.block_hash, raw };
   }
 
   /** `args` is JSON-serialised and base64-encoded here (`args_base64`) — the caller passes a

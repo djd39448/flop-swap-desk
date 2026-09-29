@@ -43,6 +43,102 @@ import {
 } from "./near-rpc.js";
 import type { CapturingRpc } from "./rpc-capture.js";
 
+// --- H1: typed write-result errors ---------------------------------------------------------
+//
+// H1: "a write succeeds only when the chain says so." Every write this rail makes now goes
+// through two gates before its evidence is ever handed back to a caller: (1) the transaction's
+// own top-level `status` must not be `Failure` (a contract panic, an out-of-gas, ...) — checked
+// first, inside `sendPrepared`/`recoverByTxHash`, and thrown as `NearTxFailedError`; (2) for a
+// `Success` transaction, `sendPrepared` re-reads `get_lock` at `final` and confirms the write
+// actually produced the state this rail's own caller asked for — a `ft_transfer_call` that ran
+// to completion but never created the intended lock (S3: refused by `ft_on_transfer`) or a
+// claim/refund whose OWN inner promise chain failed (S1: the payee was unregistered when the
+// payout promise ran) both still return `Success` at the top level; only this second read
+// catches them.
+
+/** A transaction's own top-level `status` was `Failure` — the write never happened; the ref
+ *  (hash lock or recovered tx hash) is NOT evidence of anything. `raw` is this write's own
+ *  captured exchange hashes (never lost, even on failure — a caller reconstructing what happened
+ *  still has the wire bytes). */
+export class NearTxFailedError extends Error {
+  readonly txHash: string;
+  readonly failure: unknown;
+  readonly raw: readonly string[];
+  constructor(txHash: string, failure: unknown, raw: readonly string[]) {
+    super(`near-htlc: transaction ${txHash} failed on chain: ${JSON.stringify(failure)}`);
+    this.name = "NearTxFailedError";
+    this.txHash = txHash;
+    this.failure = failure;
+    this.raw = raw;
+  }
+}
+
+/** `commitLock`'s post-send check: the transaction was `Success`, but `get_lock` afterward does
+ *  not show a lock owned by this signer with the exact terms it sent (S3: `ft_on_transfer`
+ *  refused the transfer — bad msg, duplicate hash lock, a token that isn't the configured USDC,
+ *  the contract's own storage-reserve guard, ...) — the token contract already refunded the
+ *  sender in full; there is no lock to act on. */
+export class NearLockRefusedError extends Error {
+  readonly txHash: string;
+  readonly raw: readonly string[];
+  constructor(txHash: string, raw: readonly string[]) {
+    super("near-htlc: lock refused by the contract, tokens returned");
+    this.name = "NearLockRefusedError";
+    this.txHash = txHash;
+    this.raw = raw;
+  }
+}
+
+/** `claim`'s post-send check: the transaction was `Success` (the `claim` method itself ran and
+ *  revealed the preimage) but the contract's own inner `ft_transfer` payout promise failed (S1:
+ *  the payee was unregistered by the time the payout promise ran), reverting the lock's status
+ *  back to `Locked` while keeping the preimage public (the contract's own F4 rule). The preimage
+ *  is included so a caller never has to make a second read just to learn it — the reveal frame
+ *  may still be posted even though the payout itself must be retried (`H2`'s revealed-lock
+ *  retry, once the underlying cause is fixed). */
+export class NearPayoutFailedError extends Error {
+  readonly txHash: string;
+  readonly preimage: string | null;
+  readonly raw: readonly string[];
+  constructor(txHash: string, preimage: string | null, raw: readonly string[]) {
+    super("near-htlc: payout failed, retry the claim");
+    this.name = "NearPayoutFailedError";
+    this.txHash = txHash;
+    this.preimage = preimage;
+    this.raw = raw;
+  }
+}
+
+/** `claim`'s post-send check: the lock is still `Claiming` — the outer transaction settled at
+ *  `final`, but the contract's own inner payout promise/callback had not yet resolved when this
+ *  rail re-read `get_lock`. Neither success nor failure is known yet; a caller should re-check
+ *  shortly rather than treat this as either. */
+export class NearPendingError extends Error {
+  readonly txHash: string;
+  readonly raw: readonly string[];
+  constructor(txHash: string, raw: readonly string[]) {
+    super("near-htlc: claim is pending (Claiming) on chain — check again shortly");
+    this.name = "NearPendingError";
+    this.txHash = txHash;
+    this.raw = raw;
+  }
+}
+
+/** `refund`'s post-send check: the transaction was `Success` but `get_lock` afterward does not
+ *  show `Refunded` (the inner `ft_transfer` payout promise failed — mirrors `NearPayoutFailedError`
+ *  for the refund side, but refund never reveals a preimage, so there is nothing further to
+ *  carry). */
+export class NearRefundFailedError extends Error {
+  readonly txHash: string;
+  readonly raw: readonly string[];
+  constructor(txHash: string, raw: readonly string[]) {
+    super("near-htlc: refund failed on chain");
+    this.name = "NearRefundFailedError";
+    this.txHash = txHash;
+    this.raw = raw;
+  }
+}
+
 // --- Chain pin, allow list, config validation -------------------------------------------------
 
 export interface NearChainPin {
@@ -106,6 +202,17 @@ export interface NearRailConfig {
   /** The HTLC contract's own NEAR account id. */
   contract: string;
   assets: { USDC: string };
+  /** H6: base58 sha256 of the reviewed `htlc` contract wasm (the harness fills this from
+   *  `build.sh`'s own output — see `tests-near/helpers/sandbox.ts`). Optional at the TYPE level
+   *  only, so existing `NearRailConfig` object literals elsewhere in this repo built before H6
+   *  continue to type-check; REQUIRED at the RUNTIME level by `nearRailConfigShapeReason` —
+   *  `checkNearRailConfig`/`connect()` refuse any config missing it before ever touching the
+   *  network. `connect()` then reads `view_account(contract).code_hash` and
+   *  `view_access_key_list(contract)` at the same final block and refuses to connect unless the
+   *  code hash matches exactly and the contract holds zero access keys (a locked, immutable
+   *  deployment) — a compromised or since-redeployed contract must never be trusted as the
+   *  reviewed one just because its account id matches. */
+  htlcCodeHash?: string;
 }
 
 /** D-N5: NEAR account ids permit `_` (a deliberate deviation from the generic CAIP-10 charset,
@@ -148,6 +255,11 @@ export function nearRailConfigShapeReason(value: unknown): string | null {
   const assets = v.assets as Record<string, unknown>;
   if (typeof assets.USDC !== "string" || !NEAR_ACCOUNT_ID.test(assets.USDC)) {
     return "near rail config: assets.USDC must be a valid NEAR account id";
+  }
+  // H6: required at runtime (see the field's own doc comment for why it stays optional at the
+  // type level).
+  if (typeof v.htlcCodeHash !== "string" || v.htlcCodeHash === "") {
+    return "near rail config: htlcCodeHash must be a non-empty string (H6: the pinned contract code hash)";
   }
   return null;
 }
@@ -228,12 +340,23 @@ export interface NearHtlcTerms {
   refundAfterMs: number;
 }
 
-function validateTerms(terms: NearHtlcTerms): void {
+/** H5: "refuse a payee that can never receive." A lock whose payee is the HTLC contract itself
+ *  or the USDC token account itself can never be claimed by an actual counterparty — the
+ *  contract's own `ft_on_transfer` refuses the SAME two accounts as payee (belt and suspenders:
+ *  this adapter-side check means the Buyer's `prepareLock` never even signs such a transaction,
+ *  and the contract-side check means it is refused even if some other caller sends it directly). */
+function validateTerms(terms: NearHtlcTerms, config: NearRailConfig): void {
   if (!HASH_LOCK_SHAPE.test(terms.hashLock)) {
     throw new Error("near-htlc: hashLock must be 0x + 64 lowercase hex (sha256 statement)");
   }
   if (!NEAR_ACCOUNT_ID.test(terms.payee)) {
     throw new Error("near-htlc: payee must be a valid NEAR account id");
+  }
+  if (terms.payee === config.contract) {
+    throw new Error("near-htlc: payee must not be the HTLC contract itself (H5: it could never receive or spend the payout)");
+  }
+  if (terms.payee === config.assets.USDC) {
+    throw new Error("near-htlc: payee must not be the USDC token account itself (H5: it could never receive or spend the payout)");
   }
   if (!NONNEG_DECIMAL.test(terms.amount) || BigInt(terms.amount) < BigInt(NEAR_AMOUNT_FLOOR)) {
     throw new Error(`near-htlc: amount must be a decimal-integer string >= the floor (${NEAR_AMOUNT_FLOOR})`);
@@ -270,6 +393,14 @@ export const FT_TRANSFER_CALL_GAS = 20n * TGAS;
 export const CLAIM_REFUND_GAS = 40n * TGAS;
 const ONE_YOCTO = 1n;
 
+/** H3: the adapter's own last-moment guard on `claim`'s `notAfterMs` — a claim whose deadline
+ *  leaves less than this much room before the lock's own `refundAfterMs` is refused before ever
+ *  signing, so a claim that could plausibly land ON or AFTER the refund window opens (a race the
+ *  Seller could lose to the Buyer's own refund) is never attempted in the first place. 30s is
+ *  this build's own sandbox pin (blocks every ~0.65s, D-N3) — the comment on the constant itself
+ *  is the record that a live testnet deployment needs a wider margin than this. */
+export const NEAR_CLAIM_LANDING_MARGIN_MS = 30_000;
+
 export interface NearWriteEvidence {
   ref: string;
   txHash: string;
@@ -282,6 +413,14 @@ interface NearPreparedWrite {
   ref: string;
   txHash: string;
   signedTxBase64: string;
+  /** H1: which write this is, so `sendPrepared`'s own post-send `get_lock` re-read knows what
+   *  "the write actually took effect" means for THIS write. */
+  kind: "lock" | "claim" | "refund";
+  /** H1 (`kind: "lock"` only): the exact terms `prepareLock` signed — `sendPrepared` confirms
+   *  `get_lock` afterward shows a lock owned by this signer with these exact terms before ever
+   *  treating a `Success` transaction as evidence of a real lock (S3: `ft_on_transfer` can refuse
+   *  the transfer while the outer transaction still succeeds). */
+  lockTerms?: NearHtlcTerms;
 }
 
 interface NearLockView {
@@ -364,10 +503,35 @@ export class NearHtlcRail {
     const near = new NearRpc(options.rpc);
     const rail = new NearHtlcRail(configCheck.config, options.rpc, near, options.signer, options.clock ?? Date.now);
     await rail.assertPinnedChain();
+    await rail.assertLockedContract();
     // A10-equivalent: connect's own exchanges never linger into a later write's own
     // snapshot-at-start.
     options.rpc.drain();
     return rail;
+  }
+
+  /** H6: reads `view_account(contract)` and `view_access_key_list(contract)` at the SAME final
+   *  block (fetched once, then both queries pinned to its height) and refuses to connect unless
+   *  the contract's live `code_hash` matches the config's own pinned `htlcCodeHash` exactly and
+   *  the contract account holds zero access keys — a deployment that still has a key could be
+   *  redeployed to different code at any time, so "the account id matches" is never enough on
+   *  its own to trust its code as the reviewed wasm. Fails closed: any mismatch throws, never a
+   *  boolean this caller could accidentally ignore. */
+  private async assertLockedContract(): Promise<void> {
+    const block = await this.near.block({ finality: "final" });
+    const ref: NearBlockRef = { blockId: block.header.height };
+    const account = await this.near.viewAccount(this.config.contract, ref);
+    if (account.codeHash !== this.config.htlcCodeHash) {
+      throw new Error(
+        `near-htlc: refusing to connect — contract "${this.config.contract}" code_hash "${account.codeHash}" does not match the pinned htlcCodeHash "${String(this.config.htlcCodeHash)}"`,
+      );
+    }
+    const keyList = await this.near.viewAccessKeyList(this.config.contract, ref);
+    if (keyList.keys.length !== 0) {
+      throw new Error(
+        `near-htlc: refusing to connect — contract "${this.config.contract}" still holds ${String(keyList.keys.length)} access key(s) (must be locked to zero keys, H6)`,
+      );
+    }
   }
 
   /** D-N3: `status().chain_id`/`protocol_version` are what this reads and records (`connect()`'s
@@ -422,10 +586,20 @@ export class NearHtlcRail {
     return { txHash: built.txHashBase58, signedTxBase64: Buffer.from(built.signedBytes).toString("base64") };
   }
 
-  /** Broadcasts a previously built-and-signed write (`wait_until: "FINAL"`, D-N9), then reads
-   *  the height of the block the outcome names (the outcome itself only ever carries a hash, not
-   *  a height). `before` (A10) is this write's own exchange-log snapshot-at-start, so `raw` below
-   *  covers exactly this write's own exchanges — never an earlier, un-drained read. */
+  /** Broadcasts a previously built-and-signed write (`wait_until: "FINAL"`, D-N9). `before` (A10)
+   *  is this write's own exchange-log snapshot-at-start, so `raw` below covers exactly this
+   *  write's own exchanges — never an earlier, un-drained read.
+   *
+   *  H1: "a write succeeds only when the chain says so" — two gates before this ever returns
+   *  evidence to a caller. (1) The outcome's own top-level `status`: a `Failure` throws
+   *  `NearTxFailedError` immediately, carrying the failure and this write's own captured
+   *  exchanges — the ref is NOT evidence of anything at that point. (2) For a `Success`
+   *  transaction, re-reads `get_lock` at `final` and confirms the write actually produced the
+   *  state its own caller asked for — a `Success` transaction alone is not enough: `claim`/
+   *  `refund`'s own inner `ft_transfer` payout promise can fail AFTER the outer method call
+   *  already succeeded (S1), and `ft_transfer_call`'s own receiver-side `ft_on_transfer` can
+   *  refuse the transfer while the token contract still reports `Success` for the transfer call
+   *  itself (S3) — `kind`-specific below. */
   private async sendPrepared(prepared: NearPreparedWrite): Promise<NearWriteEvidence> {
     await this.assertPinnedChain();
     const before = this.rpc.exchanges().length;
@@ -439,9 +613,51 @@ export class NearHtlcRail {
     } finally {
       this.rpc.setIdNamespace(undefined);
     }
+    const raw = (): string[] => this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256);
+
+    const status = outcome.status as Record<string, unknown> | null | undefined;
+    if (status !== null && status !== undefined && "Failure" in status) {
+      throw new NearTxFailedError(prepared.txHash, status.Failure, raw());
+    }
+
     const block = await this.near.block({ blockId: outcome.transactionOutcome.blockHash });
-    const raw = this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256);
-    return { ref: prepared.ref, txHash: prepared.txHash, blockHeight: block.header.height, blockHash: outcome.transactionOutcome.blockHash, raw };
+    const lockView = await this.getLock(prepared.ref);
+    const evidence: NearWriteEvidence = {
+      ref: prepared.ref,
+      txHash: prepared.txHash,
+      blockHeight: block.header.height,
+      blockHash: outcome.transactionOutcome.blockHash,
+      raw: raw(),
+    };
+
+    if (prepared.kind === "lock") {
+      const terms = prepared.lockTerms;
+      if (terms === undefined) throw new Error("near-htlc: internal — a lock write is missing its own lockTerms");
+      const tokenAccount = this.resolveAsset(NEAR_ASSET_ID);
+      const matches =
+        lockView !== null &&
+        lockView.payer === this.signer.accountId &&
+        lockView.payee === terms.payee &&
+        lockView.token === tokenAccount &&
+        lockView.amount === terms.amount &&
+        lockView.claimByMs === terms.claimByMs &&
+        lockView.refundAfterMs === terms.refundAfterMs;
+      if (!matches) throw new NearLockRefusedError(prepared.txHash, raw());
+      return evidence;
+    }
+
+    if (prepared.kind === "claim") {
+      if (lockView !== null && lockView.status === "Claimed") return evidence;
+      if (lockView !== null && lockView.status === "Claiming") throw new NearPendingError(prepared.txHash, raw());
+      // Locked (payout promise failed, F4 kept the preimage) or anything else unexpected: report
+      // the payout as failed, carrying whatever preimage is now on chain (F4: revealed whether or
+      // not the payout itself landed).
+      throw new NearPayoutFailedError(prepared.txHash, lockView?.preimage ?? null, raw());
+    }
+
+    // prepared.kind === "refund"
+    if (lockView !== null && lockView.status === "Refunded") return evidence;
+    throw new NearRefundFailedError(prepared.txHash, raw());
   }
 
   /**
@@ -453,7 +669,7 @@ export class NearHtlcRail {
    * return value before ever calling `commitLock()`.
    */
   async prepareLock(terms: NearHtlcTerms): Promise<{ ref: string; txHash: string }> {
-    validateTerms(terms);
+    validateTerms(terms, this.config);
     await this.assertPinnedChain();
     const tokenAccount = this.resolveAsset(NEAR_ASSET_ID);
     const msg = JSON.stringify({
@@ -471,7 +687,7 @@ export class NearHtlcRail {
       deposit: ONE_YOCTO,
     };
     const built = await this.buildAndSign(tokenAccount, [action]);
-    this.prepared = { ref: terms.hashLock, txHash: built.txHash, signedTxBase64: built.signedTxBase64 };
+    this.prepared = { ref: terms.hashLock, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "lock", lockTerms: terms };
     return { ref: terms.hashLock, txHash: built.txHash };
   }
 
@@ -517,6 +733,20 @@ export class NearHtlcRail {
    * time as the LAST read before broadcast (P22-P24-EVM-FIXES-R3.md E4's rule) — after the
    * pre-checks and the signing itself have already spent their own round trips, during which
    * real time keeps passing.
+   *
+   * H2: when `get_lock` already shows a revealed preimage (a retry after a payout that failed —
+   * `NearPayoutFailedError`'s own scenario), the contract itself permits this retry past
+   * `refund_after_ms` (its own F4 rule) — this adapter mirrors that: both the pre-check window
+   * guard and H3's own last-moment `notAfterMs`/landing-margin guard are skipped, but the
+   * storage-registration check is NOT (the payout can still fail again for the same reason).
+   *
+   * H3: the adapter's own last-moment guard, on an UNREVEALED lock only — `notAfterMs` is refused
+   * up front if it would leave less than `NEAR_CLAIM_LANDING_MARGIN_MS` before the lock's own
+   * `refund_after_ms` (a claim that could plausibly land at/after the refund window opens is
+   * never attempted), and the final broadcast-time check judges `notAfterMs` against
+   * `max(final block time, the injected clock)` rather than the block time alone — a node whose
+   * own final-block cadence has stalled must never let a stale "chain time" understate how much
+   * real time has actually passed.
    */
   async claim(hashLock: string, preimage: string, notAfterMs: number): Promise<NearWriteEvidence> {
     if (!HASH_LOCK_SHAPE.test(hashLock)) throw new Error("near-htlc: hashLock must be 0x + 64 lowercase hex");
@@ -532,13 +762,21 @@ export class NearHtlcRail {
     if (lockView === null || lockView.status !== "Locked") {
       throw new Error(`near-htlc: refusing to claim — lock is not in a claimable "Locked" state (got ${lockView?.status ?? "none"})`);
     }
+    // H2: a revealed preimage means this is a retry the contract's own F4 rule permits past the
+    // window — never trust the view's own shape alone (mirrors findClaimedPreimage's own check).
+    const revealed = lockView.preimage !== null && bytesEqual(sha256(hexToBytes(lockView.preimage.slice(2))), hashLockBytes);
     const preClaimNowMs = await this.chainTimeMs();
-    if (!(preClaimNowMs < lockView.refundAfterMs)) {
+    if (!revealed && !(preClaimNowMs < lockView.refundAfterMs)) {
       throw new Error("near-htlc: refusing to claim — chain time is already at/after refundAfterMs");
     }
     const storage = await this.storageBalanceOf(lockView.payee);
     if (storage === null) {
       throw new Error(`near-htlc: refusing to claim — payee "${lockView.payee}" is not storage-registered on the token (the payout would fail)`);
+    }
+    if (!revealed && notAfterMs > lockView.refundAfterMs - NEAR_CLAIM_LANDING_MARGIN_MS) {
+      throw new Error(
+        `near-htlc: refusing to claim — notAfterMs (${notAfterMs}) leaves less than the ${NEAR_CLAIM_LANDING_MARGIN_MS}ms landing margin before refundAfterMs (${lockView.refundAfterMs})`,
+      );
     }
 
     const action: NearAction = {
@@ -551,13 +789,16 @@ export class NearHtlcRail {
     const built = await this.buildAndSign(this.config.contract, [action]);
 
     // The deadline guard is the LAST read before broadcast — nothing but sendPrepared's own
-    // assertPinnedChain + send_tx follow.
-    const finalNowMs = await this.chainTimeMs();
-    if (finalNowMs >= notAfterMs) {
-      throw new Error(`near-htlc: refusing to broadcast claim — chain time ${finalNowMs} is at/after the given deadline (notAfterMs ${notAfterMs})`);
+    // assertPinnedChain + send_tx follow. Skipped entirely on a revealed retry (H2).
+    if (!revealed) {
+      const finalNowMs = await this.chainTimeMs();
+      const guardNowMs = Math.max(finalNowMs, this.clock());
+      if (guardNowMs >= notAfterMs) {
+        throw new Error(`near-htlc: refusing to broadcast claim — chain time ${guardNowMs} is at/after the given deadline (notAfterMs ${notAfterMs})`);
+      }
     }
 
-    return this.sendPrepared({ ref: hashLock, txHash: built.txHash, signedTxBase64: built.signedTxBase64 });
+    return this.sendPrepared({ ref: hashLock, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "claim" });
   }
 
   /**
@@ -590,7 +831,7 @@ export class NearHtlcRail {
       deposit: 0n,
     };
     const built = await this.buildAndSign(this.config.contract, [action]);
-    return this.sendPrepared({ ref: hashLock, txHash: built.txHash, signedTxBase64: built.signedTxBase64 });
+    return this.sendPrepared({ ref: hashLock, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "refund" });
   }
 
   /**
@@ -600,8 +841,15 @@ export class NearHtlcRail {
    * when the node has no record of this transaction at all (`NearUnknownTransactionError`) —
    * every other error propagates (mirrors `btc-htlc.ts`'s `recoverFunding`'s own R2-2 rule: only
    * a genuine "not found" answer may collapse to "never reached the network").
+   *
+   * H4: `expectedRef` is the caller's own ref (the hash lock this recovery is resuming) — the
+   * evidence this returns carries THAT ref, never the raw `txHash` (A9: an evidence reader keys
+   * and re-binds captures by ref, so returning anything else here would silently mislabel a
+   * recovered write). H1's own status check applies here too: a transaction the node still has a
+   * record of but that itself executed as `Failure` is reported as failed
+   * (`NearTxFailedError`), never handed back as if it were evidence of a completed write.
    */
-  async recoverByTxHash(txHash: string, senderAccountId: string): Promise<NearWriteEvidence | null> {
+  async recoverByTxHash(txHash: string, senderAccountId: string, expectedRef: string): Promise<NearWriteEvidence | null> {
     await this.assertPinnedChain();
     const before = this.rpc.exchanges().length;
     let outcome;
@@ -611,9 +859,13 @@ export class NearHtlcRail {
       if (error instanceof NearUnknownTransactionError) return null;
       throw error;
     }
+    const raw = (): string[] => this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256);
+    const status = outcome.status as Record<string, unknown> | null | undefined;
+    if (status !== null && status !== undefined && "Failure" in status) {
+      throw new NearTxFailedError(txHash, status.Failure, raw());
+    }
     const block = await this.near.block({ blockId: outcome.transactionOutcome.blockHash });
-    const raw = this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256);
-    return { ref: txHash, txHash, blockHeight: block.header.height, blockHash: outcome.transactionOutcome.blockHash, raw };
+    return { ref: expectedRef, txHash, blockHeight: block.header.height, blockHash: outcome.transactionOutcome.blockHash, raw: raw() };
   }
 
   /** D-N6: the Buyer's own cheap way to learn the secret from a pending OR already-final claim —
