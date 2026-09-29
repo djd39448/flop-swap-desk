@@ -480,13 +480,19 @@ describe("B2/C3/E4 — the last-moment claim guard is judged against max(chain t
     offerA: Awaited<ReturnType<typeof pairLockBAndAccountLines>>["offerA"];
     statement: string;
   }> {
+    // P5-NEAR-FIXES.md G5: the fake rail's own write ref must echo the Seller's real minted
+    // statement (see the identical comment elsewhere in this file) — otherwise `claimLegA`'s new
+    // G5 ref-mismatch check throws first, before ever reaching the deadline guards these two
+    // tests actually mean to exercise.
+    const hBox: { h?: ReturnType<typeof harness> } = {};
     const buyerRail = new FakeCounterAssetRail({
       currentBlockMarker: async () => 0,
-      prepareLock: async () => ({ ref: REF }),
-      commitLock: async () => ({ ref: REF, raw: [] }),
+      prepareLock: async () => ({ ref: hBox.h!.sellerFlow.statement! }),
+      commitLock: async () => ({ ref: hBox.h!.sellerFlow.statement!, raw: [] }),
     });
     const sellerRail = new FakeCounterAssetRail({});
     const h = harness(buyerRail, sellerRail);
+    hBox.h = h;
     const { offerA } = await pairLockBAndAccountLines(h);
     await h.buyerFlow.lockLegA();
     const statement = h.sellerFlow.statement;
@@ -500,16 +506,17 @@ describe("B2/C3/E4 — the last-moment claim guard is judged against max(chain t
     // max() must pick the chain's own (later, more dangerous) reading.
     h.clockRef.ms = offerA.refundAfterMs - 6 * 60 * 60_000;
     (sellerRail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
-      new FakeConnectedRail({ chainTimeMs: async () => offerA.claimByMs });
-    await expect(h.sellerFlow.claimLegA(statement)).rejects.toThrow(/refusing to claim leg A/);
+      // P5-NEAR-FIXES.md G2/G3: nothing has claimed yet — must be scripted to answer `null`.
+      new FakeConnectedRail({ findClaimedPreimage: async () => null, chainTimeMs: async () => offerA.claimByMs });
+    await expect(h.sellerFlow.claimLegA(statement)).rejects.toThrow(/refusing to claim leg A at\/after its claimByMs/);
   });
 
   it("refuses a claim when WALL-CLOCK is already unsafe even though the chain's own time still looks early", async () => {
     const { h, sellerRail, offerA, statement } = await lockedForClaim();
     h.clockRef.ms = offerA.claimByMs; // wall-clock at/after claimByMs
     (sellerRail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
-      new FakeConnectedRail({ chainTimeMs: async () => offerA.refundAfterMs - 6 * 60 * 60_000 }); // chain still looks early
-    await expect(h.sellerFlow.claimLegA(statement)).rejects.toThrow(/refusing to claim leg A/);
+      new FakeConnectedRail({ findClaimedPreimage: async () => null, chainTimeMs: async () => offerA.refundAfterMs - 6 * 60 * 60_000 }); // chain still looks early
+    await expect(h.sellerFlow.claimLegA(statement)).rejects.toThrow(/refusing to claim leg A at\/after its claimByMs/);
   });
 });
 
@@ -679,13 +686,21 @@ describe("learnSecret — from a posted reveal frame, or from a Claiming/Claimed
     buyerRail: FakeCounterAssetRail;
     sellerRail: FakeCounterAssetRail;
   }> {
+    // P5-NEAR-FIXES.md G5: `near-htlc`'s own write ref IS the Seller's minted hash lock (D-N4),
+    // never a fixed dummy value unrelated to it — `SellerFlow.claimLegA` now enforces this
+    // (rejecting a mismatched accepted-lock-frame ref exactly like `evm-htlc`), so this fake
+    // rail's own `ref` must echo the real statement, the same way the real near-rail.ts adapter
+    // always does. `hBox` exists only because the statement isn't minted (via `acceptLegA`,
+    // inside `pairLockBAndAccountLines` below) until after `harness()` itself needs `buyerRail`.
+    const hBox: { h?: ReturnType<typeof harness> } = {};
     const buyerRail = new FakeCounterAssetRail({
       currentBlockMarker: async () => 0,
-      prepareLock: async () => ({ ref: REF }),
-      commitLock: async () => ({ ref: REF, raw: [] }),
+      prepareLock: async () => ({ ref: hBox.h!.sellerFlow.statement! }),
+      commitLock: async () => ({ ref: hBox.h!.sellerFlow.statement!, raw: [] }),
     });
     const sellerRail = new FakeCounterAssetRail({});
     const h = harness(buyerRail, sellerRail);
+    hBox.h = h;
     await pairLockBAndAccountLines(h);
     await h.buyerFlow.lockLegA();
     return { h, buyerRail, sellerRail };
@@ -695,6 +710,9 @@ describe("learnSecret — from a posted reveal frame, or from a Claiming/Claimed
     const { h, sellerRail } = await lockedFlowWithSeller();
     (sellerRail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
       new FakeConnectedRail({
+        // P5-NEAR-FIXES.md G2/G3: SellerFlow.claimLegA now checks findClaimedPreimage first, for
+        // near-htlc — nothing has claimed yet, so this must be scripted to answer `null`.
+        findClaimedPreimage: async () => null,
         chainTimeMs: async () => h.clockRef.ms,
         verifyLockFinal: async () => ({
           lock: { rail: "near-htlc", ref: REF, terms: {} as never, railVerified: true, checkedAtMs: 0 },
@@ -752,18 +770,24 @@ describe("learnSecret — from a posted reveal frame, or from a Claiming/Claimed
 
 describe("claim refused when the payee is unregistered (near-htlc's own storage-registration pre-check)", () => {
   it("SellerFlow.claimLegA propagates the rail's own refusal without swallowing it, and posts no reveal frame", async () => {
+    // P5-NEAR-FIXES.md G5: see the identical comment on `lockedFlowWithSeller` above — the fake
+    // rail's own write ref must echo the Seller's real minted statement.
+    const hBox: { h?: ReturnType<typeof harness> } = {};
     const buyerRail = new FakeCounterAssetRail({
       currentBlockMarker: async () => 0,
-      prepareLock: async () => ({ ref: REF }),
-      commitLock: async () => ({ ref: REF, raw: [] }),
+      prepareLock: async () => ({ ref: hBox.h!.sellerFlow.statement! }),
+      commitLock: async () => ({ ref: hBox.h!.sellerFlow.statement!, raw: [] }),
     });
     const sellerRail = new FakeCounterAssetRail({});
     const h = harness(buyerRail, sellerRail);
+    hBox.h = h;
     const { acceptA } = await pairLockBAndAccountLines(h);
     await h.buyerFlow.lockLegA();
 
     (sellerRail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
       new FakeConnectedRail({
+        // P5-NEAR-FIXES.md G2/G3: see the identical comment above — nothing has claimed yet.
+        findClaimedPreimage: async () => null,
         chainTimeMs: async () => h.clockRef.ms,
         verifyLockFinal: async () => ({
           lock: { rail: "near-htlc", ref: REF, terms: {} as never, railVerified: true, checkedAtMs: 0 },
