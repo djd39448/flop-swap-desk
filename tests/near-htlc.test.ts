@@ -482,9 +482,13 @@ describe("chainTimeMs / currentBlockMarker", () => {
 // ── gas / floor constants sanity ────────────────────────────────────────────────────────────
 
 describe("D-N9 gas constants", () => {
-  it("ft_transfer_call gas is 100 Tgas and claim/refund gas is 60 Tgas", () => {
-    expect(FT_TRANSFER_CALL_GAS).toBe(100_000_000_000_000n);
-    expect(CLAIM_REFUND_GAS).toBe(60_000_000_000_000n);
+  // NB-int corrected these from the provisional 100/60 Tgas against real measured burn on a live
+  // near-sandbox node (src/rails/near-htlc.ts's own doc comment on these constants carries the
+  // exact measured numbers and why claim/refund need more headroom than the raw burn figure
+  // alone would suggest).
+  it("ft_transfer_call gas is 20 Tgas and claim/refund gas is 40 Tgas", () => {
+    expect(FT_TRANSFER_CALL_GAS).toBe(20_000_000_000_000n);
+    expect(CLAIM_REFUND_GAS).toBe(40_000_000_000_000n);
   });
 });
 

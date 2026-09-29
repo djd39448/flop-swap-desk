@@ -243,11 +243,31 @@ function validateTerms(terms: NearHtlcTerms): void {
   }
 }
 
-/** D-N9: explicit gas constants, mirroring the contract's own (measured once live, NB-int
- *  corrects these in the commit message that does the measuring). */
+/** D-N9: explicit gas constants. Corrected here (NB-int) from the provisional 100/60 Tgas
+ *  against REAL measured burn on a live near-sandbox node (`tests-near/near-htlc.near.test.ts`'s
+ *  own `measuredGasBurnt`, reading each write's own captured `send_tx` outcome's total gas burnt
+ *  across the whole receipt chain — the transaction outcome plus every receipt it produced, as
+ *  originally measured with the provisional 100/60 Tgas attached): `ft_transfer_call` (lock)
+ *  burnt ~6.90 Tgas, `claim` ~7.36 Tgas, `refund` ~7.27 Tgas (this commit's own message carries
+ *  the exact numbers).
+ *
+ *  `FT_TRANSFER_CALL_GAS` (20 Tgas, ~3x the measured 6.90) held up fine at that lower ceiling —
+ *  `ft_on_transfer` never schedules a further cross-contract call of its own (only
+ *  near-contract-standards' OWN `ft_resolve_transfer` chain does, which the token contract
+ *  allocates internally). `claim`/`refund` are different: the CONTRACT itself statically
+ *  sub-allocates `FT_TRANSFER_GAS` (10 Tgas) + `CALLBACK_GAS` (10 Tgas) = 20 Tgas out of
+ *  whatever is attached to the outer `claim`/`refund` `FunctionCall`, and that reservation is
+ *  checked eagerly against what remains AFTER the method's own pre-promise execution (account/
+ *  storage reads, the sha256 check, the `LookupMap` write) — dropping `CLAIM_REFUND_GAS` to 20
+ *  Tgas (tried during this same measurement pass) left no room for that overhead on top of the
+ *  20 Tgas already earmarked for the two promises, and the payout callback failed every time
+ *  (lock reverted to `Locked`, no payout) even though the FINAL measured burn (~7.3 Tgas) was
+ *  well under 20 — confirming empirically that "total burn" and "gas that must be reservable
+ *  when the promise is created" are two different constraints. 40 Tgas (double the contract's
+ *  own 20 Tgas of static sub-allocations) is what this stage confirmed actually succeeds. */
 const TGAS = 1_000_000_000_000n;
-export const FT_TRANSFER_CALL_GAS = 100n * TGAS;
-export const CLAIM_REFUND_GAS = 60n * TGAS;
+export const FT_TRANSFER_CALL_GAS = 20n * TGAS;
+export const CLAIM_REFUND_GAS = 40n * TGAS;
 const ONE_YOCTO = 1n;
 
 export interface NearWriteEvidence {
