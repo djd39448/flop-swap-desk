@@ -1,0 +1,15 @@
+[package]
+name = "htlc"
+version = "0.1.0"
+edition = "2021"
+description = "First-party, unaudited, testnet-only NEAR HTLC for a NEP-141 token (P5-NEAR-SPEC.md section 3)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "=5.29.1"
+near-contract-standards = "=5.29.1"
+
+[dev-dependencies]
+near-sdk = { version = "=5.29.1", features = ["unit-testing"] }
