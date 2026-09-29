@@ -438,6 +438,18 @@ describe("findClaimedPreimage / checkPendingClaim", () => {
     await expect(r.findClaimedPreimage(HASH_LOCK)).resolves.toBeNull();
   });
 
+  it("returns the preimage from a Locked lock whose payout failed after the reveal (F4: revealed, refund refused)", async () => {
+    // The contract's F4 rule: a claim whose ft_transfer failed reverts the status to Locked but
+    // keeps the (now public) preimage and refuses every refund. The Buyer's leg A is gone either
+    // way; learning `s` here is what lets it still take leg B (main-loop review 2026-09-29).
+    const revealedButLocked = lockView({ status: "Locked", preimage: PREIMAGE_HEX });
+    const bodies = [statusBody(), callFunctionBody(revealedButLocked), callFunctionBody(revealedButLocked)];
+    const { rail } = railWith(bodies);
+    const r = await rail();
+    await expect(r.findClaimedPreimage(HASH_LOCK)).resolves.toBe(PREIMAGE);
+    await expect(r.checkPendingClaim(HASH_LOCK)).resolves.toBe(PREIMAGE);
+  });
+
   it("returns null when the lock does not exist", async () => {
     const bodies = [statusBody(), callFunctionBody(null)];
     const { rail } = railWith(bodies);

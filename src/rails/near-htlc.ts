@@ -620,12 +620,19 @@ export class NearHtlcRail {
    *  `get_lock` in `Claiming` (the payout callback hasn't landed yet) or `Claimed` both carry the
    *  preimage (it becomes public the moment `claim()` is called, not only once it settles). Only
    *  ever returns a preimage that actually opens `hashLock` — never trusts the view's own shape
-   *  alone (mirrors `evm-htlc.ts`'s `findClaimedPreimage`). */
+   *  alone (mirrors `evm-htlc.ts`'s `findClaimedPreimage`).
+   *
+   *  The lock's STATUS is deliberately not consulted: a revealed preimage is public whatever the
+   *  status says. The contract's own F4 rule means a claim whose payout failed (payee not
+   *  storage-registered, token paused) drops the status back to `Locked` with the preimage kept
+   *  and the refund refused forever — the Seller can retry its claim at any time from then on, so
+   *  the Buyer's leg A is spent and its only remaining move is to take leg B with this secret.
+   *  Gating on `Claiming`/`Claimed` here made `BuyerFlow.learnSecret` blind to exactly that
+   *  state (main-loop review 2026-09-29): the Buyer would have missed leg B's own window. */
   async findClaimedPreimage(hashLock: string): Promise<string | null> {
     if (!HASH_LOCK_SHAPE.test(hashLock)) throw new Error("near-htlc: hashLock must be 0x + 64 lowercase hex");
     const lock = await this.getLock(hashLock);
     if (lock === null || lock.preimage === null) return null;
-    if (lock.status !== "Claiming" && lock.status !== "Claimed") return null;
     const hashLockBytes = hexToBytes(hashLock.slice(2));
     const preimageBytes = hexToBytes(lock.preimage.slice(2));
     if (!bytesEqual(sha256(preimageBytes), hashLockBytes)) return null;

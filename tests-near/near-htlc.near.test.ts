@@ -336,6 +336,12 @@ describe("near-htlc (sandbox)", () => {
     // promise ever ran, so it stays public even though the claim did not pay out.
     expect(view?.status).toBe("Locked");
     expect(view?.preimage).toBe(preimageHex);
+
+    // The Buyer must still learn `s` from this revealed-but-Locked state (its leg A is spent
+    // for good: the contract refuses the refund and the Seller may retry the payout any time),
+    // otherwise it misses leg B — findClaimedPreimage does not gate on the status.
+    await expect(buyerRail.findClaimedPreimage(hashLock0x)).resolves.toBe(preimage0x);
+    await expect(buyerRail.refund(hashLock0x)).rejects.toThrow();
   });
 
   it("recovers a lost reply by transaction hash; an unknown transaction hash resolves to null", async () => {
