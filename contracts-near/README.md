@@ -24,9 +24,12 @@ per-finding rationale and the test that fails without each fix.
   publishing `H = sha256(s')` for `|s'| != 32`.
 - **A lock can only be created by the configured token.** `#[init]` takes one `usdc_token:
   AccountId`; `ft_on_transfer` refuses (full refund) any call whose predecessor isn't that
-  account (F3). This closes hash-lock squatting (an attacker occupying a swap's public
-  `hash_lock` key before the real payer locks) and direct-call storage-spam, at the cost of
-  making the contract single-token per deployment — see "Known limits" below.
+  account (F3). This closes direct-call storage-spam (a non-token account can no longer occupy or
+  drain the contract's own storage staking by calling `ft_on_transfer` directly with no real
+  transfer behind it), at the cost of making the contract single-token per deployment — see
+  "Known limits" below. It does NOT close hash-lock squatting: any holder of the configured token
+  can still lock 1 unit under a public hash lock before the real payer's own lock lands — see
+  "Known limits".
   `ft_on_transfer` also validates `msg` strictly: unknown JSON fields are refused
   (`deny_unknown_fields`), and `claim_by_ms`/`refund_after_ms` must be a plain digit string
   with no leading `+` or leading zero (F8).
