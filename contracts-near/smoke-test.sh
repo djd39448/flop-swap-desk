@@ -14,10 +14,18 @@ SANDBOX_BIN="$HOME/.near-sandbox/2.13.4/Linux-x86_64/near-sandbox"
 SANDBOX_HOME=/tmp/nb1-smoke-home
 PORT=3131
 
+SANDBOX_PID=""
 cleanup() {
-  # -x matches the exact process name (comm), not the full cmdline — see
-  # tests-near/probe/README.md's "Environment gotcha" section for why -f self-matches.
-  pkill -x near-sandbox >/dev/null 2>&1 || true
+  # F7: kill only the sandbox process this script started, by pid -- not every near-sandbox
+  # on the machine. These worktrees are shared by concurrent builders/sessions (D-N2, D-N12);
+  # `pkill -x near-sandbox` matched every near-sandbox by exact process name (comm), so
+  # another builder's NB-int run in the same WSL instance would have its sandbox killed
+  # mid-suite by this script's cleanup. Fall back to the old exact-name pkill only if the pid
+  # was never captured (e.g. the script failed before starting the sandbox).
+  if [ -n "$SANDBOX_PID" ]; then
+    kill "$SANDBOX_PID" >/dev/null 2>&1 || true
+    wait "$SANDBOX_PID" 2>/dev/null || true
+  fi
   rm -rf "$SANDBOX_HOME"
 }
 trap cleanup EXIT
@@ -45,6 +53,7 @@ with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 nohup "$SANDBOX_BIN" --home "$SANDBOX_HOME" run > "$SANDBOX_HOME/run.log" 2>&1 &
+SANDBOX_PID=$!
 disown
 for i in $(seq 1 60); do
   if curl -s -m 2 -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/" \
