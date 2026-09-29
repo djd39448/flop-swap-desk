@@ -61,13 +61,42 @@ export interface CaptureSink {
 
 /** Carries a JSON-RPC error's own `code`/`message` (per §2.1: "throws an error carrying the
  *  JSON-RPC code/message") instead of collapsing it into a generic `Error`. */
+/** H4: optional, chain-agnostic passthrough of a JSON-RPC error object's own structured fields
+ *  beyond `code`/`message` — populated only when the response's `error` object actually carries
+ *  them (NEAR's own error shape nests `name`/`cause`/`data` alongside `code`/`message`; a plain
+ *  EVM/Bitcoin JSON-RPC error never has these, so `errorName`/`cause`/`data` stay `undefined`
+ *  there and neither rail's own behaviour changes). `errorName` (not `name`) so it never collides
+ *  with `Error.prototype.name`, which this class reserves for its own constructor identity
+ *  ("RpcCaptureError") — every existing `instanceof`/`.name === "RpcCaptureError"` check anywhere
+ *  in this repo keeps working unchanged. */
+export interface RpcCaptureErrorExtra {
+  /** The error object's own `name` (NEAR: `"HANDLER_ERROR"`). Explicitly `| undefined` (rather
+   *  than plain optional) so a caller can pass `errorName: undefined` under this repo's own
+   *  `exactOptionalPropertyTypes` — every caller does exactly that when the response carried no
+   *  such field. */
+  errorName?: string | undefined;
+  /** The error object's own `cause` (NEAR: `{ name: "UNKNOWN_TRANSACTION" | "TIMEOUT_ERROR" |
+   *  "INVALID_TRANSACTION" | ..., info?: unknown }`) — passed through structurally, never parsed
+   *  here (chain-specific interpretation belongs to the caller, e.g. `near-rpc.ts`). */
+  cause?: unknown;
+  /** The error object's own `data` (a free-form string or value; NEAR sometimes puts a human
+   *  message here, e.g. `"Timeout"`). */
+  data?: unknown;
+}
+
 export class RpcCaptureError extends Error {
   readonly code: number;
+  readonly errorName?: string | undefined;
+  readonly errorCause?: unknown;
+  readonly errorData?: unknown;
 
-  constructor(code: number, message: string) {
+  constructor(code: number, message: string, extra?: RpcCaptureErrorExtra) {
     super(message);
     this.name = "RpcCaptureError";
     this.code = code;
+    this.errorName = extra?.errorName;
+    this.errorCause = extra?.cause;
+    this.errorData = extra?.data;
   }
 }
 
@@ -231,11 +260,21 @@ export class CapturingRpc implements CaptureSink {
     if (parsed === null || typeof parsed !== "object") {
       throw new Error(`rpc-capture: response for ${method} is not a JSON-RPC object`);
     }
-    const envelope = parsed as { result?: unknown; error?: { code?: unknown; message?: unknown } };
+    const envelope = parsed as {
+      result?: unknown;
+      error?: { code?: unknown; message?: unknown; name?: unknown; cause?: unknown; data?: unknown };
+    };
     if (envelope.error !== undefined && envelope.error !== null) {
       const code = typeof envelope.error.code === "number" ? envelope.error.code : -32603;
       const message = typeof envelope.error.message === "string" ? envelope.error.message : "rpc error";
-      throw new RpcCaptureError(code, message);
+      // H4: pass the error object's own name/cause/data through untouched when present — see
+      // `RpcCaptureErrorExtra`'s own doc for why this changes nothing for EVM/Bitcoin (their
+      // error objects never carry these fields, so all three stay `undefined` there).
+      throw new RpcCaptureError(code, message, {
+        errorName: typeof envelope.error.name === "string" ? envelope.error.name : undefined,
+        cause: envelope.error.cause,
+        data: envelope.error.data,
+      });
     }
     return envelope.result;
   }
