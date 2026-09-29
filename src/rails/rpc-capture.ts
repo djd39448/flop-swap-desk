@@ -133,7 +133,24 @@ export interface CapturingRpcOptions {
    *  extends to the node's own RPC cookie exactly as it does to a private key. Defaults to no
    *  extra headers (every existing EVM caller is unaffected). */
   headers?: () => Record<string, string>;
+  /** P5-NEAR-FIXES.md E5: a hard cap on one response's own byte length. `Content-Length` is
+   *  checked first (when the response carries one) so an oversized reply can be refused before
+   *  ever buffering its body; the buffered length is checked again afterward regardless (a
+   *  chunked reply carries no `Content-Length` at all, and a lying header must never be trusted
+   *  on its own) — either way, going over the cap throws a plain transport-class `Error` (never
+   *  an `RpcCaptureError`: nothing here claims to be a JSON-RPC-level reply) BEFORE the exchange
+   *  is pushed onto `this.log`, so an oversized response is never written to `raw/rpc/*.json` or
+   *  handed back to a caller as if it were a completed read. `captureNearLeg`
+   *  (src/rails/near-evidence.ts) relies on exactly this: only an `RpcCaptureError` counts as a
+   *  completed read there (E2); everything else — this cap included — fails the capture closed
+   *  (`index.error`, counted under `nearChainReadsSkipped`). Defaults to 4 MiB, comfortably above
+   *  any real EVM/Bitcoin/NEAR JSON-RPC response this repo's own suites ever see, so neither
+   *  rail's behaviour changes by default. */
+  maxResponseBytes?: number;
 }
+
+/** E5: the default `maxResponseBytes` — see `CapturingRpcOptions.maxResponseBytes`'s own doc. */
+export const DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 /**
  * An EIP-1193-shaped client (`{ request(...) }`) over one JSON-RPC `endpoint`. Every call is
@@ -153,6 +170,7 @@ export class CapturingRpc implements CaptureSink {
   private readonly clock: () => number;
   private readonly timeoutMs: number | undefined;
   private readonly headersFn: () => Record<string, string>;
+  private readonly maxResponseBytes: number;
   private readonly log: Exchange[] = [];
   private nextId = 1;
   private idNamespace: string | undefined;
@@ -164,6 +182,7 @@ export class CapturingRpc implements CaptureSink {
     this.clock = options.clock ?? Date.now;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
     this.headersFn = options.headers ?? (() => ({}));
+    this.maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
   }
 
   /**
@@ -227,11 +246,30 @@ export class CapturingRpc implements CaptureSink {
         body: requestBody,
         signal: controller.signal,
       });
+      // E5: refuse an oversized reply before ever buffering its body, when the response is
+      // honest enough to declare one. Optional chaining throughout — none of this repo's own
+      // fake-`fetch` test doubles implement `.headers`, and a real `fetch` Response always does.
+      const declaredLength = Number.parseInt(response.headers?.get?.("content-length") ?? "", 10);
+      if (Number.isFinite(declaredLength) && declaredLength > this.maxResponseBytes) {
+        controller.abort();
+        throw new Error(
+          `rpc-capture: response for ${method} declares content-length ${declaredLength}, exceeding maxResponseBytes ${this.maxResponseBytes} (endpoint ${this.endpoint})`,
+        );
+      }
       // A9: hash and store the exact wire bytes (`arrayBuffer()`), never a UTF-8 decode/re-encode
       // round trip through `.text()` — a response containing bytes that are not valid UTF-8
       // would decode with lossy replacement characters, so hashing the *decoded* string could
       // never reproduce the sha256 of what the server actually sent.
       responseBytes = new Uint8Array(await response.arrayBuffer());
+      // E5: a chunked reply carries no `Content-Length` at all, and a lying header must never be
+      // trusted on its own either — check the buffered length itself regardless of the header
+      // check above. Still before `this.log.push` below, so an oversized response is never
+      // written to `raw/rpc/*.json` or treated as a completed read (near-evidence.ts's E2).
+      if (responseBytes.length > this.maxResponseBytes) {
+        throw new Error(
+          `rpc-capture: response for ${method} is ${responseBytes.length} bytes, exceeding maxResponseBytes ${this.maxResponseBytes} (endpoint ${this.endpoint})`,
+        );
+      }
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }

@@ -13,7 +13,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { CapturingRpc, RpcCaptureError, readCapture, writeCapture } from "../src/rails/rpc-capture.js";
+import { CapturingRpc, DEFAULT_MAX_RESPONSE_BYTES, RpcCaptureError, readCapture, writeCapture } from "../src/rails/rpc-capture.js";
 
 function sha256Hex(text: string): string {
   return bytesToHex(sha256(new TextEncoder().encode(text)));
@@ -194,6 +194,59 @@ describe("CapturingRpc.request", () => {
     const drained = rpc.drain();
     expect(drained).toHaveLength(2);
     expect(rpc.exchanges()).toHaveLength(0); // cleared
+  });
+});
+
+// P5-NEAR-FIXES.md E5: a byte cap on captured responses — over the cap, the read aborts with a
+// transport-class error (never an RpcCaptureError) and is never recorded as an exchange at all.
+describe("CapturingRpc maxResponseBytes (E5)", () => {
+  it("defaults to 4 MiB", () => {
+    expect(DEFAULT_MAX_RESPONSE_BYTES).toBe(4 * 1024 * 1024);
+  });
+
+  it("refuses a response whose declared content-length exceeds maxResponseBytes, before ever buffering it", async () => {
+    let bodyRead = false;
+    const fetchImpl = (async () =>
+      ({
+        headers: { get: (name: string) => (name === "content-length" ? "1000" : null) },
+        arrayBuffer: async () => {
+          bodyRead = true;
+          return new TextEncoder().encode('{"jsonrpc":"2.0","id":1,"result":"0x1"}').buffer;
+        },
+      }) as unknown as Response) as typeof fetch;
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl, maxResponseBytes: 10 });
+
+    await expect(rpc.request({ method: "eth_chainId", params: [] })).rejects.toThrow(/exceeding maxResponseBytes/);
+    expect(bodyRead).toBe(false);
+    expect(rpc.exchanges()).toHaveLength(0);
+  });
+
+  it("refuses an over-cap response with no content-length header, after buffering it", async () => {
+    const bigBody = `{"jsonrpc":"2.0","id":1,"result":"${"a".repeat(100)}"}`;
+    const { fetch: fetchImpl } = fakeFetch([bigBody]);
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl, maxResponseBytes: 10 });
+
+    await expect(rpc.request({ method: "eth_chainId", params: [] })).rejects.toThrow(/exceeding maxResponseBytes/);
+    expect(rpc.exchanges()).toHaveLength(0); // never recorded — not a completed read
+  });
+
+  it("never refuses a response under the cap (the default, and every existing EVM/Bitcoin call, is unaffected)", async () => {
+    const { fetch: fetchImpl } = fakeFetch(['{"jsonrpc":"2.0","id":1,"result":"0x1"}']);
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl });
+    await expect(rpc.request({ method: "eth_chainId", params: [] })).resolves.toBe("0x1");
+    expect(rpc.exchanges()).toHaveLength(1);
+  });
+
+  it("a thrown maxResponseBytes error is a plain Error, never an RpcCaptureError", async () => {
+    const { fetch: fetchImpl } = fakeFetch([`{"jsonrpc":"2.0","id":1,"result":"${"a".repeat(100)}"}`]);
+    const rpc = new CapturingRpc({ endpoint: "http://x", fetch: fetchImpl, maxResponseBytes: 10 });
+    try {
+      await rpc.request({ method: "eth_chainId", params: [] });
+      expect.unreachable();
+    } catch (error) {
+      expect(error).not.toBeInstanceOf(RpcCaptureError);
+      expect(error).toBeInstanceOf(Error);
+    }
   });
 });
 
