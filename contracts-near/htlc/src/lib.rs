@@ -173,7 +173,14 @@ impl Contract {
             .unwrap_or_else(|| env::panic_str("No lock for this hash"));
         require!(lock.status == LockStatus::Locked, "Lock is not claimable");
         let now_ms = env::block_timestamp_ms();
-        require!(now_ms < lock.refund_after_ms, "Refund window has opened");
+        // F4: once a preimage has been revealed (this is a retry after a failed payout
+        // callback -- see `refund`, which now refuses a revealed lock), the payee owns this
+        // lock and may keep retrying past `refund_after_ms`; only a lock that has never been
+        // claimed is bound by the window.
+        require!(
+            now_ms < lock.refund_after_ms || lock.revealed,
+            "Refund window has opened"
+        );
 
         let preimage_bytes =
             decode_hex(&preimage).unwrap_or_else(|| env::panic_str("Preimage is not valid hex"));
@@ -218,6 +225,15 @@ impl Contract {
             "Only the payer can refund"
         );
         require!(lock.status == LockStatus::Locked, "Lock is not refundable");
+        // F4: once a valid preimage has been revealed (claim ran, then its payout callback
+        // failed and reverted status to Locked), the lock belongs to the payee -- refunding
+        // here would let the payer take leg A back while it already knows the secret and can
+        // claim leg B, so the counterparty loses both legs. The payer is unharmed: it can use
+        // the now-public preimage on leg B itself.
+        require!(
+            !lock.revealed,
+            "Lock already claimed (preimage revealed); refund is refused"
+        );
         let now_ms = env::block_timestamp_ms();
         require!(
             now_ms >= lock.refund_after_ms,
@@ -903,6 +919,43 @@ mod tests {
         testing_env!(ctx(payer(), 2 * HOUR_MS).build());
         let _p2 = c.refund(hash.clone());
         assert_eq!(c.get_lock(hash).unwrap().status, "Refunding");
+    }
+
+    #[test]
+    #[should_panic(expected = "Lock already claimed (preimage revealed); refund is refused")]
+    fn refund_refused_after_preimage_revealed_and_payout_failed() {
+        let mut c = setup();
+        let (preimage, hash) = preimage_and_hash();
+        let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
+
+        testing_env!(ctx(payee(), HOUR_MS / 2).build());
+        let _p = c.claim(hash.clone(), preimage);
+
+        testing_env!(ctx(contract_account(), HOUR_MS / 2).build());
+        c.on_transfer_complete(hash.clone(), Exit::Claim, Err(PromiseError::Failed));
+
+        testing_env!(ctx(payer(), 2 * HOUR_MS).build());
+        let _ = c.refund(hash); // today (pre-fix): succeeds, moves to Refunding
+    }
+
+    #[test]
+    fn payee_can_retry_claim_after_refund_after_once_revealed() {
+        let mut c = setup();
+        let (preimage, hash) = preimage_and_hash();
+        let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
+
+        testing_env!(ctx(payee(), HOUR_MS / 2).build());
+        let _p = c.claim(hash.clone(), preimage.clone());
+
+        testing_env!(ctx(contract_account(), HOUR_MS / 2).build());
+        c.on_transfer_complete(hash.clone(), Exit::Claim, Err(PromiseError::Failed));
+
+        // Past refund_after_ms, but the preimage was already revealed by the first claim
+        // attempt -- the retry must still succeed (pre-fix: panics "Refund window has
+        // opened").
+        testing_env!(ctx(payee(), 3 * HOUR_MS).build());
+        let _p2 = c.claim(hash.clone(), preimage);
+        assert_eq!(c.get_lock(hash).unwrap().status, "Claiming");
     }
 
     // ---- hex helpers ----
