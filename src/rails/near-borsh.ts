@@ -130,19 +130,24 @@ function writeSignature(w: BorshWriter, sig: Ed25519Signature): void {
 }
 
 /**
- * The five `Action` variants this build ever constructs — nearcore's own `Action` enum has more
- * (Stake, DeleteKey, DeleteAccount, the meta-tx Delegate action, …); none of those are needed
- * here, so none are implemented (an attempt to write one that isn't in this union is a
- * compile-time error, not a silent wrong tag). Tags below are the plain declaration-order index
- * of each variant nearcore's own `Action` enum uses (`CreateAccount = 0`, `DeployContract = 1`,
- * `FunctionCall = 2`, `Transfer = 3`, `Stake = 4` [unused here], `AddKey = 5`).
+ * The six `Action` variants this build ever constructs — nearcore's own `Action` enum has more
+ * (Stake, DeleteAccount, the meta-tx Delegate action, …); none of those are needed here, so none
+ * are implemented (an attempt to write one that isn't in this union is a compile-time error, not
+ * a silent wrong tag). Tags below are the plain declaration-order index of each variant
+ * nearcore's own `Action` enum uses (`CreateAccount = 0`, `DeployContract = 1`, `FunctionCall =
+ * 2`, `Transfer = 3`, `Stake = 4` [unused here], `AddKey = 5`, `DeleteKey = 6`).
+ *
+ * H6: `DeleteKey` is the harness's own tool for locking a deployed contract account down to zero
+ * access keys after setup finishes (`tests-near/helpers/sandbox.ts`) — never used by the rail
+ * itself (`near-htlc.ts` never deletes a key), only by the test harness driving the sandbox.
  */
 export type NearAction =
   | { type: "CreateAccount" }
   | { type: "DeployContract"; code: Uint8Array }
   | { type: "FunctionCall"; methodName: string; args: Uint8Array; gas: bigint; deposit: bigint }
   | { type: "Transfer"; deposit: bigint }
-  | { type: "AddKey"; publicKey: Ed25519PublicKey; nonce: bigint; permission: "FullAccess" };
+  | { type: "AddKey"; publicKey: Ed25519PublicKey; nonce: bigint; permission: "FullAccess" }
+  | { type: "DeleteKey"; publicKey: Ed25519PublicKey };
 
 function writeAction(w: BorshWriter, action: NearAction): void {
   switch (action.type) {
@@ -170,6 +175,10 @@ function writeAction(w: BorshWriter, action: NearAction): void {
       w.writeU64(action.nonce);
       // AccessKeyPermission::FunctionCall = 0 (unused here), FullAccess = 1.
       w.writeU8(1);
+      return;
+    case "DeleteKey":
+      w.writeU8(6);
+      writePublicKey(w, action.publicKey);
       return;
     default: {
       // Exhaustiveness guard — a new NearAction variant that forgets to extend this switch fails

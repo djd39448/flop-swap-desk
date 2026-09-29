@@ -67,6 +67,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 
+import { sha256 } from "@noble/hashes/sha2.js";
 import { base58 } from "@scure/base";
 
 import { buildSignedTransaction, type NearAction } from "../../src/rails/near-borsh.js";
@@ -293,6 +294,19 @@ export interface NearSandboxHandle {
    *  string) — a small test convenience over `ft_balance_of`, going through the SAME setup
    *  (non-capturing) transport as account creation, never a test's own `CapturingRpc`. */
   usdcBalanceOf(accountId: string): Promise<string>;
+  /** H6 test support only: deploys a SECOND copy of the exact same reviewed `htlc` wasm to a
+   *  fresh sub-account of `test.near` that is deliberately left WITH its access key (never
+   *  locked down the way `htlcContract` itself is by `startNearSandbox`) — exists purely so
+   *  `NearHtlcRail.connect()`'s own "refuses when the contract still holds an access key" branch
+   *  can be exercised against a real, live contract. `accountId` must be `<name>.test.near`. */
+  deployUnlockedHtlcClone(accountId: string): Promise<{ contract: string; codeHash: string }>;
+  /** Test support only: creates a fresh, funded, storage-registered (zero-balance) sub-account of
+   *  `test.near` with its own in-memory signer — used where a test needs a payee GUARANTEED never
+   *  to have received a payout before (e.g. H1's own S1 probe, which relies on
+   *  `storage_unregister` actually succeeding: near-contract-standards' own implementation panics
+   *  rather than unregistering when the caller's balance is nonzero, so `sandbox.seller` — reused
+   *  and credited across this whole file's own tests — is never safe to reuse for that). */
+  createFundedAccount(accountId: string): Promise<{ accountId: string; signer: NearSigner }>;
   stop(): Promise<void>;
 }
 
@@ -448,11 +462,26 @@ export async function startNearSandbox(options: StartNearSandboxOptions = {}): P
     const buyerMintAmount = options.buyerMintAmount ?? "1000000000";
     await callSetup(near, usdcSigner, "usdc.test.near", "usdc.test.near", "mint", { account_id: "buyer.test.near", amount: buyerMintAmount }, 30n * TGAS, 0n);
 
+    // H6: once every setup step that needed the HTLC contract account's own (throwaway) key has
+    // run, remove that key — `NearHtlcRail.connect()` refuses to trust a deployed contract's code
+    // as the reviewed wasm unless the account holds ZERO access keys (a key left in place could
+    // redeploy the contract to different code at any later moment). This must be the LAST setup
+    // action taken with `htlcSigner` — nothing below this point ever signs with it again.
+    await sendSetupTx(near, htlcSigner, "htlc.test.near", "htlc.test.near", [
+      { type: "DeleteKey", publicKey: { keyType: "ED25519", data: htlcSigner.publicKeyRaw() } },
+    ]);
+
+    // H6: the config's own pinned code hash — base58 of the raw sha256 of the exact wasm bytes
+    // just deployed (matches `sandbox_patch_state`'s own convention per NB0; `view_account`'s
+    // live `code_hash` is compared against this by `NearHtlcRail.connect()`).
+    const htlcCodeHash = base58.encode(sha256(htlcWasm));
+
     const config2: NearRailConfig = {
       pin: NEAR_SANDBOX_PIN,
       endpoint,
       contract: "htlc.test.near",
       assets: { USDC: "usdc.test.near" },
+      htlcCodeHash,
     };
 
     return {
@@ -479,6 +508,22 @@ export async function startNearSandbox(options: StartNearSandboxOptions = {}): P
         const result = await near.callFunction("usdc.test.near", "ft_balance_of", { account_id: accountId });
         setupRpc.drain();
         return JSON.parse(result.resultText) as string;
+      },
+      createFundedAccount: async (accountId) => {
+        const signer = await createSubAccount(near, rootSigner, accountId, 20n * ONE_NEAR);
+        await callSetup(near, signer, accountId, "usdc.test.near", "storage_deposit", {}, 30n * TGAS, STORAGE_DEPOSIT_YOCTO);
+        setupRpc.drain();
+        return { accountId, signer };
+      },
+      deployUnlockedHtlcClone: async (accountId) => {
+        await createSubAccount(near, rootSigner, accountId, 50n * ONE_NEAR, {
+          wasm: htlcWasm,
+          methodName: "new",
+          args: { usdc_token: "usdc.test.near" },
+          gas: 100n * TGAS,
+        });
+        setupRpc.drain();
+        return { contract: accountId, codeHash: htlcCodeHash };
       },
       stop: async () => {
         await stopChild();
