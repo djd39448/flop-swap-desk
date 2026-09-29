@@ -47,10 +47,17 @@ const SELLER_ACCOUNT = "seller.near-sandbox-flop";
 const OTHER_ACCOUNT = "someone-else.near-sandbox-flop";
 
 const PIN: NearChainPin = NEAR_SANDBOX_PIN;
-const CONFIG: NearRailConfig = { pin: PIN, endpoint: "http://127.0.0.1:9999", contract: CONTRACT, assets: { USDC } };
+// H6 (landed before this Group-E fix list): NearRailConfig requires htlcCodeHash — any
+// well-formed base58 string here, this file never exercises H6's own on-chain code-hash check
+// (that lives in near-htlc.ts's connect(), not the pure nearEvidence() decoder this file tests).
+const HTLC_CODE_HASH = "5CVXgVR5RfKHGYqDDXWMKcadxHTfjaEczo6zRLfBrpFT";
+const CONFIG: NearRailConfig = { pin: PIN, endpoint: "http://127.0.0.1:9999", contract: CONTRACT, assets: { USDC }, htlcCodeHash: HTLC_CODE_HASH };
 
 const HASH_LOCK = `0x${"ab".repeat(32)}`;
 const HASH_LOCK_HEX = HASH_LOCK.slice(2);
+// E1: a leg contract id (tclk's own CONTRACT_ID shape, `0x` + 64 lowercase hex) — the second half
+// of `loadNearCapture`'s (hashLock, legContract) key.
+const LEG_CONTRACT = `0x${"22".repeat(32)}`;
 
 const TERMS: LockTerms = {
   contract: "0x" + "11".repeat(32),
@@ -107,23 +114,23 @@ interface ExchangeSpec {
   body: string;
 }
 
-function statusExchange(opts: { chainId?: string; protocolVersion?: number; error?: boolean } = {}): ExchangeSpec {
+function statusExchange(opts: { chainId?: string; protocolVersion?: number; error?: boolean; ref?: string } = {}): ExchangeSpec {
   const params: unknown = [];
   return {
     method: "status",
     params,
     body: opts.error
-      ? jsonRpcError(nearId(1), -32000, "internal error")
-      : jsonRpcResult(nearId(1), { chain_id: opts.chainId ?? PIN.chainId, protocol_version: opts.protocolVersion ?? 86, sync_info: {} }),
+      ? jsonRpcError(nearId(1, opts.ref), -32000, "internal error")
+      : jsonRpcResult(nearId(1, opts.ref), { chain_id: opts.chainId ?? PIN.chainId, protocol_version: opts.protocolVersion ?? 86, sync_info: {} }),
   };
 }
 
-function blockExchange(opts: { finality?: string; height?: number; hash?: string; timestampNs?: string; error?: boolean; malformed?: boolean } = {}): ExchangeSpec {
+function blockExchange(opts: { finality?: string; height?: number; hash?: string; timestampNs?: string; error?: boolean; malformed?: boolean; ref?: string } = {}): ExchangeSpec {
   const params = { finality: opts.finality ?? "final" };
   let body: string;
-  if (opts.error) body = jsonRpcError(nearId(2), -32000, "internal error");
-  else if (opts.malformed) body = jsonRpcResult(nearId(2), { header: { height: "not-a-number" } });
-  else body = jsonRpcResult(nearId(2), { header: { height: opts.height ?? BLOCK_HEIGHT, hash: opts.hash ?? BLOCK_HASH, timestamp_nanosec: opts.timestampNs ?? TIMESTAMP_NS } });
+  if (opts.error) body = jsonRpcError(nearId(2, opts.ref), -32000, "internal error");
+  else if (opts.malformed) body = jsonRpcResult(nearId(2, opts.ref), { header: { height: "not-a-number" } });
+  else body = jsonRpcResult(nearId(2, opts.ref), { header: { height: opts.height ?? BLOCK_HEIGHT, hash: opts.hash ?? BLOCK_HASH, timestamp_nanosec: opts.timestampNs ?? TIMESTAMP_NS } });
   return { method: "block", params, body };
 }
 
@@ -135,6 +142,7 @@ function getLockExchange(opts: {
   view?: Record<string, unknown> | null | "malformed";
   panic?: string;
   error?: boolean;
+  ref?: string;
 } = {}): ExchangeSpec {
   const params = {
     request_type: "call_function",
@@ -144,11 +152,11 @@ function getLockExchange(opts: {
     block_id: opts.blockId ?? BLOCK_HASH,
   };
   let body: string;
-  if (opts.error) body = jsonRpcError(nearId(3), -32000, "internal error");
-  else if (opts.panic !== undefined) body = jsonRpcResult(nearId(3), { error: opts.panic, logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
-  else if (opts.view === "malformed") body = jsonRpcResult(nearId(3), { result: resultBytesOf({ status: "NotAStatus" }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
-  else if (opts.view === null) body = jsonRpcResult(nearId(3), { result: resultBytesOf(null), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
-  else body = jsonRpcResult(nearId(3), { result: resultBytesOf(opts.view ?? lockViewPayload()), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  if (opts.error) body = jsonRpcError(nearId(3, opts.ref), -32000, "internal error");
+  else if (opts.panic !== undefined) body = jsonRpcResult(nearId(3, opts.ref), { error: opts.panic, logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  else if (opts.view === "malformed") body = jsonRpcResult(nearId(3, opts.ref), { result: resultBytesOf({ status: "NotAStatus" }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  else if (opts.view === null) body = jsonRpcResult(nearId(3, opts.ref), { result: resultBytesOf(null), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  else body = jsonRpcResult(nearId(3, opts.ref), { result: resultBytesOf(opts.view ?? lockViewPayload()), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
   return { method: "query", params, body };
 }
 
@@ -160,6 +168,7 @@ function storageBalanceExchange(opts: {
   balance?: Record<string, unknown> | null | "malformed";
   panic?: string;
   error?: boolean;
+  ref?: string;
 } = {}): ExchangeSpec {
   const params = {
     request_type: "call_function",
@@ -169,11 +178,11 @@ function storageBalanceExchange(opts: {
     block_id: opts.blockId ?? BLOCK_HASH,
   };
   let body: string;
-  if (opts.error) body = jsonRpcError(nearId(4), -32000, "internal error");
-  else if (opts.panic !== undefined) body = jsonRpcResult(nearId(4), { error: opts.panic, logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
-  else if (opts.balance === "malformed") body = jsonRpcResult(nearId(4), { result: resultBytesOf({ nope: true }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
-  else if (opts.balance === null) body = jsonRpcResult(nearId(4), { result: resultBytesOf(null), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
-  else body = jsonRpcResult(nearId(4), { result: resultBytesOf(opts.balance ?? { total: "1250000000000000000000", available: "0" }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  if (opts.error) body = jsonRpcError(nearId(4, opts.ref), -32000, "internal error");
+  else if (opts.panic !== undefined) body = jsonRpcResult(nearId(4, opts.ref), { error: opts.panic, logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  else if (opts.balance === "malformed") body = jsonRpcResult(nearId(4, opts.ref), { result: resultBytesOf({ nope: true }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  else if (opts.balance === null) body = jsonRpcResult(nearId(4, opts.ref), { result: resultBytesOf(null), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  else body = jsonRpcResult(nearId(4, opts.ref), { result: resultBytesOf(opts.balance ?? { total: "1250000000000000000000", available: "0" }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
   return { method: "query", params, body };
 }
 
@@ -273,6 +282,69 @@ describe("nearEvidence — happy path", () => {
   });
 });
 
+// ── E4: a revealed lock is not "locked" ─────────────────────────────────────────────────────
+
+describe("nearEvidence — E4: a revealed lock is not \"locked\"", () => {
+  // Needs a preimage that GENUINELY opens the ref (sha256(preimage) === ref) — HASH_LOCK is a
+  // fixture value with no known preimage, so this computes its own fresh (preimage, hash) pair
+  // and threads it through every exchange's own id binding via each builder's `ref` option.
+  const REVEALED_PREIMAGE_BYTES = new Uint8Array(32).fill(0x07);
+  const REVEALED_PREIMAGE_HEX = bytesToHex(REVEALED_PREIMAGE_BYTES);
+  const REVEALED_HASH_LOCK = `0x${bytesToHex(sha256(REVEALED_PREIMAGE_BYTES))}`;
+  const REVEALED_TERMS: LockTerms = { ...TERMS, statement: REVEALED_HASH_LOCK };
+
+  it("Locked with a preimage that genuinely opens the hash lock -> railVerified null, no rail (F4, not locked)", () => {
+    const capture = buildCapture({
+      ref: REVEALED_HASH_LOCK,
+      exchanges: [
+        statusExchange({ ref: REVEALED_HASH_LOCK }),
+        blockExchange({ ref: REVEALED_HASH_LOCK }),
+        getLockExchange({ ref: REVEALED_HASH_LOCK, hashLockArg: REVEALED_HASH_LOCK.slice(2), view: lockViewPayload({ preimage: REVEALED_PREIMAGE_HEX }) }),
+      ],
+    });
+    const result = nearEvidence({ terms: REVEALED_TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toBe("near-htlc: preimage revealed (F4): payer refund refused, payee may claim");
+    expect(result.rail).toBeUndefined();
+  });
+
+  it("Locked with a preimage present but NOT opening the hash lock -> still evaluated as an ordinary Locked view (storage check reached)", () => {
+    const capture = buildCapture({
+      ref: REVEALED_HASH_LOCK,
+      exchanges: [
+        statusExchange({ ref: REVEALED_HASH_LOCK }),
+        blockExchange({ ref: REVEALED_HASH_LOCK }),
+        getLockExchange({ ref: REVEALED_HASH_LOCK, hashLockArg: REVEALED_HASH_LOCK.slice(2), view: lockViewPayload({ preimage: "cd".repeat(32) }) }),
+        storageBalanceExchange({ ref: REVEALED_HASH_LOCK }),
+      ],
+    });
+    const result = nearEvidence({ terms: REVEALED_TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    // A preimage field that does not actually open the hash lock is never trusted as "revealed"
+    // — falls through to the ordinary Locked/storage-registered path exactly as before E4.
+    expect(result.lock.railVerified).toBe(true);
+    expect(result.rail?.status).toBe("locked");
+  });
+
+  it("a mismatched Locked view with a revealed preimage still fails closed on the mismatch first (never reports 'revealed' for the wrong lock)", () => {
+    const capture = buildCapture({
+      ref: REVEALED_HASH_LOCK,
+      exchanges: [
+        statusExchange({ ref: REVEALED_HASH_LOCK }),
+        blockExchange({ ref: REVEALED_HASH_LOCK }),
+        getLockExchange({
+          ref: REVEALED_HASH_LOCK,
+          hashLockArg: REVEALED_HASH_LOCK.slice(2),
+          view: lockViewPayload({ preimage: REVEALED_PREIMAGE_HEX, payee: OTHER_ACCOUNT }),
+        }),
+      ],
+    });
+    const result = nearEvidence({ terms: REVEALED_TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBe(false);
+    expect(result.lock.reason).toMatch(/on-chain payee differs/);
+    expect(result.rail).toBeUndefined();
+  });
+});
+
 // ── ref/lock and asset gates ────────────────────────────────────────────────────────────────
 
 describe("nearEvidence — ref/lock/asset gates", () => {
@@ -335,6 +407,42 @@ describe("nearEvidence — captured config checks (A4/D3)", () => {
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/different rail config/);
     expect(result.rail).toBeUndefined();
+  });
+});
+
+// ── E6: the index's own top-level pin/caip2/endpoint fields, checked against its embedded
+// config ──────────────────────────────────────────────────────────────────────────────────────
+
+describe("nearEvidence — E6: index's own top-level pin/caip2/endpoint fields", () => {
+  it("index.pin disagrees with its own embedded config.pin.name -> railVerified null, tampered index", () => {
+    const capture = buildCapture({ exchanges: standardExchanges() });
+    const tampered: NearCapture = { ...capture, index: { ...capture.index, pin: "near-mainnet-forged" } };
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: tampered });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/E6, tampered index/);
+    expect(result.rail).toBeUndefined();
+  });
+
+  it("index.caip2 disagrees with its own embedded config.pin.caip2 -> railVerified null, tampered index", () => {
+    const capture = buildCapture({ exchanges: standardExchanges() });
+    const tampered: NearCapture = { ...capture, index: { ...capture.index, caip2: "near:mainnet" } };
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: tampered });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/E6, tampered index/);
+  });
+
+  it("index.endpoint disagrees with its own embedded config.endpoint -> railVerified null, tampered index", () => {
+    const capture = buildCapture({ exchanges: standardExchanges() });
+    const tampered: NearCapture = { ...capture, index: { ...capture.index, endpoint: "http://evil.example/rpc" } };
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: tampered });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/E6, tampered index/);
+  });
+
+  it("index.pin/caip2/endpoint all agree with the embedded config (the default) -> unaffected", () => {
+    const capture = buildCapture({ exchanges: standardExchanges() });
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBe(true);
   });
 });
 
@@ -696,6 +804,82 @@ describe("captureNearLeg — live (mocked fetch)", () => {
     expect(exchanges).toHaveLength(0);
     expect(index.error).toBeUndefined();
   });
+
+  // ── E2: only an RpcCaptureError is a completed read; any other error is a failure capture ──
+
+  /** Answers each call in order with either `{ result }`, a genuine JSON-RPC `{ error }`
+   *  envelope (still an HTTP-200, still fully recorded — becomes an `RpcCaptureError`), or
+   *  `"throw"` (a transport-level failure — `CapturingRpc` never gets to push anything for that
+   *  call at all). Echoes back whatever id the real outgoing request minted, exactly like
+   *  `fakeFetch` above. */
+  function fakeFetchWithOutcomes(outcomes: Array<{ result: unknown } | { errorMessage: string } | "throw">): typeof fetch {
+    let i = 0;
+    return (async (_url: unknown, init?: RequestInit) => {
+      const parsed = JSON.parse(String(init?.body)) as { id: string | number };
+      const outcome = outcomes[i];
+      i += 1;
+      if (outcome === undefined) throw new Error(`fakeFetchWithOutcomes: ran out of canned outcomes (call #${i})`);
+      if (outcome === "throw") throw new TypeError("network failure");
+      const envelope =
+        "errorMessage" in outcome
+          ? { jsonrpc: "2.0", id: parsed.id, error: { code: -32000, message: outcome.errorMessage } }
+          : { jsonrpc: "2.0", id: parsed.id, result: outcome.result };
+      const body = JSON.stringify(envelope);
+      const bytes = new TextEncoder().encode(body);
+      return { text: async () => body, arrayBuffer: async () => bytes.buffer } as Response;
+    }) as typeof fetch;
+  }
+
+  const STATUS_RESULT = { chain_id: PIN.chainId, protocol_version: 86, sync_info: {} };
+  const BLOCK_RESULT = { header: { height: BLOCK_HEIGHT, hash: BLOCK_HASH, timestamp_nanosec: TIMESTAMP_NS } };
+  const LOCK_RESULT = { result: resultBytesOf(lockViewPayload()), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH };
+  const STORAGE_RESULT = { result: resultBytesOf({ total: "1", available: "0" }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH };
+
+  it("E2: a genuine JSON-RPC error on get_lock is a completed read — no index.error, storage_balance_of still attempted", async () => {
+    const fetchImpl = fakeFetchWithOutcomes([
+      { result: STATUS_RESULT },
+      { result: BLOCK_RESULT },
+      { errorMessage: "contract panicked" }, // get_lock: a real RpcCaptureError, still recorded
+      { result: STORAGE_RESULT },
+    ]);
+    const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => 1_700_000_900_000 });
+    const { index, exchanges } = await captureNearLeg(rpc, CONFIG, TERMS, ACCOUNTS, HASH_LOCK, 1_700_000_900_000);
+    expect(index.error).toBeUndefined();
+    expect(exchanges).toHaveLength(4);
+    expect(exchanges[2]!.responseBody).toContain("contract panicked");
+  });
+
+  it("E2: a transport failure on get_lock sets index.error and never reaches storage_balance_of", async () => {
+    const fetchImpl = fakeFetchWithOutcomes([{ result: STATUS_RESULT }, { result: BLOCK_RESULT }, "throw"]);
+    const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => 1_700_000_900_000 });
+    const { index, exchanges } = await captureNearLeg(rpc, CONFIG, TERMS, ACCOUNTS, HASH_LOCK, 1_700_000_900_000);
+    expect(index.error).toBeDefined();
+    // Only status and block were ever recorded — get_lock's own transport failure left nothing
+    // for `CapturingRpc` to push, and storage_balance_of was never even attempted.
+    expect(exchanges).toHaveLength(2);
+  });
+
+  it("E2: a genuine JSON-RPC error on storage_balance_of is a completed read — no index.error", async () => {
+    const fetchImpl = fakeFetchWithOutcomes([
+      { result: STATUS_RESULT },
+      { result: BLOCK_RESULT },
+      { result: LOCK_RESULT },
+      { errorMessage: "token contract panicked" }, // storage_balance_of: a real RpcCaptureError
+    ]);
+    const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => 1_700_000_900_000 });
+    const { index, exchanges } = await captureNearLeg(rpc, CONFIG, TERMS, ACCOUNTS, HASH_LOCK, 1_700_000_900_000);
+    expect(index.error).toBeUndefined();
+    expect(exchanges).toHaveLength(4);
+    expect(exchanges[3]!.responseBody).toContain("token contract panicked");
+  });
+
+  it("E2: a transport failure on storage_balance_of sets index.error (get_lock's own exchange is still kept)", async () => {
+    const fetchImpl = fakeFetchWithOutcomes([{ result: STATUS_RESULT }, { result: BLOCK_RESULT }, { result: LOCK_RESULT }, "throw"]);
+    const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => 1_700_000_900_000 });
+    const { index, exchanges } = await captureNearLeg(rpc, CONFIG, TERMS, ACCOUNTS, HASH_LOCK, 1_700_000_900_000);
+    expect(index.error).toBeDefined();
+    expect(exchanges).toHaveLength(3);
+  });
 });
 
 // ── loadNearCapture (disk round trip, newest-only) ──────────────────────────────────────────
@@ -727,19 +911,53 @@ describe("loadNearCapture", () => {
   }
 
   it("no capture directory -> capture null, no skip", async () => {
-    const result = await loadNearCapture(root, HASH_LOCK);
+    const result = await loadNearCapture(root, HASH_LOCK, LEG_CONTRACT);
     expect(result.capture).toBeNull();
     expect(result.skipped).toEqual([]);
   });
 
+  // E1: keyed by (hashLock, legContract) — a malformed legContract must never touch the
+  // filesystem at all, the same discipline readCapture's own SHA256_HEX guard applies.
+  it("a malformed legContract is refused before ever touching the filesystem", async () => {
+    const dir = join(root, "raw", "near", HASH_LOCK, LEG_CONTRACT);
+    const capture = buildCapture({ exchanges: standardExchanges() });
+    await writeIndexFile(dir, "2026-09-29T00-00-00-000Z", capture.index, capture.index.exchanges, capture.bytes as Map<string, Uint8Array>);
+
+    for (const badLegContract of ["../../etc/passwd", "not-a-contract-id", `0x${"AB".repeat(32)}` /* uppercase refused */]) {
+      const result = await loadNearCapture(root, HASH_LOCK, badLegContract);
+      expect(result.capture).toBeNull();
+      expect(result.skipped).toEqual([]);
+    }
+  });
+
+  // E1: two different leg contracts genuinely sharing the same hash lock each get their own
+  // capture, isolated by directory — reading one never sees, and can never be overwritten by,
+  // the other's.
+  it("two different leg contracts sharing the same hash lock never see or overwrite each other's capture", async () => {
+    const otherLegContract = `0x${"33".repeat(32)}`;
+    const mine = buildCapture({ exchanges: standardExchanges() });
+    const theirs = buildCapture({ exchanges: standardExchanges({ lock: { view: lockViewPayload({ status: "Refunded" }) }, storage: false }) });
+    await writeIndexFile(join(root, "raw", "near", HASH_LOCK, LEG_CONTRACT), "only", mine.index, mine.index.exchanges, mine.bytes as Map<string, Uint8Array>);
+    await writeIndexFile(join(root, "raw", "near", HASH_LOCK, otherLegContract), "only", theirs.index, theirs.index.exchanges, theirs.bytes as Map<string, Uint8Array>);
+
+    const mineResult = await loadNearCapture(root, HASH_LOCK, LEG_CONTRACT);
+    const theirsResult = await loadNearCapture(root, HASH_LOCK, otherLegContract);
+    expect(mineResult.capture).not.toBeNull();
+    expect(theirsResult.capture).not.toBeNull();
+    const mineDecoded = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: mineResult.capture! });
+    const theirsDecoded = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: theirsResult.capture! });
+    expect(mineDecoded.rail?.status).toBe("locked");
+    expect(theirsDecoded.rail?.status).toBe("refunded");
+  });
+
   it("reads the newest of two capture files, never an older one", async () => {
-    const dir = join(root, "raw", "near", HASH_LOCK);
+    const dir = join(root, "raw", "near", HASH_LOCK, LEG_CONTRACT);
     const older = buildCapture({ exchanges: standardExchanges({ lock: { view: lockViewPayload({ status: "Refunded" }) }, storage: false } ) });
     const newer = buildCapture({ exchanges: standardExchanges() });
     await writeIndexFile(dir, "2026-09-29T00-00-00-000Z", older.index, older.index.exchanges, older.bytes as Map<string, Uint8Array>);
     await writeIndexFile(dir, "2026-09-29T00-01-00-000Z", newer.index, newer.index.exchanges, newer.bytes as Map<string, Uint8Array>);
 
-    const result = await loadNearCapture(root, HASH_LOCK);
+    const result = await loadNearCapture(root, HASH_LOCK, LEG_CONTRACT);
     expect(result.capture).not.toBeNull();
     expect(result.skipped).toEqual([]);
     const decoded = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: result.capture! });
@@ -747,13 +965,13 @@ describe("loadNearCapture", () => {
   });
 
   it("a corrupt newest file fails closed (capture: null) rather than falling back to an older one", async () => {
-    const dir = join(root, "raw", "near", HASH_LOCK);
+    const dir = join(root, "raw", "near", HASH_LOCK, LEG_CONTRACT);
     const older = buildCapture({ exchanges: standardExchanges() });
     await writeIndexFile(dir, "2026-09-29T00-00-00-000Z", older.index, older.index.exchanges, older.bytes as Map<string, Uint8Array>);
     const { writeFile } = await import("node:fs/promises");
     await writeFile(join(dir, "2026-09-29T00-01-00-000Z.json"), "{ not valid json", "utf8");
 
-    const result = await loadNearCapture(root, HASH_LOCK);
+    const result = await loadNearCapture(root, HASH_LOCK, LEG_CONTRACT);
     expect(result.capture).toBeNull();
     expect(result.skipped).toEqual(["2026-09-29T00-01-00-000Z.json"]);
   });

@@ -50,8 +50,11 @@ import { join } from "node:path";
 
 import type { LockTerms } from "@flop-labs/tclk";
 
+import { sha256 } from "@noble/hashes/sha2.js";
+import { hexToBytes } from "@noble/hashes/utils.js";
+
 import { checkNearRailConfig, NEAR_ASSET_ID, type NearRailConfig } from "./near-htlc.js";
-import { readCapture, type CapturingRpc, type Exchange } from "./rpc-capture.js";
+import { readCapture, RpcCaptureError, type CapturingRpc, type Exchange } from "./rpc-capture.js";
 import type { LockEvidence, RailObservation } from "../types.js";
 
 export const NEAR_RAIL_ID = "near-htlc";
@@ -364,6 +367,26 @@ function finalizedRefFor(pinName: string, height: number, blockHash: string): st
   return `${pinName}:final:${height}:${blockHash}`;
 }
 
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/** E4: mirrors `near-htlc.ts`'s own `claim()` check (H2) — a lock's `preimage` field is never
+ *  trusted merely because it is present; it must actually hash to the ref (this leg's own hash
+ *  lock) before this reader treats the lock as "revealed" rather than "locked". `hashLockHex` is
+ *  `capture.index.ref` with its `0x` prefix stripped. */
+function preimageOpensHashLock(preimageHex0x: string, hashLockHex: string): boolean {
+  try {
+    return bytesEqual(sha256(hexToBytes(preimageHex0x.slice(2))), hexToBytes(hashLockHex));
+  } catch {
+    return false;
+  }
+}
+
 function firstFieldMismatch(args: {
   onChainPayee: string;
   onChainPayer: string;
@@ -436,6 +459,31 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
     capturedConfig.assets.USDC !== config.assets.USDC
   ) {
     return { lock: { ...base, railVerified: null, reason: "near-htlc: capture was taken under a different rail config (D3)" } };
+  }
+
+  // E6: the index's own top-level `pin`/`caip2`/`endpoint` fields are redundant with (and
+  // editable independently of) `capture.index.config` above — nothing else in this function ever
+  // reads them, so a tampered or simply stale top-level field would otherwise sit there
+  // unchecked, silently disagreeing with the config this reader actually trusts. Require them to
+  // agree, or fail closed (never "checked or dropped" halfway: an index that disagrees with
+  // itself is exactly the kind of tampering `bindExchange` already refuses everywhere else in
+  // this file). The filename stamp under `raw/near/<hashLock>/<legContract>/*.json` is NOT bound
+  // by this check (or by anything else here) — `captureNearLeg`'s callers (src/watcher.ts,
+  // fixture capture) name every file `isoStamp(checkedAtMs)` by convention, but a reader here has
+  // no way to see the filename at all (it is handed only the parsed index), so this is a
+  // documented honesty limit, not an enforced one (P5-NEAR-FIXES.md E6).
+  if (
+    capture.index.pin !== capturedConfig.pin.name ||
+    capture.index.caip2 !== capturedConfig.pin.caip2 ||
+    capture.index.endpoint !== capturedConfig.endpoint
+  ) {
+    return {
+      lock: {
+        ...base,
+        railVerified: null,
+        reason: "near-htlc: capture's own top-level pin/caip2/endpoint fields disagree with its embedded config (E6, tampered index)",
+      },
+    };
   }
 
   const base2 = { ...base, endpoint: capturedConfig.endpoint };
@@ -534,6 +582,23 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
     // fails closed with NO rail, never "locked but wrong terms".
     if (mismatch !== null) {
       return { lock: { ...baseAtFinalizedView, railVerified: false, reason: mismatch } };
+    }
+
+    // E4: a `Locked` status with a preimage that genuinely opens this lock's own hash lock is
+    // the contract's F4 state — the payee's claim revealed `s` but the inner payout promise
+    // failed, so the contract dropped the lock back to `Locked` while keeping the preimage
+    // public rather than reporting `Claimed`. That is never "locked" evidence (the payer's own
+    // refund is refused by the contract from this point on, H2) — it is its own outcome, with no
+    // `RailObservation` attached at all (the fold shows "revealed" once the preimage itself
+    // reaches a frame, never fabricated here from a status enum alone).
+    if (lockView.preimage !== null && preimageOpensHashLock(lockView.preimage, capture.index.ref.slice(2))) {
+      return {
+        lock: {
+          ...baseAtFinalizedView,
+          railVerified: null,
+          reason: "near-htlc: preimage revealed (F4): payer refund refused, payee may claim",
+        },
+      };
     }
 
     // Position 3: query call_function storage_balance_of(payee) — D-N10: a locked verdict must
@@ -683,9 +748,19 @@ export async function captureNearLeg(
         method: "query",
         params: { request_type: "call_function", account_id: config.contract, method_name: "get_lock", args_base64: lockArgsBase64, block_id: block.hash },
       });
-    } catch {
-      // A view-call error is still a legitimate captured exchange (CapturingRpc records before
-      // throwing) — nearEvidence sees it on replay and fails closed; nothing more to decide here.
+    } catch (error) {
+      // E2: an `RpcCaptureError` is a legitimate JSON-RPC-level error reply — `CapturingRpc`
+      // still recorded the exchange before throwing it, so this is a completed read (a contract
+      // panic on the view call, say); `nearEvidence` sees it on replay and fails closed, nothing
+      // more to decide here. Any OTHER error (a transport failure, a timeout, `rpc-capture.ts`'s
+      // own E5 byte cap) means nothing was recorded for this read at all — `finish` with the
+      // reason so this capture's own `index.error` is set and the caller counts it under
+      // `nearChainReadsSkipped`, rather than silently treating a missing exchange as if the
+      // sequence had completed (which used to leave `exchanges[2]`/`[3]` shifted and confusing on
+      // replay instead of honestly reporting the read as incomplete).
+      if (!(error instanceof RpcCaptureError)) {
+        return finish(error instanceof Error ? error.message : String(error));
+      }
     }
 
     if (accounts.payee !== undefined) {
@@ -701,8 +776,11 @@ export async function captureNearLeg(
             block_id: block.hash,
           },
         });
-      } catch {
-        // Same as above — recorded regardless.
+      } catch (error) {
+        // E2: same rule as the get_lock read above.
+        if (!(error instanceof RpcCaptureError)) {
+          return finish(error instanceof Error ? error.message : String(error));
+        }
       }
     }
 
@@ -736,6 +814,30 @@ function looksLikeCaptureIndexFile(value: unknown, ref: string): value is NearCa
   return true;
 }
 
+/** tclk's own `CONTRACT_ID` shape (`node_modules/@flop-labs/tclk/dist/technocore.js`) — a leg
+ *  contract id is `0x` + 64 lowercase hex, exactly the same shape as a hash lock and, like it,
+ *  already filename-safe as-is. */
+const LEG_CONTRACT_SHAPE = /^0x[0-9a-f]{64}$/;
+
+/** E1: `raw/near/<hashLock>/<legContract>/<stamp>.json` — the directory a capture for this
+ *  (hashLock, legContract) pair lives under. Exported so `src/watcher.ts` (the writer) and
+ *  `examples/audit-export.mjs` (the reader) both build the identical path from the identical two
+ *  values, rather than each re-deriving its own string. */
+export function nearCaptureDir(root: string, hashLock: string, legContract: string): string {
+  return join(root, "raw", "near", hashLock, legContract);
+}
+
+/** E1: the composite key every in-memory `Map<string, NearCapture>` this repo builds (the live
+ *  sweep's `nearChainCaptures`, `foldCaptured`'s own `input.nearChain`) is keyed by — a bare hash
+ *  lock is no longer enough once two different legs can genuinely share one (a copycat pair, or
+ *  H7's own hash-lock-squatting scenario): keying by the pair means a squatter's own capture can
+ *  never overwrite, or be folded into, the genuine leg's capture, even when both name the exact
+ *  same hash lock. `":"` is a safe separator — neither a hash lock nor a leg contract id (both
+ *  `0x` + 64 lowercase hex) can ever contain one. */
+export function nearCaptureKey(hashLock: string, legContract: string): string {
+  return `${hashLock}:${legContract}`;
+}
+
 export interface LoadNearCaptureResult {
   capture: NearCapture | null;
   /** The newest index filename when it failed to read, parse, or validate as a capture index for
@@ -746,12 +848,19 @@ export interface LoadNearCaptureResult {
 /**
  * The one place a replay does file I/O for a `near-htlc` capture — everything downstream
  * (`nearEvidence`) is pure and synchronous over the result. Reads only the newest
- * `raw/near/<hashLock>/*.json` under `root` (ISO-stamped filenames sort chronologically;
- * `.tmp-*` leftovers are never candidates). If that newest file fails to read/parse/validate, the
- * leg fails closed (`capture: null`) — it never falls back to an older capture.
+ * `raw/near/<hashLock>/<legContract>/*.json` under `root` (ISO-stamped filenames sort
+ * chronologically; `.tmp-*` leftovers are never candidates) — E1: scoped to this exact
+ * (hashLock, legContract) pair, so a copycat leg sharing the same hash lock reads from (and can
+ * never overwrite) an entirely different directory. If that newest file fails to
+ * read/parse/validate, the leg fails closed (`capture: null`) — it never falls back to an older
+ * capture.
  */
-export async function loadNearCapture(root: string, ref: string): Promise<LoadNearCaptureResult> {
-  const dir = join(root, "raw", "near", ref);
+export async function loadNearCapture(root: string, ref: string, legContract: string): Promise<LoadNearCaptureResult> {
+  // A malformed legContract can never resolve to real evidence and must never be allowed to walk
+  // this out of `root` (the same discipline `readCapture`'s own SHA256_HEX guard applies) —
+  // refused before ever touching the filesystem.
+  if (!LEG_CONTRACT_SHAPE.test(legContract)) return { capture: null, skipped: [] };
+  const dir = nearCaptureDir(root, ref, legContract);
   let allEntries: string[];
   try {
     allEntries = await readdir(dir);
