@@ -10,12 +10,13 @@
 //
 // `<rail-id>` is canonical per tclk's own closed registry (`@flop-labs/tclk`'s
 // `CANONICAL_RAIL_IDS`); `<caip-10 account>` is `namespace:reference:address` (CAIP-10),
-// namespace fixed by the rail (`RAIL_NAMESPACES` below — `evm-htlc` ↔ `eip155` is the only one
-// with a chain-specific address grammar in this build; `btc-htlc`/`near-htlc` are reserved in
-// tclk's registry for later chains and parse under the generic CAIP-10 address grammar only
-// (`validateGenericCaip10` below) — the wire shape CAIP-10 itself defines, not that chain's own
-// semantic rules (bech32, NEAR account names, …), which is deferred to that rail's own build
-// stage).
+// namespace fixed by the rail (`RAIL_NAMESPACES` below). `evm-htlc` ↔ `eip155` and (D-N5)
+// `near-htlc` ↔ `near` each have their own chain-specific address grammar in this build
+// (`validateEip155Address`/`validateNearAccountId`); `btc-htlc` is reserved in tclk's registry
+// for its own account-line-shaped chain (it in fact uses the separate pubkey line below, P4-BTC-
+// SPEC.md §6) and parses under the generic CAIP-10 address grammar only (`validateGenericCaip10`
+// below) — the wire shape CAIP-10 itself defines, not that chain's own semantic rules, which is
+// deferred to that rail's own build stage.
 //
 // The line carries no signature of its own beyond the transcript record it rides in: the
 // binding DID is `record.sender` (whoever signed the record), never a field inside the line —
@@ -84,10 +85,10 @@ function validateEip155Address(reference: string, address: string): string | nul
 
 /** CAIP-2's own reference grammar and CAIP-10's own address grammar, verbatim (the CASA specs,
  *  not this repo's invention) — used for a namespace this build has no chain-specific rule for
- *  yet (`btc-htlc`/`near-htlc`). This is the wire shape only: it says nothing about whether a
- *  given string is a real Bitcoin or NEAR address (bech32 checksum, NEAR account-name rules,
- *  …) — that is that rail's own build stage's job, same as `eip155` had its own rule added
- *  above. No normalization: neither namespace's casing convention is known here. */
+ *  yet (`btc-htlc`). This is the wire shape only: it says nothing about whether a given string is
+ *  a real Bitcoin address (bech32 checksum, …) — that is that rail's own build stage's job, same
+ *  as `eip155`/`near` had their own rules added (above/below). No normalization: this namespace's
+ *  own casing convention is not known here. */
 const CAIP2_REFERENCE = /^[-a-zA-Z0-9]{1,32}$/;
 const CAIP10_ADDRESS = /^[-.%a-zA-Z0-9]{1,128}$/;
 
@@ -97,10 +98,31 @@ function validateGenericCaip10(reference: string, address: string): string | nul
   return address;
 }
 
+/** D-N5: NEAR's own account-id grammar (mirrors `src/rails/near-htlc.ts`'s identical private
+ *  `NEAR_ACCOUNT_ID` — kept as its own copy here rather than a cross-file import, the same way
+ *  each rail's own evidence/account-line code already owns small local copies of shared shape
+ *  checks elsewhere in this build): 2-64 chars, lowercase-alphanumeric segments joined by a
+ *  single `-`, `_` or `.` separator — never leading/trailing or doubled-up. `_` is accepted here
+ *  even though it is NOT part of the generic CAIP-10 address grammar above (`CAIP10_ADDRESS`
+ *  has no `_`) — a deliberate, documented deviation: a real NEAR account (an implicit 64-hex-char
+ *  account, or a named one like `alice_capital.near-sandbox-flop`) can legitimately contain one,
+ *  and refusing it here would make a genuine NEAR account line unparseable. The chain id itself
+ *  (the CAIP-2 reference, e.g. `"near-sandbox-flop"`, `"testnet"`) still uses the generic CAIP-2
+ *  reference grammar (`CAIP2_REFERENCE`) — NEAR's own chain ids are plain identifiers, not
+ *  NEAR-account-shaped. */
+const NEAR_ACCOUNT_ID = /^(?=.{2,64}$)[a-z0-9]+(?:[-_.][a-z0-9]+)*$/;
+
+function validateNearAccountId(reference: string, address: string): string | null {
+  if (!CAIP2_REFERENCE.test(reference)) return null;
+  if (!NEAR_ACCOUNT_ID.test(address)) return null;
+  return address;
+}
+
 /** Shared core of `formatAccountLine`/`parseAccountLine`: validate one namespace's
  *  reference+address grammar. */
 function validateChainAddress(namespace: string, reference: string, address: string): string | null {
   if (namespace === "eip155") return validateEip155Address(reference, address);
+  if (namespace === "near") return validateNearAccountId(reference, address);
   return validateGenericCaip10(reference, address);
 }
 
