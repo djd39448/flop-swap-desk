@@ -38,6 +38,7 @@ import {
   type NearSigner,
   type NearWriteEvidence,
 } from "../rails/near-htlc.js";
+import { NearRpc } from "../rails/near-rpc.js";
 import { verifiedExchangeBytes, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import type {
   ConnectedCounterAssetRail,
@@ -89,11 +90,15 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
   private readonly nearRail: NearHtlcRail;
   private readonly options: NearCounterRailOptions;
   private readonly accounts: RailAccounts;
+  /** G4: this leg's own frozen terms, kept only for `lockRecorded`'s own permissive existence
+   *  check — every other method here already gets what it needs from its own arguments. */
+  private readonly terms: LockTerms;
 
-  constructor(nearRail: NearHtlcRail, options: NearCounterRailOptions, accounts: RailAccounts) {
+  constructor(nearRail: NearHtlcRail, options: NearCounterRailOptions, accounts: RailAccounts, terms: LockTerms) {
     this.nearRail = nearRail;
     this.options = options;
     this.accounts = accounts;
+    this.terms = terms;
   }
 
   get exchanges(): readonly Exchange[] {
@@ -187,6 +192,55 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
   async currentBlockMarker(): Promise<RailBlockMarker> {
     return this.nearRail.currentBlockMarker();
   }
+
+  /** G4: a permissive existence check, read directly against `get_lock` (never through
+   *  `near-evidence.ts`'s own strict pipeline, which withholds `rail` the moment ANY field —
+   *  including the payee's own storage registration, which has nothing to do with whether THIS
+   *  signer genuinely locked this ref — fails to match). Confirms only: a lock exists under
+   *  `ref`, its `payer` is this connected handle's own signer, and its `amount` matches this
+   *  leg's own frozen terms — enough to answer "did I lock this" without ever vouching for
+   *  whether the payout could actually land (that is exactly the question this check is NOT
+   *  answering; `verifyLockFinal`'s own `railVerified`/`rail` remain the only source for that). */
+  async lockRecorded(ref: string): Promise<{ exists: boolean; reason?: string }> {
+    if (this.terms.lock !== "hash" || ref !== this.terms.statement) {
+      return { exists: false, reason: "near-rail: ref does not match this leg's own hash lock (G4)" };
+    }
+    const near = new NearRpc(this.options.rpc);
+    let resultText: string;
+    try {
+      const result = await near.callFunction(this.options.config.contract, "get_lock", { hash_lock: ref.slice(2) });
+      resultText = result.resultText;
+    } catch (error) {
+      return { exists: false, reason: `near-rail: lockRecorded could not read get_lock: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(resultText);
+    } catch {
+      return { exists: false, reason: "near-rail: get_lock returned an unparseable body" };
+    }
+    if (parsed === null) return { exists: false, reason: "near-rail: no lock recorded for this hash lock" };
+    if (typeof parsed !== "object") return { exists: false, reason: "near-rail: get_lock returned an unrecognised shape" };
+    const v = parsed as Record<string, unknown>;
+    if (typeof v.payer !== "string" || typeof v.amount !== "string") {
+      return { exists: false, reason: "near-rail: get_lock returned an unrecognised shape" };
+    }
+    if (v.payer !== this.options.signer.accountId) {
+      return { exists: false, reason: "near-rail: a lock exists under this hash but its payer is not this signer's own account" };
+    }
+    let onChainAmount: bigint;
+    let expectedAmount: bigint;
+    try {
+      onChainAmount = BigInt(v.amount);
+      expectedAmount = BigInt(this.terms.amount);
+    } catch {
+      return { exists: false, reason: "near-rail: get_lock returned an unusable amount" };
+    }
+    if (onChainAmount !== expectedAmount) {
+      return { exists: false, reason: "near-rail: a lock exists for this payer but its amount does not match this leg's own terms" };
+    }
+    return { exists: true };
+  }
 }
 
 class NearCounterRail implements CounterAssetRail {
@@ -235,7 +289,7 @@ class NearCounterRail implements CounterAssetRail {
       signer: this.options.signer,
       clock: this.options.clock,
     });
-    return new ConnectedNearCounterRail(nearRail, this.options, accounts);
+    return new ConnectedNearCounterRail(nearRail, this.options, accounts, terms);
   }
 }
 

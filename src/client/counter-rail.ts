@@ -157,6 +157,16 @@ export interface ConnectedCounterAssetRail {
   /** D-11: capture live, then decide — never throws for a chain-state reason, only a genuine
    *  transport failure. */
   verifyLockFinal(terms: LockTerms, ref: string, accounts: RailAccounts): Promise<RailEvidenceResult>;
+  /** P5-NEAR-FIXES.md G4: a cheap, PERMISSIVE existence check — does a lock for this ref exist on
+   *  chain at all, owned by this connected handle's own signer/payer, with terms matching what
+   *  this handle was `connect()`-ed with? Unlike `verifyLockFinal`, this never withholds an
+   *  answer merely because some OTHER field the strict evidence pipeline also checks (near-htlc:
+   *  the payee's own storage registration) fails to match — it exists specifically for
+   *  `reconcileLockA` to tell "I did lock this, even though the strict reader can't yet fully
+   *  vouch for it" apart from "nothing is there at all". Optional: a rail with no cheaper way to
+   *  answer this than the strict reader already gives (`evm-htlc`, `btc-htlc`: no behaviour
+   *  change for either) simply omits it. */
+  lockRecorded?(ref: string): Promise<{ exists: boolean; reason?: string }>;
   /** How the Buyer learns `s` when the Seller claims on chain without ever posting a reveal
    *  frame — a bounded search from `fromMarker` (omitted: the adapter's own genesis default). */
   findClaimedPreimage(ref: string, fromMarker?: RailBlockMarker): Promise<string | null>;
