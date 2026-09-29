@@ -337,6 +337,29 @@ describe("D-N8 — a NEAR flow uses NEAR_LOCAL_POLICY's own 45/5-minute numbers"
 
 // ── G2: one funding per swap ─────────────────────────────────────────────────────────────────
 
+// ── G5: the rail ref IS the Seller's own minted hash lock ───────────────────────────────────
+
+describe("G5 — near-htlc's own rail ref IS the Seller's minted hash lock", () => {
+  it("claimLegA refuses when the accepted lock frame's own ref disagrees with the Seller's own statement", async () => {
+    // Unlike every other test in this file (which echoes the Seller's real statement, per G5),
+    // this fake buyer rail deliberately locks under a DIFFERENT ref — modelling a Buyer (buggy
+    // or malicious) whose accepted lock frame names a ref that isn't this Seller's own hash lock.
+    const WRONG_REF = `0x${"bb".repeat(32)}`;
+    const buyerRail = new FakeCounterAssetRail({
+      currentBlockMarker: async () => 0,
+      prepareLock: async () => ({ ref: WRONG_REF }),
+      commitLock: async () => ({ ref: WRONG_REF, raw: [] }),
+    });
+    const sellerRail = new FakeCounterAssetRail({});
+    const h = harness(buyerRail, sellerRail);
+    await pairLockBAndAccountLines(h);
+    await h.buyerFlow.lockLegA();
+    const statement = h.sellerFlow.statement;
+    if (statement === undefined) throw new Error("test setup: seller's own statement was never minted");
+    await expect(h.sellerFlow.claimLegA(statement)).rejects.toThrow(/accepted lock frame's own ref does not match this flow's own hash lock \(G5/);
+  });
+});
+
 describe("G2 — one funding per swap", () => {
   it("a second lockLegA call throws, and the rail's own commitLock is never called a second time", async () => {
     let commitCalls = 0;
