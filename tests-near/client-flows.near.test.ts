@@ -67,6 +67,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { base58 } from "@scure/base";
 import { MemoryNoteStore, OFFER_ROOM, PaperRail, dealRoom, paperNote, verifyHashPreimage, type LockTerms } from "@flop-labs/tclk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -76,9 +77,10 @@ import type { CounterAssetRail } from "../src/client/counter-rail.js";
 import { createNearCounterRail } from "../src/client/near-rail.js";
 import { SellerFlow } from "../src/client/seller.js";
 import { MemoryVenue } from "../src/client/venue.js";
+import { buildSignedTransaction, type NearAction } from "../src/rails/near-borsh.js";
 import type { NearAccounts } from "../src/rails/near-evidence.js";
-import { NearHtlcRail, type NearRailConfig } from "../src/rails/near-htlc.js";
-import { NearRpc } from "../src/rails/near-rpc.js";
+import { NearHtlcRail, type NearRailConfig, type NearSigner } from "../src/rails/near-htlc.js";
+import { NearRpc, NearTimeoutError } from "../src/rails/near-rpc.js";
 import { CapturingRpc, type Exchange } from "../src/rails/rpc-capture.js";
 import { swapId as computeSwapId } from "../src/profile.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
@@ -557,14 +559,105 @@ describe("Seller/Buyer client flows against a real near-sandbox node", () => {
       signer: sandbox.buyer.signer,
       clock: Date.now,
     });
-    const recovered = await recoveryRail.recoverByTxHash(lockA.writeEvidence.txHash, sandbox.buyer.accountId);
+    // H4: `recoverByTxHash` now takes the CALLER's own expected ref and returns it as
+    // `evidence.ref` verbatim — never the raw txHash (A9: an evidence reader keys and re-binds
+    // captures by ref, so returning anything else would silently mislabel a recovered write).
+    // Here the caller's own ref is the hash lock itself (D-N4: near-htlc's own write ref).
+    const recovered = await recoveryRail.recoverByTxHash(lockA.writeEvidence.txHash, sandbox.buyer.accountId, lockA.writeEvidence.ref);
     expect(recovered).not.toBeNull();
     expect(recovered?.blockHash).toBe(lockA.writeEvidence.blockHash);
-    expect(recovered?.ref).toBe(lockA.writeEvidence.txHash); // recoverByTxHash's own ref IS the tx hash (D-N4)
+    expect(recovered?.ref).toBe(lockA.writeEvidence.ref);
 
-    // An unrelated/never-sent tx hash resolves to null, never a guess.
+    // H4 (confirmed live in tests-near/near-htlc.near.test.ts, this same finding): a hash the
+    // node has NEVER seen at all does not answer quickly with "not found" — `EXPERIMENTAL_tx_
+    // status` long-polls until its own internal wait expires, then answers with a structured
+    // `TIMEOUT_ERROR` cause, which `recoverByTxHash` reports as `NearTimeoutError`, never
+    // collapsing it to `null` (H4: "returns null only for unknown", and a genuine "ask again" is
+    // not the same as "never broadcast"). Intentionally slow — waits out the node's own timeout.
     const flippedLastChar = lockA.writeEvidence.txHash.endsWith("z") ? "y" : "z";
-    const unknown = await recoveryRail.recoverByTxHash(`${lockA.writeEvidence.txHash.slice(0, -1)}${flippedLastChar}`, sandbox.buyer.accountId);
-    expect(unknown).toBeNull();
+    await expect(
+      recoveryRail.recoverByTxHash(`${lockA.writeEvidence.txHash.slice(0, -1)}${flippedLastChar}`, sandbox.buyer.accountId, lockA.writeEvidence.ref),
+    ).rejects.toBeInstanceOf(NearTimeoutError);
   }, 120_000);
+
+  /** P5-NEAR-FIXES.md G3's own decode of the signer's `ed25519:<base58>` public key string —
+   *  duplicated tiny rather than exported from near-htlc.ts (that file's own `decodePublicKey`
+   *  is private), the same choice tests-near/near-htlc.near.test.ts's own `decodePublicKeyRaw`
+   *  makes for the identical reason. */
+  function decodePublicKeyRaw(publicKey: string): Uint8Array {
+    return base58.decode(publicKey.slice("ed25519:".length));
+  }
+
+  /** A minimal raw signed-transaction sender, deliberately going AROUND `NearHtlcRail`'s own
+   *  TS-side guards — used here only to pay another account's storage deposit on the token
+   *  (`storage_deposit`, NEP-145), the one setup step scenario 8 needs that no existing client
+   *  method performs. Mirrors tests-near/near-htlc.near.test.ts's own `sendRawTx` (kept separate
+   *  rather than imported, the same reasoning that file's own header gives: a test that reaches
+   *  for this should not also inherit the harness's own construction-time invariants). */
+  async function sendRawTx(rpc: CapturingRpc, signer: NearSigner, signerAccountId: string, receiverId: string, actions: NearAction[]) {
+    const near = new NearRpc(rpc);
+    const accessKey = await near.viewAccessKey(signerAccountId, signer.publicKey);
+    const block = await near.block({ finality: "final" });
+    const built = await buildSignedTransaction(
+      {
+        signerId: signerAccountId,
+        publicKey: { keyType: "ED25519", data: decodePublicKeyRaw(signer.publicKey) },
+        nonce: BigInt(accessKey.nonce) + 1n,
+        receiverId,
+        blockHash: base58.decode(block.header.hash),
+        actions,
+      },
+      (hash) => signer.sign(hash),
+    );
+    return near.sendTx(Buffer.from(built.signedBytes).toString("base64"), "FINAL");
+  }
+
+  it(
+    "scenario 8 (G3): claiming to an unregistered payee is refused by the real pre-check; once the payee registers, a plain retry through the real client flow pays",
+    async () => {
+      const buyer = ident(17);
+      const seller = ident(18);
+      const t0 = await chainNowMs();
+      const h = setupSwap(sandbox, sandbox.config, freshParty(buyer), freshParty(seller), t0);
+
+      // Mirrors scenario 6's own setup (the accepted account line names a payee that was never
+      // storage_deposit'd on the token) — G3's own sandbox scenario is this same starting point,
+      // continued past the first refusal: register the payee, then retry through the SAME
+      // SellerFlow instance (never a fresh one), proving the real client flow's own G2/G3 checks
+      // (findClaimedPreimage first, for near-htlc) neither block nor mis-route an ordinary retry
+      // that never actually revealed anything on its failed first attempt (the adapter's own
+      // no-secret storage_balance_of pre-check refuses BEFORE ever signing — P5-NEAR-SPEC.md §4).
+      const unregisteredPayee = "nobody-g3.test.near";
+      const { acceptA } = await pairAndLockB("00000009", buyer, h, t0, unregisteredPayee);
+
+      const lockA = await h.buyerFlow.lockLegA();
+
+      await expect(h.sellerFlow.claimLegA(lockA.hashLock)).rejects.toThrow(/is not storage-registered/);
+      expect(h.sellerFlow.exchanges.some((e) => e.method === "send_tx")).toBe(false);
+
+      // Register the payee (any signer may pay another account's own storage deposit) — no new
+      // account creation needed, mirrors near-htlc.near.test.ts's own H2 sandbox test.
+      await sendRawTx(sandbox.createCapturingRpc(), sandbox.buyer.signer, sandbox.buyer.accountId, sandbox.usdcToken, [
+        {
+          type: "FunctionCall",
+          methodName: "storage_deposit",
+          args: new TextEncoder().encode(JSON.stringify({ account_id: unregisteredPayee })),
+          gas: 30_000_000_000_000n,
+          deposit: 50_000_000_000_000_000_000_000n / 20n,
+        },
+      ]);
+
+      const balanceBefore = BigInt(await sandbox.usdcBalanceOf(unregisteredPayee));
+      // The SAME SellerFlow instance, retried — nothing was ever revealed by the first (refused)
+      // attempt, so this is an ordinary claim that must simply succeed now that the pre-check
+      // passes; `findClaimedPreimage` (G2/G3's own first check) correctly finds nothing of this
+      // flow's own to report, and falls through to the normal guarded path unchanged.
+      const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
+      expect(claimed.receipt).toBeDefined();
+      const balanceAfter = BigInt(await sandbox.usdcBalanceOf(unregisteredPayee));
+      expect(balanceAfter).toBeGreaterThan(balanceBefore);
+      void acceptA;
+    },
+    120_000,
+  );
 });
