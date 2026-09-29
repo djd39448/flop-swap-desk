@@ -21,6 +21,17 @@ pub const CALLBACK_GAS: Gas = Gas::from_tgas(10);
 
 const HASH_HEX_LEN: usize = 64;
 
+/// F2: kept free in the contract's own account balance, beyond what `env::storage_usage()`
+/// already owes in storage staking, before a new lock is accepted. Without this, the
+/// contract's free balance can be driven to (or toward) zero by lock storage staking --
+/// spammed by an attacker calling `ft_on_transfer` directly (closed separately by F3's token
+/// allow-list) or simply by honest lock volume over time -- and a later `claim`/`refund`'s
+/// `ft_transfer` promise then fails with `LackBalanceForState` *after* its preimage (for a
+/// claim) is already public in the transaction, with no way to undo that disclosure.
+fn storage_reserve() -> NearToken {
+    NearToken::from_millinear(50)
+}
+
 #[near(serializers = [borsh])]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LockStatus {
@@ -53,9 +64,19 @@ pub struct Lock {
     pub claim_by_ms: u64,
     pub refund_after_ms: u64,
     pub status: LockStatus,
-    /// Lowercase hex, set once `claim` reveals it; public thereafter (including in the event
-    /// log), even if the payout callback later fails and `status` reverts to `Locked`.
-    pub preimage: Option<String>,
+    /// F2: a fixed-size 32-byte slot, allocated (zeroed) at lock time and only ever
+    /// overwritten in place by `claim` -- never `Option<String>`, whose borsh encoding would
+    /// grow the entry from `None` (1 byte) to `Some(String)` (roughly 69 bytes for a 64-hex-
+    /// char preimage) the moment `claim` reveals it. A growing entry makes `claim` itself
+    /// consume additional storage staking out of the contract's own balance at the exact
+    /// moment the preimage becomes public, which is the least safe time for that write to be
+    /// able to fail. Meaningless (all zero) until `revealed` is true.
+    pub preimage: [u8; 32],
+    /// True once `claim` has verified a preimage against `hash_lock` and stored it in
+    /// `preimage`; the preimage is public from that point on (including in the event log,
+    /// F6), even if the payout callback later fails and `status` reverts to `Locked` (F4: a
+    /// revealed lock may no longer be refunded).
+    pub revealed: bool,
 }
 
 /// `get_lock`'s return shape: every field, amounts/times as decimal strings (near-sdk's own
@@ -82,7 +103,11 @@ impl From<&Lock> for LockView {
             claim_by_ms: U64(l.claim_by_ms),
             refund_after_ms: U64(l.refund_after_ms),
             status: l.status.as_str().to_string(),
-            preimage: l.preimage.clone(),
+            preimage: if l.revealed {
+                Some(hex_encode(&l.preimage))
+            } else {
+                None
+            },
         }
     }
 }
@@ -153,7 +178,10 @@ impl Contract {
         require!(computed == hash_lock, "Preimage does not match hash lock");
 
         lock.status = LockStatus::Claiming;
-        lock.preimage = Some(preimage.to_lowercase());
+        // F2: overwrite the fixed-size array in place -- the entry's serialized size (and
+        // therefore `env::storage_usage()`) is identical before and after this write.
+        lock.preimage.copy_from_slice(&preimage_bytes);
+        lock.revealed = true;
         self.locks.insert(&hash_lock, &lock);
         log_event("claiming", &hash_lock, &lock);
 
@@ -294,9 +322,23 @@ impl FungibleTokenReceiver for Contract {
             claim_by_ms,
             refund_after_ms,
             status: LockStatus::Locked,
-            preimage: None,
+            preimage: [0u8; 32],
+            revealed: false,
         };
         self.locks.insert(&parsed.hash_lock, &lock);
+
+        // F2: refuse (and let the token refund the sender in full) unless the contract's own
+        // balance still covers its storage staking plus a fixed reserve after this insert --
+        // otherwise a later claim/refund's payout promise can fail (LackBalanceForState) with
+        // the preimage, for a claim, already public in the transaction.
+        let required = env::storage_byte_cost()
+            .saturating_mul(env::storage_usage() as u128)
+            .saturating_add(storage_reserve());
+        if env::account_balance() < required {
+            self.locks.remove(&parsed.hash_lock);
+            return refuse_all;
+        }
+
         log_event("locked", &parsed.hash_lock, &lock);
 
         PromiseOrValue::Value(U128(0))
@@ -663,6 +705,33 @@ mod tests {
         // Now claim is blocked while Refunding.
         testing_env!(ctx(payee(), 2 * HOUR_MS).build());
         let _ = c.claim(hash, preimage);
+    }
+
+    #[test]
+    fn claim_is_storage_neutral() {
+        let mut c = setup();
+        let pre = vec![9u8; 32];
+        testing_env!(ctx(token(), 0).build());
+        let hash = hex_encode(&env::sha256(&pre));
+        let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
+        let before = env::storage_usage();
+        let mut b = ctx(payee(), HOUR_MS / 2);
+        b.storage_usage(before);
+        testing_env!(b.build());
+        let _p = c.claim(hash, hex_encode(&pre));
+        assert_eq!(env::storage_usage(), before, "claim grew storage");
+    }
+
+    #[test]
+    fn lock_refused_when_contract_cannot_cover_storage_plus_reserve() {
+        let mut c = setup();
+        let (_, hash) = preimage_and_hash();
+        let mut b = ctx(token(), 0);
+        b.account_balance(NearToken::from_yoctonear(1));
+        testing_env!(b.build());
+        let res = c.ft_on_transfer(payer(), U128(1_000), lock_msg(&hash, HOUR_MS, 2 * HOUR_MS));
+        assert_value(res, 1_000);
+        assert!(c.get_lock(hash).is_none());
     }
 
     // ---- refund ----
