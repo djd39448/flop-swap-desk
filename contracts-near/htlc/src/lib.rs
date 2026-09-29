@@ -423,7 +423,7 @@ fn hex_val(b: u8) -> Option<u8> {
 /// NEP-297 event log: `EVENT_JSON:{"standard":"near-htlc","version":"1.0.0","event":<kind>,
 /// "data":[{...}]}`.
 fn log_event(kind: &str, hash_lock: &str, lock: &Lock) {
-    let entry = near_sdk::serde_json::json!({
+    let mut entry = near_sdk::serde_json::json!({
         "hash_lock": hash_lock,
         "payer": lock.payer,
         "payee": lock.payee,
@@ -431,6 +431,13 @@ fn log_event(kind: &str, hash_lock: &str, lock: &Lock) {
         "amount": lock.amount.to_string(),
         "status": lock.status.as_str(),
     });
+    // F6: the doc comment on `Lock::preimage`/`LockView::preimage` says the preimage is
+    // "public thereafter (including in the event log)" once revealed -- make that true. A
+    // log-based reader (mirroring how the EVM rail's findClaimedPreimage reads Claimed logs)
+    // would otherwise silently miss the secret and have to fall back to `get_lock` state.
+    if lock.revealed {
+        entry["preimage"] = near_sdk::serde_json::Value::String(hex_encode(&lock.preimage));
+    }
     let event = near_sdk::serde_json::json!({
         "standard": "near-htlc",
         "version": "1.0.0",
@@ -956,6 +963,22 @@ mod tests {
         testing_env!(ctx(payee(), 3 * HOUR_MS).build());
         let _p2 = c.claim(hash.clone(), preimage);
         assert_eq!(c.get_lock(hash).unwrap().status, "Claiming");
+    }
+
+    #[test]
+    fn claiming_event_carries_the_preimage() {
+        let mut c = setup();
+        let (preimage, hash) = preimage_and_hash();
+        let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
+
+        testing_env!(ctx(payee(), HOUR_MS / 2).build());
+        let _p = c.claim(hash, preimage.clone());
+        let logs = near_sdk::test_utils::get_logs();
+        let claiming = logs
+            .iter()
+            .find(|l| l.contains("\"claiming\""))
+            .expect("a claiming event was logged");
+        assert!(claiming.contains(&preimage));
     }
 
     // ---- hex helpers ----
