@@ -73,6 +73,20 @@ per-finding rationale and the test that fails without each fix.
   can't reproduce, as the reviewer's own note on this finding says ("not testable
   hermetically... unit tests call the method body directly and skip the macro's
   deserialization"). Left for a future pass with sandbox-backed (not unit) coverage.
+- **An unregistered payee's claim reveals the preimage without paying out.** `claim()` writes
+  the preimage (making it public) and flips the lock to `Claiming` BEFORE its own `ft_transfer`
+  cross-contract promise ever runs; if the payee named in the lock was never
+  `storage_deposit`'d on the token, that promise fails, and the callback reverts the lock back
+  to `Locked` — but the preimage stays public regardless, since it was written before the
+  promise chain even started. This is inherent to any "reveal-then-pay" callback design on
+  NEAR, not a bug this contract could fix by reordering (the preimage must be checked, and so
+  known, before any transfer can be attempted at all). The desk's own client
+  (`src/rails/near-htlc.ts`'s `claim()`) mitigates this with a no-secret `storage_balance_of`
+  pre-check before ever signing a claim; a caller that builds and sends the raw transaction
+  directly, bypassing that guard, can still reach this state — exercised end to end by
+  `tests-near/near-htlc.near.test.ts`'s own "claim to an unregistered payee" scenario and
+  `tests-near/client-flows.near.test.ts`'s client-flow twin of it (see the main `README.md`'s
+  own "NEAR leg" section).
 - **No 1-yoctoNEAR requirement on `claim`/`refund`.** Unlike `ft_transfer`/`ft_transfer_call`
   on the NEP-141 side, this contract's own `claim`/`refund` methods don't require an attached
   deposit from their caller — anyone may call `claim` permissionlessly by design (the payee
@@ -88,8 +102,18 @@ per-finding rationale and the test that fails without each fix.
 | `CALLBACK_GAS` | 10 Tgas | attached to `on_transfer_complete` |
 | storage reserve | 0.05 NEAR | kept free (beyond storage staking already owed) before a new lock is accepted, F2 |
 
-Per D-N9, these are provisional; NB-int measures the real gas burn on the sandbox and the
-numbers are corrected once, with the measurement recorded in that commit's message.
+These two constants are this CONTRACT's own internal gas reservation — how much of whatever the
+caller attaches to `claim`/`refund` this contract itself statically sub-allocates for the
+`ft_transfer` promise and its callback — and were left unchanged by NB-int's own D-N9 pass.
+What NB-int measured and corrected was the CALLER's own side of this: the adapter's
+`FT_TRANSFER_CALL_GAS`/`CLAIM_REFUND_GAS` (`src/rails/near-htlc.ts`, attached gas, not this
+table's reservation), from a provisional 100/60 Tgas down to 20/40 Tgas against real measured
+burn on the sandbox (`tests-near/near-htlc.near.test.ts`'s own `measuredGasBurnt`) — see that
+file's own doc comment for the full story, including why `CLAIM_REFUND_GAS` could not simply be
+set close to the ~7.3 Tgas actually burnt: it must stay comfortably above this table's own 20
+Tgas of static sub-allocation (`FT_TRANSFER_GAS` + `CALLBACK_GAS`), which is checked eagerly at
+promise-creation time, a different constraint from total gas burnt. See the main `README.md`'s
+own "NEAR leg" section for how to run this leg's tests and what its committed fixtures prove.
 
 ## Build instructions
 

@@ -117,6 +117,91 @@ containing no private key material (nothing in this build holds one to begin wit
 these captures ever name is a public pubkey/fingerprint/path, and the node's own RPC cookie is
 never captured, logged, or written into any file this repo commits).
 
+## First-party NEAR-leg files (P5-NEAR-SPEC.md) — unaudited, testnet-only
+
+Not vendored — original to this repo, written for the local/keyless NEAR leg
+(`handoff/P5-NEAR-SPEC.md`, `handoff/P5-NEAR-DECISIONS-2026-09-29.md` D-N1..D-N12). Listed here
+per that spec's own instruction, not because anything below reuses outside code, except where
+noted: **unaudited, testnet-only**, same as the EVM and Bitcoin legs' own files above — none of
+it has been reviewed for a real deployment, and no deployment this repo drives today carries
+mainnet value (the allow list refuses every chain id but `near-sandbox-flop`/`testnet` by name,
+`mainnet` is refused explicitly, and no private key, seed, mnemonic or ed25519 secret key for any
+NEAR account exists anywhere in this build — D-N2, `tests-near/helpers/sandbox.ts`'s own header
+comment).
+
+- `contracts-near/htlc/src/lib.rs` — the hashed-timelock NEAR contract (§3): `ft_on_transfer`
+  locks a NEP-141 transfer behind a sha256 hash lock, `claim`/`refund` pay out with an explicit
+  gas-reserving callback. See `contracts-near/README.md` for the full guarantees list and the
+  NB1 fix pass (F1-F8) that hardened it.
+- `contracts-near/mock-ft/src/lib.rs` — a test-only NEP-141 + NEP-145 token standing in for
+  Circle's NEAR USDC (6 decimals, symbol `USDC`, owner-minted), exactly like `MockERC20` on the
+  EVM leg.
+- `contracts-near/build.sh`/`contracts-near/smoke-test.sh` — the WSL build/keyless-smoke-test
+  scripts (§0/§2).
+- `src/rails/near-borsh.ts` — the first-party borsh transaction writer (D-N1: no new npm
+  dependency): `TransactionV0`, its five actions, `SignedTransaction`, pinned against a known
+  near-api-js test vector.
+- `src/rails/near-rpc.ts` — the thin fetch JSON-RPC client (`status`, `block`, `call_function`,
+  `send_tx`, `EXPERIMENTAL_tx_status`, `viewAccessKey`) through `CapturingRpc`, including
+  `NearUnknownTransactionError`'s own recognition of near-sandbox's real tx-status timeout shape
+  (confirmed live against the sandbox, NB-int).
+- `src/rails/near-htlc.ts` — the desk-facing `near-htlc` adapter: chain pin (allow list
+  `near-sandbox-flop`/`testnet`), keyless writes via an in-memory `NearSigner` (§1/§4), the
+  sign-and-record-then-broadcast split (D-N4), `FT_TRANSFER_CALL_GAS`/`CLAIM_REFUND_GAS`
+  corrected from their provisional 100/60 Tgas to 20/40 Tgas against real measured gas burn on
+  the sandbox (D-N9, NB-int).
+- `src/rails/near-evidence.ts` — the pure, fail-closed finalized-view evidence decoder shared by
+  the live rail and the offline replay, the NEAR twin of `src/rails/evm-evidence.ts`/
+  `src/rails/btc-evidence.ts` (D-N10).
+- `src/rails/near-signer-memory.ts` — `InMemoryNearSigner`, the ONLY concrete `NearSigner`
+  implementation in this build (test/harness code only — §1/D-N2/D-10): `generate()` for a fresh
+  in-memory keypair, `fromNearSecretKey()` for `tests-near/helpers/sandbox.ts`'s own one-time
+  read of the sandbox's own `test.near` key.
+- `src/client/near-rail.ts` — the `near-htlc` implementation of `src/client/counter-rail.ts`'s
+  `CounterAssetRail` interface, the rail-agnostic wiring `src/client/seller.ts`/`buyer.ts` drive
+  (§4/§7a); `resendRefundIfDropped` deliberately omitted (D-N6: NEAR has no mempool-drop concept
+  for it to paper over), `checkPendingClaim` implemented (D-N6).
+- `src/client/policy.ts`'s `NEAR_LOCAL_POLICY` — the NEAR-local deadline policy (D-N8): reuses
+  EVM's own `minRevealWindowMs`/`finalityAMs` numbers verbatim rather than re-deriving them from
+  NEAR's own (much faster) Doomslug finality — see that constant's own doc comment and
+  `tests-near/client-flows.near.test.ts`'s header comment for the NB-int timing this stage
+  measured but did not use to tighten it.
+- `src/client/bundle.ts`'s NEAR-leg addition (`NearBundleCapture`) — writes a `near-htlc` leg's
+  own `raw/near/`, `rails.json` entry and `finalizedRef` into the same watch-root-shaped bundle
+  the EVM/Bitcoin legs' own writers produce (§4).
+- `src/replay.ts`'s/`src/watcher.ts`'s/`bin/watch.mjs`'s/`examples/audit-export.mjs`'s
+  `near-htlc` branches — added exactly the way the `evm-htlc`/`btc-htlc` branches already
+  existed, dispatching on the tclk contract machine's own accepted lock rail/ref (§4).
+- `tests-near/helpers/sandbox.ts` — the NB-int sandbox harness: spawns `near-sandbox` inside
+  WSL (D-N2's argv-array `wsl.exe` invocation, never a `bash -lc` string carrying `$VAR`s),
+  builds and deploys both contracts, creates the buyer/seller/token/contract accounts with fresh
+  in-memory keys, and exposes `fastForward` (D-N7, confirmed empirically to advance the FINAL
+  block's own timestamp).
+- `tests-near/near-htlc.near.test.ts` — adapter integration against the real sandbox (nine
+  scenarios: lock, claim, wrong-preimage refusal, refund timing, a malformed `ft_transfer_call`
+  msg, an unregistered-payee claim forced past its own pre-check, lost-reply recovery, and the
+  evidence reader end to end); this is also where D-N9's gas measurement was taken.
+- `tests-near/client-flows.near.test.ts` — the Seller/Buyer client flows end to end against the
+  same real sandbox (P5-NEAR-SPEC.md §5): the happy path to `settled`; both refund paths,
+  `refunded` and `refunded-b`; a claim refused before a finalized on-chain lock exists and
+  allowed once one does; the Buyer learning the secret from `get_lock` alone with no reveal frame
+  posted; a claim to an unregistered payee refused before ever sending a transaction; and a
+  lost-reply recovery by transaction hash (D-N4) exercised from inside a real client flow.
+- `tests-near/probe/` — the NB0 wasm-compatibility probe (contract, script, findings) this leg's
+  every later stage builds on.
+
+`fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b}/` are also first-party: real
+capture bytes from a real, local, ephemeral `near-sandbox` node this repo itself starts and stops
+(`tests-near/client-flows.near.test.ts`) — not from any external service, and containing no
+private key material (this build never holds a real NEAR secret key to begin with beyond the
+one sandbox-generated `test.near` key, read once into memory and never serialized — D-N2; every
+account and key these captures ever name past that point is this process's own freshly generated,
+zero-value, in-memory keypair). `tests/near-sandbox-fixtures.test.ts`'s own extended key-material
+scan (the Bitcoin fixture scan's patterns plus NEAR's own literal `"secret_key"` field name —
+see that file's own comment for why a length-based `ed25519:` heuristic alone cannot reliably
+distinguish a secret key from an ordinary, entirely public chain signature of the same byte
+length) additionally pins this for the three committed directories on every `npm test` run.
+
 ## Settlement-view vocabulary — pinned to tclk PR #173
 
 `none | unverified | unfunded | funded | claimed | refunded` (per-leg `SwapView.settlementView`,

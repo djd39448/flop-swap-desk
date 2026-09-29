@@ -355,6 +355,150 @@ party or reveal the secret without payment.
   mines on demand and never reorgs; a real deployment choosing how many confirmations count as
   final for a given amount, and how to handle a reorg past that depth, is out of scope here.
 
+## NEAR leg (local sandbox in WSL)
+
+`contracts-near/` (a Cargo workspace: `htlc`, `mock-ft`) is a first-party, unaudited NEAR
+contract pair — see `contracts-near/README.md` for the full guarantees list. `src/rails/
+near-borsh.ts` is a small first-party borsh transaction writer (D-N1: no `near-api-js`, no
+`@near-js/*`, no near-workspaces), `src/rails/near-rpc.ts` a thin fetch JSON-RPC client, `src/
+rails/near-htlc.ts` the desk-facing `near-htlc` adapter (a chain pin allow-listing only
+`near-sandbox-flop`/`testnet`, keyless writes through an in-memory `NearSigner`, D-N4's
+sign-and-record-then-broadcast split so a write's own ref/txHash is known before it ever
+broadcasts), and `src/rails/near-evidence.ts` the pure, fail-closed finalized-view evidence
+reader, the NEAR twin of `src/rails/evm-evidence.ts`/`src/rails/btc-evidence.ts`. `src/client/
+near-rail.ts` implements the same `CounterAssetRail` interface the EVM/Bitcoin legs do, so `src/
+client/seller.ts`/`buyer.ts` drive a `near-htlc` leg through the identical Seller/Buyer flow.
+Unlike Bitcoin's dual-pubkey script, a `near-htlc` leg posts a single D-08 ACCOUNT-id line per
+party (`swap1 account near-htlc near:<chain id>:<account id>`, D-N5) — the contract authorizes
+by NEAR account id (`predecessor_account_id`), not by a pubkey the script itself commits to.
+
+Run it:
+
+```bash
+npm run test:near
+```
+
+This builds `dist/`, then (inside WSL Ubuntu, Rust 1.98.1 + `wasm32-unknown-unknown`,
+near-sandbox 2.13.4/protocol 86 — `contracts-near/README.md`'s own build instructions,
+`tests-near/probe/README.md`'s WSL-invocation gotcha) builds both contracts, spawns a real
+throwaway `near-sandbox` node (chain id `near-sandbox-flop`, D-N3), and drives `tests-near/
+near-htlc.near.test.ts` (the adapter alone: lock, claim, wrong-preimage refusal, refund timing,
+a malformed `ft_transfer_call` msg refunded in full, an unregistered-payee claim forced past its
+own pre-check, lost-reply recovery by transaction hash, and the evidence reader end to end — this
+is also where D-N9's real gas measurement was taken and `FT_TRANSFER_CALL_GAS`/
+`CLAIM_REFUND_GAS` corrected from their provisional 100/60 Tgas to the measured 20/40 Tgas) and
+`tests-near/client-flows.near.test.ts` (the Seller/Buyer flows end to end: the happy path to
+`settled`; both refund paths, `refunded` and `refunded-b`, the Buyer's own refund crossing
+`refundAfterMs` via `sandbox_fast_forward`'s real advance of the FINAL block's own timestamp,
+D-N7; a claim refused before a finalized on-chain lock exists at all and allowed once the Buyer
+actually locks — NEAR's own twin of the Bitcoin leg's "before N confirmations" scenario, since
+`send_tx`'s own `wait_until: "FINAL"` leaves no observable "broadcast but not yet final" window
+for a write that actually happened; the Buyer learning the secret from `get_lock` alone with no
+reveal frame ever posted; a claim to an unregistered payee refused before ever sending a
+transaction; and a lost-reply recovery by transaction hash exercised from inside a real client
+flow). `npm test` never spawns `near-sandbox`, builds no contract and opens no WSL process — a
+missing toolchain or sandbox binary fails `test:near` loudly instead (P4-BTC-SPEC.md §7a's own
+lessons checklist, reused here).
+
+**Fixture capture is opt-in**, identical in shape to the EVM/Bitcoin legs' own
+`CAPTURE_EVM_FIXTURES`/`CAPTURE_BTC_FIXTURES`: every client-flow scenario writes its watch-root
+bundle to a fresh `mkdtemp` directory by default, so an ordinary `npm run test:near` never
+touches the three committed fixtures below. Regenerating them is a deliberate, separate step:
+
+```bash
+CAPTURE_NEAR_FIXTURES=1 npm run test:near
+```
+
+which overwrites `fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b}/` in place.
+Commit the result and then confirm both that `tests/near-sandbox-fixtures.test.ts` (hermetic,
+`npm test`) replays it and that a plain `npm run test:near` afterward leaves `git status` clean.
+An ordinary (non-capture) run removes its own `mkdtemp` bundle directories once the suite
+finishes; set `KEEP_NEAR_BUNDLES=1` to keep them around for inspecting a scenario's exact written
+bundle by hand (and `KEEP_NEAR_SANDBOX_HOME=1`, `tests-near/helpers/sandbox.ts`, to keep the
+sandbox's own throwaway WSL home under `/tmp`).
+
+**Keyless throughout except one sandbox-only bootstrap key (D-N2):** the ONLY key this build
+ever reads off disk is the throwaway sandbox's own `test.near` validator key, read exactly once
+into memory (`wsl.exe -- cat`, never a `bash -lc` string, never logged, never written to disk on
+the Windows side, never returned from `tests-near/helpers/sandbox.ts` in any form) and used only
+to sign the four `CreateAccount` transactions that bootstrap the buyer/seller/token/contract
+accounts. Every account past that point — including both parties' own swap-signing keys — is a
+fresh, in-memory, zero-value ed25519 keypair this process itself generates
+(`InMemoryNearSigner.generate`), never written to disk, never printed, never in a fixture. This
+is a deliberately narrower exception than the Bitcoin/EVM legs' own fully keyless design (NEAR
+has no node-side signer the way a bitcoind wallet or anvil's own accounts do), approved by Dave
+specifically for the sandboxed build (`handoff/P5-NEAR-SPEC.md` §1: "yes, in-memory throwaway
+keys are fine").
+
+**A claim is checked before it is ever broadcast.** `NearHtlcRail.claim()` verifies the preimage
+actually opens the hash lock, reads a fresh `Locked` state still inside its window, and confirms
+the payee is storage-registered on the token (so a "locked" verdict also proves the payout can
+land) — all before anything is signed. `notAfterMs` is re-checked against fresh chain time as the
+very last read before broadcast. A claim that would fail any of these (the wrong preimage, a
+lock that's expired or already resolved, a payee who was never storage-registered) is refused
+client-side and never sent at all.
+
+**What this proves, and what it does not.** The three committed fixtures
+(`fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b}/`, replayed hermetically by
+`tests/near-sandbox-fixtures.test.ts`) show a real `htlc` contract funded, claimed or refunded on
+a real near-sandbox 2.13.4 node, with every verdict re-derivable from the exact captured RPC
+bytes — but on a throwaway sandbox this repo itself starts and stops, never a real network, and
+never with mainnet value at any point in this build. `NEAR_TESTNET_PIN` (`src/rails/
+near-htlc.ts`) is present but named `"near-testnet-UNVERIFIED"` and refuses to match a live node
+until this build has actually connected to NEAR testnet and confirmed it.
+
+Re-deriving a verdict from the captured bytes detects the bytes being tampered with after the
+fact — damaged, truncated, spliced from another capture, answered for a different request, or
+taken under a different rail config — never that the capturing process told the truth about the
+chain to begin with, and never forgery: a fabricated or edited RPC response, saved under the
+sha256 of its own new bytes, replays exactly as a genuine one would (identical honesty limit to
+the EVM/Bitcoin legs' own). The independent check is each leg's own `finalizedRef`
+(`near-sandbox:final:<height>:<blockHash>`): it names a real block on the chain it was read from,
+so anyone with their own RPC access to that chain can re-query the same lock at that exact block
+hash and compare against what this build reported, independent of this repository entirely.
+
+### Known limits of the NEAR leg
+
+Each is written down instead of hidden, per the same discipline the EVM and Bitcoin legs' own
+"Known limits" sections follow — only what this build's own tests actually prove is claimed here.
+
+- **Reused, not re-derived, deadline margins.** `NEAR_LOCAL_POLICY` (`src/client/policy.ts`)
+  reuses `EVM_LOCAL_POLICY`'s own `minRevealWindowMs` (45 min) and `finalityAMs` (20 min)
+  verbatim, by D-N8's own explicit design ("not re-derived, pending NB-int's own live sandbox
+  timing"). This stage measured the sandbox's own real timing (Doomslug finality in ~2 blocks,
+  roughly 1.2-1.5 s at the sandbox's own ~0.6-0.7 s/block cadence — an order of magnitude faster
+  than even anvil's near-instant EVM blocks) but did not tighten the shared constant to match,
+  since doing so would need to stay green against every other suite that already pins today's
+  numbers — out of scope for this stage's own deliverable. A real NEAR deployment's own margins
+  are accordingly wider than the chain's own finality lag strictly requires, not narrower.
+- **One throwaway sandbox node, no reorg handling.** Like the Bitcoin leg's own regtest node,
+  this build's sandbox is a single node this repo itself starts and stops; it never reorgs, and a
+  real deployment's own choice of what counts as final, and how to handle a reorg past that
+  point, is out of scope here.
+- **A malformed `ft_transfer_call` msg refunds in full, but the payer's storage stays touched
+  for the duration.** `ft_on_transfer` returning the full amount for an invalid `msg` (an
+  unparseable JSON body, a duplicate hash lock, a window violation) is the token's own standard
+  NEP-141 refund path (near-contract-standards), not something this build's own contract code
+  implements — verified working (`tests-near/near-htlc.near.test.ts`'s own malformed-`msg`
+  scenario) but not owned by this repo's own code.
+- **An unregistered payee's claim reveals the preimage without paying out.**
+  `contracts-near/README.md`'s own documented consequence, exercised end to end by this stage's
+  own client-flow scenario 6: `claim()`'s payout runs as an inner cross-contract promise, so a
+  payee who was never `storage_deposit`'d on the token fails only that inner transfer — the
+  preimage is already public (the contract wrote it before ever calling `ft_transfer`) even
+  though the lock reverts back to `Locked` and no payout lands. `NearHtlcRail.claim()`'s own
+  no-secret `storage_balance_of` pre-check (P5-NEAR-SPEC.md §4) exists specifically to stop this
+  build's own client from ever reaching that state through the normal claim path; it is only
+  reachable by a caller that builds and sends the raw transaction directly, bypassing the
+  adapter's own guard on purpose (exactly how this stage's own test reproduces it).
+- **The replay detects damage and splicing, not forgery.** Identical honesty limit to the
+  EVM/Bitcoin legs' own (see above).
+- **`sandbox_fast_forward`'s own simulated-time-per-block figure (D-N7, ~337 ms/block) was
+  measured once, this stage, and is not chain-enforced.** It is this build's own test-harness
+  convenience for crossing a `refundAfterMs` deadline without a real-time wait; nothing about it
+  is a NEAR protocol guarantee, and a real deployment obviously has no such lever at all — real
+  time simply has to pass.
+
 ## What this is not
 
 No AMM, no pool, no custody, no relayer (yellow paper R10.4's allowlisted relayer is
