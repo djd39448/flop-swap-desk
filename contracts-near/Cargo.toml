@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["htlc", "mock-ft"]
+
+# Shared release profile per P5-NEAR-SPEC.md section 2 / D-N11: small, deterministic,
+# panic=abort wasm with overflow checks on for financial contract arithmetic. Confirmed
+# by tests-near/probe/README.md (NB0) to be accepted by near-sandbox 2.13.4 (protocol 86)
+# with no extra RUSTFLAGS.
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
