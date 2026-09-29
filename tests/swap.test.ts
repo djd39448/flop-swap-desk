@@ -308,6 +308,53 @@ describe("foldSwap — SPEC §4 states", () => {
     expect(view.status).toBe("refunded-a");
   });
 
+  // P5-NEAR-FIXES.md E3: a refund frame conflicting with a chain rail's own `claimed`/`locked`
+  // observation must never fold to refunded-a/refunded-b/refunded — only that leg's own rail
+  // (when one is watching) decides, and the frame's disagreement is reported, not trusted.
+  it("E3: leg A's refund frame conflicts with its own chain evidence (claimed) — falls through to refunded-b, not refunded", () => {
+    const s = build();
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.refundB],
+      evidence: { aRail: { status: "claimed", final: true, checkedAtMs: T0 + 61 * MIN } },
+      nowMs: s.frames.offerB.refundAfterMs + 2 * MIN,
+    });
+    // Leg A's own frame says refunded but its own chain rail says claimed+final — never trusted
+    // on the frame's say alone; leg B has no rail evidence at all, so its own frunded frame
+    // still folds the old (unaffected) way.
+    expect(view.status).toBe("refunded-b");
+    expect(view.status).not.toBe("refunded");
+    expect(view.reasons.some((r) => r.includes("leg A refund frame conflicts with its own chain evidence"))).toBe(true);
+  });
+
+  it("E3: leg A's refund frame conflicts with its own chain evidence (locked) with no leg B — never folds to refunded-a", () => {
+    const s = build();
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
+      legB: [],
+      evidence: { aRail: { status: "locked", final: true, checkedAtMs: T0 + 61 * MIN } },
+      nowMs: s.frames.offerA.refundAfterMs + 2 * MIN,
+    });
+    expect(view.status).not.toBe("refunded-a");
+    expect(view.reasons.some((r) => r.includes("leg A refund frame conflicts with its own chain evidence"))).toBe(true);
+    expect(view.reasons).toContain("leg A advanced with no leg B present");
+  });
+
+  // A rail's own refunded+final observation is still sufficient entirely on its own (no frame
+  // at all needed) — E3 only tightens the case where a frame DISAGREES with the rail, it never
+  // weakens the "rail evidence alone" case tested just above.
+  it("E3: a rail's own refunded+final observation still folds to refunded-a with no refund frame at all", () => {
+    const s = build();
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: { aRail: { status: "refunded", final: true, checkedAtMs: T0 + 61 * MIN } },
+      nowMs: T0 + 61 * MIN,
+    });
+    expect(view.status).toBe("refunded-a");
+    expect(view.reasons.some((r) => r.includes("conflicts"))).toBe(false);
+  });
+
   it("abandoned: paired but leg B never locked before leg A's offer expired", () => {
     const s = build();
     const view = foldSwap({

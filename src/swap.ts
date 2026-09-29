@@ -132,6 +132,31 @@ function settlementViewForLeg(evidence: LockEvidence | undefined, rail: RailObse
   return "unverified";
 }
 
+/** P5-NEAR-FIXES.md E3: a leg's own `refund` frame is never enough, on its own, to fold to
+ *  `refunded`/`refunded-a`/`refunded-b` once a chain rail observation exists for that leg. Every
+ *  paper-rail leg leaves `rail` (`evidence.aRail`/`bRail`) undefined — `foldCaptured`
+ *  (`src/replay.ts`) only ever attaches a `RailObservation` for a chain-backed rail
+ *  (`evm-htlc`/`btc-htlc`/`near-htlc`) — so this only ever changes behaviour for those, never for
+ *  the paper path (which keeps falling back to the frame alone, unchanged). When a chain rail IS
+ *  watching, its own `refunded`+final observation is both necessary and sufficient — a `refund`
+ *  frame that disagrees with a `claimed` or `locked` on-chain observation is a real conflict
+ *  (a stale client, a race, or worse) and must never be allowed to talk this fold into
+ *  "refunded" on its say alone; it is reported as a reason instead, and contributes nothing
+ *  toward any `refunded-*` status.
+ */
+function refundedFold(legLabel: "A" | "B", legStatus: string, rail: RailObservation | undefined, reasons: string[]): boolean {
+  if (rail !== undefined) {
+    const railRefunded = rail.status === "refunded" && rail.final === true;
+    if (legStatus === "refunded" && !railRefunded) {
+      reasons.push(
+        `leg ${legLabel} refund frame conflicts with its own chain evidence (rail reports "${rail.status}"${rail.final ? "" : ", not final"}) — not folded to refunded`,
+      );
+    }
+    return railRefunded;
+  }
+  return legStatus === "refunded";
+}
+
 function foldLeg(records: readonly TranscriptRecord[]): TranscriptFoldResult | null {
   return records.length === 0 ? null : foldTranscript(records);
 }
@@ -265,8 +290,14 @@ export function foldSwap(input: SwapFoldInput): SwapView {
       return view;
     }
     if (legAState.status === "refunded") {
-      reasons.push("leg A refunded with no leg B");
-      view.status = "refunded-a";
+      // E3: same rule as the paired-legs branch below — a refund frame conflicting with leg
+      // A's own chain evidence never folds to refunded-a.
+      if (refundedFold("A", legAState.status, evidence.aRail, reasons)) {
+        reasons.push("leg A refunded with no leg B");
+        view.status = "refunded-a";
+        return view;
+      }
+      reasons.push("leg A advanced with no leg B present");
       return view;
     }
     reasons.push("leg A advanced with no leg B present");
@@ -356,12 +387,9 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     return view;
   }
 
-  const refundedA =
-    legAState.status === "refunded" ||
-    (evidence.aRail?.status === "refunded" && evidence.aRail.final === true);
-  const refundedB =
-    legBState.status === "refunded" ||
-    (evidence.bRail?.status === "refunded" && evidence.bRail.final === true);
+  // E3: keyed off each leg's own chain rail observation when one exists, never the frame alone.
+  const refundedA = refundedFold("A", legAState.status, evidence.aRail, reasons);
+  const refundedB = refundedFold("B", legBState.status, evidence.bRail, reasons);
   if (refundedA && refundedB) {
     view.status = "refunded";
     return view;
