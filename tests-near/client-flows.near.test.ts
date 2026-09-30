@@ -7,8 +7,8 @@
 // in-memory `NoteStore`. Mirrors tests-regtest/client-flows.regtest.test.ts's own structure
 // (one shared node for the whole file, `writeBundle` + `examples/audit-export.mjs` replay per
 // scenario, `CAPTURE_NEAR_FIXTURES`) with NEAR's own primitives swapped in for Bitcoin's:
-// account ids instead of a dual-pubkey script (D-N5), the hash lock itself as the write ref
-// instead of a funding outpoint (D-N4), and `sandbox.fastForward` (D-N7: the FINAL block's own
+// account ids instead of a dual-pubkey script (D-N5), the `0x<hash lock>:<payer>` write ref
+// instead of a funding outpoint (squatting fix, replacing D-N4), and `sandbox.fastForward` (D-N7: the FINAL block's own
 // timestamp advances with height under fast-forward) to cross a `refundAfterMs` deadline instead
 // of Bitcoin's `setmocktime` + mining.
 //
@@ -68,7 +68,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { base58 } from "@scure/base";
-import { MemoryNoteStore, OFFER_ROOM, PaperRail, dealRoom, paperNote, verifyHashPreimage, type LockTerms } from "@flop-labs/tclk";
+import { MemoryNoteStore, OFFER_ROOM, PaperRail, dealRoom, paperNote, tryDecodeFrame, verifyHashPreimage, type LockTerms } from "@flop-labs/tclk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
@@ -375,6 +375,73 @@ describe("Seller/Buyer client flows against a real near-sandbox node", () => {
     });
   }, 120_000);
 
+  // Squatting fix: a third account holding the configured token locks 1 unit under the swap's
+  // (public) hash lock BEFORE the Buyer's lockLegA. Pre-fix the Buyer's real lock was refused and
+  // the swap died; now the lock is keyed by (payer, hash lock) and the whole swap settles, with
+  // the squatter's own unit left for its own payer.
+  it("squatting fix: a third account locks 1 unit under the swap's hash lock before lockLegA; the swap still settles", async () => {
+    const buyer = ident(41);
+    const seller = ident(42);
+    const t0 = await chainNowMs();
+    const h = setupSwap(sandbox, sandbox.config, freshParty(buyer), freshParty(seller), t0);
+    const startedAtMs = h.clock();
+
+    const { swapId, offerA, acceptA, acceptB } = await pairAndLockB("00000041", buyer, h, t0);
+    const statement = h.sellerFlow.statement;
+    if (statement === undefined) throw new Error("test setup: seller's own statement was never minted");
+
+    // The squat: any holder of the token reads the hash lock off the public offer and locks first.
+    const squatter = await sandbox.createFundedAccount("squatter2.test.near");
+    await sandbox.mintUsdc(squatter.accountId, "10");
+    const squatterRpc = sandbox.createCapturingRpc();
+    const squatterRail = await NearHtlcRail.connect({ config: sandbox.config, rpc: squatterRpc, signer: squatter.signer, clock: Date.now });
+    await squatterRail.prepareLock({
+      hashLock: statement,
+      amount: "1",
+      payee: sandbox.seller.accountId,
+      claimByMs: offerA.claimByMs,
+      refundAfterMs: offerA.refundAfterMs,
+    });
+    await squatterRail.commitLock();
+
+    // The Buyer's real lock still goes through, and its ref names the Buyer.
+    const lockA = await h.buyerFlow.lockLegA();
+    expect(lockA.writeEvidence.ref).toBe(`${statement}:${sandbox.buyer.accountId}`);
+    const lockFrame = (await h.venue.read(dealRoom(acceptA.contract))).map((r) => tryDecodeFrame(r.line)).find((f) => f?.type === "lock");
+    expect((lockFrame as { ref: string } | undefined)?.ref).toBe(lockA.writeEvidence.ref);
+
+    const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
+    expect(claimed.reveal).toBeDefined();
+    const secret = await h.buyerFlow.learnSecret();
+    expect(verifyHashPreimage(lockA.hashLock, secret)).toBe(true);
+    await h.buyerFlow.claimLegB(secret);
+
+    // The squatter's own unit is untouched: still Locked under ITS OWN key.
+    const near = new NearRpc(sandbox.createCapturingRpc());
+    const squatView = JSON.parse((await near.callFunction(sandbox.htlcContract, "get_lock", { hash_lock: statement.slice(2), payer: squatter.accountId })).resultText) as { status: string };
+    expect(squatView.status).toBe("Locked");
+
+    const termsA = offerAcceptLockTerms(offerA, acceptA);
+    const accounts = await resolveNearAccounts(h, h.buyerRail, acceptA.contract, termsA);
+    await writeAndReplay({
+      scenario: "squat-settled",
+      swapId,
+      status: "settled",
+      venue: h.venue,
+      acceptAContract: acceptA.contract,
+      acceptBContract: acceptB.contract,
+      noteStore: h.noteStore,
+      near: { ref: lockA.writeEvidence.ref, terms: termsA, accounts },
+      startedAtMs,
+      nowMs: h.clock(),
+      writes: [
+        { leg: "a", step: "lock", rail: "near-htlc", evidence: lockA.writeEvidence },
+        { leg: "a", step: "claim", rail: "near-htlc", evidence: claimed.evidence },
+      ],
+      writeExchanges: [...h.buyerFlow.exchanges, ...h.sellerFlow.exchanges],
+    });
+  }, 120_000);
+
   it(
     "scenario 2: refunded — Seller never claims; Buyer refunds A after refundAfterMs (real chain time, via fastForward), Seller refunds B -> refunded",
     async () => {
@@ -562,7 +629,7 @@ describe("Seller/Buyer client flows against a real near-sandbox node", () => {
     // H4: `recoverByTxHash` now takes the CALLER's own expected ref and returns it as
     // `evidence.ref` verbatim — never the raw txHash (A9: an evidence reader keys and re-binds
     // captures by ref, so returning anything else would silently mislabel a recovered write).
-    // Here the caller's own ref is the hash lock itself (D-N4: near-htlc's own write ref).
+    // Here the caller's own ref is `0x<hash lock>:<payer>` (squatting fix: near-htlc's own write ref).
     const recovered = await recoveryRail.recoverByTxHash(lockA.writeEvidence.txHash, sandbox.buyer.accountId, lockA.writeEvidence.ref);
     expect(recovered).not.toBeNull();
     expect(recovered?.blockHash).toBe(lockA.writeEvidence.blockHash);

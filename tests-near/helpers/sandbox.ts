@@ -307,6 +307,9 @@ export interface NearSandboxHandle {
    *  rather than unregistering when the caller's balance is nonzero, so `sandbox.seller` — reused
    *  and credited across this whole file's own tests — is never safe to reuse for that). */
   createFundedAccount(accountId: string): Promise<{ accountId: string; signer: NearSigner }>;
+  /** Test support only: mints `amount` micro-USDC to an already storage-registered account (the
+   *  token is self-owned, so the setup signer can mint) — e.g. a squatter that needs a unit to lock. */
+  mintUsdc(accountId: string, amount: string): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -514,6 +517,10 @@ export async function startNearSandbox(options: StartNearSandboxOptions = {}): P
         await callSetup(near, signer, accountId, "usdc.test.near", "storage_deposit", {}, 30n * TGAS, STORAGE_DEPOSIT_YOCTO);
         setupRpc.drain();
         return { accountId, signer };
+      },
+      mintUsdc: async (accountId, amount) => {
+        await callSetup(near, usdcSigner, "usdc.test.near", "usdc.test.near", "mint", { account_id: accountId, amount }, 30n * TGAS, 0n);
+        setupRpc.drain();
       },
       deployUnlockedHtlcClone: async (accountId) => {
         await createSubAccount(near, rootSigner, accountId, 50n * ONE_NEAR, {

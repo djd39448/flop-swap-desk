@@ -95,10 +95,15 @@ describe("near-htlc (sandbox)", () => {
     return Number(BigInt(block.header.timestampNs) / 1_000_000n);
   }
 
-  async function getLockView(hashLock0x: string): Promise<LockViewRaw | null> {
+  /** Squatting fix: the ref is `0x<hash lock>:<payer>`; every lock in this file is the buyer's unless a test says otherwise. */
+  function refOf(hashLock0x: string, payer: string = sandbox.buyer.accountId): string {
+    return `${hashLock0x}:${payer}`;
+  }
+
+  async function getLockView(hashLock0x: string, payer: string = sandbox.buyer.accountId): Promise<LockViewRaw | null> {
     const rpc = sandbox.createCapturingRpc();
     const near = new NearRpc(rpc);
-    const result = await near.callFunction(sandbox.htlcContract, "get_lock", { hash_lock: hashLock0x.slice(2) });
+    const result = await near.callFunction(sandbox.htlcContract, "get_lock", { hash_lock: hashLock0x.slice(2), payer });
     return JSON.parse(result.resultText) as LockViewRaw | null;
   }
 
@@ -196,9 +201,9 @@ describe("near-htlc (sandbox)", () => {
     const { rail: buyerRail, rpc: buyerRpc } = await connect(sandbox.buyer.signer);
     const terms: NearHtlcTerms = { hashLock: hashLock0x, amount, payee: sandbox.seller.accountId, claimByMs, refundAfterMs };
     const { ref } = await buyerRail.prepareLock(terms);
-    expect(ref).toBe(hashLock0x);
+    expect(ref).toBe(refOf(hashLock0x));
     const evidence = await buyerRail.commitLock();
-    expect(evidence.ref).toBe(hashLock0x);
+    expect(evidence.ref).toBe(refOf(hashLock0x));
     expect(evidence.txHash).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/);
     expect(evidence.blockHash).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/);
 
@@ -234,8 +239,8 @@ describe("near-htlc (sandbox)", () => {
 
     const { rail: sellerRail, rpc: sellerRpc } = await connect(sandbox.seller.signer);
     const notAfterMs = refundAfterMs - 60_000;
-    const evidence = await sellerRail.claim(hashLock0x, preimage0x, notAfterMs);
-    expect(evidence.ref).toBe(hashLock0x);
+    const evidence = await sellerRail.claim(refOf(hashLock0x), preimage0x, notAfterMs);
+    expect(evidence.ref).toBe(refOf(hashLock0x));
 
     const gas = measuredGasBurnt(sellerRpc);
     console.log(`[gas] claim total gas_burnt = ${gas.toString()} (${(Number(gas) / 1e12).toFixed(2)} Tgas)`);
@@ -261,7 +266,7 @@ describe("near-htlc (sandbox)", () => {
     await buyerRail.commitLock();
 
     const { rail: sellerRail, rpc: sellerRpc } = await connect(sandbox.seller.signer);
-    await expect(sellerRail.claim(hashLock0x, `0x${bytesToHex(wrongPreimage)}`, refundAfterMs - 1000)).rejects.toThrow(/does not open hashLock/);
+    await expect(sellerRail.claim(refOf(hashLock0x), `0x${bytesToHex(wrongPreimage)}`, refundAfterMs - 1000)).rejects.toThrow(/does not open hashLock/);
     expect(sellerRpc.exchanges().some((e) => e.method === "send_tx")).toBe(false);
   });
 
@@ -275,7 +280,7 @@ describe("near-htlc (sandbox)", () => {
     await buyerRail.prepareLock({ hashLock: hashLock0x, amount: "1", payee: sandbox.seller.accountId, claimByMs, refundAfterMs });
     await buyerRail.commitLock();
 
-    await expect(buyerRail.refund(hashLock0x)).rejects.toThrow(/chain time has not yet reached refundAfterMs/);
+    await expect(buyerRail.refund(refOf(hashLock0x))).rejects.toThrow(/chain time has not yet reached refundAfterMs/);
   });
 
   it("refund after refundAfterMs (reached via fastForward) pays the buyer back; claim afterward is refused", async () => {
@@ -294,8 +299,8 @@ describe("near-htlc (sandbox)", () => {
     await sandbox.fastForward(150); // ~ comfortably past a few-second window (D-N7: timestamp advances with height)
 
     const refundRail = buyerRail;
-    const evidence = await refundRail.refund(hashLock0x);
-    expect(evidence.ref).toBe(hashLock0x);
+    const evidence = await refundRail.refund(refOf(hashLock0x));
+    expect(evidence.ref).toBe(refOf(hashLock0x));
 
     const gas = measuredGasBurnt(buyerRpc);
     console.log(`[gas] refund total gas_burnt = ${gas.toString()} (${(Number(gas) / 1e12).toFixed(2)} Tgas)`);
@@ -309,7 +314,7 @@ describe("near-htlc (sandbox)", () => {
 
     // claim after a refund is refused (the lock is no longer Locked).
     const { rail: sellerRail } = await connect(sandbox.seller.signer);
-    await expect(sellerRail.claim(hashLock0x, preimage0x, refundAfterMs + 60_000)).rejects.toThrow(/not in a claimable "Locked" state/);
+    await expect(sellerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs + 60_000)).rejects.toThrow(/not in a claimable "Locked" state/);
   });
 
   it("a malformed ft_transfer_call msg is refused by ft_on_transfer and the full amount returns to the buyer, with no lock created", async () => {
@@ -340,7 +345,7 @@ describe("near-htlc (sandbox)", () => {
     // Pre-check: NearHtlcRail.claim's own no-secret storage_balance_of check refuses before ever
     // signing or sending — proven by asserting no send_tx exchange happened.
     const { rail: sellerRail, rpc: sellerRpc } = await connect(sandbox.seller.signer);
-    await expect(sellerRail.claim(hashLock0x, preimage0x, refundAfterMs - 1000)).rejects.toThrow(/is not storage-registered/);
+    await expect(sellerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs - 1000)).rejects.toThrow(/is not storage-registered/);
     expect(sellerRpc.exchanges().some((e) => e.method === "send_tx")).toBe(false);
 
     // Forced past the pre-check: build and send the claim transaction directly, bypassing
@@ -350,7 +355,7 @@ describe("near-htlc (sandbox)", () => {
       {
         type: "FunctionCall",
         methodName: "claim",
-        args: new TextEncoder().encode(JSON.stringify({ hash_lock: hashLockHex, preimage: preimageHex })),
+        args: new TextEncoder().encode(JSON.stringify({ hash_lock: hashLockHex, payer: sandbox.buyer.accountId, preimage: preimageHex })),
         gas: 60n * TGAS,
         deposit: 0n,
       },
@@ -369,8 +374,8 @@ describe("near-htlc (sandbox)", () => {
     // The Buyer must still learn `s` from this revealed-but-Locked state (its leg A is spent
     // for good: the contract refuses the refund and the Seller may retry the payout any time),
     // otherwise it misses leg B — findClaimedPreimage does not gate on the status.
-    await expect(buyerRail.findClaimedPreimage(hashLock0x)).resolves.toBe(preimage0x);
-    await expect(buyerRail.refund(hashLock0x)).rejects.toThrow();
+    await expect(buyerRail.findClaimedPreimage(refOf(hashLock0x))).resolves.toBe(preimage0x);
+    await expect(buyerRail.refund(refOf(hashLock0x))).rejects.toThrow();
   });
 
   it("recovers a lost reply by transaction hash; an unknown transaction hash resolves to null", async () => {
@@ -383,10 +388,10 @@ describe("near-htlc (sandbox)", () => {
     await buyerRail.prepareLock({ hashLock: hashLock0x, amount: "9", payee: sandbox.seller.accountId, claimByMs, refundAfterMs });
     const evidence = await buyerRail.commitLock();
 
-    const recovered = await buyerRail.recoverByTxHash(evidence.txHash, sandbox.buyer.accountId, hashLock0x);
+    const recovered = await buyerRail.recoverByTxHash(evidence.txHash, sandbox.buyer.accountId, refOf(hashLock0x));
     expect(recovered).not.toBeNull();
     expect(recovered?.blockHash).toBe(evidence.blockHash);
-    expect(recovered?.ref).toBe(hashLock0x); // H4: the CALLER's own expectedRef, not the raw txHash
+    expect(recovered?.ref).toBe(refOf(hashLock0x)); // H4: the CALLER's own expectedRef, not the raw txHash
 
     // H4 (confirmed live, this stage): `EXPERIMENTAL_tx_status` for a hash the node has NEVER
     // seen does not answer quickly with a "not found" error the way a view call would — it
@@ -396,7 +401,7 @@ describe("near-htlc (sandbox)", () => {
     // again" is not the same as "this was never broadcast" (H4: "returns null only for
     // unknown"). This assertion is intentionally slow (waits out the node's own real timeout).
     const fakeTxHash = base58.encode(randomBytes(32));
-    await expect(buyerRail.recoverByTxHash(fakeTxHash, sandbox.buyer.accountId, hashLock0x)).rejects.toBeInstanceOf(NearTimeoutError);
+    await expect(buyerRail.recoverByTxHash(fakeTxHash, sandbox.buyer.accountId, refOf(hashLock0x))).rejects.toBeInstanceOf(NearTimeoutError);
   });
 
   // ── H1 S1/S2/S3 probes, the H2 revealed-lock retry, and H6's code-hash/key-list checks ──────
@@ -448,7 +453,7 @@ describe("near-htlc (sandbox)", () => {
       // H3: notAfterMs must clear the 30s landing margin before refundAfterMs on an unrevealed
       // (first) attempt, or the adapter's own margin guard would refuse before ever reaching the
       // network — this scenario is about the payout callback failing, not the margin guard.
-      await buyerRail.claim(hashLock0x, preimage0x, refundAfterMs - 60_000);
+      await buyerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs - 60_000);
     } catch (error) {
       caught = error;
     }
@@ -478,7 +483,7 @@ describe("near-htlc (sandbox)", () => {
     // send it directly for an unregistered payee, bypassing NearHtlcRail's own pre-check on
     // purpose (mirrors the existing "claim to an unregistered payee" scenario above).
     await sendRawTx(sandbox.createCapturingRpc(), sandbox.seller.signer, sandbox.seller.accountId, sandbox.htlcContract, [
-      { type: "FunctionCall", methodName: "claim", args: new TextEncoder().encode(JSON.stringify({ hash_lock: hashLockHex, preimage: preimageHex })), gas: 60n * TGAS, deposit: 0n },
+      { type: "FunctionCall", methodName: "claim", args: new TextEncoder().encode(JSON.stringify({ hash_lock: hashLockHex, payer: sandbox.buyer.accountId, preimage: preimageHex })), gas: 60n * TGAS, deposit: 0n },
     ]);
     const preClaim = await getLockView(hashLock0x);
     expect(preClaim?.status).toBe("Locked");
@@ -486,7 +491,7 @@ describe("near-htlc (sandbox)", () => {
 
     await sandbox.fastForward(600); // past refundAfterMs
 
-    await expect(buyerRail.refund(hashLock0x)).rejects.toThrow(NearTxFailedError);
+    await expect(buyerRail.refund(refOf(hashLock0x))).rejects.toThrow(NearTxFailedError);
     // the preimage is still public and the lock is untouched by the refused refund attempt.
     const after = await getLockView(hashLock0x);
     expect(after?.status).toBe("Locked");
@@ -503,7 +508,7 @@ describe("near-htlc (sandbox)", () => {
     const { rail: buyerRail } = await connect(sandbox.buyer.signer);
     await buyerRail.prepareLock({ hashLock: hashLock0x, amount: "10", payee: sandbox.seller.accountId, claimByMs, refundAfterMs });
     const firstEvidence = await buyerRail.commitLock();
-    expect(firstEvidence.ref).toBe(hashLock0x);
+    expect(firstEvidence.ref).toBe(refOf(hashLock0x));
 
     // Second attempt under the SAME hash lock, a different amount — the contract's own
     // first-writer-wins rule refuses it (ft_on_transfer returns the full amount), but the OUTER
@@ -536,7 +541,7 @@ describe("near-htlc (sandbox)", () => {
     // Force a revealed-but-Locked lock (same pattern as S2 above): the payout fails because the
     // payee was never storage-registered.
     await sendRawTx(sandbox.createCapturingRpc(), sandbox.seller.signer, sandbox.seller.accountId, sandbox.htlcContract, [
-      { type: "FunctionCall", methodName: "claim", args: new TextEncoder().encode(JSON.stringify({ hash_lock: hashLockHex, preimage: preimageHex })), gas: 60n * TGAS, deposit: 0n },
+      { type: "FunctionCall", methodName: "claim", args: new TextEncoder().encode(JSON.stringify({ hash_lock: hashLockHex, payer: sandbox.buyer.accountId, preimage: preimageHex })), gas: 60n * TGAS, deposit: 0n },
     ]);
     const forced = await getLockView(hashLock0x);
     expect(forced?.status).toBe("Locked");
@@ -555,8 +560,8 @@ describe("near-htlc (sandbox)", () => {
 
     const balanceBefore = BigInt(await sandbox.usdcBalanceOf(unregisteredPayee));
     const { rail: sellerRail } = await connect(sandbox.seller.signer);
-    const evidence = await sellerRail.claim(hashLock0x, preimage0x, refundAfterMs - 1_000); // already in the past
-    expect(evidence.ref).toBe(hashLock0x);
+    const evidence = await sellerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs - 1_000); // already in the past
+    expect(evidence.ref).toBe(refOf(hashLock0x));
 
     const balanceAfter = BigInt(await sandbox.usdcBalanceOf(unregisteredPayee));
     expect(balanceAfter).toBe(balanceBefore + BigInt(amount));
@@ -598,7 +603,7 @@ describe("near-htlc (sandbox)", () => {
       const terms = lockTermsFixture(hashLock0x, amount, claimByMs, refundAfterMs);
       const accounts: NearAccounts = { payee: sandbox.seller.accountId, payer: sandbox.buyer.accountId };
       const evidenceRpc = sandbox.createCapturingRpc();
-      const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, hashLock0x, Date.now());
+      const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, refOf(hashLock0x), Date.now());
       const capture: NearCapture = { index, bytes: verifiedExchangeBytes(exchanges as Exchange[]) };
       const result = nearEvidence({ terms, config: sandbox.config, accounts, capture });
       expect(result.lock.railVerified).toBe(true);
@@ -617,12 +622,12 @@ describe("near-htlc (sandbox)", () => {
       await buyerRail.prepareLock({ hashLock: hashLock0x, amount, payee: sandbox.seller.accountId, claimByMs, refundAfterMs });
       await buyerRail.commitLock();
       const { rail: sellerRail } = await connect(sandbox.seller.signer);
-      await sellerRail.claim(hashLock0x, preimage0x, refundAfterMs - 60_000); // H3: clear the landing margin
+      await sellerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs - 60_000); // H3: clear the landing margin
 
       const terms = lockTermsFixture(hashLock0x, amount, claimByMs, refundAfterMs);
       const accounts: NearAccounts = { payee: sandbox.seller.accountId, payer: sandbox.buyer.accountId };
       const evidenceRpc = sandbox.createCapturingRpc();
-      const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, hashLock0x, Date.now());
+      const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, refOf(hashLock0x), Date.now());
       const capture: NearCapture = { index, bytes: verifiedExchangeBytes(exchanges as Exchange[]) };
       const result = nearEvidence({ terms, config: sandbox.config, accounts, capture });
       expect(result.rail?.status).toBe("claimed");
@@ -639,15 +644,88 @@ describe("near-htlc (sandbox)", () => {
       await buyerRail.prepareLock({ hashLock: hashLock0x, amount, payee: sandbox.seller.accountId, claimByMs, refundAfterMs });
       await buyerRail.commitLock();
       await sandbox.fastForward(150);
-      await buyerRail.refund(hashLock0x);
+      await buyerRail.refund(refOf(hashLock0x));
 
       const terms = lockTermsFixture(hashLock0x, amount, claimByMs, refundAfterMs);
       const accounts: NearAccounts = { payee: sandbox.seller.accountId, payer: sandbox.buyer.accountId };
       const evidenceRpc = sandbox.createCapturingRpc();
-      const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, hashLock0x, Date.now());
+      const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, refOf(hashLock0x), Date.now());
       const capture: NearCapture = { index, bytes: verifiedExchangeBytes(exchanges as Exchange[]) };
       const result = nearEvidence({ terms, config: sandbox.config, accounts, capture });
       expect(result.rail?.status).toBe("refunded");
     }
+  });
+
+  it("squatting fix (sandbox): a third account locks 1 unit under the swap's hash lock FIRST; the buyer's lock still succeeds, the seller claims it, the squatter refunds only its own unit", async () => {
+    const { preimage0x, hashLock0x } = randomHashLock();
+
+    // The squatter: any holder of the configured token, here with 100 micro-USDC.
+    const squatter = await sandbox.createFundedAccount("squatter.test.near");
+    await sandbox.mintUsdc(squatter.accountId, "100");
+    const squatterBalanceStart = BigInt(await sandbox.usdcBalanceOf(squatter.accountId));
+    expect(squatterBalanceStart).toBe(100n);
+
+    const now = await chainNowMs();
+    // The squatter picks its OWN windows (short, so it can refund quickly); the contract keys its
+    // lock by (squatter, hash lock), which the buyer's own key never touches.
+    const squatTerms: NearHtlcTerms = { hashLock: hashLock0x, amount: "1", payee: sandbox.seller.accountId, claimByMs: now + 2_000, refundAfterMs: now + 4_000 };
+    const { rail: squatterRail } = await connect(squatter.signer);
+    const squatPrepared = await squatterRail.prepareLock(squatTerms);
+    expect(squatPrepared.ref).toBe(refOf(hashLock0x, squatter.accountId));
+    await squatterRail.commitLock();
+    expect((await getLockView(hashLock0x, squatter.accountId))?.status).toBe("Locked");
+
+    // The buyer's real lock, under the very same hash lock, now succeeds (pre-fix: refused and
+    // returned, NearLockRefusedError, the swap dead).
+    const claimByMs = now + 10 * 60_000;
+    const refundAfterMs = now + 20 * 60_000;
+    const amount = "5000";
+    const { rail: buyerRail } = await connect(sandbox.buyer.signer);
+    const { ref } = await buyerRail.prepareLock({ hashLock: hashLock0x, amount, payee: sandbox.seller.accountId, claimByMs, refundAfterMs });
+    expect(ref).toBe(refOf(hashLock0x));
+    const lockEvidence = await buyerRail.commitLock();
+    expect(lockEvidence.ref).toBe(ref);
+    const buyerView = await getLockView(hashLock0x);
+    expect(buyerView).toMatchObject({ status: "Locked", payer: sandbox.buyer.accountId, payee: sandbox.seller.accountId, amount });
+
+    // The evidence reader binds to the buyer's own pair, never the squatter's.
+    const terms = lockTermsFixture(hashLock0x, amount, claimByMs, refundAfterMs);
+    const accounts: NearAccounts = { payee: sandbox.seller.accountId, payer: sandbox.buyer.accountId };
+    const evidenceRpc = sandbox.createCapturingRpc();
+    const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, ref, Date.now());
+    const capture: NearCapture = { index, bytes: verifiedExchangeBytes(exchanges as Exchange[]) };
+    const evidence = nearEvidence({ terms, config: sandbox.config, accounts, capture });
+    expect(evidence.lock.railVerified).toBe(true);
+    expect(evidence.rail?.status).toBe("locked");
+    // ...and the same hash lock under the squatter's ref does not verify the buyer's terms (amount 1, other times).
+    const squatCapture = await captureNearLeg(sandbox.createCapturingRpc(), sandbox.config, terms, { payee: sandbox.seller.accountId }, refOf(hashLock0x, squatter.accountId), Date.now());
+    const squatEvidence = nearEvidence({
+      terms,
+      config: sandbox.config,
+      accounts: { payee: sandbox.seller.accountId },
+      capture: { index: squatCapture.index, bytes: verifiedExchangeBytes(squatCapture.exchanges as Exchange[]) },
+    });
+    expect(squatEvidence.lock.railVerified).toBe(false);
+    expect(squatEvidence.rail).toBeUndefined();
+
+    // The seller claims the buyer's lock (naming the buyer as payer through the ref).
+    const sellerBalanceBefore = BigInt(await sandbox.usdcBalanceOf(sandbox.seller.accountId));
+    const { rail: sellerRail } = await connect(sandbox.seller.signer);
+    const claimEvidence = await sellerRail.claim(ref, preimage0x, refundAfterMs - 60_000);
+    expect(claimEvidence.ref).toBe(ref);
+    expect(BigInt(await sandbox.usdcBalanceOf(sandbox.seller.accountId))).toBe(sellerBalanceBefore + BigInt(amount));
+    expect((await getLockView(hashLock0x))?.status).toBe("Claimed");
+    // The squatter's lock is untouched by the claim.
+    expect((await getLockView(hashLock0x, squatter.accountId))?.status).toBe("Locked");
+    // The buyer learns the secret from its own pair; nothing leaks from (or to) the squatter's.
+    await expect(buyerRail.findClaimedPreimage(ref)).resolves.toBe(preimage0x);
+
+    // The squatter's window opens: it refunds its own 1 unit, and only that.
+    await sandbox.fastForward(150);
+    await expect(squatterRail.refund(refOf(hashLock0x))).rejects.toThrow(/payer's own account/); // a ref naming the buyer is refused before any write
+    await squatterRail.refund(squatPrepared.ref);
+    expect((await getLockView(hashLock0x, squatter.accountId))?.status).toBe("Refunded");
+    expect(BigInt(await sandbox.usdcBalanceOf(squatter.accountId))).toBe(squatterBalanceStart);
+    expect((await getLockView(hashLock0x))?.status).toBe("Claimed");
   });
 });
