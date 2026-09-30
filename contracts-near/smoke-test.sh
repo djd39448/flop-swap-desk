@@ -177,9 +177,9 @@ def call_view(account_id, method_name, args: dict):
     result_bytes = bytes(query_result["result"]["result"])
     return json.loads(result_bytes.decode("utf-8"))
 
-# get_lock on a hash that was never locked -> None (JSON null).
+# get_lock on a (hash, payer) pair that was never locked -> None (JSON null).
 never_locked_hash = "0" * 64
-lock = call_view(HTLC_ACCOUNT, "get_lock", {"hash_lock": never_locked_hash})
+lock = call_view(HTLC_ACCOUNT, "get_lock", {"hash_lock": never_locked_hash, "payer": "nobody.smoke.near"})
 print("get_lock(never-locked hash) decoded:", lock)
 assert lock is None, f"expected null, got {lock!r}"
 

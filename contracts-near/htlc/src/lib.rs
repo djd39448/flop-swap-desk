@@ -152,16 +152,17 @@ fn parse_u64_strict(s: &str) -> Option<u64> {
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Contract {
+    /// Keyed by `lock_key(payer, hash_lock)` (squatting fix): a lock lives under its own
+    /// payer, so another account locking under the same public hash lock first can never
+    /// occupy the real payer's key.
     locks: LookupMap<String, Lock>,
     /// F3: the only NEP-141 token whose `ft_transfer_call` may create a lock (checked at the
-    /// top of `ft_on_transfer`). `locks` is keyed by `hash_lock` alone with first-writer-wins
-    /// semantics, and `ft_on_transfer` is otherwise a public method any account can call
-    /// directly with no real token transfer behind it (gas only) -- without this allow-list,
-    /// an attacker could read a swap's public hash_lock off the offer and pre-register a lock
-    /// under it (squatting the key) to permanently block the real payer's lock under the same
-    /// hash, or spam locks to drain the contract's storage staking (F2). This makes the
-    /// contract single-token per deployment rather than the fully asset-agnostic design in
-    /// this file's original header comment -- see README "Known limits".
+    /// top of `ft_on_transfer`). `ft_on_transfer` is otherwise a public method any account
+    /// can call directly with no real token transfer behind it (gas only) -- without this
+    /// allow-list an attacker could spam locks to drain the contract's storage staking (F2).
+    /// This makes the contract single-token per deployment rather than the fully
+    /// asset-agnostic design in this file's original header comment -- see README "Known
+    /// limits".
     usdc_token: AccountId,
 }
 
@@ -175,18 +176,22 @@ impl Contract {
         }
     }
 
-    /// All fields plus `preimage` once known; amounts/times as decimal strings. `None` if no
-    /// lock has ever been stored under `hash_lock`.
-    pub fn get_lock(&self, hash_lock: String) -> Option<LockView> {
-        self.locks.get(&hash_lock).map(|l| LockView::from(&l))
+    /// All fields plus `preimage` once known; amounts/times as decimal strings. `None` if
+    /// `payer` has never locked under `hash_lock`.
+    pub fn get_lock(&self, hash_lock: String, payer: AccountId) -> Option<LockView> {
+        self.locks
+            .get(&lock_key(&payer, &hash_lock))
+            .map(|l| LockView::from(&l))
     }
 
     /// Permissionless. Reveals `preimage` (public from this point on, even if the payout
     /// callback later fails and status reverts to `Locked`) and schedules the payout.
-    pub fn claim(&mut self, hash_lock: String, preimage: String) -> Promise {
+    /// Addresses only the lock `payer` made under `hash_lock`; pays the stored payee.
+    pub fn claim(&mut self, hash_lock: String, payer: AccountId, preimage: String) -> Promise {
+        let key = lock_key(&payer, &hash_lock);
         let mut lock = self
             .locks
-            .get(&hash_lock)
+            .get(&key)
             .unwrap_or_else(|| env::panic_str("No lock for this hash"));
         require!(lock.status == LockStatus::Locked, "Lock is not claimable");
         let now_ms = env::block_timestamp_ms();
@@ -217,7 +222,7 @@ impl Contract {
         // therefore `env::storage_usage()`) is identical before and after this write.
         lock.preimage.copy_from_slice(&preimage_bytes);
         lock.revealed = true;
-        self.locks.insert(&hash_lock, &lock);
+        self.locks.insert(&key, &lock);
         log_event("claiming", &hash_lock, &lock);
 
         ext_ft_core::ext(lock.token.clone())
@@ -227,20 +232,20 @@ impl Contract {
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(CALLBACK_GAS)
-                    .on_transfer_complete(hash_lock, Exit::Claim),
+                    .on_transfer_complete(hash_lock, payer, Exit::Claim),
             )
     }
 
-    /// Payer only. Only once the refund window has opened.
+    /// Payer only: addresses the lock `(predecessor, hash_lock)`, so a caller can only ever
+    /// name its own lock. Only once the refund window has opened.
     pub fn refund(&mut self, hash_lock: String) -> Promise {
+        let payer = env::predecessor_account_id();
+        let key = lock_key(&payer, &hash_lock);
         let mut lock = self
             .locks
-            .get(&hash_lock)
+            .get(&key)
             .unwrap_or_else(|| env::panic_str("No lock for this hash"));
-        require!(
-            env::predecessor_account_id() == lock.payer,
-            "Only the payer can refund"
-        );
+        require!(payer == lock.payer, "Only the payer can refund");
         require!(lock.status == LockStatus::Locked, "Lock is not refundable");
         // F4: once a valid preimage has been revealed (claim ran, then its payout callback
         // failed and reverted status to Locked), the lock belongs to the payee -- refunding
@@ -258,7 +263,7 @@ impl Contract {
         );
 
         lock.status = LockStatus::Refunding;
-        self.locks.insert(&hash_lock, &lock);
+        self.locks.insert(&key, &lock);
         log_event("refunding", &hash_lock, &lock);
 
         ext_ft_core::ext(lock.token.clone())
@@ -268,7 +273,7 @@ impl Contract {
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(CALLBACK_GAS)
-                    .on_transfer_complete(hash_lock, Exit::Refund),
+                    .on_transfer_complete(hash_lock, payer, Exit::Refund),
             )
     }
 
@@ -279,12 +284,14 @@ impl Contract {
     pub fn on_transfer_complete(
         &mut self,
         hash_lock: String,
+        payer: AccountId,
         exit: Exit,
         #[callback_result] result: Result<(), PromiseError>,
     ) {
+        let key = lock_key(&payer, &hash_lock);
         let mut lock = self
             .locks
-            .get(&hash_lock)
+            .get(&key)
             .unwrap_or_else(|| env::panic_str("No lock for this hash"));
         let ok = result.is_ok();
         lock.status = match (exit, ok) {
@@ -293,7 +300,7 @@ impl Contract {
             (Exit::Refund, true) => LockStatus::Refunded,
             (Exit::Refund, false) => LockStatus::Locked,
         };
-        self.locks.insert(&hash_lock, &lock);
+        self.locks.insert(&key, &lock);
         log_event(
             if ok {
                 match exit {
@@ -368,7 +375,9 @@ impl FungibleTokenReceiver for Contract {
         if now_ms >= refund_after_ms {
             return refuse_all;
         }
-        if self.locks.get(&parsed.hash_lock).is_some() {
+        // Squatting fix: a duplicate is refused only for the same (payer, hash_lock) pair.
+        let key = lock_key(&sender_id, &parsed.hash_lock);
+        if self.locks.get(&key).is_some() {
             return refuse_all;
         }
 
@@ -384,7 +393,7 @@ impl FungibleTokenReceiver for Contract {
             preimage: [0u8; 32],
             revealed: false,
         };
-        self.locks.insert(&parsed.hash_lock, &lock);
+        self.locks.insert(&key, &lock);
 
         // F2: refuse (and let the token refund the sender in full) unless the contract's own
         // balance still covers its storage staking plus a fixed reserve after this insert --
@@ -394,7 +403,7 @@ impl FungibleTokenReceiver for Contract {
             .saturating_mul(env::storage_usage() as u128)
             .saturating_add(storage_reserve());
         if env::account_balance() < required {
-            self.locks.remove(&parsed.hash_lock);
+            self.locks.remove(&key);
             return refuse_all;
         }
 
@@ -402,6 +411,12 @@ impl FungibleTokenReceiver for Contract {
 
         PromiseOrValue::Value(U128(0))
     }
+}
+
+/// Storage key of a lock: `"<payer account>:<hash_lock hex>"`. The NEAR account-id grammar has
+/// no `:`, so the pair is unambiguous.
+fn lock_key(payer: &AccountId, hash_lock: &str) -> String {
+    format!("{payer}:{hash_lock}")
 }
 
 fn is_valid_hash_hex(s: &str) -> bool {
@@ -563,7 +578,7 @@ mod tests {
         let res = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
         assert_value(res, 0);
 
-        let view = c.get_lock(hash.clone()).expect("lock stored");
+        let view = c.get_lock(hash.clone(), payer()).expect("lock stored");
         assert_eq!(view.payer, payer());
         assert_eq!(view.payee, payee());
         assert_eq!(view.token, token());
@@ -577,7 +592,7 @@ mod tests {
     #[test]
     fn get_lock_before_any_lock_is_none() {
         let c = setup();
-        assert!(c.get_lock("a".repeat(64)).is_none());
+        assert!(c.get_lock("a".repeat(64), payer()).is_none());
     }
 
     #[test]
@@ -594,7 +609,7 @@ mod tests {
         let (_, hash) = preimage_and_hash();
         let res = lock_via_transfer(&mut c, 0, 0, &hash, HOUR_MS, 2 * HOUR_MS);
         assert_value(res, 0);
-        assert!(c.get_lock(hash).is_none());
+        assert!(c.get_lock(hash, payer()).is_none());
     }
 
     #[test]
@@ -633,7 +648,7 @@ mod tests {
         );
         let res = c.ft_on_transfer(payer(), U128(500), msg);
         assert_value(res, 500);
-        assert!(c.get_lock(hash).is_none());
+        assert!(c.get_lock(hash, payer()).is_none());
     }
 
     #[test]
@@ -650,7 +665,7 @@ mod tests {
         );
         let res = c.ft_on_transfer(payer(), U128(500), msg);
         assert_value(res, 500);
-        assert!(c.get_lock(hash).is_none());
+        assert!(c.get_lock(hash, payer()).is_none());
     }
 
     #[test]
@@ -667,7 +682,7 @@ mod tests {
         );
         let res = c.ft_on_transfer(payer(), U128(500), msg);
         assert_value(res, 500);
-        assert!(c.get_lock(hash).is_none());
+        assert!(c.get_lock(hash, payer()).is_none());
     }
 
     #[test]
@@ -677,7 +692,7 @@ mod tests {
         // claim_by_ms >= refund_after_ms is rejected.
         let res = lock_via_transfer(&mut c, 0, 1_000, &hash, 2 * HOUR_MS, HOUR_MS);
         assert_value(res, 1_000);
-        assert!(c.get_lock(hash).is_none());
+        assert!(c.get_lock(hash, payer()).is_none());
     }
 
     #[test]
@@ -695,7 +710,7 @@ mod tests {
         // now_ms (3*HOUR_MS) >= refund_after_ms (2*HOUR_MS): the window is already closed.
         let res = lock_via_transfer(&mut c, 3 * HOUR_MS, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
         assert_value(res, 1_000);
-        assert!(c.get_lock(hash).is_none());
+        assert!(c.get_lock(hash, payer()).is_none());
     }
 
     #[test]
@@ -709,7 +724,7 @@ mod tests {
         assert_value(second, 42);
 
         // Original lock is untouched by the rejected second attempt.
-        let view = c.get_lock(hash).unwrap();
+        let view = c.get_lock(hash, payer()).unwrap();
         assert_eq!(view.amount, U128(1_000));
     }
 
@@ -722,7 +737,7 @@ mod tests {
         testing_env!(ctx(accounts(4), 0).build());
         let res = c.ft_on_transfer(accounts(4), U128(1), lock_msg(&hash, HOUR_MS, 2 * HOUR_MS));
         assert_value(res, 1);
-        assert!(c.get_lock(hash).is_none());
+        assert!(c.get_lock(hash, payer()).is_none());
     }
 
     #[test]
@@ -740,7 +755,7 @@ mod tests {
         );
         let res = c.ft_on_transfer(payer(), U128(500), msg);
         assert_value(res, 500);
-        assert!(c.get_lock(hash).is_none());
+        assert!(c.get_lock(hash, payer()).is_none());
     }
 
     #[test]
@@ -758,7 +773,7 @@ mod tests {
         );
         let res = c.ft_on_transfer(payer(), U128(500), msg);
         assert_value(res, 500);
-        assert!(c.get_lock(hash).is_none());
+        assert!(c.get_lock(hash, payer()).is_none());
     }
 
     #[test]
@@ -768,11 +783,105 @@ mod tests {
         testing_env!(ctx(accounts(4), 0).build()); // not a token: a direct call
         let squat = c.ft_on_transfer(accounts(4), U128(1), lock_msg(&hash, HOUR_MS, u64::MAX / 2));
         assert_value(squat, 1);
-        assert!(c.get_lock(hash.clone()).is_none(), "squat must never be stored");
+        assert!(c.get_lock(hash.clone(), payer()).is_none(), "squat must never be stored");
 
         let real = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
         assert_value(real, 0);
-        assert_eq!(c.get_lock(hash).unwrap().amount, U128(1_000));
+        assert_eq!(c.get_lock(hash, payer()).unwrap().amount, U128(1_000));
+    }
+
+    // ---- squatting fix: locks are keyed by (payer, hash_lock) ----
+
+    fn lock_as(
+        contract: &mut Contract,
+        sender: AccountId,
+        now_ms: u64,
+        amount: u128,
+        hash_lock: &str,
+    ) -> PromiseOrValue<U128> {
+        testing_env!(ctx(token(), now_ms).build());
+        contract.ft_on_transfer(sender, U128(amount), lock_msg(hash_lock, HOUR_MS, 2 * HOUR_MS))
+    }
+
+    #[test]
+    fn squat_by_another_payer_first_does_not_block_the_real_lock_and_it_pays_out() {
+        let mut c = setup();
+        let (preimage, hash) = preimage_and_hash();
+        // accounts(4) holds the token and locks 1 unit under the public hash lock FIRST.
+        assert_value(lock_as(&mut c, accounts(4), 0, 1, &hash), 0);
+        // The real payer's lock under the same hash lock is still accepted in full.
+        assert_value(lock_as(&mut c, payer(), 0, 1_000, &hash), 0);
+        assert_eq!(c.get_lock(hash.clone(), payer()).unwrap().amount, U128(1_000));
+        assert_eq!(c.get_lock(hash.clone(), accounts(4)).unwrap().amount, U128(1));
+
+        // Claiming the real lock reveals and pays the real payee 1_000, not the squat.
+        testing_env!(ctx(payee(), HOUR_MS / 2).build());
+        let _p = c.claim(hash.clone(), payer(), preimage);
+        assert_eq!(c.get_lock(hash.clone(), payer()).unwrap().status, "Claiming");
+        testing_env!(ctx(contract_account(), HOUR_MS / 2).build());
+        c.on_transfer_complete(hash.clone(), payer(), Exit::Claim, Ok(()));
+        assert_eq!(c.get_lock(hash.clone(), payer()).unwrap().status, "Claimed");
+        assert_eq!(c.get_lock(hash, accounts(4)).unwrap().status, "Locked");
+    }
+
+    #[test]
+    fn claim_refund_and_get_lock_address_only_their_own_pair() {
+        let mut c = setup();
+        let (preimage, hash) = preimage_and_hash();
+        assert_value(lock_as(&mut c, accounts(4), 0, 1, &hash), 0);
+        assert_value(lock_as(&mut c, payer(), 0, 1_000, &hash), 0);
+
+        // Claiming the squatter's pair moves only that pair.
+        testing_env!(ctx(payee(), HOUR_MS / 2).build());
+        let _p = c.claim(hash.clone(), accounts(4), preimage);
+        assert_eq!(c.get_lock(hash.clone(), accounts(4)).unwrap().status, "Claiming");
+        assert_eq!(c.get_lock(hash.clone(), payer()).unwrap().status, "Locked");
+        assert_eq!(c.get_lock(hash.clone(), payer()).unwrap().preimage, None);
+
+        // A refund names (predecessor, hash): the payer's own lock, never the squatter's.
+        testing_env!(ctx(payer(), 2 * HOUR_MS).build());
+        let _r = c.refund(hash.clone());
+        assert_eq!(c.get_lock(hash.clone(), payer()).unwrap().status, "Refunding");
+        assert_eq!(c.get_lock(hash.clone(), accounts(4)).unwrap().status, "Claiming");
+
+        // An account with no lock under this hash gets nothing.
+        assert!(c.get_lock(hash, accounts(5)).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "No lock for this hash")]
+    fn claim_naming_a_payer_with_no_lock_panics() {
+        let mut c = setup();
+        let (preimage, hash) = preimage_and_hash();
+        assert_value(lock_as(&mut c, payer(), 0, 1_000, &hash), 0);
+        testing_env!(ctx(payee(), HOUR_MS / 2).build());
+        let _ = c.claim(hash, accounts(4), preimage);
+    }
+
+    #[test]
+    #[should_panic(expected = "No lock for this hash")]
+    fn refund_by_an_account_with_no_lock_under_the_hash_panics() {
+        let mut c = setup();
+        let (_, hash) = preimage_and_hash();
+        assert_value(lock_as(&mut c, payer(), 0, 1_000, &hash), 0);
+        testing_env!(ctx(accounts(4), 2 * HOUR_MS).build());
+        let _ = c.refund(hash);
+    }
+
+    #[test]
+    fn same_payer_cannot_lock_the_same_hash_lock_twice() {
+        let mut c = setup();
+        let (_, hash) = preimage_and_hash();
+        assert_value(lock_as(&mut c, payer(), 0, 1_000, &hash), 0);
+        assert_value(lock_as(&mut c, payer(), 0, 42, &hash), 42);
+        assert_eq!(c.get_lock(hash, payer()).unwrap().amount, U128(1_000));
+    }
+
+    #[test]
+    fn lock_key_is_unambiguous_per_payer_and_hash() {
+        let h = "a".repeat(64);
+        assert_eq!(lock_key(&payer(), &h), format!("{}:{}", payer(), h));
+        assert_ne!(lock_key(&payer(), &h), lock_key(&accounts(4), &h));
     }
 
     // ---- claim ----
@@ -784,9 +893,9 @@ mod tests {
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
 
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _promise = c.claim(hash.clone(), preimage.clone());
+        let _promise = c.claim(hash.clone(), payer(), preimage.clone());
 
-        let view = c.get_lock(hash).unwrap();
+        let view = c.get_lock(hash, payer()).unwrap();
         assert_eq!(view.status, "Claiming");
         assert_eq!(view.preimage.as_deref(), Some(preimage.to_lowercase().as_str()));
     }
@@ -801,7 +910,7 @@ mod tests {
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
         // 32 bytes (F1), but the wrong 32 bytes -- exercises the hash-mismatch check, not the
         // length check.
-        let _ = c.claim(hash, hex_encode(b"totally-wrong-secret-32-bytes!!!"));
+        let _ = c.claim(hash, payer(), hex_encode(b"totally-wrong-secret-32-bytes!!!"));
     }
 
     #[test]
@@ -812,7 +921,7 @@ mod tests {
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
 
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _ = c.claim(hash, "not hex zz".to_string());
+        let _ = c.claim(hash, payer(), "not hex zz".to_string());
     }
 
     #[test]
@@ -824,7 +933,7 @@ mod tests {
         let hash = hex_encode(&env::sha256(&pre));
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _ = c.claim(hash, hex_encode(&pre));
+        let _ = c.claim(hash, payer(), hex_encode(&pre));
     }
 
     #[test]
@@ -836,7 +945,7 @@ mod tests {
         let hash = hex_encode(&env::sha256(&pre));
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _ = c.claim(hash, hex_encode(&pre));
+        let _ = c.claim(hash, payer(), hex_encode(&pre));
     }
 
     #[test]
@@ -848,7 +957,7 @@ mod tests {
         let hash = hex_encode(&env::sha256(&pre));
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _ = c.claim(hash, hex_encode(&pre));
+        let _ = c.claim(hash, payer(), hex_encode(&pre));
     }
 
     #[test]
@@ -856,7 +965,7 @@ mod tests {
     fn claim_on_unknown_hash_lock_panics() {
         let mut c = setup();
         testing_env!(ctx(payee(), 0).build());
-        let _ = c.claim("a".repeat(64), "00".to_string());
+        let _ = c.claim("a".repeat(64), payer(), "00".to_string());
     }
 
     #[test]
@@ -867,7 +976,7 @@ mod tests {
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
 
         testing_env!(ctx(payee(), 2 * HOUR_MS).build());
-        let _ = c.claim(hash, preimage);
+        let _ = c.claim(hash, payer(), preimage);
     }
 
     #[test]
@@ -883,7 +992,7 @@ mod tests {
 
         // Now claim is blocked while Refunding.
         testing_env!(ctx(payee(), 2 * HOUR_MS).build());
-        let _ = c.claim(hash, preimage);
+        let _ = c.claim(hash, payer(), preimage);
     }
 
     #[test]
@@ -897,7 +1006,7 @@ mod tests {
         let mut b = ctx(payee(), HOUR_MS / 2);
         b.storage_usage(before);
         testing_env!(b.build());
-        let _p = c.claim(hash, hex_encode(&pre));
+        let _p = c.claim(hash, payer(), hex_encode(&pre));
         assert_eq!(env::storage_usage(), before, "claim grew storage");
     }
 
@@ -910,7 +1019,7 @@ mod tests {
         testing_env!(b.build());
         let res = c.ft_on_transfer(payer(), U128(1_000), lock_msg(&hash, HOUR_MS, 2 * HOUR_MS));
         assert_value(res, 1_000);
-        assert!(c.get_lock(hash).is_none());
+        assert!(c.get_lock(hash, payer()).is_none());
     }
 
     // ---- refund ----
@@ -924,13 +1033,15 @@ mod tests {
         testing_env!(ctx(payer(), 2 * HOUR_MS).build());
         let _promise = c.refund(hash.clone());
 
-        let view = c.get_lock(hash).unwrap();
+        let view = c.get_lock(hash, payer()).unwrap();
         assert_eq!(view.status, "Refunding");
     }
 
     #[test]
-    #[should_panic(expected = "Only the payer can refund")]
+    #[should_panic(expected = "No lock for this hash")]
     fn non_payer_refund_panics() {
+        // Squatting fix: refund is keyed by (predecessor, hash), so a non-payer simply has
+        // no lock under the hash; the payer-equality require is now structurally redundant.
         let mut c = setup();
         let (_, hash) = preimage_and_hash();
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
@@ -967,7 +1078,7 @@ mod tests {
 
         // Move the lock to Claiming first (still within the claim window).
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _p = c.claim(hash.clone(), preimage);
+        let _p = c.claim(hash.clone(), payer(), preimage);
 
         // Refund is blocked while Claiming, even after the window opens.
         testing_env!(ctx(payer(), 2 * HOUR_MS).build());
@@ -982,12 +1093,12 @@ mod tests {
         let (preimage, hash) = preimage_and_hash();
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _p = c.claim(hash.clone(), preimage);
+        let _p = c.claim(hash.clone(), payer(), preimage);
 
         testing_env!(ctx(contract_account(), HOUR_MS / 2).build());
-        c.on_transfer_complete(hash.clone(), Exit::Claim, Ok(()));
+        c.on_transfer_complete(hash.clone(), payer(), Exit::Claim, Ok(()));
 
-        assert_eq!(c.get_lock(hash).unwrap().status, "Claimed");
+        assert_eq!(c.get_lock(hash, payer()).unwrap().status, "Claimed");
     }
 
     #[test]
@@ -996,12 +1107,12 @@ mod tests {
         let (preimage, hash) = preimage_and_hash();
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _p = c.claim(hash.clone(), preimage.clone());
+        let _p = c.claim(hash.clone(), payer(), preimage.clone());
 
         testing_env!(ctx(contract_account(), HOUR_MS / 2).build());
-        c.on_transfer_complete(hash.clone(), Exit::Claim, Err(PromiseError::Failed));
+        c.on_transfer_complete(hash.clone(), payer(), Exit::Claim, Err(PromiseError::Failed));
 
-        let view = c.get_lock(hash).unwrap();
+        let view = c.get_lock(hash, payer()).unwrap();
         assert_eq!(view.status, "Locked");
         assert_eq!(view.preimage.as_deref(), Some(preimage.to_lowercase().as_str()));
     }
@@ -1015,9 +1126,9 @@ mod tests {
         let _p = c.refund(hash.clone());
 
         testing_env!(ctx(contract_account(), 2 * HOUR_MS).build());
-        c.on_transfer_complete(hash.clone(), Exit::Refund, Ok(()));
+        c.on_transfer_complete(hash.clone(), payer(), Exit::Refund, Ok(()));
 
-        assert_eq!(c.get_lock(hash).unwrap().status, "Refunded");
+        assert_eq!(c.get_lock(hash, payer()).unwrap().status, "Refunded");
     }
 
     #[test]
@@ -1029,15 +1140,15 @@ mod tests {
         let _p = c.refund(hash.clone());
 
         testing_env!(ctx(contract_account(), 2 * HOUR_MS).build());
-        c.on_transfer_complete(hash.clone(), Exit::Refund, Err(PromiseError::Failed));
+        c.on_transfer_complete(hash.clone(), payer(), Exit::Refund, Err(PromiseError::Failed));
 
-        let view = c.get_lock(hash.clone()).unwrap();
+        let view = c.get_lock(hash.clone(), payer()).unwrap();
         assert_eq!(view.status, "Locked");
 
         // A reverted-to-Locked lock is claimable/refundable again.
         testing_env!(ctx(payer(), 2 * HOUR_MS).build());
         let _p2 = c.refund(hash.clone());
-        assert_eq!(c.get_lock(hash).unwrap().status, "Refunding");
+        assert_eq!(c.get_lock(hash, payer()).unwrap().status, "Refunding");
     }
 
     #[test]
@@ -1048,10 +1159,10 @@ mod tests {
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
 
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _p = c.claim(hash.clone(), preimage);
+        let _p = c.claim(hash.clone(), payer(), preimage);
 
         testing_env!(ctx(contract_account(), HOUR_MS / 2).build());
-        c.on_transfer_complete(hash.clone(), Exit::Claim, Err(PromiseError::Failed));
+        c.on_transfer_complete(hash.clone(), payer(), Exit::Claim, Err(PromiseError::Failed));
 
         testing_env!(ctx(payer(), 2 * HOUR_MS).build());
         let _ = c.refund(hash); // today (pre-fix): succeeds, moves to Refunding
@@ -1064,17 +1175,17 @@ mod tests {
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
 
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _p = c.claim(hash.clone(), preimage.clone());
+        let _p = c.claim(hash.clone(), payer(), preimage.clone());
 
         testing_env!(ctx(contract_account(), HOUR_MS / 2).build());
-        c.on_transfer_complete(hash.clone(), Exit::Claim, Err(PromiseError::Failed));
+        c.on_transfer_complete(hash.clone(), payer(), Exit::Claim, Err(PromiseError::Failed));
 
         // Past refund_after_ms, but the preimage was already revealed by the first claim
         // attempt -- the retry must still succeed (pre-fix: panics "Refund window has
         // opened").
         testing_env!(ctx(payee(), 3 * HOUR_MS).build());
-        let _p2 = c.claim(hash.clone(), preimage);
-        assert_eq!(c.get_lock(hash).unwrap().status, "Claiming");
+        let _p2 = c.claim(hash.clone(), payer(), preimage);
+        assert_eq!(c.get_lock(hash, payer()).unwrap().status, "Claiming");
     }
 
     #[test]
@@ -1084,7 +1195,7 @@ mod tests {
         let _ = lock_via_transfer(&mut c, 0, 1_000, &hash, HOUR_MS, 2 * HOUR_MS);
 
         testing_env!(ctx(payee(), HOUR_MS / 2).build());
-        let _p = c.claim(hash, preimage.clone());
+        let _p = c.claim(hash, payer(), preimage.clone());
         let logs = near_sdk::test_utils::get_logs();
         let claiming = logs
             .iter()
