@@ -17,6 +17,7 @@ import { describe, expect, it } from "vitest";
 import { legAContext, legBContext, swapId as computeSwapId } from "../src/profile.js";
 import { foldSwap } from "../src/swap.js";
 import { identity, record, unsignedRecord } from "./helpers/identity.js";
+import { observe } from "./helpers/observations.js";
 import { scenario } from "./helpers/scenario.js";
 
 const T0 = 1_758_000_000_000;
@@ -227,8 +228,8 @@ describe("foldSwap — SPEC §4 states", () => {
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.revealA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.revealB],
       evidence: {
-        aRail: { status: "locked", final: true, checkedAtMs: T0 + 9 * MIN },
-        bRail: { status: "claimed", final: true, checkedAtMs: T0 + 9 * MIN },
+        aRail: observe(s, "a", "locked", T0 + 9 * MIN),
+        bRail: observe(s, "b", "claimed", T0 + 9 * MIN),
       },
       nowMs: T0 + 9 * MIN,
     });
@@ -242,8 +243,8 @@ describe("foldSwap — SPEC §4 states", () => {
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.revealA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.revealB],
       evidence: {
-        aRail: { status: "claimed", final: true, checkedAtMs: T0 + 9 * MIN },
-        bRail: { status: "claimed", final: true, checkedAtMs: T0 + 9 * MIN },
+        aRail: observe(s, "a", "claimed", T0 + 9 * MIN),
+        bRail: observe(s, "b", "claimed", T0 + 9 * MIN),
       },
       nowMs: T0 + 9 * MIN,
     });
@@ -258,8 +259,8 @@ describe("foldSwap — SPEC §4 states", () => {
       evidence: {
         a: { rail: "paper", ref: s.frames.lockA.contract, terms: s.legATerms, railVerified: false, checkedAtMs: T0 + 9 * MIN, reason: "paper record is claimed; paper rail holds no value and a stranger can overwrite it" },
         b: { rail: "paper", ref: s.frames.lockB.contract, terms: s.legBTerms, railVerified: false, checkedAtMs: T0 + 9 * MIN, reason: "paper record is claimed; paper rail holds no value and a stranger can overwrite it" },
-        aRail: { status: "claimed", final: true, checkedAtMs: T0 + 9 * MIN },
-        bRail: { status: "claimed", final: true, checkedAtMs: T0 + 9 * MIN },
+        aRail: observe(s, "a", "claimed", T0 + 9 * MIN),
+        bRail: observe(s, "b", "claimed", T0 + 9 * MIN),
       },
       nowMs: T0 + 9 * MIN,
     });
@@ -302,7 +303,7 @@ describe("foldSwap — SPEC §4 states", () => {
     const view = foldSwap({
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
-      evidence: { aRail: { status: "refunded", final: true, checkedAtMs: T0 + 61 * MIN } },
+      evidence: { aRail: observe(s, "a", "refunded", T0 + 61 * MIN) },
       nowMs: T0 + 61 * MIN,
     });
     expect(view.status).toBe("refunded-a");
@@ -316,7 +317,7 @@ describe("foldSwap — SPEC §4 states", () => {
     const view = foldSwap({
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.refundB],
-      evidence: { aRail: { status: "claimed", final: true, checkedAtMs: T0 + 61 * MIN } },
+      evidence: { aRail: observe(s, "a", "claimed", T0 + 61 * MIN) },
       nowMs: s.frames.offerB.refundAfterMs + 2 * MIN,
     });
     // Leg A's own frame says refunded but its own chain rail says claimed+final — never trusted
@@ -332,7 +333,7 @@ describe("foldSwap — SPEC §4 states", () => {
     const view = foldSwap({
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
       legB: [],
-      evidence: { aRail: { status: "locked", final: true, checkedAtMs: T0 + 61 * MIN } },
+      evidence: { aRail: observe(s, "a", "locked", T0 + 61 * MIN) },
       nowMs: s.frames.offerA.refundAfterMs + 2 * MIN,
     });
     expect(view.status).not.toBe("refunded-a");
@@ -348,7 +349,7 @@ describe("foldSwap — SPEC §4 states", () => {
     const view = foldSwap({
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
-      evidence: { aRail: { status: "refunded", final: true, checkedAtMs: T0 + 61 * MIN } },
+      evidence: { aRail: observe(s, "a", "refunded", T0 + 61 * MIN) },
       nowMs: T0 + 61 * MIN,
     });
     expect(view.status).toBe("refunded-a");
@@ -583,7 +584,7 @@ describe("foldSwap — settlementView (H3, tclk PR #173 vocabulary)", () => {
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
       evidence: {
         b: { rail: "paper", ref: "flop-escrow-1", terms: s.legBTerms, railVerified: true, checkedAtMs: T0 },
-        bRail: { status: "locked", final: true, checkedAtMs: T0 },
+        bRail: observe(s, "b", "locked", T0),
       },
       nowMs: T0 + 5 * MIN,
     });
@@ -595,7 +596,7 @@ describe("foldSwap — settlementView (H3, tclk PR #173 vocabulary)", () => {
       legA: [s.records.offerA, s.records.acceptA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
       evidence: {
-        bRail: { status: "claimed", final: true, checkedAtMs: T0 },
+        bRail: observe(s, "b", "claimed", T0),
       },
       nowMs: T0 + 5 * MIN,
     });
@@ -612,7 +613,7 @@ describe("foldSwap — settlementView (H3, tclk PR #173 vocabulary)", () => {
       legA: [s.records.offerA, s.records.acceptA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
       evidence: {
-        bRail: { status: "refunded", final: true, checkedAtMs: T0 },
+        bRail: observe(s, "b", "refunded", T0),
       },
       nowMs: T0 + 5 * MIN,
     });
@@ -624,7 +625,7 @@ describe("foldSwap — settlementView (H3, tclk PR #173 vocabulary)", () => {
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
       legB: [s.records.offerB, s.records.acceptB],
       evidence: {
-        aRail: { status: "locked", final: true, checkedAtMs: T0 },
+        aRail: observe(s, "a", "locked", T0),
       },
       nowMs: T0 + 5 * MIN,
     });

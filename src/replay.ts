@@ -49,7 +49,7 @@ import { nearEvidence, nearCaptureKey, NEAR_RAIL_ID, type NearCapture } from "./
 import { checkNearRailConfig, type NearRailConfig } from "./rails/near-htlc.js";
 import { parseNearRef } from "./rails/near-ref.js";
 import { offerAcceptLockTerms } from "./swap.js";
-import type { Board, BoardInput, LockEvidence, RailObservation, SwapEvidence, SwapLeg } from "./types.js";
+import type { Board, BoardInput, LegEvidence, LockEvidence, RailObservation, SwapLeg } from "./types.js";
 
 // An offer/accept authenticated for the signed lane in tclk-offers (the same checks as
 // transcript.ts's private authenticatedFrame, built from the exported primitives only).
@@ -326,7 +326,10 @@ export interface FoldCapturedInput {
 export function foldCaptured(input: FoldCapturedInput): Board {
   const buildBoardFn = input.board ?? defaultBuildBoard;
   const { candidates } = findSwapLegCandidates(input.offers);
-  const evidenceBySwap = new Map<string, SwapEvidence>();
+  // tclk#194 finding 2: keyed by the leg's own contract id (unique per offer/accept pair), never
+  // by `swapId`, which a buyer can reuse across distinct pairs — the board assembles each swap's
+  // evidence from the two contracts it actually paired.
+  const evidenceByContract = new Map<string, LegEvidence>();
   const evmConfig = input.rails?.evm;
   // A3: validated once per fold, not once per candidate â€” every entry point a rail config can
   // reach this from (a live sweep's `--rails` file, a replayed `rails.json`) is untrusted data,
@@ -539,21 +542,13 @@ export function foldCaptured(input: FoldCapturedInput): Board {
       continue; // an unrecognised rail, or a rail this build has no evidence reader for
     }
 
-    const entry: SwapEvidence = evidenceBySwap.get(candidate.swapId) ?? {};
-    if (candidate.leg === "a") {
-      entry.a = result.lock;
-      if (result.rail !== undefined) entry.aRail = result.rail;
-    } else {
-      entry.b = result.lock;
-      if (result.rail !== undefined) entry.bRail = result.rail;
-    }
-    evidenceBySwap.set(candidate.swapId, entry);
+    evidenceByContract.set(candidate.contract, result.rail === undefined ? { lock: result.lock } : { lock: result.lock, rail: result.rail });
   }
 
   return buildBoardFn({
     offers: input.offers,
     dealRooms: input.dealRooms,
-    evidence: evidenceBySwap,
+    evidence: evidenceByContract,
     nowMs: input.nowMs,
   });
 }

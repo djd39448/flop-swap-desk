@@ -843,14 +843,22 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   const newLines: string[] = [];
   let reachedPairedOrLater = false;
 
+  // tclk#194 finding 2: `swapId` is not unique (a buyer picks the nonce), so two swaps sharing one
+  // are tracked under distinct state keys rather than overwriting each other's last-seen status.
+  const swapIdCounts = new Map<string, number>();
+  for (const swap of board.swaps) {
+    if (swap.swapId !== null) swapIdCounts.set(swap.swapId, (swapIdCounts.get(swap.swapId) ?? 0) + 1);
+  }
   for (const swap of board.swaps) {
     if (swap.swapId === null) continue;
-    if (state.statuses[swap.swapId] !== swap.status) {
-      state.statuses[swap.swapId] = swap.status;
+    const stateKey = (swapIdCounts.get(swap.swapId) ?? 0) > 1 ? `${swap.swapId}@${swap.legAOfferId ?? ""}` : swap.swapId;
+    if (state.statuses[stateKey] !== swap.status) {
+      state.statuses[stateKey] = swap.status;
       newLines.push(
         JSON.stringify({
           sweptAtMs: nowMs,
           swapId: swap.swapId,
+          pairKey: swap.pairKey,
           status: swap.status,
           // H3: money state per leg, from rail evidence alone (tclk PR #173 vocabulary).
           settlementView: swap.settlementView,

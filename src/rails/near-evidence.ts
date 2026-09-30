@@ -56,7 +56,7 @@ import { hexToBytes } from "@noble/hashes/utils.js";
 import { checkNearRailConfig, NEAR_ASSET_ID, type NearRailConfig } from "./near-htlc.js";
 import { NEAR_HASH_LOCK_SHAPE, parseNearRef } from "./near-ref.js";
 import { readCapture, RpcCaptureError, type CapturingRpc, type Exchange } from "./rpc-capture.js";
-import type { LockEvidence, RailObservation } from "../types.js";
+import { railBinding, type LockEvidence, type RailObservation } from "../types.js";
 
 export const NEAR_RAIL_ID = "near-htlc";
 
@@ -662,7 +662,7 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
         },
       };
     }
-    const rail: RailObservation = { status: "locked", final: true, checkedAtMs, finalizedRef };
+    const rail: RailObservation = { status: "locked", final: true, checkedAtMs, finalizedRef, ...railBinding(base2) };
     return { lock: { ...baseAtFinalizedView, railVerified: true, reason: "near-htlc: locked and on-chain state matches terms (payee is storage-registered)" }, rail };
   }
 
@@ -681,7 +681,7 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
       },
     };
   }
-  const rail: RailObservation = { status: label, final: true, checkedAtMs, finalizedRef };
+  const rail: RailObservation = { status: label, final: true, checkedAtMs, finalizedRef, ...railBinding(base2) };
   return { lock: { ...baseAtFinalizedView, railVerified: false, reason: baseReason }, rail };
 }
 

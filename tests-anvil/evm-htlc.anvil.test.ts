@@ -165,7 +165,11 @@ describe("EvmHtlcRail against a real anvil node", () => {
 
       const afterTwoBlocks = await rail.verifyLockFinal(terms, hashLock.hash, accounts);
       expect(afterTwoBlocks.lock.railVerified).toBe(true);
-      expect(afterTwoBlocks.rail).toEqual({
+      expect(afterTwoBlocks.rail).toMatchObject({
+        rail: "evm-htlc",
+        ref: hashLock.hash,
+        contract: terms.contract,
+        terms,
         status: "locked",
         final: true,
         checkedAtMs: expect.any(Number),
@@ -179,7 +183,11 @@ describe("EvmHtlcRail against a real anvil node", () => {
 
       const afterClaim = await rail.verifyLockFinal(terms, hashLock.hash, accounts);
       expect(afterClaim.lock.railVerified).toBe(false);
-      expect(afterClaim.rail).toEqual({
+      expect(afterClaim.rail).toMatchObject({
+        rail: "evm-htlc",
+        ref: hashLock.hash,
+        contract: terms.contract,
+        terms,
         status: "claimed",
         final: true,
         checkedAtMs: expect.any(Number),

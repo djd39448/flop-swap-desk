@@ -96,8 +96,8 @@ describe("buildBoard", () => {
     ]);
     const evidence = new Map([
       [
-        s1.swapId,
-        { b: { rail: "flop-htlc", ref: "flop-escrow-1", terms: s1.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN } },
+        s1.frames.acceptB.contract,
+        { lock: { rail: s1.frames.lockB.rail, ref: s1.frames.lockB.ref, terms: s1.legBTerms, railVerified: true, checkedAtMs: T0 + 5 * MIN } },
       ],
     ]);
 

@@ -237,7 +237,8 @@ describe("evmEvidence — happy path", () => {
     const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
 
     expect(result.lock.railVerified).toBe(true);
-    expect(result.rail).toEqual({ status: "locked", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ status: "locked", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ rail: result.lock.rail, ref: result.lock.ref, contract: result.lock.terms.contract, terms: result.lock.terms });
     expect(result.lock.finalizedRef).toBe(FINALIZED_REF);
     expect(result.lock.ref).toBe(HASH_LOCK);
     expect(result.lock.rail).toBe("evm-htlc");
@@ -507,14 +508,16 @@ describe("evmEvidence — on-chain status", () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Claimed }) }) });
     const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(false);
-    expect(result.rail).toEqual({ status: "claimed", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ status: "claimed", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ rail: result.lock.rail, ref: result.lock.ref, contract: result.lock.terms.contract, terms: result.lock.terms });
   });
 
   it("status Refunded -> railVerified false, rail observation refunded/final", async () => {
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Refunded }) }) });
     const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(false);
-    expect(result.rail).toEqual({ status: "refunded", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ status: "refunded", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ rail: result.lock.rail, ref: result.lock.ref, contract: result.lock.terms.contract, terms: result.lock.terms });
   });
 
   // P22-P24-EVM-FIXES.md A2: an on-chain status outside 0..3 (the contract's own declared
@@ -565,7 +568,8 @@ describe("evmEvidence — D1: Claimed/Refunded also compare the locks() tuple", 
     const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Refunded }) }) });
     const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(false);
-    expect(result.rail).toEqual({ status: "refunded", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ status: "refunded", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ rail: result.lock.rail, ref: result.lock.ref, contract: result.lock.terms.contract, terms: result.lock.terms });
   });
 });
 

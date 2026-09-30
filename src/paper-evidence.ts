@@ -20,7 +20,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { decodePaperRecord, verifySecret, type LockKind, type LockTerms } from "@flop-labs/tclk";
 
-import type { LockEvidence, RailObservation } from "./types.js";
+import { railBinding, type LockEvidence, type RailObservation } from "./types.js";
 
 /** `LockEvidence.rail` value this module always sets. */
 export const PAPER_RAIL_ID = "paper";
@@ -117,6 +117,7 @@ export function paperEvidence(
     final: true,
     checkedAtMs,
     finalizedRef,
+    ...railBinding(base),
   };
   return {
     lock: { ...base, railVerified, reason: paperReason(`paper record is ${record.status}`) },

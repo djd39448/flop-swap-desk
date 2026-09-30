@@ -266,7 +266,7 @@ describe("btcEvidence — locked", () => {
     expect(result.lock.rail).toBe(BTC_RAIL_ID);
     expect(result.lock.ref).toBe(REF);
     expect(result.lock.checkedAtMs).toBe(CHECKED_AT_MS);
-    expect(result.rail).toEqual({ status: "locked", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: `btc-regtest:confirmations-2:108:${FUNDING_BLOCK_HASH}` });
+    expect(result.rail).toMatchObject({ status: "locked", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: `btc-regtest:confirmations-2:108:${FUNDING_BLOCK_HASH}` });
   });
 
   // P4-BTC-FIXES-R3.md K3: the reviewer's "USDC"-labelled leg against a real, genuinely-matching
@@ -299,6 +299,10 @@ describe("btcEvidence — locked", () => {
       final: true,
       checkedAtMs: CHECKED_AT_MS,
       finalizedRef: `btc-regtest:confirmations-2:${realFundingHeight}:${FUNDING_BLOCK_HASH}`,
+      rail: "btc-htlc",
+      ref: result.lock.ref,
+      contract: TERMS.contract,
+      terms: TERMS,
     });
   });
 
@@ -398,6 +402,10 @@ describe("btcEvidence — claimed / refunded", () => {
       final: true,
       checkedAtMs: CHECKED_AT_MS,
       finalizedRef: `btc-regtest:confirmations-2:109:${(109).toString(16).padStart(2, "0").repeat(32).slice(0, 64)}`,
+      rail: "btc-htlc",
+      ref: result.lock.ref,
+      contract: TERMS.contract,
+      terms: TERMS,
     });
     expect(result.lock.railVerified).toBe(false);
     expect(result.lock.reason).toMatch(/claimed on-chain, not locked/);

@@ -525,6 +525,8 @@ function describeSwap(view) {
   );
   return {
     swapId: view.swapId,
+    // tclk#194 finding 2: `swapId` is not unique; this is (leg A offer id | leg A contract | leg B contract).
+    pairKey: view.pairKey,
     status: view.status,
     // H3: money state per leg, from rail evidence alone (tclk PR #173 vocabulary).
     settlementView: view.settlementView,
@@ -660,8 +662,9 @@ async function main() {
 
   let ok = true;
   for (const expectation of args.expect) {
-    const found = swaps.find((s) => s.swapId === expectation.swapId);
-    const actual = found ? found.status : "(swap not found)";
+    const matches = swaps.filter((s) => s.swapId === expectation.swapId);
+    // tclk#194 finding 2: a swapId shared by several swaps cannot name one of them.
+    const actual = matches.length > 1 ? `(ambiguous: swapId shared by ${matches.length} swaps: ${matches.map((s) => s.status).join(", ")})` : matches[0] ? matches[0].status : "(swap not found)";
     if (actual !== expectation.status) {
       ok = false;
       process.stderr.write(`expect failed: ${expectation.swapId} = ${expectation.status}, got ${actual}\n`);

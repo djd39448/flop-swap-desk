@@ -363,7 +363,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     expect(view).toBeDefined();
     expect(view!.evidence.a?.rail).toBe("evm-htlc");
     expect(view!.evidence.a?.railVerified).toBe(true);
-    expect(view!.evidence.aRail).toEqual({ status: "locked", final: true, checkedAtMs: T0, finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
+    expect(view!.evidence.aRail).toMatchObject({ status: "locked", final: true, checkedAtMs: T0, finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
     expect(view!.status).toBe("a-locked");
   });
 
@@ -433,7 +433,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
 
     const view = board.swaps.find((sw) => sw.swapId === s.swapId);
     expect(view).toBeDefined();
-    expect(view!.evidence.aRail).toEqual({ status: "refunded", final: true, checkedAtMs: T0, finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
+    expect(view!.evidence.aRail).toMatchObject({ status: "refunded", final: true, checkedAtMs: T0, finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
     expect(view!.status).toBe("refunded-a");
   });
 
@@ -1035,7 +1035,7 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     expect(view).toBeDefined();
     expect(view!.evidence.a?.rail).toBe("btc-htlc");
     expect(view!.evidence.a?.railVerified).toBe(true);
-    expect(view!.evidence.aRail).toEqual({ status: "locked", final: true, checkedAtMs: T0, finalizedRef: `btc-regtest:confirmations-1:109:${FUNDING_BLOCK_HASH}` });
+    expect(view!.evidence.aRail).toMatchObject({ status: "locked", final: true, checkedAtMs: T0, finalizedRef: `btc-regtest:confirmations-1:109:${FUNDING_BLOCK_HASH}` });
     expect(view!.status).toBe("a-locked");
   });
 
@@ -1118,7 +1118,7 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
 
     const view = board.swaps.find((sw) => sw.swapId === s.swapId);
     expect(view).toBeDefined();
-    expect(view!.evidence.aRail).toEqual({
+    expect(view!.evidence.aRail).toMatchObject({
       status: "refunded",
       final: true,
       checkedAtMs: T0,

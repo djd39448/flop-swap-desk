@@ -11,6 +11,7 @@ import {
   foldTranscript,
   lockTerms,
   type AcceptFrame,
+  type ContractState,
   type LockTerms,
   type OfferFrame,
   type TranscriptFoldResult,
@@ -19,7 +20,7 @@ import {
 
 import { PAPER_RAIL_ID } from "./paper-evidence.js";
 import { checkOrientation, classifySwapOffer } from "./profile.js";
-import type { LockEvidence, RailObservation, SettlementView, SwapFoldInput, SwapView } from "./types.js";
+import type { LockEvidence, RailObservation, SettlementView, SwapEvidence, SwapFoldInput, SwapView } from "./types.js";
 
 /** Pushed once, on every status (including `settled`), when either leg's lock evidence
  *  came from tclk's `paper` rail â€” a rehearsal record, never a payment (see
@@ -74,6 +75,13 @@ function lockTermsMismatch(expected: LockTerms, actual: LockTerms): keyof LockTe
   return null;
 }
 
+/** The unique per-pair identifier (tclk#194 finding 2): leg A's offer id plus both legs'
+ *  contract ids. `swapId` is a hash of the buyer's DID and a buyer-chosen nonce and is not
+ *  unique across pairs. */
+export function pairKey(legAOfferId: string, legAContract: string, legBContract: string): string {
+  return `${legAOfferId}|${legAContract}|${legBContract}`;
+}
+
 interface LockEvaluation {
   corroborated: boolean;
   reason?: string;
@@ -91,8 +99,16 @@ function evaluateLock(
   evidence: LockEvidence | undefined,
   expected: LockTerms,
   leg: "A" | "B",
+  state: ContractState,
 ): LockEvaluation {
   if (evidence === undefined) return { corroborated: false };
+  // tclk#194: the evidence must also be for the rail and ref the contract machine accepted.
+  if (evidence.rail !== state.rail || evidence.ref !== state.railRef) {
+    return {
+      corroborated: false,
+      reason: `leg ${leg} lock evidence is for a different rail/ref than the accepted lock frame`,
+    };
+  }
   const mismatch = lockTermsMismatch(expected, evidence.terms);
   if (mismatch !== null) {
     return {
@@ -102,6 +118,52 @@ function evaluateLock(
   }
   if (evidence.railVerified !== true) return { corroborated: false };
   return { corroborated: true };
+}
+
+/**
+ * tclk#194 finding 1: a `RailObservation` is used only when it is bound to THIS leg's accepted
+ * offer/accept pair and accepted lock frame — its rail id, ref and contract equal the lock the
+ * tclk machine accepted, and its copy of the nine `LockTerms` equals the leg's own
+ * `lockTerms()`. Anything else (missing binding fields, a leg with no accepted lock, any field
+ * that differs) is refused: a reason is pushed and the observation is treated as absent, so it
+ * can contribute to none of funded / claimed / refunded / settled. Pure; never throws.
+ */
+function bindObservation(
+  leg: "A" | "B",
+  state: ContractState | null,
+  observation: RailObservation | undefined,
+  reasons: string[],
+): RailObservation | undefined {
+  if (observation === undefined) return undefined;
+  const refuse = (why: string): undefined => {
+    reasons.push(`leg ${leg} rail observation ignored: ${why}`);
+    return undefined;
+  };
+  const claimed = observation as Partial<RailObservation>;
+  if (
+    typeof claimed.rail !== "string" ||
+    typeof claimed.ref !== "string" ||
+    typeof claimed.contract !== "string" ||
+    typeof claimed.terms !== "object" ||
+    claimed.terms === null
+  ) {
+    return refuse("it carries no rail/ref/contract/terms binding");
+  }
+  if (state === null || state.rail === undefined || state.railRef === undefined) {
+    return refuse("the leg has no accepted lock frame to bind it to");
+  }
+  let expected: LockTerms;
+  try {
+    expected = lockTerms(state);
+  } catch {
+    return refuse("the leg has no accepted offer/accept pair to bind it to");
+  }
+  if (claimed.rail !== state.rail) return refuse("rail differs from the accepted lock frame's rail");
+  if (claimed.ref !== state.railRef) return refuse("ref differs from the accepted lock frame's ref");
+  if (claimed.contract !== expected.contract) return refuse("contract differs from the leg's accepted contract");
+  const mismatch = lockTermsMismatch(expected, claimed.terms as LockTerms);
+  if (mismatch !== null) return refuse(`terms differ from the accepted offer/accept pair: ${mismatch} mismatch`);
+  return observation;
 }
 
 /** `RailObservation.status` (this repo's internal, paper-rail-shaped vocabulary) to the H3
@@ -209,12 +271,22 @@ function lockOrderViolated(
 export function foldSwap(input: SwapFoldInput): SwapView {
   const nowMs = input.nowMs;
   const reasons: string[] = [];
-  const evidence = input.evidence ?? {};
+  const suppliedEvidence = input.evidence ?? {};
 
   const legAFold = foldLeg(input.legA);
   const legBFold = foldLeg(input.legB);
   collectStepReasons(legAFold, "legA", reasons);
   collectStepReasons(legBFold, "legB", reasons);
+
+  // tclk#194 finding 1: rail observations are bound to each leg's accepted pair/lock before
+  // anything below may read them; a refused one is absent from `evidence` from here on.
+  const evidence: SwapEvidence = { ...suppliedEvidence };
+  delete evidence.aRail;
+  delete evidence.bRail;
+  const aRail = bindObservation("A", legAFold?.state ?? null, suppliedEvidence.aRail, reasons);
+  const bRail = bindObservation("B", legBFold?.state ?? null, suppliedEvidence.bRail, reasons);
+  if (aRail !== undefined) evidence.aRail = aRail;
+  if (bRail !== undefined) evidence.bRail = bRail;
 
   if (evidence.a?.rail === PAPER_RAIL_ID || evidence.b?.rail === PAPER_RAIL_ID) {
     reasons.push(PAPER_REHEARSAL_REASON);
@@ -230,6 +302,7 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     feeBps: null,
     legA: legAFold,
     legB: legBFold,
+    pairKey: null,
     evidence,
     // H3: rail-evidence-only, computed once here so it is set on every return path below,
     // independent of how far (or whether) the frame-derived choreography status advances.
@@ -332,6 +405,9 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     return view;
   }
   view.sellerDid = legBOffer.from;
+  if (legAState.contract !== undefined && legBState.contract !== undefined) {
+    view.pairKey = pairKey(legAOffer.id, legAState.contract, legBState.contract);
+  }
 
   if (legAState.status === "proposed") {
     reasons.push("leg B exists before leg A was accepted");
@@ -447,7 +523,7 @@ export function foldSwap(input: SwapFoldInput): SwapView {
   // H1 (tclk#180): a leg counts as locked only once its evidence's LockTerms equal the
   // accepted offer's own terms in all nine fields; a rail's own verifyLock (`railVerified`)
   // is corroboration on top of that, never sufficient alone.
-  const legBEvaluation = evaluateLock(evidence.b, lockTerms(legBState), "B");
+  const legBEvaluation = evaluateLock(evidence.b, lockTerms(legBState), "B", legBState);
   if (!legBEvaluation.corroborated) {
     reasons.push(legBEvaluation.reason ?? "leg B lock unverified");
     view.status = "paired";
@@ -466,7 +542,7 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     return view;
   }
 
-  const legAEvaluation = evaluateLock(evidence.a, lockTerms(legAState), "A");
+  const legAEvaluation = evaluateLock(evidence.a, lockTerms(legAState), "A", legAState);
   if (!legAEvaluation.corroborated) {
     reasons.push(legAEvaluation.reason ?? "leg A lock unverified");
     view.status = "b-locked";

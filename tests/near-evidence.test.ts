@@ -257,7 +257,8 @@ describe("nearEvidence — happy path", () => {
     const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
 
     expect(result.lock.railVerified).toBe(true);
-    expect(result.rail).toEqual({ status: "locked", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ status: "locked", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ rail: result.lock.rail, ref: result.lock.ref, contract: result.lock.terms.contract, terms: result.lock.terms });
     expect(result.lock.finalizedRef).toBe(FINALIZED_REF);
     expect(result.lock.ref).toBe(REF);
     expect(result.lock.rail).toBe("near-htlc");
@@ -275,14 +276,16 @@ describe("nearEvidence — happy path", () => {
     const capture = buildCapture({ exchanges: standardExchanges({ lock: { view: lockViewPayload({ status: "Claimed", preimage: "cd".repeat(32) }) }, storage: false }) });
     const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(false);
-    expect(result.rail).toEqual({ status: "claimed", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ status: "claimed", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ rail: result.lock.rail, ref: result.lock.ref, contract: result.lock.terms.contract, terms: result.lock.terms });
   });
 
   it("refunded, fields match -> railVerified false, rail refunded+final", () => {
     const capture = buildCapture({ exchanges: standardExchanges({ lock: { view: lockViewPayload({ status: "Refunded" }) }, storage: false }) });
     const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBe(false);
-    expect(result.rail).toEqual({ status: "refunded", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ status: "refunded", final: true, checkedAtMs: CHECKED_AT_MS, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toMatchObject({ rail: result.lock.rail, ref: result.lock.ref, contract: result.lock.terms.contract, terms: result.lock.terms });
   });
 });
 

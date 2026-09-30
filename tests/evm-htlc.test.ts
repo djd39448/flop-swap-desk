@@ -744,7 +744,7 @@ describe("EvmHtlcRail.verifyLockFinal — representative finalized-view branches
     const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
     const evidence = await rail.verifyLockFinal(TERMS, TERMS.statement, { payee: PAYEE, payer: PAYER });
     expect(evidence.lock.railVerified).toBe(true);
-    expect(evidence.rail).toEqual({ status: "locked", final: true, checkedAtMs: expect.any(Number), finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
+    expect(evidence.rail).toMatchObject({ status: "locked", final: true, checkedAtMs: expect.any(Number), finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
   });
 
   it("status None -> railVerified null", async () => {

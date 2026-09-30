@@ -56,7 +56,7 @@ import { readCapture, type CapturingRpc, type Exchange } from "./rpc-capture.js"
 // inside a function body called well after both modules have finished loading (ESM resolves
 // circular imports via live bindings, not eager evaluation order).
 import { checkEvmRailConfig, type EvmFinality, type EvmRailConfig } from "./evm-htlc.js";
-import type { LockEvidence, RailObservation } from "../types.js";
+import { railBinding, type LockEvidence, type RailObservation } from "../types.js";
 
 export const EVM_RAIL_ID = "evm-htlc";
 
@@ -737,12 +737,12 @@ export function evmEvidence(input: EvmEvidenceInput): EvmEvidenceResult {
     }
     return {
       lock: { ...baseAtFinalizedView, railVerified: false, reason: baseReason },
-      rail: { status: label, final: true, checkedAtMs, finalizedRef },
+      rail: { status: label, final: true, checkedAtMs, finalizedRef, ...railBinding(base2) },
     };
   }
 
   // status === Locked.
-  const rail: RailObservation = { status: "locked", final: true, checkedAtMs, finalizedRef };
+  const rail: RailObservation = { status: "locked", final: true, checkedAtMs, finalizedRef, ...railBinding(base2) };
 
   if (accounts.payee === undefined) {
     return { lock: { ...baseAtFinalizedView, railVerified: null, reason: "payee has no account line" }, rail };

@@ -62,7 +62,7 @@ import {
 } from "./btc-script.js";
 import { assetIdFor, checkBtcRailConfig, scanWindowFor, type BtcChainPin, type BtcRailConfig } from "./btc-htlc.js";
 import { readCapture, RpcCaptureError, type CapturingRpc, type Exchange } from "./rpc-capture.js";
-import type { LockEvidence, RailObservation } from "../types.js";
+import { railBinding, type LockEvidence, type RailObservation } from "../types.js";
 
 export const BTC_RAIL_ID = "btc-htlc";
 
@@ -497,7 +497,7 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
         lock: { ...base2, railVerified: null, reason: `btc-htlc: funding has ${fundingConfirmations} confirmation(s), need ${n}` },
       };
     }
-    rail = { status: "locked", final: true, checkedAtMs, finalizedRef: finalizedRefFor(capturedConfig.pin.name, n, fundingHeight, fundingBlockHash) };
+    rail = { status: "locked", final: true, checkedAtMs, finalizedRef: finalizedRefFor(capturedConfig.pin.name, n, fundingHeight, fundingBlockHash), ...railBinding(base2) };
   } else {
     // Confirmed but no longer unspent — spent. Find it with the bounded getblock(hash, 2) scan
     // starting at the funding height, in strict (height, hash) pairs from position 5 on, never
@@ -551,6 +551,7 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
       final: true,
       checkedAtMs,
       finalizedRef: finalizedRefFor(capturedConfig.pin.name, n, found.height, found.blockHash),
+      ...railBinding(base2),
     };
   }
 

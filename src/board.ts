@@ -21,7 +21,7 @@ import {
 
 import { classifySwapOffer } from "./profile.js";
 import { foldSwap } from "./swap.js";
-import type { Board, BoardInput, LegAContext, LegBContext, SwapView } from "./types.js";
+import type { Board, BoardInput, LegAContext, LegBContext, SwapEvidence, SwapView } from "./types.js";
 
 interface AuthenticatedFrame {
   record: TranscriptRecord;
@@ -93,6 +93,29 @@ function chooseAccept(
   return { accept: accepts[0], coordinationOnly: accepts.length > 1 };
 }
 
+/** Assemble one pair's `SwapEvidence` from per-leg evidence keyed by each leg's own accepted
+ *  contract id; `undefined` when neither leg has any. */
+function pairEvidence(
+  byContract: BoardInput["evidence"],
+  acceptA: AuthenticatedFrame | undefined,
+  acceptB: AuthenticatedFrame | undefined,
+): SwapEvidence | undefined {
+  if (byContract === undefined) return undefined;
+  const legA = acceptA === undefined ? undefined : byContract.get((acceptA.frame as AcceptFrame).contract);
+  const legB = acceptB === undefined ? undefined : byContract.get((acceptB.frame as AcceptFrame).contract);
+  if (legA === undefined && legB === undefined) return undefined;
+  const out: SwapEvidence = {};
+  if (legA !== undefined) {
+    out.a = legA.lock;
+    if (legA.rail !== undefined) out.aRail = legA.rail;
+  }
+  if (legB !== undefined) {
+    out.b = legB.lock;
+    if (legB.rail !== undefined) out.bRail = legB.rail;
+  }
+  return out;
+}
+
 /** Fold every offer in `input.offers` (all of `tclk-offers`, venue order) into a board. */
 export function buildBoard(input: BoardInput): Board {
   const authed = authenticateOffers(input.offers);
@@ -162,7 +185,11 @@ export function buildBoard(input: BoardInput): Board {
   }
 
   const swaps: SwapView[] = [];
+  const swapIdCount = new Map<string, number>();
+  for (const legA of legAByOfferId.values()) swapIdCount.set(legA.swapId, (swapIdCount.get(legA.swapId) ?? 0) + 1);
+
   for (const [legAOfferId, legA] of legAByOfferId) {
+    const duplicated = (swapIdCount.get(legA.swapId) ?? 0) > 1;
     const legB = legBByLegAOfferId.get(legAOfferId);
     const acceptAChoice = chooseAccept(acceptsByRef.get(legAOfferId), legB?.offer.from);
     const legARecords = buildLegRecords(legA.record, acceptAChoice.accept, input.dealRooms);
@@ -170,12 +197,20 @@ export function buildBoard(input: BoardInput): Board {
       ? chooseAccept(acceptsByRef.get(legB.offer.id), legA.offer.from)
       : { accept: undefined, coordinationOnly: false };
     const legBRecords = legB ? buildLegRecords(legB.record, acceptBChoice.accept, input.dealRooms) : [];
-    const evidence = input.evidence?.get(legA.swapId);
+    // tclk#194 finding 2: `swapId` is not unique (a buyer picks the nonce), so evidence is looked
+    // up by the two accepted contract ids of THIS pair — and not at all when the swapId is
+    // shared by more than one active swap, so neither can fold past what its own frames prove.
+    const evidence = duplicated ? undefined : pairEvidence(input.evidence, acceptAChoice.accept, acceptBChoice.accept);
     const view = foldSwap(
       evidence === undefined
         ? { legA: legARecords, legB: legBRecords, nowMs: input.nowMs }
         : { legA: legARecords, legB: legBRecords, evidence, nowMs: input.nowMs },
     );
+    if (duplicated) {
+      view.reasons.push(
+        `swapId ${legA.swapId} is shared by ${swapIdCount.get(legA.swapId)} active swaps (same buyer and nonce) — no rail evidence is looked up for any of them; each folds only as far as its own frames prove`,
+      );
+    }
     // H4: foldSwap has no visibility into how an accept was chosen among several candidates
     // for the same offer id â€” that choice happens here, before folding â€” so it is appended
     // after the fact rather than threaded through as another input (tclk#175).

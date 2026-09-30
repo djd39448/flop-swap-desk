@@ -135,6 +135,10 @@ describe("paperEvidence", () => {
       final: true,
       checkedAtMs: T0,
       finalizedRef: expect.stringMatching(/^paper:sha256:[0-9a-f]{64}$/),
+      rail: "paper",
+      ref: terms().contract,
+      contract: terms().contract,
+      terms: terms(),
     });
   });
 
@@ -206,6 +210,10 @@ describe("paperEvidence", () => {
         final: true,
         checkedAtMs: T0,
         finalizedRef: expect.stringMatching(/^paper:sha256:[0-9a-f]{64}$/),
+        rail: "paper",
+        ref: contract,
+        contract,
+        terms: result.lock.terms,
       });
     });
   });
