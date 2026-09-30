@@ -384,7 +384,9 @@ near-sandbox 2.13.4/protocol 86 — `contracts-near/README.md`'s own build instr
 throwaway `near-sandbox` node (chain id `near-sandbox-flop`, D-N3), and drives `tests-near/
 near-htlc.near.test.ts` (the adapter alone: lock, claim, wrong-preimage refusal, refund timing,
 a malformed `ft_transfer_call` msg refunded in full, an unregistered-payee claim forced past its
-own pre-check, lost-reply recovery by transaction hash, and the evidence reader end to end — this
+own pre-check, `recoverByTxHash` against a completed write (and a timeout-class error for an
+unknown hash), the H1-H6 chain-confirmation, revealed-lock-retry and code-hash-pin scenarios, and
+the evidence reader end to end — this
 is also where D-N9's real gas measurement was taken and `FT_TRANSFER_CALL_GAS`/
 `CLAIM_REFUND_GAS` corrected from their provisional 100/60 Tgas to the measured 20/40 Tgas) and
 `tests-near/client-flows.near.test.ts` (the Seller/Buyer flows end to end: the happy path to
@@ -395,8 +397,13 @@ actually locks — NEAR's own twin of the Bitcoin leg's "before N confirmations"
 `send_tx`'s own `wait_until: "FINAL"` leaves no observable "broadcast but not yet final" window
 for a write that actually happened; the Buyer learning the secret from `get_lock` alone with no
 reveal frame ever posted; a claim to an unregistered payee refused before ever sending a
-transaction; and a lost-reply recovery by transaction hash exercised from inside a real client
-flow). `npm test` never spawns `near-sandbox`, builds no contract and opens no WSL process — a
+transaction; a retry of a refused claim once the payee registers; and `recoverByTxHash` against a
+completed write, called on the rail directly in a client-flow scenario). Recovery in the client
+flows is by hash-lock state (`get_lock`, the reader the flows re-derive their evidence from), not
+by transaction hash: `recoverByTxHash` is a rail primitive pinned against a write that did
+complete, and neither flow calls it. The lock is the only two-step write
+(`prepareLock` signs and records the ref and transaction hash, `commitLock` broadcasts);
+`claim` and `refund` are single calls. `npm test` never spawns `near-sandbox`, builds no contract and opens no WSL process — a
 missing toolchain or sandbox binary fails `test:near` loudly instead (P4-BTC-SPEC.md §7a's own
 lessons checklist, reused here).
 
@@ -432,8 +439,11 @@ keys are fine").
 
 **A claim is checked before it is ever broadcast.** `NearHtlcRail.claim()` verifies the preimage
 actually opens the hash lock, reads a fresh `Locked` state still inside its window, and confirms
-the payee is storage-registered on the token (so a "locked" verdict also proves the payout can
-land) — all before anything is signed. `notAfterMs` is re-checked against fresh chain time as the
+the payee is storage-registered on the token — all before anything is signed. A "locked" verdict
+from the evidence reader proves only that the payee was storage-registered at that block;
+the payee can still be unregistered afterwards, so it does not prove a later payout will land (the
+adapter checks again immediately before each claim, and after the write re-reads `get_lock` to
+confirm the chain agrees, H1). `notAfterMs` is re-checked against fresh chain time as the
 very last read before broadcast. A claim that would fail any of these (the wrong preimage, a
 lock that's expired or already resolved, a payee who was never storage-registered) is refused
 client-side and never sent at all.
@@ -441,7 +451,8 @@ client-side and never sent at all.
 **What this proves, and what it does not.** The three committed fixtures
 (`fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b}/`, replayed hermetically by
 `tests/near-sandbox-fixtures.test.ts`) show a real `htlc` contract funded, claimed or refunded on
-a real near-sandbox 2.13.4 node, with every verdict re-derivable from the exact captured RPC
+a real near-sandbox 2.13.4 node (`refunded-b` carries no NEAR bytes at all: the Buyer never locked
+leg A, so it shows only the paper-rail fold and the absence of any NEAR write), with every verdict re-derivable from the exact captured RPC
 bytes — but on a throwaway sandbox this repo itself starts and stops, never a real network, and
 never with mainnet value at any point in this build. `NEAR_TESTNET_PIN` (`src/rails/
 near-htlc.ts`) is present but named `"near-testnet-UNVERIFIED"` and refuses to match a live node
@@ -491,6 +502,38 @@ Each is written down instead of hidden, per the same discipline the EVM and Bitc
   build's own client from ever reaching that state through the normal claim path; it is only
   reachable by a caller that builds and sends the raw transaction directly, bypassing the
   adapter's own guard on purpose (exactly how this stage's own test reproduces it).
+- **A stuck `Claiming`/`Refunding` lock has no recovery method (F5).** If the payout callback
+  itself fails, the lock stays in that state and no method moves it out. Reachable only with a
+  non-standard token whose `ft_transfer` result is not empty or JSON unit; the evidence reader
+  reports `Claiming`/`Refunding` as non-final, never as an outcome. Full account in
+  `contracts-near/README.md`.
+- **A revealed lock cannot be refunded (F4), with consequences.** Once a claim has revealed the
+  preimage, the contract refuses `refund` even after `refundAfterMs`, and the claim may be retried
+  at any time. If the payee never becomes storage-registered, the payer's funds on that leg stay
+  locked; the payer's only recourse is to use the now-public preimage on the other leg. The
+  adapter mirrors this: a revealed-but-`Locked` lock is retried without the deadline guards (H2)
+  but only after verifying the preimage opens the hash lock, and the evidence reader reports it as
+  revealed rather than `locked` (E4).
+- **Hash-lock squatting is not prevented (H7).** Any holder of the configured token can lock 1
+  unit under a public hash lock before the Buyer's real lock lands; the Buyer's lock is then
+  refused and returned, the adapter reports that honestly (`NearLockRefusedError`, so no lock
+  frame is posted), and the swap ends with the Seller refunding leg B. No funds move. The EVM rail
+  has the same property. Keying locks by (payer, hash lock) would fix it but changes the contract
+  API, the ref and the evidence; that is an open decision, not done.
+- **The capture filename stamp is not bound.** `raw/near/<hashLock>/<legContract>/<stamp>.json`:
+  the evidence reader sees only the parsed index, never the filename, so the stamp is a sort
+  convention. It is not evidence of when a read was taken; the index's own fields are checked
+  (`pin`, `caip2`, `endpoint` must equal the auditor's config, E6).
+- **`audit-export`'s `rails.json` is a trust anchor.** By default the auditor reads the NEAR
+  config (contract, token, code hash) from `DIR/rails.json`, which travels with the bundle and so
+  can be edited together with it. For an independent audit pass `--rails` with the contract and
+  token you know.
+- **The token's code hash is not pinned.** `connect()` pins the `htlc` contract's code hash and
+  refuses a contract that holds any access key (H6), but the NEP-141 token is checked only by
+  account id. Circle's USDC is upgradeable by its issuer; a code change there is not detected.
+- **The landing margin is a sandbox figure.** `NEAR_CLAIM_LANDING_MARGIN_MS` (30 s) is sized for
+  the sandbox's ~0.65 s blocks; it was not measured on testnet, and a testnet or mainnet
+  deployment needs a measured, wider margin before any claim is trusted to land ahead of a refund.
 - **The replay detects damage and splicing, not forgery.** Identical honesty limit to the
   EVM/Bitcoin legs' own (see above).
 - **`sandbox_fast_forward`'s own simulated-time-per-block figure (D-N7, ~337 ms/block) was
