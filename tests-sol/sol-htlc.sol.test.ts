@@ -36,13 +36,14 @@ import {
   escrowAddress,
   refundInstructionData,
   vaultAddress,
+  type SolHtlcRailOptions,
   type SolHtlcTerms,
   type SolPreparedRecord,
   type SolRailConfig,
   type SolSigner,
 } from "../src/rails/sol-htlc.js";
 import { SolBlockhashNotFoundError, SolRpc, SolSimulationFailedError } from "../src/rails/sol-rpc.js";
-import { TOKEN_PROGRAM_ID, associatedTokenAddress } from "../src/rails/sol-spl.js";
+import { TOKEN_PROGRAM_ID, associatedTokenAddress, createAssociatedTokenAccountIdempotent, transferChecked } from "../src/rails/sol-spl.js";
 import { compileLegacyMessage, pubkeyFromBase58, pubkeyToBase58, signTransaction, type SolInstruction, type SolTransaction } from "../src/rails/sol-tx.js";
 import { startSolValidator, type SolParty, type SolValidatorHandle } from "./helpers/validator.js";
 
@@ -65,8 +66,8 @@ describe("sol-htlc (solana-test-validator)", () => {
     if (v !== undefined) await v.stop();
   });
 
-  async function connect(party: SolParty, config: SolRailConfig = v.config, rpc: CapturingRpc = v.createCapturingRpc()): Promise<{ rail: SolHtlcRail; rpc: CapturingRpc }> {
-    const rail = await SolHtlcRail.connect({ config, rpc, signer: party.signer as SolSigner });
+  async function connect(party: SolParty, config: SolRailConfig = v.config, rpc: CapturingRpc = v.createCapturingRpc(), extra: Partial<SolHtlcRailOptions> = {}): Promise<{ rail: SolHtlcRail; rpc: CapturingRpc }> {
+    const rail = await SolHtlcRail.connect({ config, rpc, signer: party.signer as SolSigner, ...extra });
     return { rail, rpc };
   }
 
@@ -522,6 +523,144 @@ describe("sol-htlc (solana-test-validator)", () => {
     const claimEvidence = await recoverUntilSettled(sellerRail, recorded as unknown as SolPreparedRecord);
     expect(claimEvidence.signature).toBe((recorded as unknown as SolPreparedRecord).signature);
     expect((await sellerRail.getEscrow(record.ref)).escrow).toMatchObject({ status: "Claimed", preimage });
+  });
+
+  // -- review fixes (SOL-A1 .. SOL-A4), live ---------------------------------------------------------------
+
+  /** Signs and sends a plain setup-style transaction from `party` and waits until it is FINALIZED. */
+  async function sendFinalized(party: SolParty, instructions: SolInstruction[]): Promise<string> {
+    const sol = new SolRpc(v.createCapturingRpc());
+    const latest = await sol.getLatestBlockhash("confirmed");
+    const message = compileLegacyMessage({ feePayer: party.signer.publicKeyBytes, recentBlockhash: pubkeyFromBase58(latest.blockhash), instructions });
+    const tx = await signTransaction(message, [party.signer]);
+    await sol.sendTransaction(tx.bytes, { preflightCommitment: "confirmed" });
+    for (const deadline = Date.now() + 120_000; ; ) {
+      const [status] = await sol.getSignatureStatuses([tx.signature]);
+      if (status !== undefined && status !== null) {
+        if (status.err !== null) throw new Error(`test: setup transaction failed: ${JSON.stringify(status.err)}`);
+        if (status.confirmationStatus === "finalized") return tx.signature;
+      }
+      if (Date.now() >= deadline) throw new Error("test: setup transaction never finalized");
+      await sleep(500);
+    }
+  }
+
+  async function settle(rail: SolHtlcRail, record: SolPreparedRecord): Promise<unknown> {
+    for (const deadline = Date.now() + 120_000; ; ) {
+      try {
+        return await rail.recoverBySignature(record);
+      } catch (error) {
+        if (!(error instanceof SolPendingError) || Date.now() >= deadline) throw error;
+        await sleep(1000);
+      }
+    }
+  }
+
+  it("SOL-A1: a 1-unit donation into the vault after the lock lands does not turn commitLock or recoverBySignature into 'nothing was locked'", async () => {
+    const { hashLock } = newSecret();
+    const donor = await v.createParty({ usdc: 10n });
+    const mint = pubkeyFromBase58(v.mint);
+    const vaultKey = vaultAddress(v.config.programId, escrowAddress(v.config.programId, v.buyer.address, hashLock).address).address;
+    let donated = false;
+    const donate = async (): Promise<void> => {
+      if (donated) return;
+      donated = true;
+      // the vault exists once the lock is processed: wait for it at confirmed (a transfer needs it)
+      const probe = new SolRpc(v.createCapturingRpc());
+      for (const deadline = Date.now() + 60_000; (await probe.getAccountInfo(pubkeyToBase58(vaultKey), { commitment: "confirmed" })).account === null; ) {
+        if (Date.now() >= deadline) throw new Error("test: the vault never appeared");
+        await sleep(200);
+      }
+      await sendFinalized(donor, [transferChecked({ source: pubkeyFromBase58(donor.tokenAccount as string), mint, destination: vaultKey, authority: donor.signer.publicKeyBytes, amount: 1n, decimals: 6 })]);
+    };
+    // The rail's own poll-sleep hook runs after the lock is sent and before it finalizes: donate then, and
+    // return only once the donation is FINALIZED too, so the rail's confirm read at finalized sees it.
+    const { rail: buyerRail } = await connect(v.buyer, v.config, v.createCapturingRpc(), { sleep: async () => donate() });
+    const now = await nowMs(buyerRail);
+    const record = await buyerRail.prepareLock({ hashLock, amount: "500", payee: v.seller.address, claimByMs: now + 10 * MINUTE, refundAfterMs: now + 20 * MINUTE });
+    const evidence = await buyerRail.commitLock();
+    expect(donated).toBe(true);
+    expect(evidence.signature).toBe(record.signature);
+    const vaultNow = await new SolRpc(v.createCapturingRpc()).getAccountInfo(pubkeyToBase58(vaultKey), { commitment: "finalized" });
+    expect(new DataView((vaultNow.account?.data as Uint8Array).buffer, (vaultNow.account?.data.byteOffset as number) + 64, 8).getBigUint64(0, true)).toBe(501n);
+    // recovery by signature agrees, and the evidence reader (which already used "at least") says locked
+    expect(await buyerRail.recoverBySignature(record)).toMatchObject({ signature: record.signature });
+    const terms = lockTermsFixture(hashLock, "500", now + 10 * MINUTE, now + 20 * MINUTE);
+    const result = await evidenceFor(record.ref, terms, { payee: v.seller.address, payer: v.buyer.address });
+    expect(result.lock.railVerified).toBe(true);
+  });
+
+  it("SOL-A3: a claim past its own notAfterMs is neither signed, simulated nor sent (no signed claim, and so no secret, leaves the process)", async () => {
+    const { preimage, hashLock } = newSecret();
+    const { rail: buyerRail } = await connect(v.buyer);
+    const now = await nowMs(buyerRail);
+    const { record } = await lockOn(buyerRail, hashLock, "7", v.seller.address, now + 10 * MINUTE, now + 20 * MINUTE);
+    const { rail: sellerRail, rpc } = await connect(v.seller);
+    let signed = 0;
+    await expect(sellerRail.claim(record.ref, preimage, Date.now() - 60_000, () => void (signed += 1))).rejects.toThrow(/has already passed/);
+    expect(signed).toBe(0);
+    expect(rpc.exchanges().filter((e) => e.method === "simulateTransaction" || e.method === "sendTransaction")).toHaveLength(0);
+    expect((await sellerRail.getEscrow(record.ref)).escrow?.status).toBe("Locked");
+  });
+
+  it("SOL-A4: a claim that fails only because a relayer's claim landed first is reported as already claimed (payee paid), not as 'retry at once'", async () => {
+    const { preimage, hashLock } = newSecret();
+    const relayer = await v.createParty({ tokenAccount: false, sol: 1 });
+    const { rail: buyerRail } = await connect(v.buyer);
+    const now = await nowMs(buyerRail);
+    const { record } = await lockOn(buyerRail, hashLock, "33", v.seller.address, now + 10 * MINUTE, now + 20 * MINUTE);
+    const sellerBefore = ((await v.usdcBalanceOf(v.seller.address)) ?? 0n) as bigint;
+
+    const viaRelayer = await rawWrite("claim", record.ref, v.buyer.address, v.seller.address, preimage, relayer);
+    const viaSeller = await rawWrite("claim", record.ref, v.buyer.address, v.seller.address, preimage, v.seller);
+    const sol = new SolRpc(v.createCapturingRpc());
+    await sol.sendTransaction(viaRelayer.tx.bytes, { preflightCommitment: "confirmed" });
+    for (const deadline = Date.now() + 60_000; ; ) {
+      const [s] = await sol.getSignatureStatuses([viaRelayer.record.signature]);
+      if (s !== undefined && s !== null && s.err === null) break;
+      if (Date.now() >= deadline) throw new Error("test: the relayer's claim never confirmed");
+      await sleep(300);
+    }
+    await sol.sendTransaction(viaSeller.tx.bytes, { skipPreflight: true }); // lands and fails: the escrow is already Claimed
+
+    const { rail: sellerRail } = await connect(v.seller);
+    const outcome = await settle(sellerRail, viaSeller.record);
+    expect(outcome).toMatchObject({ signature: viaSeller.record.signature, claimedByAnotherTransaction: true });
+    expect((await txMeta(viaSeller.record.signature)).err).toEqual({ InstructionError: [0, { Custom: 18 }] }); // NotLocked
+    expect((await sellerRail.getEscrow(record.ref)).escrow).toMatchObject({ status: "Claimed", preimage });
+    expect(await v.usdcBalanceOf(v.seller.address)).toBe(sellerBefore + 33n);
+  });
+
+  it("SOL-A2: after a claim landed and failed (secret public) the payee fixes its token account and a retryPublicSecret claim pays it inside the old landing bounds; the Buyer's refund is then refused", async () => {
+    const { preimage, hashLock } = newSecret();
+    const payee = await v.createParty({ tokenAccount: false, sol: 1 });
+    const { rail: buyerRail } = await connect(v.buyer);
+    const start = await nowMs(buyerRail);
+    const refundAfterMs = start + 240_000;
+    const claimByMs = start + 30_000; // passes the margin rule; is past by the time the retry happens (waited for below)
+    const { record } = await lockOn(buyerRail, hashLock, "44", payee.address, claimByMs, refundAfterMs);
+    const { rail: payeeRail, rpc: payeeRpc } = await connect(payee);
+
+    // the claim lands and fails (no token account for the payee): the secret is public
+    const forced = await rawWrite("claim", record.ref, v.buyer.address, payee.address, preimage, payee);
+    await new SolRpc(v.createCapturingRpc()).sendTransaction(forced.tx.bytes, { skipPreflight: true });
+    await expect(settle(payeeRail, forced.record)).rejects.toBeInstanceOf(SolClaimFailedError);
+    expect(await buyerRail.findClaimedPreimage(record.ref)).toBe(preimage);
+
+    // the payee creates its token account
+    await sendFinalized(payee, [createAssociatedTokenAccountIdempotent({ payer: payee.signer.publicKeyBytes, owner: payee.signer.publicKeyBytes, mint: pubkeyFromBase58(v.mint) })]);
+
+    // the ordinary claim is refused once its deadline has passed; the public-secret retry is not
+    while (Date.now() <= claimByMs + 1000) await sleep(500);
+    await expect(payeeRail.claim(record.ref, preimage, claimByMs)).rejects.toThrow(/has already passed|SolClaimTooLate|landing/);
+    const sendsBefore = sendCount(payeeRpc);
+    const evidence = await payeeRail.claim(record.ref, preimage, claimByMs, undefined, { retryPublicSecret: true });
+    expect(sendCount(payeeRpc)).toBe(sendsBefore + 1);
+    expect(evidence.ref).toBe(record.ref);
+    expect((await payeeRail.getEscrow(record.ref)).escrow).toMatchObject({ status: "Claimed", preimage });
+    expect(await v.usdcBalanceOf(payee.address)).toBe(44n);
+    // the Buyer, holding the secret, cannot also refund: the escrow is Claimed
+    await expect(buyerRail.refund(record.ref)).rejects.toThrow(/not in a refundable "Locked" state/);
   });
 
   it("SB-int hygiene: the party signers never leak a key through JSON or inspect", () => {
