@@ -218,3 +218,13 @@ independently of tclk's own choreography status (H3, tclk#180/#181). Vendored tc
 `vendor/tclk`) is pinned at `5cc4ab9` and does not contain PR #173 — it is unmerged upstream. If
 `flop-labs/tclk#172` changes the vocabulary before PR #173 merges, this line — and the mapping in
 `src/swap.ts`'s `RAIL_STATUS_TO_SETTLEMENT_VIEW` — moves with it.
+
+## Evidence binding and pair keys � response to the tclk#194 review
+
+`RailObservation` gained `rail`, `ref`, `contract` and `terms`, `src/swap.ts` gained
+`bindObservation` and `pairKey`, and `BoardInput.evidence` is keyed by leg contract id instead of
+`swapId`, after Viriat01's review of `flop-labs/tclk#194` (2026-09-28): a bare final `claimed`
+observation folded a swap to `settled`, and two pairs with the same buyer and nonce shared one
+evidence entry. Both are first-party changes; nothing is vendored or copied from that review beyond
+the two reproductions, which are regression tests in `tests/binding.test.ts`. No capture or
+evidence file format changed, so no fixture was recaptured.

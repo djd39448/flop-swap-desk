@@ -78,6 +78,30 @@ check is its own `finalizedRef`: it names a real block hash, so anyone with thei
 access to that chain can re-query `locks(hashLock)` at that exact block and compare, without
 trusting this repository or whoever ran the sweep.
 
+### Evidence is bound to the pair it belongs to (tclk#194 review, 2026-09-28)
+
+Two rules the fold enforces on every rail (paper, `evm-htlc`, `btc-htlc`, `near-htlc`):
+
+1. **A rail observation is used only if it is bound to the leg's accepted pair.** A
+   `RailObservation` (`src/types.ts`) now carries `rail`, `ref`, `contract` and a copy of the
+   nine `LockTerms` it was checked against, filled by every evidence reader from the same
+   values as its `LockEvidence`. `src/swap.ts` (`bindObservation`) refuses an observation
+   unless its rail and ref equal the accepted lock frame's, its contract equals the leg's
+   accepted contract, and all nine terms equal the accepted offer/accept pair's own
+   `lockTerms()`. A refused observation is dropped from `SwapView.evidence`, a reason is
+   recorded, and it counts toward none of funded, claimed, refunded or settled. `LockEvidence`
+   must likewise name the accepted rail and ref before a leg counts as locked.
+2. **`swapId` is not a unique key.** It is a hash of the buyer's DID and a nonce the buyer
+   picks, so one buyer can sign two different pairs with the same one. Board evidence
+   (`BoardInput.evidence`) is keyed by each leg's own contract id, and each swap gets a
+   `pairKey` (`<leg A offer id>|<leg A contract>|<leg B contract>`). When two active swaps
+   share a `swapId`, no evidence is looked up for either: both are reported with a reason and
+   fold only as far as their own frames prove. The watcher tracks such swaps under separate
+   state keys, and `audit-export --expect` reports a shared `swapId` as ambiguous.
+
+The capture and evidence file formats are unchanged (the binding is computed at replay time
+from the same terms), so no fixture was recaptured.
+
 `fixtures/rehearsal-2026-09-18/` is a byte-exact, watch-root-shaped capture of the real
 2026-09-18 G0 rehearsal on `paper` — the four `tclk-offers` lines that made the pair, both
 deal rooms' lock/reveal/receipt, and both paper notes fetched once, live, with curl. Run it:
