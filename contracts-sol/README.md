@@ -58,7 +58,9 @@ Errors are `ProgramError::Custom(n)`; the numbering is the `HtlcError` enum in `
 
 - **Lock** refuses: amount 0; `claim_by_ms >= refund_after_ms`; `now_ms >= refund_after_ms`
   (`now_ms = Clock.unix_timestamp * 1000`, checked multiplication); a payee equal to the escrow or vault
-  address; any mint other than the configured one; a payer token account that is not the payer's, not for
+  address, the all-zero address (System Program id), this program, the token program or the mint (a payee
+  nobody can sign for; the NEAR H5 twin; other unreceivable addresses such as another escrow PDA cannot be
+  told apart on chain and stay a client check); any mint other than the configured one; a payer token account that is not the payer's, not for
   the mint, frozen, or too small; a second lock by the same payer under the same hash lock. Rent for both
   new accounts is paid by the payer. The transfer is a `TransferChecked` CPI and the vault balance is
   re-read and must equal the amount.
@@ -67,8 +69,17 @@ Errors are `ProgramError::Custom(n)`; the numbering is the `HtlcError` enum in `
   the preimage, then pays the vault to the payee's token account. The payout CPI is atomic with the
   state change: a failed payout reverts the whole transaction (status stays Locked, no preimage stored), so a
   "revealed but unpaid" state cannot exist on Solana. The preimage is still public in the failed
-  transaction's instruction data (the same top-level-failure class as EVM/NEAR); only the payer already has
-  it, and the claim can be resent once the payee account exists.
+  transaction's instruction data, and, unlike NEAR (which records the reveal and then refuses refund), Solana
+  keeps no revealed state: the escrow stays Locked with revealed = 0, so the payer can still `Refund` after
+  `refund_after_ms`. In the desk's protocol the Seller mints the secret and the Buyer is the payer of this
+  leg, so the leaked secret reaches the Buyer, who could claim leg B *and* refund this escrow. The program
+  cannot close this (the secret is in the instruction data whether the transaction succeeds or fails; a
+  claim landing at or after `refund_after_ms` fails with ClaimWindowClosed and leaks it the same way). The
+  protection lives in the SB2 client: always simulate a claim first; give it a blockhash whose
+  `lastValidBlockHeight` expires (at the slower slot-time estimate) before `refund_after_ms` minus a margin,
+  so a late claim is dropped rather than executed and published; treat any failed claim as urgent and retry
+  at once. Tests: `failed_claim_leaves_the_escrow_locked_and_refundable`,
+  `late_claim_fails_with_the_secret_public_and_refund_still_works`.
 - **Refund** needs the payer's signature, status Locked and `now_ms >= refund_after_ms`; it pays the vault to
   a token account owned by the payer and sets Refunded. Claim and Refund are mutually exclusive at the
   boundary: at `now_ms == refund_after_ms` claim is closed and refund open; one millisecond earlier it is
@@ -111,7 +122,22 @@ The litesvm tests assume the default mint.
   resolution; a claim landing close to `refund_after_ms` can lose the race to a refund, so clients keep a
   landing margin.
 - **No on-chain claim_by enforcement.** `claim_by_ms` is recorded and validated against `refund_after_ms`
-  but only `refund_after_ms` gates a claim (as on NEAR); the client enforces `claim_by`.
+  but only `refund_after_ms` gates a claim (as on NEAR); the client enforces `claim_by`. Consequence for the
+  protocol: the secret can become public as late as `refund_after_ms` minus one second, so the Buyer derives
+  leg-B safety from leg A's `refund_after_ms`, never from `claim_by_ms`; SB2/SB3 terms validation must refuse
+  terms where legB.refundAfter minus legA.refundAfter is smaller than the Buyer's landing margin even when
+  claimBy leaves room, and an evidence reader must not treat `claim_by_ms` as a bound on disclosure.
+- **Not yet run on a real validator (SB-int).** Lock, Claim and Refund (including the prefunded lock, the
+  CPIs made without the callee in `account_infos`, the executable-flag checks and the rent path) are proven
+  only in litesvm 0.17; `smoke.sh` exercises only an unknown-tag simulation. A runtime difference would be a
+  liveness failure, not a fund loss (every failure is atomic). SB-int must run them end to end on
+  `solana-test-validator` (mock mint created at its fixed address with `--account`) before the `.so` hash is
+  pinned.
+- **Upgrade-authority rule the evidence reader inherits.** Accept a ProgramData authority of exactly `None`
+  (tag 0) or `Some` of the 32 zero bytes, nothing broader. The zero bytes are a small-order ed25519 point;
+  this is safe only because Solana verifies transaction signatures with `verify_strict`, which rejects such
+  keys, so nobody can sign as the all-zero address. Any other key, including other low-order encodings, fails
+  closed (SB2 `sol-evidence.ts` / `connect()` must spell this out and test it).
 - **Gas/compute** is small (well under the default 200k units per instruction) and was not tuned.
 - **Unaudited, testnet/localnet-only.** Not for mainnet value.
 
@@ -140,7 +166,7 @@ then stops the validator by its own pid and deletes the ledger. It never opens t
   `solana-pubkey` 3.x while `solana-program 5.1.0` uses 4.x, so the two `Pubkey` types differ and its
   instruction builders cannot feed `solana_program::program::invoke`. The program therefore builds the
   `TransferChecked` / `InitializeAccount3` instructions itself (a few bytes each) and unit tests pin them, and
-  the account/mint layout constants, against the interface crate's `pack()` output. No other crate is added
+  the account/mint layout constants, against the interface crate's `pack()` output. It is a dev-dependency only (unit tests), not in the SBF build graph. No other crate is added
   to the program; the system-program instructions are hand-encoded too.
 - Tests: `litesvm = "=0.17.0"` (in-process SVM, Agave 4.3 based; loads the built `.so` and lets the harness
   set the Clock sysvar). Chosen over `mollusk-svm` because it runs whole transactions with real account
