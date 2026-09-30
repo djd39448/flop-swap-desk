@@ -656,6 +656,36 @@ describe("near-htlc (sandbox)", () => {
     }
   });
 
+  it("H8 (sandbox): the evidence reader binds the contract's real code hash and zero-key state; a config pinning any other hash reports null with the reason", async () => {
+    const { hashLock0x } = randomHashLock();
+    const now = await chainNowMs();
+    const claimByMs = now + 10 * 60_000;
+    const refundAfterMs = now + 20 * 60_000;
+    const amount = "777";
+    const { rail: buyerRail } = await connect(sandbox.buyer.signer);
+    await buyerRail.prepareLock({ hashLock: hashLock0x, amount, payee: sandbox.seller.accountId, claimByMs, refundAfterMs });
+    await buyerRail.commitLock();
+
+    const terms = lockTermsFixture(hashLock0x, amount, claimByMs, refundAfterMs);
+    const accounts: NearAccounts = { payee: sandbox.seller.accountId, payer: sandbox.buyer.accountId };
+
+    // The real reads: positions 3 and 4 are view_account / view_access_key_list of the contract at the finalized block.
+    const good = await captureNearLeg(sandbox.createCapturingRpc(), sandbox.config, terms, accounts, refOf(hashLock0x), Date.now());
+    expect(good.exchanges.map((e) => (e.params as { request_type?: string }).request_type)).toEqual([undefined, undefined, "call_function", "view_account", "view_access_key_list", "call_function"]);
+    const goodResult = nearEvidence({ terms, config: sandbox.config, accounts, capture: { index: good.index, bytes: verifiedExchangeBytes(good.exchanges as Exchange[]) } });
+    expect(goodResult.lock.railVerified).toBe(true);
+
+    // The same real reads under a config that pins some other code hash: the auditor (config) and the capture agree on the wrong pin,
+    // so only the on-chain code_hash can disagree -- and it does.
+    const wrongHash = base58.encode(sha256(new TextEncoder().encode("definitely not the reviewed wasm")));
+    const badConfig = { ...sandbox.config, htlcCodeHash: wrongHash };
+    const bad = await captureNearLeg(sandbox.createCapturingRpc(), badConfig, terms, accounts, refOf(hashLock0x), Date.now());
+    const badResult = nearEvidence({ terms, config: badConfig, accounts, capture: { index: bad.index, bytes: verifiedExchangeBytes(bad.exchanges as Exchange[]) } });
+    expect(badResult.lock.railVerified).toBeNull();
+    expect(badResult.lock.reason).toMatch(/is not the pinned htlcCodeHash/);
+    expect(badResult.rail).toBeUndefined();
+  });
+
   it("squatting fix (sandbox): a third account locks 1 unit under the swap's hash lock FIRST; the buyer's lock still succeeds, the seller claims it, the squatter refunds only its own unit", async () => {
     const { preimage0x, hashLock0x } = randomHashLock();
 

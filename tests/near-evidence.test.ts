@@ -182,12 +182,63 @@ function storageBalanceExchange(opts: {
     block_id: opts.blockId ?? BLOCK_HASH,
   };
   let body: string;
-  if (opts.error) body = jsonRpcError(nearId(4, opts.ref), -32000, "internal error");
-  else if (opts.panic !== undefined) body = jsonRpcResult(nearId(4, opts.ref), { error: opts.panic, logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
-  else if (opts.balance === "malformed") body = jsonRpcResult(nearId(4, opts.ref), { result: resultBytesOf({ nope: true }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
-  else if (opts.balance === null) body = jsonRpcResult(nearId(4, opts.ref), { result: resultBytesOf(null), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
-  else body = jsonRpcResult(nearId(4, opts.ref), { result: resultBytesOf(opts.balance ?? { total: "1250000000000000000000", available: "0" }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  if (opts.error) body = jsonRpcError(nearId(6, opts.ref), -32000, "internal error");
+  else if (opts.panic !== undefined) body = jsonRpcResult(nearId(6, opts.ref), { error: opts.panic, logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  else if (opts.balance === "malformed") body = jsonRpcResult(nearId(6, opts.ref), { result: resultBytesOf({ nope: true }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  else if (opts.balance === null) body = jsonRpcResult(nearId(6, opts.ref), { result: resultBytesOf(null), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  else body = jsonRpcResult(nearId(6, opts.ref), { result: resultBytesOf(opts.balance ?? { total: "1250000000000000000000", available: "0" }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
   return { method: "query", params, body };
+}
+
+/** H8: position 3, `view_account` for the HTLC contract pinned to the finalized block. */
+function contractExchange(opts: {
+  accountId?: string;
+  blockId?: string;
+  codeHash?: string;
+  resultBlockHash?: string;
+  malformed?: boolean;
+  error?: boolean;
+  ref?: string;
+} = {}): ExchangeSpec {
+  const params = { request_type: "view_account", account_id: opts.accountId ?? CONTRACT, block_id: opts.blockId ?? BLOCK_HASH };
+  let body: string;
+  if (opts.error) body = jsonRpcError(nearId(4, opts.ref), -32000, "internal error");
+  else if (opts.malformed) body = jsonRpcResult(nearId(4, opts.ref), { amount: "1" });
+  else {
+    body = jsonRpcResult(nearId(4, opts.ref), {
+      amount: "1000000000000000000000000",
+      locked: "0",
+      code_hash: opts.codeHash ?? HTLC_CODE_HASH,
+      storage_usage: 200000,
+      storage_paid_at: 0,
+      block_height: BLOCK_HEIGHT,
+      block_hash: opts.resultBlockHash ?? BLOCK_HASH,
+    });
+  }
+  return { method: "query", params, body };
+}
+
+/** H8: position 4, `view_access_key_list` for the HTLC contract (zero keys = locked deployment). */
+function keysExchange(opts: {
+  accountId?: string;
+  blockId?: string;
+  keys?: unknown[];
+  resultBlockHash?: string;
+  malformed?: boolean;
+  error?: boolean;
+  ref?: string;
+} = {}): ExchangeSpec {
+  const params = { request_type: "view_access_key_list", account_id: opts.accountId ?? CONTRACT, block_id: opts.blockId ?? BLOCK_HASH };
+  let body: string;
+  if (opts.error) body = jsonRpcError(nearId(5, opts.ref), -32000, "internal error");
+  else if (opts.malformed) body = jsonRpcResult(nearId(5, opts.ref), { nope: true });
+  else body = jsonRpcResult(nearId(5, opts.ref), { keys: opts.keys ?? [], block_height: BLOCK_HEIGHT, block_hash: opts.resultBlockHash ?? BLOCK_HASH });
+  return { method: "query", params, body };
+}
+
+/** The two H8 reads with the reviewed, locked-down defaults. */
+function pinExchanges(ref?: string): ExchangeSpec[] {
+  return [contractExchange(ref === undefined ? {} : { ref }), keysExchange(ref === undefined ? {} : { ref })];
 }
 
 /** Also builds each exchange's request/response bytes so binding (requestBody parses to exactly
@@ -232,17 +283,21 @@ function buildCapture(opts: {
   return { index, bytes: bySha };
 }
 
-/** The standard four-exchange sequence (status, block, get_lock, storage_balance_of), with room
- *  to override or omit any single exchange. */
+/** The standard six-exchange sequence (status, block, get_lock, view_account,
+ *  view_access_key_list, storage_balance_of), with room to override or omit any single exchange. */
 function standardExchanges(
   opts: {
     status?: Parameters<typeof statusExchange>[0];
     block?: Parameters<typeof blockExchange>[0];
     lock?: Parameters<typeof getLockExchange>[0];
+    contract?: Parameters<typeof contractExchange>[0] | false;
+    keys?: Parameters<typeof keysExchange>[0] | false;
     storage?: Parameters<typeof storageBalanceExchange>[0] | false;
   } = {},
 ): ExchangeSpec[] {
   const specs = [statusExchange(opts.status), blockExchange(opts.block), getLockExchange(opts.lock)];
+  if (opts.contract !== false) specs.push(contractExchange(opts.contract));
+  if (opts.keys !== false) specs.push(keysExchange(opts.keys));
   if (opts.storage !== false) specs.push(storageBalanceExchange(opts.storage));
   return specs;
 }
@@ -308,6 +363,7 @@ describe("nearEvidence — E4: a revealed lock is not \"locked\"", () => {
         statusExchange({ ref: REVEALED_REF }),
         blockExchange({ ref: REVEALED_REF }),
         getLockExchange({ ref: REVEALED_REF, hashLockArg: REVEALED_HASH_LOCK.slice(2), view: lockViewPayload({ preimage: REVEALED_PREIMAGE_HEX }) }),
+        ...pinExchanges(REVEALED_REF),
       ],
     });
     const result = nearEvidence({ terms: REVEALED_TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
@@ -323,6 +379,7 @@ describe("nearEvidence — E4: a revealed lock is not \"locked\"", () => {
         statusExchange({ ref: REVEALED_REF }),
         blockExchange({ ref: REVEALED_REF }),
         getLockExchange({ ref: REVEALED_REF, hashLockArg: REVEALED_HASH_LOCK.slice(2), view: lockViewPayload({ preimage: "cd".repeat(32) }) }),
+        ...pinExchanges(REVEALED_REF),
         storageBalanceExchange({ ref: REVEALED_REF }),
       ],
     });
@@ -344,6 +401,7 @@ describe("nearEvidence — E4: a revealed lock is not \"locked\"", () => {
           hashLockArg: REVEALED_HASH_LOCK.slice(2),
           view: lockViewPayload({ preimage: REVEALED_PREIMAGE_HEX, payee: OTHER_ACCOUNT }),
         }),
+        ...pinExchanges(REVEALED_REF),
       ],
     });
     const result = nearEvidence({ terms: REVEALED_TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
@@ -465,7 +523,7 @@ describe("nearEvidence — status binding", () => {
   });
 
   it("status exchange missing -> railVerified null", () => {
-    const capture = buildCapture({ exchanges: [blockExchange(), getLockExchange(), storageBalanceExchange()] });
+    const capture = buildCapture({ exchanges: [blockExchange(), getLockExchange(), ...pinExchanges(), storageBalanceExchange()] });
     const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/no status exchange/);
@@ -476,14 +534,14 @@ describe("nearEvidence — block binding", () => {
   it("the block request does not ask for finality \"final\" (tampered selector) -> railVerified null", () => {
     const tampered = blockExchange();
     const spec: ExchangeSpec = { ...tampered, params: { finality: "optimistic" } };
-    const capture = buildCapture({ exchanges: [statusExchange(), spec, getLockExchange(), storageBalanceExchange()] });
+    const capture = buildCapture({ exchanges: [statusExchange(), spec, getLockExchange(), ...pinExchanges(), storageBalanceExchange()] });
     const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/finality "final"/);
   });
 
   it("malformed block result -> railVerified null", () => {
-    const capture = buildCapture({ exchanges: [statusExchange(), blockExchange({ malformed: true }), getLockExchange(), storageBalanceExchange()] });
+    const capture = buildCapture({ exchanges: [statusExchange(), blockExchange({ malformed: true }), getLockExchange(), ...pinExchanges(), storageBalanceExchange()] });
     const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/malformed block result/);
@@ -576,7 +634,7 @@ describe("nearEvidence — squatting fix: the ref is 0x<hash lock>:<payer>", () 
       block_id: BLOCK_HASH,
     };
     const good = getLockExchange();
-    const capture = buildCapture({ exchanges: [statusExchange(), blockExchange(), { ...good, params }, storageBalanceExchange()] });
+    const capture = buildCapture({ exchanges: [statusExchange(), blockExchange(), { ...good, params }, ...pinExchanges(), storageBalanceExchange()] });
     const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/does not target this lock/);
@@ -591,7 +649,7 @@ describe("nearEvidence — squatting fix: the ref is 0x<hash lock>:<payer>", () 
       block_id: BLOCK_HASH,
     };
     const good = getLockExchange();
-    const capture = buildCapture({ exchanges: [statusExchange(), blockExchange(), { ...good, params }, storageBalanceExchange()] });
+    const capture = buildCapture({ exchanges: [statusExchange(), blockExchange(), { ...good, params }, ...pinExchanges(), storageBalanceExchange()] });
     const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toMatch(/does not target this lock/);
@@ -770,6 +828,74 @@ describe("nearEvidence — storage_balance_of (payout can land)", () => {
   });
 });
 
+// ── H8: the contract pin (code hash + zero keys) in the evidence path ───────────────────────
+
+describe("nearEvidence -- H8: the contract must be the reviewed, locked-down deployment", () => {
+  const OTHER_HASH = "11111111111111111111111111111111";
+  const KEY = { public_key: "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp", access_key: { nonce: 0, permission: "FullAccess" } };
+
+  it("a wrong code hash -> railVerified null with the reason, no rail (Locked, Claimed and Refunded alike)", () => {
+    for (const view of [lockViewPayload(), lockViewPayload({ status: "Claimed", preimage: "cd".repeat(32) }), lockViewPayload({ status: "Refunded" })]) {
+      const capture = buildCapture({ exchanges: standardExchanges({ lock: { view }, contract: { codeHash: OTHER_HASH } }) });
+      const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+      expect(result.lock.railVerified).toBeNull();
+      expect(result.lock.reason).toMatch(/code_hash .* is not the pinned htlcCodeHash/);
+      expect(result.rail).toBeUndefined();
+    }
+  });
+
+  it("an access key still present on the contract -> railVerified null, no rail", () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ keys: { keys: [KEY] } }) });
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/still holds 1 access key/);
+    expect(result.rail).toBeUndefined();
+  });
+
+  it("the view_account exchange missing (a pre-H8 capture) -> railVerified null", () => {
+    const capture = buildCapture({ exchanges: [statusExchange(), blockExchange(), getLockExchange(), storageBalanceExchange()] });
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/view_account/);
+  });
+
+  it("the view_access_key_list exchange missing -> railVerified null", () => {
+    const capture = buildCapture({ exchanges: standardExchanges({ keys: false, storage: false }) });
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/no view_access_key_list exchange/);
+  });
+
+  it("unbound reads: another account, another block, or a result naming another block -> null (tampered)", () => {
+    const cases: Array<[string, Parameters<typeof standardExchanges>[0], RegExp]> = [
+      ["view_account of another account", { contract: { accountId: OTHER_ACCOUNT } }, /view_account read does not target the contract/],
+      ["view_account at another block", { contract: { blockId: "9".repeat(44) } }, /view_account read does not target the contract/],
+      ["view_account result at another block", { contract: { resultBlockHash: "9".repeat(44) } }, /malformed view_account result/],
+      ["view_access_key_list of another account", { keys: { accountId: OTHER_ACCOUNT } }, /view_access_key_list read does not target the contract/],
+      ["view_access_key_list at another block", { keys: { blockId: "9".repeat(44) } }, /view_access_key_list read does not target the contract/],
+      ["view_access_key_list result at another block", { keys: { resultBlockHash: "9".repeat(44) } }, /malformed view_access_key_list result/],
+      ["malformed view_account", { contract: { malformed: true } }, /malformed view_account result/],
+      ["malformed view_access_key_list", { keys: { malformed: true } }, /malformed view_access_key_list result/],
+      ["rpc rejected view_account", { contract: { error: true } }, /rpc rejected view_account/],
+      ["rpc rejected view_access_key_list", { keys: { error: true } }, /rpc rejected view_access_key_list/],
+    ];
+    for (const [label, opts, reason] of cases) {
+      const capture = buildCapture({ exchanges: standardExchanges(opts) });
+      const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+      expect(result.lock.railVerified, label).toBeNull();
+      expect(result.lock.reason, label).toMatch(reason);
+      expect(result.rail, label).toBeUndefined();
+    }
+  });
+
+  it("htlcCodeHash joins the captured-vs-auditor config comparison", () => {
+    const capture = buildCapture({ exchanges: standardExchanges(), config: { ...CONFIG, htlcCodeHash: OTHER_HASH } });
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/different rail config/);
+  });
+});
+
 // ── failure capture (F1) ────────────────────────────────────────────────────────────────────
 
 describe("nearEvidence — failure capture (F1)", () => {
@@ -803,8 +929,8 @@ describe("nearEvidence — id binding: a donor-nonce splice fails closed", () =>
     };
     const donorBody = jsonRpcResult(nearId(3, REF, CHECKED_AT_MS, donorNonce), JSON.parse(donorLockSpec.body).result);
 
-    const capture = buildCapture({ exchanges: [statusExchange(), blockExchange(), getLockExchange(), storageBalanceExchange()] });
-    const splicedIndex: NearCaptureIndex = { ...capture.index, exchanges: [capture.index.exchanges[0]!, capture.index.exchanges[1]!, donorExchange, capture.index.exchanges[3]!] };
+    const capture = buildCapture({ exchanges: [statusExchange(), blockExchange(), getLockExchange(), ...pinExchanges(), storageBalanceExchange()] });
+    const splicedIndex: NearCaptureIndex = { ...capture.index, exchanges: [capture.index.exchanges[0]!, capture.index.exchanges[1]!, donorExchange, ...capture.index.exchanges.slice(3)] };
     const bytes = new Map(capture.bytes);
     bytes.set(donorExchange.responseSha256, new TextEncoder().encode(donorBody));
 
@@ -839,12 +965,14 @@ function fakeFetch(resultsInOrder: unknown[]): { fetch: typeof fetch; requests: 
 }
 
 describe("captureNearLeg — live (mocked fetch)", () => {
-  it("captures status, block, get_lock and storage_balance_of in order, ids namespaced by ref/nowMs/nonce", async () => {
+  it("captures status, block, get_lock, view_account, view_access_key_list and storage_balance_of in order, ids namespaced by ref/nowMs/nonce", async () => {
     const nowMs = 1_700_000_900_000;
     const results = [
       { chain_id: PIN.chainId, protocol_version: 86, sync_info: {} },
       { header: { height: BLOCK_HEIGHT, hash: BLOCK_HASH, timestamp_nanosec: TIMESTAMP_NS } },
       { result: resultBytesOf(lockViewPayload()), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
+      { amount: "1000000000000000000000000", locked: "0", code_hash: HTLC_CODE_HASH, storage_usage: 200000, storage_paid_at: 0, block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
+      { keys: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
       { result: resultBytesOf({ total: "1", available: "0" }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
     ];
     const { fetch: fetchImpl, requests } = fakeFetch(results);
@@ -853,13 +981,16 @@ describe("captureNearLeg — live (mocked fetch)", () => {
     const { index, exchanges } = await captureNearLeg(rpc, CONFIG, TERMS, ACCOUNTS, REF, nowMs);
 
     expect(index.error).toBeUndefined();
-    expect(exchanges).toHaveLength(4);
-    expect(requests.map((r) => r.method)).toEqual(["status", "block", "query", "query"]);
+    expect(exchanges).toHaveLength(6);
+    expect(requests.map((r) => r.method)).toEqual(["status", "block", "query", "query", "query", "query"]);
     expect(requests[1]!.params).toEqual({ finality: "final" });
     const lockParams = requests[2]!.params as Record<string, unknown>;
     expect(lockParams.method_name).toBe("get_lock");
     expect(lockParams.block_id).toBe(BLOCK_HASH);
-    const storageParams = requests[3]!.params as Record<string, unknown>;
+    // H8: the contract's own code hash and key list, pinned to the same block hash.
+    expect(requests[3]!.params).toEqual({ request_type: "view_account", account_id: CONTRACT, block_id: BLOCK_HASH });
+    expect(requests[4]!.params).toEqual({ request_type: "view_access_key_list", account_id: CONTRACT, block_id: BLOCK_HASH });
+    const storageParams = requests[5]!.params as Record<string, unknown>;
     expect(storageParams.method_name).toBe("storage_balance_of");
     expect(storageParams.account_id).toBe(USDC);
 
@@ -882,6 +1013,8 @@ describe("captureNearLeg — live (mocked fetch)", () => {
       { chain_id: PIN.chainId, protocol_version: 86, sync_info: {} },
       { header: { height: BLOCK_HEIGHT, hash: BLOCK_HASH, timestamp_nanosec: TIMESTAMP_NS } },
       { result: resultBytesOf(lockViewPayload()), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
+      { amount: "1000000000000000000000000", locked: "0", code_hash: HTLC_CODE_HASH, storage_usage: 200000, storage_paid_at: 0, block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
+      { keys: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
     ];
     const { fetch: fetchImpl, requests } = fakeFetch(results);
     const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => nowMs });
@@ -896,18 +1029,20 @@ describe("captureNearLeg — live (mocked fetch)", () => {
     expect(none.requests).toHaveLength(0);
   });
 
-  it("no accounts.payee -> only 3 exchanges (status, block, get_lock); no storage_balance_of call", async () => {
+  it("no accounts.payee -> only 5 exchanges (status, block, get_lock, view_account, view_access_key_list); no storage_balance_of call", async () => {
     const nowMs = 1_700_000_900_000;
     const results = [
       { chain_id: PIN.chainId, protocol_version: 86, sync_info: {} },
       { header: { height: BLOCK_HEIGHT, hash: BLOCK_HASH, timestamp_nanosec: TIMESTAMP_NS } },
       { result: resultBytesOf(lockViewPayload()), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
+      { amount: "1000000000000000000000000", locked: "0", code_hash: HTLC_CODE_HASH, storage_usage: 200000, storage_paid_at: 0, block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
+      { keys: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
     ];
     const { fetch: fetchImpl, requests } = fakeFetch(results);
     const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => nowMs });
     const { exchanges } = await captureNearLeg(rpc, CONFIG, TERMS, {}, REF, nowMs);
-    expect(exchanges).toHaveLength(3);
-    expect(requests.map((r) => r.method)).toEqual(["status", "block", "query"]);
+    expect(exchanges).toHaveLength(5);
+    expect(requests.map((r) => r.method)).toEqual(["status", "block", "query", "query", "query"]);
   });
 
   it("a transport failure on the very first call sets index.error and captures nothing", async () => {
@@ -958,6 +1093,8 @@ describe("captureNearLeg — live (mocked fetch)", () => {
   const STATUS_RESULT = { chain_id: PIN.chainId, protocol_version: 86, sync_info: {} };
   const BLOCK_RESULT = { header: { height: BLOCK_HEIGHT, hash: BLOCK_HASH, timestamp_nanosec: TIMESTAMP_NS } };
   const LOCK_RESULT = { result: resultBytesOf(lockViewPayload()), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH };
+  const ACCOUNT_RESULT = { amount: "1000000000000000000000000", locked: "0", code_hash: HTLC_CODE_HASH, storage_usage: 200000, storage_paid_at: 0, block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH };
+  const KEYS_RESULT = { keys: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH };
   const STORAGE_RESULT = { result: resultBytesOf({ total: "1", available: "0" }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH };
 
   it("E2: a genuine JSON-RPC error on get_lock is a completed read — no index.error, storage_balance_of still attempted", async () => {
@@ -965,12 +1102,14 @@ describe("captureNearLeg — live (mocked fetch)", () => {
       { result: STATUS_RESULT },
       { result: BLOCK_RESULT },
       { errorMessage: "contract panicked" }, // get_lock: a real RpcCaptureError, still recorded
+      { result: ACCOUNT_RESULT },
+      { result: KEYS_RESULT },
       { result: STORAGE_RESULT },
     ]);
     const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => 1_700_000_900_000 });
     const { index, exchanges } = await captureNearLeg(rpc, CONFIG, TERMS, ACCOUNTS, REF, 1_700_000_900_000);
     expect(index.error).toBeUndefined();
-    expect(exchanges).toHaveLength(4);
+    expect(exchanges).toHaveLength(6);
     expect(exchanges[2]!.responseBody).toContain("contract panicked");
   });
 
@@ -989,21 +1128,56 @@ describe("captureNearLeg — live (mocked fetch)", () => {
       { result: STATUS_RESULT },
       { result: BLOCK_RESULT },
       { result: LOCK_RESULT },
+      { result: ACCOUNT_RESULT },
+      { result: KEYS_RESULT },
       { errorMessage: "token contract panicked" }, // storage_balance_of: a real RpcCaptureError
     ]);
     const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => 1_700_000_900_000 });
     const { index, exchanges } = await captureNearLeg(rpc, CONFIG, TERMS, ACCOUNTS, REF, 1_700_000_900_000);
     expect(index.error).toBeUndefined();
-    expect(exchanges).toHaveLength(4);
-    expect(exchanges[3]!.responseBody).toContain("token contract panicked");
+    expect(exchanges).toHaveLength(6);
+    expect(exchanges[5]!.responseBody).toContain("token contract panicked");
   });
 
   it("E2: a transport failure on storage_balance_of sets index.error (get_lock's own exchange is still kept)", async () => {
-    const fetchImpl = fakeFetchWithOutcomes([{ result: STATUS_RESULT }, { result: BLOCK_RESULT }, { result: LOCK_RESULT }, "throw"]);
+    const fetchImpl = fakeFetchWithOutcomes([
+      { result: STATUS_RESULT },
+      { result: BLOCK_RESULT },
+      { result: LOCK_RESULT },
+      { result: ACCOUNT_RESULT },
+      { result: KEYS_RESULT },
+      "throw",
+    ]);
     const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => 1_700_000_900_000 });
     const { index, exchanges } = await captureNearLeg(rpc, CONFIG, TERMS, ACCOUNTS, REF, 1_700_000_900_000);
     expect(index.error).toBeDefined();
-    expect(exchanges).toHaveLength(3);
+    expect(exchanges).toHaveLength(5);
+  });
+
+  it("H8: a transport failure on view_account sets index.error; a JSON-RPC error on view_access_key_list is a completed read", async () => {
+    const failing = fakeFetchWithOutcomes([{ result: STATUS_RESULT }, { result: BLOCK_RESULT }, { result: LOCK_RESULT }, "throw"]);
+    const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: failing, clock: () => 1_700_000_900_000 });
+    const first = await captureNearLeg(rpc, CONFIG, TERMS, ACCOUNTS, REF, 1_700_000_900_000);
+    expect(first.index.error).toBeDefined();
+    expect(first.exchanges).toHaveLength(3);
+
+    const erroring = fakeFetchWithOutcomes([
+      { result: STATUS_RESULT },
+      { result: BLOCK_RESULT },
+      { result: LOCK_RESULT },
+      { result: ACCOUNT_RESULT },
+      { errorMessage: "keys unavailable" },
+      { result: STORAGE_RESULT },
+    ]);
+    const rpc2 = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: erroring, clock: () => 1_700_000_900_000 });
+    const second = await captureNearLeg(rpc2, CONFIG, TERMS, ACCOUNTS, REF, 1_700_000_900_000);
+    expect(second.index.error).toBeUndefined();
+    expect(second.exchanges).toHaveLength(6);
+    const bytes = new Map<string, Uint8Array>();
+    for (const exchange of second.exchanges) bytes.set(exchange.responseSha256, exchange.responseBytes);
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: { index: second.index, bytes } });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toBe("rpc rejected view_access_key_list");
   });
 });
 

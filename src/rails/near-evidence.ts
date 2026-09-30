@@ -15,9 +15,13 @@
 // Unlike EVM's single `eth_call`, NEAR's own evidence read is D-N10's fixed sequence, always in
 // this order: `status` (the pin's own chain id + protocol version), `block` at
 // `finality: "final"` (height + hash + timestamp), `query call_function get_lock` **pinned to
-// that exact block hash**, and — only once the leg's own resolved payee account is known and the
-// lock is genuinely `Locked` with every other field matching — `query call_function
-// storage_balance_of` for that payee on the configured USDC token, pinned to the same block hash.
+// that exact block hash**, then (H8) `query view_account` and `query view_access_key_list` for the
+// HTLC contract pinned to the same block hash (the contract must run exactly the reviewed wasm,
+// `htlcCodeHash`, and hold zero access keys: an account with a key can be redeployed at any time,
+// so a `get_lock` answer alone proves nothing about who wrote the state), and — only once the
+// leg's own resolved payee account is known and the lock is genuinely `Locked` with every other
+// field matching — `query call_function storage_balance_of` for that payee on the configured USDC
+// token, pinned to the same block hash.
 // That last read is D-N10's own reason for existing: near-htlc's payout is a token transfer, and
 // a payee who was never storage-registered on the token would make even a perfectly matching
 // `Locked` on-chain state worthless (the payout could never land) — so this reader never reports
@@ -218,8 +222,9 @@ function bindExchange(capture: NearCapture, exchange: NearCaptureIndexExchange |
 }
 
 /** Position-authenticated lookup: `captureNearLeg` always appends this leg's own reads in a
- *  fixed order (0: status, 1: block, 2: query/get_lock, 3: query/storage_balance_of — the last
- *  only when a payee account is known) — a convenience for a known layout, never a substitute
+ *  fixed order (0: status, 1: block, 2: query/get_lock, 3: query/view_account, 4:
+ *  query/view_access_key_list, 5: query/storage_balance_of — the last only when a payee account
+ *  is known) — a convenience for a known layout, never a substitute
  *  for `bindExchange`'s own content binding (a candidate at the wrong position is refused because
  *  its own `.method` there would simply not equal what the caller asks for). */
 function exchangeAt(exchanges: readonly NearCaptureIndexExchange[], i: number, expectedMethod: string): NearCaptureIndexExchange | null {
@@ -414,6 +419,63 @@ function firstFieldMismatch(args: {
   return null;
 }
 
+/** H8: positions 3 (`view_account`) and 4 (`view_access_key_list`) -- both bound to this capture,
+ *  to the configured contract account and to the finalized block hash exactly like `get_lock`,
+ *  and the result must itself name that block. `null` when the contract is provably the reviewed
+ *  one (`code_hash == htlcCodeHash`, zero access keys); otherwise the reason it is not (or could
+ *  not be shown to be). */
+function contractPinReason(
+  capture: NearCapture,
+  exchanges: readonly NearCaptureIndexExchange[],
+  config: NearRailConfig,
+  block: { hash: string },
+): string | null {
+  const accountBound = bindExchange(capture, exchangeAt(exchanges, 3, "query"), "view_account");
+  if (accountBound.kind === "missing") return accountBound.reason;
+  const accountParams = requestParamsObject(accountBound.request);
+  if (
+    accountParams === null ||
+    accountParams.request_type !== "view_account" ||
+    accountParams.account_id !== config.contract ||
+    accountParams.block_id !== block.hash
+  ) {
+    return "near-htlc: the view_account read does not target the contract at the finalized block (tampered)";
+  }
+  if (accountBound.outcome.kind === "error") return "rpc rejected view_account";
+  const account = accountBound.outcome.value;
+  if (account === null || typeof account !== "object") return "near-htlc: malformed view_account result";
+  const a = account as { code_hash?: unknown; block_hash?: unknown };
+  if (typeof a.code_hash !== "string" || a.code_hash === "" || a.block_hash !== block.hash) {
+    return "near-htlc: malformed view_account result (code_hash missing or not at the finalized block)";
+  }
+  if (a.code_hash !== config.htlcCodeHash) {
+    return `near-htlc: contract "${config.contract}" code_hash "${a.code_hash}" is not the pinned htlcCodeHash "${String(config.htlcCodeHash)}" (H8)`;
+  }
+
+  const keysBound = bindExchange(capture, exchangeAt(exchanges, 4, "query"), "view_access_key_list");
+  if (keysBound.kind === "missing") return keysBound.reason;
+  const keysParams = requestParamsObject(keysBound.request);
+  if (
+    keysParams === null ||
+    keysParams.request_type !== "view_access_key_list" ||
+    keysParams.account_id !== config.contract ||
+    keysParams.block_id !== block.hash
+  ) {
+    return "near-htlc: the view_access_key_list read does not target the contract at the finalized block (tampered)";
+  }
+  if (keysBound.outcome.kind === "error") return "rpc rejected view_access_key_list";
+  const keyList = keysBound.outcome.value;
+  if (keyList === null || typeof keyList !== "object") return "near-htlc: malformed view_access_key_list result";
+  const k = keyList as { keys?: unknown; block_hash?: unknown };
+  if (!Array.isArray(k.keys) || k.block_hash !== block.hash) {
+    return "near-htlc: malformed view_access_key_list result (keys missing or not at the finalized block)";
+  }
+  if (k.keys.length !== 0) {
+    return `near-htlc: contract "${config.contract}" still holds ${String(k.keys.length)} access key(s) -- not the locked deployment (H8)`;
+  }
+  return null;
+}
+
 // ── the pure decoder ─────────────────────────────────────────────────────────────────────────
 
 /**
@@ -461,7 +523,8 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
     capturedConfig.pin.chainId !== config.pin.chainId ||
     capturedConfig.pin.name !== config.pin.name ||
     capturedConfig.contract !== config.contract ||
-    capturedConfig.assets.USDC !== config.assets.USDC
+    capturedConfig.assets.USDC !== config.assets.USDC ||
+    capturedConfig.htlcCodeHash !== config.htlcCodeHash
   ) {
     return { lock: { ...base, railVerified: null, reason: "near-htlc: capture was taken under a different rail config (D3)" } };
   }
@@ -561,6 +624,12 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
   }
   const lockView = parsedLock.view;
 
+  // H8: the contract itself must be the reviewed, locked-down deployment at this same block --
+  // every status below (locked, claimed, refunded) is only meaningful if the state came from the
+  // reviewed code, so this comes before any verdict.
+  const pinReason = contractPinReason(capture, exchanges, capturedConfig, block);
+  if (pinReason !== null) return { lock: { ...baseAtFinalizedView, railVerified: null, reason: pinReason } };
+
   // D-N10: Claiming/Refunding are transitional contract states — never a final RailObservation.
   if (lockView.status === "Claiming" || lockView.status === "Refunding") {
     return {
@@ -616,7 +685,7 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
 
     // Position 3: query call_function storage_balance_of(payee) — D-N10: a locked verdict must
     // also prove the payout can land, only performed once the lock itself already matches.
-    const storageBound = bindExchange(capture, exchangeAt(exchanges, 3, "query"), "storage_balance_of");
+    const storageBound = bindExchange(capture, exchangeAt(exchanges, 5, "query"), "storage_balance_of");
     if (storageBound.kind === "missing") {
       return { lock: { ...baseAtFinalizedView, railVerified: null, reason: storageBound.reason } };
     }
@@ -710,7 +779,7 @@ function buildIndex(config: NearRailConfig, ref: string, checkedAtMs: number, no
 /**
  * The live half of "capture live, then decode" (mirrors `captureEvmLeg`/`captureBtcLeg`):
  * `status`, `block(finality: "final")`, `query call_function get_lock` pinned to that block's own
- * hash, and — only once `accounts.payee` is known — `query call_function storage_balance_of` for
+ * hash, `query view_account` and `query view_access_key_list` for the contract (H8), and — only once `accounts.payee` is known — `query call_function storage_balance_of` for
  * that payee on `config.assets.USDC`, pinned to the same block hash. Every call through `rpc`, so
  * every byte is captured, and every id namespaced `"<ref>:<nowMs>:<nonce>:<n>"`. Never throws for
  * a chain-state reason (no such lock, a contract-side panic on a view call) — those are recorded
@@ -775,6 +844,19 @@ export async function captureNearLeg(
       // replay instead of honestly reporting the read as incomplete).
       if (!(error instanceof RpcCaptureError)) {
         return finish(error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    // H8: the contract's own code hash and key list at the same final block (positions 3 and 4).
+    // A JSON-RPC-level error reply is a completed read (`nearEvidence` fails closed on it);
+    // anything else is a transport failure that sets `index.error`, exactly as for get_lock.
+    for (const request_type of ["view_account", "view_access_key_list"] as const) {
+      try {
+        await rpc.request({ method: "query", params: { request_type, account_id: config.contract, block_id: block.hash } });
+      } catch (error) {
+        if (!(error instanceof RpcCaptureError)) {
+          return finish(error instanceof Error ? error.message : String(error));
+        }
       }
     }
 

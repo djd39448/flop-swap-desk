@@ -491,6 +491,17 @@ each index records the full ref, and the fold requires it to equal the accepted 
 Contract signatures and the storage-key layout: `contracts-near/README.md`. A pre-fix bare
 hash-lock ref, or one naming another hash lock, is rejected everywhere.
 
+**The contract pin is part of the evidence, not only of `connect()` (H8).** Each capture also reads
+`view_account` and `view_access_key_list` for the HTLC contract, pinned to the same final block hash
+as `get_lock`, and the reader binds both like `get_lock` (request type, contract account, block
+hash; the result must itself name that block). It reports a verdict only when the contract's
+`code_hash` equals the config's `htlcCodeHash` and it holds zero access keys; otherwise
+`railVerified` is null with the reason. `htlcCodeHash` also joins the captured-versus-auditor config
+comparison, so a capture taken under a different pin never replays under the auditor's. The fixed
+read order is now status, block, `get_lock`, `view_account`, `view_access_key_list`, then
+`storage_balance_of` (only when a payee account line exists); fixtures taken before H8 lack the two
+reads and replay as unverified until recaptured.
+
 **A claim is checked before it is ever broadcast.** `NearHtlcRail.claim()` verifies the preimage
 actually opens the hash lock, reads a fresh `Locked` state still inside its window, and confirms
 the payee is storage-registered on the token — all before anything is signed. A "locked" verdict
@@ -577,7 +588,8 @@ Each is written down instead of hidden, per the same discipline the EVM and Bitc
   can be edited together with it. For an independent audit pass `--rails` with the contract and
   token you know.
 - **The token's code hash is not pinned.** `connect()` pins the `htlc` contract's code hash and
-  refuses a contract that holds any access key (H6), but the NEP-141 token is checked only by
+  refuses a contract that holds any access key (H6), and the evidence reader proves the same two
+  facts per capture at the finalized block (H8), but the NEP-141 token is checked only by
   account id. Circle's USDC is upgradeable by its issuer; a code change there is not detected.
 - **The landing margin is a sandbox figure.** `NEAR_CLAIM_LANDING_MARGIN_MS` (30 s) is sized for
   the sandbox's ~0.65 s blocks; it was not measured on testnet, and a testnet or mainnet

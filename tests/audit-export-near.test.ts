@@ -144,10 +144,22 @@ function buildNearFixture(opts: { capturePayer?: string } = {}) {
   const statusBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 1), { chain_id: NEAR_SANDBOX_PIN.chainId, protocol_version: 86, sync_info: {} });
   const blockBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 2), { header: { height: BLOCK_HEIGHT, hash: BLOCK_HASH, timestamp_nanosec: TIMESTAMP_NS } });
   const getLockBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 3), { result: resultBytesOf(lockViewPayload), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
-  const storageBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 4), { result: resultBytesOf(storageBalancePayload), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  // H8: the contract's own code hash and key list at the same block (positions 3 and 4).
+  const accountBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 4), {
+    amount: "1000000000000000000000000",
+    locked: "0",
+    code_hash: NEAR_CONFIG.htlcCodeHash,
+    storage_usage: 200000,
+    storage_paid_at: 0,
+    block_height: BLOCK_HEIGHT,
+    block_hash: BLOCK_HASH,
+  });
+  const keysBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 5), { keys: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  const storageBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 6), { result: resultBytesOf(storageBalancePayload), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
 
   // D-N10's fixed read order: status, block(final), get_lock (pinned to that block hash),
-  // storage_balance_of (pinned to the same block hash) — mirroring evm-evidence's own A1/D1
+  // view_account and view_access_key_list of the contract (H8), storage_balance_of (pinned to the
+  // same block hash) — mirroring evm-evidence's own A1/D1
   // binding rules: each exchange's own `requestBody` must actually ask for its declared
   // `method`/`params`, and every id is bound to this capture's own ref/checkedAtMs/nonce.
   const index = {
@@ -189,10 +201,34 @@ function buildNearFixture(opts: { capturePayer?: string } = {}) {
       },
       {
         method: "query",
-        params: { request_type: "call_function", account_id: USDC_ACCOUNT, method_name: "storage_balance_of", args_base64: argsBase64({ account_id: PAYEE_ACCOUNT }), block_id: BLOCK_HASH },
+        params: { request_type: "view_account", account_id: CONTRACT_ACCOUNT, block_id: BLOCK_HASH },
         requestBody: JSON.stringify({
           jsonrpc: "2.0",
           id: nearId(nearRef, checkedAtMs, 4),
+          method: "query",
+          params: { request_type: "view_account", account_id: CONTRACT_ACCOUNT, block_id: BLOCK_HASH },
+        }),
+        responseSha256: sha256Hex(accountBody),
+        atMs: T0,
+      },
+      {
+        method: "query",
+        params: { request_type: "view_access_key_list", account_id: CONTRACT_ACCOUNT, block_id: BLOCK_HASH },
+        requestBody: JSON.stringify({
+          jsonrpc: "2.0",
+          id: nearId(nearRef, checkedAtMs, 5),
+          method: "query",
+          params: { request_type: "view_access_key_list", account_id: CONTRACT_ACCOUNT, block_id: BLOCK_HASH },
+        }),
+        responseSha256: sha256Hex(keysBody),
+        atMs: T0,
+      },
+      {
+        method: "query",
+        params: { request_type: "call_function", account_id: USDC_ACCOUNT, method_name: "storage_balance_of", args_base64: argsBase64({ account_id: PAYEE_ACCOUNT }), block_id: BLOCK_HASH },
+        requestBody: JSON.stringify({
+          jsonrpc: "2.0",
+          id: nearId(nearRef, checkedAtMs, 6),
           method: "query",
           params: { request_type: "call_function", account_id: USDC_ACCOUNT, method_name: "storage_balance_of", args_base64: argsBase64({ account_id: PAYEE_ACCOUNT }), block_id: BLOCK_HASH },
         }),
@@ -206,7 +242,7 @@ function buildNearFixture(opts: { capturePayer?: string } = {}) {
   // (hashLock, legContract) key, exactly the value `src/watcher.ts` passes as `candidate.contract`.
   return {
     swapId, hashLock, ref: nearRef, legContract: legAAccept.contract, legAOffer, legAAccept, legBOffer, legBAccept, legATerms,
-    offerRows, dealRoomA, dealRoomARows, index, statusBody, blockBody, getLockBody, storageBody,
+    offerRows, dealRoomA, dealRoomARows, index, statusBody, blockBody, getLockBody, accountBody, keysBody, storageBody,
   };
 }
 
@@ -222,7 +258,9 @@ async function writeWatchRoot(root: string, fixture: ReturnType<typeof buildNear
     [fixture.index.exchanges[0]!.responseSha256, fixture.statusBody],
     [fixture.index.exchanges[1]!.responseSha256, fixture.blockBody],
     [fixture.index.exchanges[2]!.responseSha256, fixture.getLockBody],
-    [fixture.index.exchanges[3]!.responseSha256, fixture.storageBody],
+    [fixture.index.exchanges[3]!.responseSha256, fixture.accountBody],
+    [fixture.index.exchanges[4]!.responseSha256, fixture.keysBody],
+    [fixture.index.exchanges[5]!.responseSha256, fixture.storageBody],
   ] as const) {
     await writeFile(join(root, "raw", "rpc", `${sha}.json`), body);
   }
@@ -343,7 +381,7 @@ describe("examples/audit-export.mjs — near-htlc leg end to end", () => {
     const fixture = buildNearFixture();
     await writeWatchRoot(root, fixture, { rails: { near: NEAR_CONFIG } });
 
-    const storageSha = fixture.index.exchanges[3]!.responseSha256;
+    const storageSha = fixture.index.exchanges[5]!.responseSha256;
     await writeFile(join(root, "raw", "rpc", `${storageSha}.json`), "tampered, does not match its own filename's hash");
 
     const result = run(["--root", root, "--json"]);

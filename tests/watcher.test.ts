@@ -1703,7 +1703,7 @@ describe("runSweep", () => {
       }) as typeof fetch;
     }
 
-    /** `status`/`block(final)`/`query get_lock`/`query storage_balance_of`, in D-N10's own fixed
+    /** `status`/`block(final)`/`query get_lock`/`query view_account`/`query view_access_key_list`/`query storage_balance_of`, in D-N10's own fixed
      *  order — `method` alone cannot tell `get_lock` apart from `storage_balance_of` (both are
      *  NEAR's `query` method), so this reads `params.method_name` the same way the real adapter's
      *  own request does. */
@@ -1714,7 +1714,12 @@ describe("runSweep", () => {
           return { result: { header: { height: BLOCK_HEIGHT, hash: BLOCK_HASH, timestamp_nanosec: TIMESTAMP_NS } } };
         }
         if (method === "query") {
-          const p = params as { method_name?: string };
+          const p = params as { method_name?: string; request_type?: string };
+          // H8: the contract's own code hash and key list at the finalized block.
+          if (p.request_type === "view_account") {
+            return { result: { amount: "1", locked: "0", code_hash: HTLC_CODE_HASH, storage_usage: 1, storage_paid_at: 0, block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH } };
+          }
+          if (p.request_type === "view_access_key_list") return { result: { keys: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH } };
           if (p.method_name === "get_lock") return { result: { result: resultBytesOf(lockViewPayload) } };
           if (p.method_name === "storage_balance_of") return { result: { result: resultBytesOf(STORAGE_BALANCE) } };
         }
@@ -1786,7 +1791,7 @@ describe("runSweep", () => {
       // Squatting fix: the index records the full ref (0x<hash lock>:<payer>) from the accepted
       // lock frame, and the live get_lock read names that payer next to the hash lock.
       expect(index.ref).toBe(`${swap.lock.hash}:${BUYER_ACCOUNT}`);
-      expect(index.exchanges).toHaveLength(4);
+      expect(index.exchanges).toHaveLength(6);
       const lockRead = index.exchanges[2].params as { method_name: string; args_base64: string };
       expect(lockRead.method_name).toBe("get_lock");
       expect(JSON.parse(Buffer.from(lockRead.args_base64, "base64").toString("utf8"))).toEqual({
@@ -1795,7 +1800,7 @@ describe("runSweep", () => {
       });
 
       const rpcFiles = await readdir(join(root, "raw", "rpc"));
-      expect(rpcFiles.length).toBe(4);
+      expect(rpcFiles.length).toBe(6);
 
       const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
       const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);
