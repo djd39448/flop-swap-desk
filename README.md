@@ -721,6 +721,89 @@ Each is written down instead of hidden, per the same discipline the EVM and Bitc
   is a NEAR protocol guarantee, and a real deployment obviously has no such lever at all — real
   time simply has to pass.
 
+## Solana leg (local validator in WSL)
+
+`contracts-sol/` is a first-party, unaudited native-Rust escrow program (no Anchor); its README has
+the byte layouts, error codes and the client duties it hands to this layer. The TypeScript side is
+`src/rails/sol-htlc.ts` (the adapter: chain pin, program pin, keyless writes, chain-confirmed writes
+with typed errors), `sol-evidence.ts` (the pure finalized-view evidence reader plus the one live
+capture function), `sol-rpc.ts`, `sol-tx.ts`, `sol-spl.ts` (a first-party legacy-transaction and SPL
+encoder over the already-installed `@noble/*` and `@scure/base`; no `@solana/*` dependency),
+`sol-signer-memory.ts` (a key in an ES `#private` field, never serialised) and `custom-rails.ts`.
+
+**The rail id is `trustcore.sol-htlc-v1`, and it is namespaced on purpose.** The vendored tclk knows
+only its own rail ids and must not change, so a Solana leg cannot use a bare id such as
+`sol-htlc`: that would look like an id tclk itself owns. `src/rails/custom-rails.ts` builds a frozen
+per-caller registry (no module state) that admits this one id with the `solana` account-line
+namespace and refuses every id tclk already knows. The id is spelled in exactly one constant
+(`SOL_RAIL_ID`); a test scans `src/` for a second occurrence.
+
+Run the live suite (needs WSL Ubuntu with Rust and Agave v4.3.0 under
+`~/.local/share/agave/v4.3.0/bin`, see `handoff/research/sol-probe/README.md`):
+
+```bash
+npm run test:sol
+```
+
+This builds `dist/`, runs `contracts-sol/build.sh` (host tests, the SBF build, the litesvm tests) once,
+requires the built `htlc.so` to hash to the reviewed pin, spawns one throwaway `solana-test-validator`
+through `wsl.exe` (ledger under WSL `/tmp`, killed by pid only), funds fresh in-memory keys through the
+faucet and drives `tests-sol/sol-htlc.sol.test.ts` on real transactions. It takes several minutes: this
+validator finalizes about 13-15 s behind the tip and every write waits for FINALIZED. `npm test`
+(hermetic, `tests/sol-*.test.ts` on a scripted fake node) never starts a process.
+
+What is built: the program, the adapter, the evidence reader, the Solana account-line helpers and the
+custom-rails registry, all proven by the hermetic suite and the live suite. **Not built yet (stage
+SB3):** the Seller/Buyer client flows, the client rail and frames, watcher/replay wiring, audit-export
+wiring, a policy entry and client fixtures. Nothing in this repository drives a Solana swap end to end.
+
+### Known limits of the Solana leg
+
+Only what the tests prove is claimed; the rest is written down.
+
+- **A stray donation is adopted.** The vault is an ordinary token account, so anyone can add units to
+  it, and the program pays the whole balance out. The adapter and the evidence reader therefore accept a
+  vault holding AT LEAST the amount (live test: a 1-unit donation after the lock lands, `commitLock` and
+  `recoverBySignature` still succeed). Every other escrow field is compared exactly.
+- **A late claim can publish the secret, so a claim is bounded; a claim that already failed is not.**
+  A claim carries the preimage in its instruction data whether it succeeds or fails. `claim` therefore
+  refuses unless the deadline `notAfterMs` is still ahead, leaves 120 s before `refund_after_ms`, and its
+  blockhash cannot land after `refund_after_ms` minus 30 s (measured live: 455 ms per block, so the
+  600 ms estimate has about 70 s of slack). Once a claim has landed and failed the secret is public and
+  those bounds only stop the Seller being paid, so `claim(..., { retryPublicSecret: true })` skips them
+  (live test: retry pays the payee inside the old bounds and the Buyer's refund is then refused). It is
+  allowed only when the escrow's own on-chain history proves the preimage is public. It is NOT offered
+  for `SolNotLandedError` (a claim that was sent but never landed): there the secret is only possibly
+  seen, which stays a decision for a person.
+- **`simulateTransaction` receives the signed claim.** The claim is simulated first so a claim the
+  runtime would refuse is never sent, but the simulation request carries the signed transaction and so
+  the secret. Use an endpoint you trust for the Seller, as for the send path. A claim past its own
+  deadline is refused before it is signed or simulated (live test: no simulate exchange is made).
+- **A claim that lost a race is not a failure.** If another transaction (a relayer, a duplicate send from
+  another fee payer) claimed first, the failed transaction is reported as evidence with
+  `claimedByAnotherTransaction: true` when the escrow is Claimed with this claim's preimage (live test).
+  In every other state a failed claim is `SolClaimFailedError` with `secretPublic`.
+- **A stalled or suspended validator is not covered (by analysis, not run).** The landing bound assumes
+  blocks stay near 600 ms and the clock tracks blocks. If the average block time over one blockhash
+  lifetime exceeds about 760 ms, or `Clock.unix_timestamp` jumps forward while block height stands still
+  (a suspended WSL VM, for example), a claim signed before the stall can land after `refund_after_ms`,
+  fail, and publish the secret. There is no slow-block check at claim time; do not suspend the host
+  while a claim is in flight.
+- **Evidence capture can fail under network latency (measured).** `captureSolLeg` makes five sequential
+  `getAccountInfo` reads and the finalized slot advances about every 455 ms. With no added latency 20 of
+  20 captures verified on the first attempt; with 60 ms added per call, 6 of 20 still straddled two slots
+  after the 3 attempts and produced `railVerified: null`. That fails closed (no fund loss) but the Seller
+  would not see "locked". Against a remote devnet RPC most captures would fail. A single
+  `getMultipleAccounts` read would fix it and is not built.
+- **Wallet keys only.** A payee that is off the curve, an all-zero or other small-order point, or a
+  non-canonical encoding is refused before signing, because nobody can sign for it under strict
+  verification. The payee comes from the counterparty's own account line.
+- **`claim_by_ms` is enforced by the client only** (the program gates a claim on `refund_after_ms`), so
+  leg safety is derived from `refund_after_ms`; see `contracts-sol/README.md`.
+- **The program is unaudited and localnet-only.** The devnet pin (`SOL_DEVNET_PIN`) has never met a real
+  devnet and is marked UNVERIFIED; mainnet is refused by name and by genesis hash. Every write waits for
+  FINALIZED (about 15-30 s here); a real cluster's timing was not measured.
+
 ## What this is not
 
 No AMM, no pool, no custody, no relayer (yellow paper R10.4's allowlisted relayer is
