@@ -1,0 +1,114 @@
+{
+  "v": 1,
+  "rail": "near-htlc",
+  "ref": "0x9bf50a705204237ecbf2d97c992eb87b9553441d0f423106257ca6f69c61d14c:buyer.test.near",
+  "pin": "near-sandbox",
+  "caip2": "near:near-sandbox-flop",
+  "endpoint": "http://127.0.0.1:62129",
+  "checkedAtMs": 1790789911231,
+  "config": {
+    "pin": {
+      "name": "near-sandbox",
+      "chainId": "near-sandbox-flop",
+      "caip2": "near:near-sandbox-flop",
+      "finality": "final"
+    },
+    "endpoint": "http://127.0.0.1:62129",
+    "contract": "htlc.test.near",
+    "assets": {
+      "USDC": "usdc.test.near"
+    },
+    "htlcCodeHash": "6ezqvtePdkD2V71gS32GoCSREYGGrEcAkwunnPTotSza"
+  },
+  "nonce": "a0d6f7063d33abac",
+  "exchanges": [
+    {
+      "method": "status",
+      "params": [],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0x9bf50a705204237ecbf2d97c992eb87b9553441d0f423106257ca6f69c61d14c:buyer.test.near:1790789911231:a0d6f7063d33abac:1\",\"method\":\"status\",\"params\":[]}",
+      "responseSha256": "bd10299772241a7cb4c438644a4e7dc7f63f0c4e1eb5786366a2678e5c771f11",
+      "atMs": 1790789916376
+    },
+    {
+      "method": "block",
+      "params": {
+        "finality": "final"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0x9bf50a705204237ecbf2d97c992eb87b9553441d0f423106257ca6f69c61d14c:buyer.test.near:1790789911231:a0d6f7063d33abac:2\",\"method\":\"block\",\"params\":{\"finality\":\"final\"}}",
+      "responseSha256": "8a7b48a56904b0ff9d2cf814737146c94a57c0fe750191c2e17f4d8ae51b319e",
+      "atMs": 1790789916378
+    },
+    {
+      "method": "query",
+      "params": {
+        "request_type": "call_function",
+        "account_id": "htlc.test.near",
+        "method_name": "get_lock",
+        "args_base64": "eyJoYXNoX2xvY2siOiI5YmY1MGE3MDUyMDQyMzdlY2JmMmQ5N2M5OTJlYjg3Yjk1NTM0NDFkMGY0MjMxMDYyNTdjYTZmNjljNjFkMTRjIiwicGF5ZXIiOiJidXllci50ZXN0Lm5lYXIifQ==",
+        "block_id": "BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0x9bf50a705204237ecbf2d97c992eb87b9553441d0f423106257ca6f69c61d14c:buyer.test.near:1790789911231:a0d6f7063d33abac:3\",\"method\":\"query\",\"params\":{\"request_type\":\"call_function\",\"account_id\":\"htlc.test.near\",\"method_name\":\"get_lock\",\"args_base64\":\"eyJoYXNoX2xvY2siOiI5YmY1MGE3MDUyMDQyMzdlY2JmMmQ5N2M5OTJlYjg3Yjk1NTM0NDFkMGY0MjMxMDYyNTdjYTZmNjljNjFkMTRjIiwicGF5ZXIiOiJidXllci50ZXN0Lm5lYXIifQ==\",\"block_id\":\"BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc\"}}",
+      "responseSha256": "34991961821fbaae26518c63e3bc76277ff7a1187a42cae70f8cc06a325579c1",
+      "atMs": 1790789916379
+    },
+    {
+      "method": "query",
+      "params": {
+        "request_type": "view_account",
+        "account_id": "htlc.test.near",
+        "block_id": "BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0x9bf50a705204237ecbf2d97c992eb87b9553441d0f423106257ca6f69c61d14c:buyer.test.near:1790789911231:a0d6f7063d33abac:4\",\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"account_id\":\"htlc.test.near\",\"block_id\":\"BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc\"}}",
+      "responseSha256": "7f94012d5ef2ea6a51fe4c875f3188dbb33e91144363f3316a6b85df93732e34",
+      "atMs": 1790789916380
+    },
+    {
+      "method": "query",
+      "params": {
+        "request_type": "view_access_key_list",
+        "account_id": "htlc.test.near",
+        "block_id": "BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0x9bf50a705204237ecbf2d97c992eb87b9553441d0f423106257ca6f69c61d14c:buyer.test.near:1790789911231:a0d6f7063d33abac:5\",\"method\":\"query\",\"params\":{\"request_type\":\"view_access_key_list\",\"account_id\":\"htlc.test.near\",\"block_id\":\"BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc\"}}",
+      "responseSha256": "422fc0893b06f8d76ad5e1751b97dfccd3cab4f69738bac2d45f64abd603dca2",
+      "atMs": 1790789916381
+    },
+    {
+      "method": "query",
+      "params": {
+        "request_type": "call_function",
+        "account_id": "usdc.test.near",
+        "method_name": "storage_balance_of",
+        "args_base64": "eyJhY2NvdW50X2lkIjoic2VsbGVyLnRlc3QubmVhciJ9",
+        "block_id": "BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0x9bf50a705204237ecbf2d97c992eb87b9553441d0f423106257ca6f69c61d14c:buyer.test.near:1790789911231:a0d6f7063d33abac:6\",\"method\":\"query\",\"params\":{\"request_type\":\"call_function\",\"account_id\":\"usdc.test.near\",\"method_name\":\"storage_balance_of\",\"args_base64\":\"eyJhY2NvdW50X2lkIjoic2VsbGVyLnRlc3QubmVhciJ9\",\"block_id\":\"BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc\"}}",
+      "responseSha256": "2b7c53267da48b9106c1f1a068d1000b9895bc91c9ba64ad64a35415634b8b18",
+      "atMs": 1790789916382
+    },
+    {
+      "method": "query",
+      "params": {
+        "request_type": "view_access_key",
+        "account_id": "seller.test.near",
+        "public_key": "ed25519:FV27h9kRtdwtpxnqHARobNm9axmaSH5o6k77hziFs4Jf",
+        "block_id": "BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0x9bf50a705204237ecbf2d97c992eb87b9553441d0f423106257ca6f69c61d14c:buyer.test.near:1790789911231:a0d6f7063d33abac:7\",\"method\":\"query\",\"params\":{\"request_type\":\"view_access_key\",\"account_id\":\"seller.test.near\",\"public_key\":\"ed25519:FV27h9kRtdwtpxnqHARobNm9axmaSH5o6k77hziFs4Jf\",\"block_id\":\"BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc\"}}",
+      "responseSha256": "c3d9c36bd7fff6288ff81889d76dea01a4c421140538754f999c44fbd9a36e49",
+      "atMs": 1790789916383
+    },
+    {
+      "method": "query",
+      "params": {
+        "request_type": "view_access_key",
+        "account_id": "buyer.test.near",
+        "public_key": "ed25519:7BTLdDZqg3v3XLWt4QvRWgJjdKBKTNLZZYvns8uw8tX2",
+        "block_id": "BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0x9bf50a705204237ecbf2d97c992eb87b9553441d0f423106257ca6f69c61d14c:buyer.test.near:1790789911231:a0d6f7063d33abac:8\",\"method\":\"query\",\"params\":{\"request_type\":\"view_access_key\",\"account_id\":\"buyer.test.near\",\"public_key\":\"ed25519:7BTLdDZqg3v3XLWt4QvRWgJjdKBKTNLZZYvns8uw8tX2\",\"block_id\":\"BJ6QXG4S3xaVDeC1EduXi2rmACqxyhMpnFLgLniGTUpc\"}}",
+      "responseSha256": "786a5adb0a70e8781155b909430ff1430c84300e547588e20bee0e3f2bf9ad9d",
+      "atMs": 1790789916384
+    }
+  ]
+}

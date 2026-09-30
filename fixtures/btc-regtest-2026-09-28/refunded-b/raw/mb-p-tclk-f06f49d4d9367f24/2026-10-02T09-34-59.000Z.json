@@ -1,0 +1,25 @@
+{
+ "room": "mb-p-tclk-f06f49d4d9367f24",
+ "count": 2,
+ "first_seq": 1,
+ "last_seq": 2,
+ "generation": 1,
+ "messages": [
+  {
+   "seq": 1,
+   "ts": "2026-10-01T13:33:59.000Z",
+   "from": "did:key:z6Mkon22vwz9JoNpGDxCrGZRgeNFTdRTwXYYN3fvAhA3K19x",
+   "text": "swap1 pubkey btc-htlc bip122:0f9188f13cb7b2c71f2a335e3a4fc328 03e5b321580415b45ad2e5d0ef9b10ec2be859d087ad7b191f894d1d118362d498 proof bip322:AkcwRAIgIDbBoxogozkYlDoG65TrK3bz+om0CJA+R90u0JqHr3MCICR+lS8Oxm0kRgCH5vo5CoX4mcfK4oS77SrNNq+oC+DAASED5bMhWAQVtFrS5dDvmxDsK+hZ0IetexkfiU0dEYNi1Jg=",
+   "nonce": "10001",
+   "sig": "RIY5gz3CNdujdOoHovLSNhZljVxOeuE-JgrkCZzXQbVKxlJ9hKEzyxEkQkTPpgUJxmH4qU6zu8DBIVfMO978DQ"
+  },
+  {
+   "seq": 2,
+   "ts": "2026-10-01T13:33:59.000Z",
+   "from": "did:key:z6MkmtWtY63GQVBrpMyRJWEzsnxfsGkemu6CtMDwGTv4RYj2",
+   "text": "swap1 pubkey btc-htlc bip122:0f9188f13cb7b2c71f2a335e3a4fc328 036fb4de874efeab8ed98e3c6a37b99fae3991e37477d12585662ccb386eef8ec0 proof bip322:AkcwRAIgV8cz2PaSGFCmJgQAJzqx2uIdYRZJvgvUxoPwJyj9hb4CIGrWWp+Iu6sddgrhj3bsq2yKPrGMO8nBq0gKmnEjAdUFASEDb7Teh07+q47ZjjxqN7mfrjmR43R30SWFZizLOG7vjsA=",
+   "nonce": "10002",
+   "sig": "VPtriKEciOgR_2Dku0mOLzQIYnY_mZn68u8b1sMdUrrbtBCQl2iF4Ucee9HynasVzNhwokfKfliP1no-UOWPAg"
+  }
+ ]
+}

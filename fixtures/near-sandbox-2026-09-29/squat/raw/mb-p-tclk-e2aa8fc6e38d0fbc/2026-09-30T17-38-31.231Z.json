@@ -1,0 +1,33 @@
+{
+ "room": "mb-p-tclk-e2aa8fc6e38d0fbc",
+ "count": 3,
+ "first_seq": 1,
+ "last_seq": 3,
+ "generation": 1,
+ "messages": [
+  {
+   "seq": 1,
+   "ts": "2026-09-30T17:38:31.231Z",
+   "from": "did:key:z6MkgAnvkP45uNxwCKeNdt6wrYkEjpYX4f7Nrd8MQqFL8Fbn",
+   "text": "tclk1 {\"contract\":\"0xe2aa8fc6e38d0fbcf1c6ea89265b42378c798160956eeb9169a83deb9736d2fe\",\"from\":\"did:key:z6MkgAnvkP45uNxwCKeNdt6wrYkEjpYX4f7Nrd8MQqFL8Fbn\",\"rail\":\"paper\",\"ref\":\"0xe2aa8fc6e38d0fbcf1c6ea89265b42378c798160956eeb9169a83deb9736d2fe\",\"type\":\"lock\"}",
+   "nonce": "10001",
+   "sig": "zXqO3NOTAQV4YEUiGl1zuxpevbLunjZgGtrxBXt4ZjzfyIzwmHbPTh5DI9thkI8tsuzWLB00Py1qSLhBLBDNAw"
+  },
+  {
+   "seq": 2,
+   "ts": "2026-09-30T17:38:31.231Z",
+   "from": "did:key:z6MkwJFpvJVFe15ygGgYLTYuiPwfhkkDRkMG4eKQFT8g65yE",
+   "text": "tclk1 {\"contract\":\"0xe2aa8fc6e38d0fbcf1c6ea89265b42378c798160956eeb9169a83deb9736d2fe\",\"from\":\"did:key:z6MkwJFpvJVFe15ygGgYLTYuiPwfhkkDRkMG4eKQFT8g65yE\",\"ref\":\"0xe2aa8fc6e38d0fbcf1c6ea89265b42378c798160956eeb9169a83deb9736d2fe\",\"secret\":\"0xa1d1e7a766157ec09fea19c2be7bfebf821847d673368d4fdf3d02a1fdf49012\",\"type\":\"reveal\"}",
+   "nonce": "10002",
+   "sig": "fwy7ve3ZzPS6wAi-MgpyS7NurDQLQRNbu2tp37QV2gt2bV-TNDyQ9DKVnJl-ILL-CEsININ-lwQtnNUvziO2AQ"
+  },
+  {
+   "seq": 3,
+   "ts": "2026-09-30T17:38:31.231Z",
+   "from": "did:key:z6MkwJFpvJVFe15ygGgYLTYuiPwfhkkDRkMG4eKQFT8g65yE",
+   "text": "tclk1 {\"contract\":\"0xe2aa8fc6e38d0fbcf1c6ea89265b42378c798160956eeb9169a83deb9736d2fe\",\"from\":\"did:key:z6MkwJFpvJVFe15ygGgYLTYuiPwfhkkDRkMG4eKQFT8g65yE\",\"outcome\":\"claimed\",\"rail\":\"paper\",\"ref\":\"0xe2aa8fc6e38d0fbcf1c6ea89265b42378c798160956eeb9169a83deb9736d2fe\",\"type\":\"receipt\"}",
+   "nonce": "10003",
+   "sig": "vPBASE8OeTu8hmy4JLp-ujVMycQUi08AgBixqxuFVOJP01J7iiFuk72qIymOKmgYuRySrPwm2K86Snc9fV-FDQ"
+  }
+ ]
+}

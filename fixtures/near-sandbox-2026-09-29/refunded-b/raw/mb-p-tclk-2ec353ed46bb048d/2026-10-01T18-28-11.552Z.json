@@ -1,0 +1,25 @@
+{
+ "room": "mb-p-tclk-2ec353ed46bb048d",
+ "count": 2,
+ "first_seq": 1,
+ "last_seq": 2,
+ "generation": 1,
+ "messages": [
+  {
+   "seq": 1,
+   "ts": "2026-09-30T18:27:11.552Z",
+   "from": "did:key:z6Mkon22vwz9JoNpGDxCrGZRgeNFTdRTwXYYN3fvAhA3K19x",
+   "text": "swap1 account near-htlc near:near-sandbox-flop:seller.test.near proof nep413:26a3d36cfb94a58bbff12073b7e266df91c349503130d80d1ebfec2de28f6de55a189f8c2872277e2695d45d49d461c114cecc4817fdf58b3aaa73b891cbe70c ed25519:FV27h9kRtdwtpxnqHARobNm9axmaSH5o6k77hziFs4Jf",
+   "nonce": "10001",
+   "sig": "4_jKQyHNS6Az6RkNPxPq9I1iPcEqSRLHghbYzHsKG0Suf9zKNnSCKsLOgTLZBWa-_OOpNmwmkM8eaNCcQZAbBw"
+  },
+  {
+   "seq": 2,
+   "ts": "2026-09-30T18:27:11.552Z",
+   "from": "did:key:z6MkmtWtY63GQVBrpMyRJWEzsnxfsGkemu6CtMDwGTv4RYj2",
+   "text": "swap1 account near-htlc near:near-sandbox-flop:buyer.test.near proof nep413:5150fc37d57d8c0fddb9e8d77f9b5bf7dae3eea16eed78edfdaff2002b97bdf50740366c47d6ee8177026fd5983b8355fa9df9e78a3146649496315a9dcebe06 ed25519:7BTLdDZqg3v3XLWt4QvRWgJjdKBKTNLZZYvns8uw8tX2",
+   "nonce": "10002",
+   "sig": "J6pg6v8pclIri7GDxUry7b2v7ywG5XcEU3xo8z2PZOTSThw2rQspRyyM59CFEE1f2GSn4NJ2OWWwvCNER74cDg"
+  }
+ ]
+}

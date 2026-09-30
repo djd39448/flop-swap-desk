@@ -6,7 +6,7 @@
       "caip2": "near:near-sandbox-flop",
       "finality": "final"
     },
-    "endpoint": "http://127.0.0.1:54616",
+    "endpoint": "http://127.0.0.1:62129",
     "contract": "htlc.test.near",
     "assets": {
       "USDC": "usdc.test.near"
