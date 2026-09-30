@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds and tests the contracts-near Cargo workspace inside WSL.
 # Run from Windows Git Bash as:
-#   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/flop-swap-desk-near/contracts-near/build.sh'"
+#   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/<this-worktree>/contracts-near/build.sh'"
 # (never inline $VAR-bearing shell logic straight into `wsl bash -lc '...'` — see
 # tests-near/probe/README.md's "Environment gotcha" section; this file exists so that
 # gotcha never applies here.)
@@ -9,8 +9,12 @@ set -euo pipefail
 
 source "$HOME/.cargo/env"
 
-export CARGO_TARGET_DIR="$HOME/.cache/flop-near-target"
-WORKSPACE_DIR="/mnt/c/Users/trustcore-rdp/flop-swap-desk-near/contracts-near"
+# Both paths come from this script's own location, never a hard-coded worktree: the target directory
+# is unique per worktree (scripts/cargo-target-dir.sh hashes the worktree path) so two worktrees that
+# share one .git never overwrite each other's wasm, and the workspace built is always this tree's own.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export CARGO_TARGET_DIR="$(bash "$SCRIPT_DIR/../scripts/cargo-target-dir.sh" near)"
+WORKSPACE_DIR="$SCRIPT_DIR"
 
 cd "$WORKSPACE_DIR"
 

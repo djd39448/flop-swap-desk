@@ -66,6 +66,8 @@
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { sha256 } from "@noble/hashes/sha2.js";
 import { base58 } from "@scure/base";
@@ -90,7 +92,14 @@ function resolveNearSandboxBin(): string {
 /** The worktree's own path, as WSL sees it under `/mnt/c` — used only for the one-time
  *  `contracts-near/build.sh` invocation (a committed script; see that file's own header for why
  *  it is called this way rather than with inline `$VAR`s). */
-const WORKTREE_WSL_PATH = "/mnt/c/Users/trustcore-rdp/flop-swap-desk-near";
+const WORKTREE_WSL_PATH = toWslPath(resolve(dirname(fileURLToPath(import.meta.url)), "..", ".."));
+
+/** A Windows path, as WSL sees it under /mnt/<drive>. */
+function toWslPath(windowsPath: string): string {
+  const match = /^([A-Za-z]):[\\/](.*)$/.exec(windowsPath);
+  if (match === null) throw new Error(`near-sandbox helper: cannot map "${windowsPath}" to a WSL path`);
+  return `/mnt/${(match[1] as string).toLowerCase()}/${(match[2] as string).replace(/\\/g, "/")}`;
+}
 
 interface RunResult {
   status: number | null;
@@ -169,7 +178,8 @@ export async function buildContracts(): Promise<{ htlcWasmPath: string; mockFtWa
   if (build.status !== 0) {
     throw new Error(`near-sandbox helper: contracts-near/build.sh failed (exit ${String(build.status)}):\n${build.stdout}\n${build.stderr}`);
   }
-  const targetDir = runWslTextOrThrow(["bash", "-lc", "echo $HOME/.cache/flop-near-target"], "resolving CARGO_TARGET_DIR").trim();
+  // The same script build.sh used: this worktree's own target directory (unique per worktree), never a shared one.
+  const targetDir = runWslTextOrThrow(["bash", `${WORKTREE_WSL_PATH}/scripts/cargo-target-dir.sh`, "near"], "resolving CARGO_TARGET_DIR").trim();
   const htlcWasmPath = `${targetDir}/wasm32-unknown-unknown/release/htlc.wasm`;
   const mockFtWasmPath = `${targetDir}/wasm32-unknown-unknown/release/mock_ft.wasm`;
   for (const p of [htlcWasmPath, mockFtWasmPath]) {

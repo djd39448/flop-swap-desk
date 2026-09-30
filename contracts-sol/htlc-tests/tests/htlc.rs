@@ -72,9 +72,9 @@ fn mock_mint() -> Address {
     Address::new_from_array(sha(b"flop-swap-desk:sol-mock-usdc:v1"))
 }
 fn so_path() -> String {
-    std::env::var("HTLC_SO").unwrap_or_else(|_| {
-        format!("{}/.cache/flop-sol-target/deploy/htlc.so", std::env::var("HOME").unwrap())
-    })
+    // No default path: a fixed shared location is what let two worktrees overwrite each other's .so.
+    // `contracts-sol/build.sh` sets HTLC_SO to this worktree's own (hash-suffixed) target directory.
+    std::env::var("HTLC_SO").expect("HTLC_SO must name the built htlc.so (run contracts-sol/build.sh, which sets it)")
 }
 
 fn pda_escrow(payer: &Address, hash: &[u8; 32]) -> Address {

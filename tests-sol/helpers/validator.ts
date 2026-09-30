@@ -183,7 +183,9 @@ export async function buildProgram(): Promise<BuiltProgram> {
   if (build.status !== 0) {
     throw new Error(`validator helper: contracts-sol/build.sh failed (exit ${String(build.status)}):\n${build.stdout}\n${build.stderr}`);
   }
-  const soWslPath = `${home}/.cache/flop-sol-target/deploy/htlc.so`;
+  // The same script build.sh used: this worktree's own target directory (unique per worktree), never a shared one.
+  const targetDir = runWslTextOrThrow(["bash", `${WORKTREE_WSL}/scripts/cargo-target-dir.sh`, "sol"], "resolving CARGO_TARGET_DIR").trim();
+  const soWslPath = `${targetDir}/deploy/htlc.so`;
   if (runWslText(["test", "-f", soWslPath]).status !== 0) throw new Error(`validator helper: build.sh reported success but ${soWslPath} is missing`);
   const soBytes = new Uint8Array(runWslBinary(["cat", soWslPath]));
   const soSha256 = bytesToHex(sha256(soBytes));

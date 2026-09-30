@@ -5,11 +5,12 @@
 # keyless-stages rule: this stage builds only the contracts and their keyless checks).
 #
 # Run from Windows Git Bash as:
-#   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/flop-swap-desk-near/contracts-near/smoke-test.sh'"
+#   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/<this-worktree>/contracts-near/smoke-test.sh'"
 set -euo pipefail
 
-WORKSPACE_DIR="/mnt/c/Users/trustcore-rdp/flop-swap-desk-near/contracts-near"
-export CARGO_TARGET_DIR="$HOME/.cache/flop-near-target"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+WORKSPACE_DIR="$SCRIPT_DIR"
+export CARGO_TARGET_DIR="$(bash "$SCRIPT_DIR/../scripts/cargo-target-dir.sh" near)"
 SANDBOX_BIN="$HOME/.near-sandbox/2.13.4/Linux-x86_64/near-sandbox"
 SANDBOX_HOME=/tmp/nb1-smoke-home
 PORT=3131

@@ -11,7 +11,7 @@
 # gotcha"), so commands with `$` must live in a file, not the outer command
 # string:
 #
-#   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/flop-swap-desk-near/tests-near/probe/nb0-probe.sh'"
+#   MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/<this-worktree>/tests-near/probe/nb0-probe.sh'"
 #
 # Steps performed (spec §2 items 1-5, plus cleanup = item 7):
 #   1. Build the probe contract (release, wasm32-unknown-unknown).
@@ -27,9 +27,9 @@
 
 set -euo pipefail
 
-PROBE_DIR="/mnt/c/Users/trustcore-rdp/flop-swap-desk-near/tests-near/probe"
+PROBE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 CONTRACT_DIR="$PROBE_DIR/contract"
-export CARGO_TARGET_DIR="$HOME/.cache/flop-near-target"
+export CARGO_TARGET_DIR="$(bash "$PROBE_DIR/../../scripts/cargo-target-dir.sh" near)"
 SANDBOX_BIN="$HOME/.near-sandbox/2.13.4/Linux-x86_64/near-sandbox"
 HOME1=/tmp/nb0-home
 HOME2=/tmp/nb0-home2

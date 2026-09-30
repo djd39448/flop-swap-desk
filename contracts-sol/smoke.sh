@@ -8,8 +8,8 @@
 set -euo pipefail
 
 export PATH="$HOME/.local/share/agave/v4.3.0/bin:$PATH"
-DIR="/mnt/c/Users/trustcore-rdp/flop-swap-desk-sol/contracts-sol"
-SO="${HTLC_SO:-$HOME/.cache/flop-sol-target/deploy/htlc.so}"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SO="${HTLC_SO:-$(bash "$DIR/../scripts/cargo-target-dir.sh" sol)/deploy/htlc.so}"
 PROGRAM_ID="GedsjashYAxaoETcwBZQR1YgBbuEaK8QiiKu2qi6xe6C"   # base58(sha256("flop-swap-desk:sol-htlc:v1"))
 
 [ -f "$SO" ] || { echo "MISSING $SO (run build.sh first)" >&2; exit 1; }

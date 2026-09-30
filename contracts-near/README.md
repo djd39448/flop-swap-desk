@@ -164,13 +164,14 @@ gotcha"); call a script file by path instead, double-quoting the outer command:
 
 ```bash
 # cargo test --workspace, then a release wasm32-unknown-unknown build of both crates:
-MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/flop-swap-desk-near/contracts-near/build.sh'"
+MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/<this-worktree>/contracts-near/build.sh'"
 
 # keyless smoke test: deploys both wasms to a throwaway sandbox via sandbox_patch_state and
 # runs a view call against each, with no keys used or generated:
-MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/flop-swap-desk-near/contracts-near/smoke-test.sh'"
+MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/<this-worktree>/contracts-near/smoke-test.sh'"
 ```
 
-`build.sh` builds into `CARGO_TARGET_DIR=$HOME/.cache/flop-near-target` (WSL-native, not
+`build.sh` builds into `CARGO_TARGET_DIR=$HOME/.cache/flop-near-target-<hash of the worktree path>` (from
+`scripts/cargo-target-dir.sh`, so two worktrees never share or overwrite a build; WSL-native, not
 `/mnt/c`, for speed); the wasm artifacts themselves are never committed. `Cargo.lock` is
 committed (D-N11).

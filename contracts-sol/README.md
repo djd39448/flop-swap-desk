@@ -151,7 +151,7 @@ MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/f
 ```
 
 `build.sh` runs the host unit tests, builds with `cargo-build-sbf` (Agave 4.3.0, platform-tools v1.57;
-target dir `~/.cache/flop-sol-target`), deletes the generated `*-keypair.json` unread, runs the litesvm tests
+target dir `~/.cache/flop-sol-target-<hash of the worktree path>` from `scripts/cargo-target-dir.sh`, unique per worktree), deletes the generated `*-keypair.json` unread, runs the litesvm tests
 against the built `.so`, and prints its size and sha256. `smoke.sh` starts `solana-test-validator` on free
 ports with the program at genesis, checks that the program account is executable, that the ProgramData bytes
 hash to the built `.so` and that the upgrade authority is `None` or the all-zero address, that the program answers under its fixed id,

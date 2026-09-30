@@ -177,7 +177,7 @@ that uses `$` in an actual `.sh` file (written with the Write/Edit tool, which i
 subject to this stripping) under the worktree, and invoke it from Git Bash as:
 
 ```
-MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/flop-swap-desk-near/tests-near/probe/nb0-probe.sh'"
+MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/<this-worktree>/tests-near/probe/nb0-probe.sh'"
 ```
 
 (double-quoted outer command, containing only a literal path — no bare `$` for the
@@ -196,5 +196,5 @@ passed as one argument). `nb0-probe.sh`'s cleanup uses `pkill -x near-sandbox`
 
 ```bash
 # from Git Bash, always as a script file (see gotcha above):
-MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/flop-swap-desk-near/tests-near/probe/nb0-probe.sh'"
+MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc "bash '/mnt/c/Users/trustcore-rdp/<this-worktree>/tests-near/probe/nb0-probe.sh'"
 ```
