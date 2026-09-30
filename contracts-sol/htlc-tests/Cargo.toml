@@ -1,0 +1,24 @@
+# In-process tests for the htlc program, run against the BUILT .so (see ../build.sh).
+# A separate workspace on purpose: litesvm 0.17.0 pins solana-epoch-schedule ~3.3 while
+# solana-program 5.1.0 needs ^3.4, so the two cannot share one dependency graph (README.md).
+# The tests talk to the program only through bytes, never through its Rust types.
+[package]
+name = "htlc-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+litesvm = "=0.17.0"
+solana-account = "4"
+solana-address = { version = "2", features = ["curve25519"] }
+solana-clock = "3"
+solana-instruction = "3"
+solana-keypair = "3"
+solana-message = "4"
+solana-signer = "3"
+solana-transaction = "4"
+solana-transaction-error = "3"
+sha2 = "0.10"
+
+[workspace]
