@@ -7,13 +7,28 @@
 // if any build script or harness goes back to a fixed, unhashed path or to another worktree's checkout.
 
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 const ROOT = resolve(import.meta.dirname, "..");
+
+// On Windows the first `bash` on PATH can be WSL's launcher (C:\Windows\System32ash.exe), which cannot
+// open a Windows path; the script must run under Git for Windows' bash, as every other script here does.
+// Resolve it from git's own install (`git --exec-path` = <git root>/mingw64/libexec/git-core); elsewhere
+// plain `bash` is correct.
+function findBash(): string {
+  if (process.platform !== "win32") return "bash";
+  const exec = spawnSync("git", ["--exec-path"], { encoding: "utf8" });
+  if (exec.status === 0) {
+    const candidate = resolve(exec.stdout.trim(), "..", "..", "..", "bin", "bash.exe");
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error("cargo-target-dir test: Git for Windows bash not found (git --exec-path gave no bin/bash.exe)");
+}
+const BASH = findBash();
 const SCRIPT = join(ROOT, "scripts", "cargo-target-dir.sh");
 const scratch = mkdtempSync(join(tmpdir(), "cargo-target-dir-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
@@ -26,7 +41,7 @@ function worktreeCopy(name: string): string {
 }
 
 function run(script: string, arg: string): string {
-  const r = spawnSync("bash", [script.replace(/\\/g, "/"), arg], { encoding: "utf8", env: { ...process.env, HOME: "/home/test" } });
+  const r = spawnSync(BASH, [script.replace(/\\/g, "/"), arg], { encoding: "utf8", env: { ...process.env, HOME: "/home/test" } });
   if (r.status !== 0) throw new Error(`cargo-target-dir.sh failed: ${r.stderr}`);
   return r.stdout.trim();
 }
@@ -44,7 +59,7 @@ describe("scripts/cargo-target-dir.sh", () => {
   });
 
   it("refuses an unknown family", () => {
-    const r = spawnSync("bash", [SCRIPT.replace(/\\/g, "/"), "evm"], { encoding: "utf8" });
+    const r = spawnSync(BASH, [SCRIPT.replace(/\\/g, "/"), "evm"], { encoding: "utf8" });
     expect(r.status).not.toBe(0);
   });
 });
