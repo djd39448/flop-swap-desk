@@ -209,8 +209,10 @@ reported, independent of this repository entirely.
   contract id, and the account/pubkey lines in the evidence are claims, not proof of control. A
   stranger can therefore build a mirror pair (their own offers and accepts) that borrows a real
   swap's on-chain evidence and folds to `settled`. The victim's own status is unaffected and no
-  funds move: the parties' own clients verify against their own freshly minted hash lock and their
-  counterparty's signed lines, never against a board status. Two fixes are under consideration:
+  funds move: the client flows never read a board status. The Seller checks leg A against the hash
+  lock it minted itself, and each party resolves its counterparty's chain accounts only from
+  deal-room lines whose signed record's sender is that counterparty's DID, posted before the
+  accepted lock. Two fixes are under consideration:
   the lock committing to the contract id (a contract/script change; the EVM contract is vendored),
   or proof-of-control account lines signed by the chain key. Neither is done in this build; the
   lock format and the contracts are unchanged.
