@@ -1,0 +1,49 @@
+{
+ "room": "mb-p-tclk-eb504691a30d2aad",
+ "count": 5,
+ "first_seq": 1,
+ "last_seq": 5,
+ "generation": 1,
+ "messages": [
+  {
+   "seq": 1,
+   "ts": "2026-09-30T14:05:58.368Z",
+   "from": "did:key:z6Mkt6316e2PN3mZdB6N9CrzomJYUd1s5yBZi1XYHmwT9TUP",
+   "text": "swap1 account near-htlc near:near-sandbox-flop:seller.test.near",
+   "nonce": "10001",
+   "sig": "HZA2h6BbJ3OBAubnJUhEhwri-5Fhj04KXp4McavrfGmzTz7kFrJdLwNzKqD5liokMXCXeL4Z-u7t4E9F7TuEBg"
+  },
+  {
+   "seq": 2,
+   "ts": "2026-09-30T14:05:58.368Z",
+   "from": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "text": "swap1 account near-htlc near:near-sandbox-flop:buyer.test.near",
+   "nonce": "10002",
+   "sig": "qDiWZ9tXt_KbRJsgjQ9y_99yTvNPnn6piv02f95j1HraepWtXh1mKVP1fsm_Q_hCE512JRdEyxz5VqFeNXZhAQ"
+  },
+  {
+   "seq": 3,
+   "ts": "2026-09-30T14:05:58.368Z",
+   "from": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "text": "tclk1 {\"contract\":\"0xeb504691a30d2aada0b236a40f5465f06eeeb5d4bb78a7a2623dd526cfb63806\",\"from\":\"did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2\",\"rail\":\"near-htlc\",\"ref\":\"0xd0d6277e17e7c0bb0f62da4e5f4646fde185ef9224397d0fe8c1e95d7df068f6\",\"type\":\"lock\"}",
+   "nonce": "10003",
+   "sig": "7_J7h3Ao4_hdAtblvVAkeeZGmtD-6_ysgQ8nDCax3J-w5aWIWhvX0Bn2AotgeHCUXTJsgYcT6P4JI7oe2HykDA"
+  },
+  {
+   "seq": 4,
+   "ts": "2026-09-30T14:53:58.368Z",
+   "from": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "text": "tclk1 {\"contract\":\"0xeb504691a30d2aada0b236a40f5465f06eeeb5d4bb78a7a2623dd526cfb63806\",\"from\":\"did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2\",\"ref\":\"0xd0d6277e17e7c0bb0f62da4e5f4646fde185ef9224397d0fe8c1e95d7df068f6\",\"type\":\"refund\"}",
+   "nonce": "10004",
+   "sig": "Kh8T_Zobv4XdXowetrvC2_QlE5jpeMbSzEmPgLilre1b-177CiJ7YHW8RiKav13twZazfSsenrSErTJVpMRiDA"
+  },
+  {
+   "seq": 5,
+   "ts": "2026-09-30T14:53:58.368Z",
+   "from": "did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2",
+   "text": "tclk1 {\"contract\":\"0xeb504691a30d2aada0b236a40f5465f06eeeb5d4bb78a7a2623dd526cfb63806\",\"from\":\"did:key:z6MkvRXNYcE7MMduynWTgeKbDaT1iijDSC8pZqXZc8rHPrf2\",\"outcome\":\"refunded\",\"rail\":\"near-htlc\",\"ref\":\"0xd0d6277e17e7c0bb0f62da4e5f4646fde185ef9224397d0fe8c1e95d7df068f6\",\"type\":\"receipt\"}",
+   "nonce": "10005",
+   "sig": "Doo9B6kyEfEYzcgIsnquc_JXx-NOpfyXhVSv5gcfib5iuP4XvirtAKYfEysnO6b97Hht81CQddzsiW_c5fOiAA"
+  }
+ ]
+}

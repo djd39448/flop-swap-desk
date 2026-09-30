@@ -6,10 +6,11 @@
       "caip2": "near:near-sandbox-flop",
       "finality": "final"
     },
-    "endpoint": "http://127.0.0.1:64543",
+    "endpoint": "http://127.0.0.1:55733",
     "contract": "htlc.test.near",
     "assets": {
       "USDC": "usdc.test.near"
-    }
+    },
+    "htlcCodeHash": "sK4yRRzjViTUaQRgHrutid7vqBnzopWe5Lwh7zBVxNF"
   }
 }
