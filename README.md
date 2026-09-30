@@ -753,9 +753,35 @@ validator finalizes about 13-15 s behind the tip and every write waits for FINAL
 (hermetic, `tests/sol-*.test.ts` on a scripted fake node) never starts a process.
 
 What is built: the program, the adapter, the evidence reader, the Solana account-line helpers and the
-custom-rails registry, all proven by the hermetic suite and the live suite. **Not built yet (stage
-SB3):** the Seller/Buyer client flows, the client rail and frames, watcher/replay wiring, audit-export
-wiring, a policy entry and client fixtures. Nothing in this repository drives a Solana swap end to end.
+custom-rails registry, all proven by the hermetic suite and the live suite, and (stage SB3a) the client
+side: `src/client/sol-rail.ts` (`createSolCounterRail`, the `CounterAssetRail` over the adapter, with
+`SOL_LOCAL_POLICY`: 45 min reveal window, 20 min finality, a 5 min claim margin, which must exceed the
+adapter's 120 s claim landing margin or no claim could ever be signed), the Seller/Buyer flows running
+on it, `src/rails/custom-frames.ts` (frame emission for the custom rail id) and the watcher, replay,
+bundle, `bin/watch.mjs` and `examples/audit-export.mjs` wiring (`rails.sol`, `raw/sol/<hash lock>/<leg
+contract>/`). All of it is proven hermetically (`tests/client-flows-sol.test.ts` drives the real flows and
+the real adapter over a stateful fake Solana node that applies the escrow program's own state machine to
+the transactions the adapter sends; `tests/audit-export-sol.test.ts`, `tests/custom-frames.test.ts`).
+**Not built yet (stage SB3b):** client scenarios on the live validator and the `fixtures/sol-localnet-*`
+captures; until then nothing in this repository drives a Solana swap end to end on a real validator.
+
+**How the custom rail id reaches frames.** tclk's `makeOffer` and `encodeFrame` refuse any rail id outside
+its closed registry, while its decoder, `foldTranscript` and contract machine already read a rail by the
+wider tclk/1 grammar. `src/rails/custom-frames.ts` (`makeOfferWith`, `encodeFrameWith`) closes that gap
+at the desk layer, without editing `vendor/tclk`: the rail object carries its own
+`railRegistry` (`CounterAssetRail.railRegistry`, `undefined` for EVM, Bitcoin and NEAR), the flows pass it
+to every frame they emit for leg A (the offer, the lock frame, the receipts) and to the orientation check,
+and the watcher, replay and audit-export build one per fold only when `rails.sol` is configured. Nothing
+is process-global; everyone else keeps tclk's closed check and its own error, and a Solana leg read
+without `rails.sol` is reported as an unregistered rail.
+
+**What the flows do on Solana that they do not on the other rails.** A claim that lands and fails publishes
+the secret in its instruction data: the Seller then posts the reveal (the secret is public regardless) and
+retries at once through `claim(..., { retryPublicSecret: true })`, at most twice; the Buyer's pending-claim
+check and `learnSecret` read the escrow's own history, so the Buyer learns the secret from the failed
+transaction and does not refund into it. Before signing, the client rail checks who the escrow pays and its
+mint, amount and times against this leg's own terms, and refuses a claim with no resolved payee line.
+Both parties' proven `ed25519` lines are required, for the Seller's claim and for every evidence reader.
 
 ### Known limits of the Solana leg
 

@@ -40,7 +40,7 @@ import {
 import { buildBoard as defaultBuildBoard } from "./board.js";
 import { paperEvidence, stripNoteBanner, PAPER_RAIL_ID } from "./paper-evidence.js";
 import { classifySwapOffer } from "./profile.js";
-import { resolveAccounts, resolvePubkeys } from "./rails/account-line.js";
+import { resolveAccounts, resolvePubkeys, resolveSolAccounts } from "./rails/account-line.js";
 import { btcEvidence, BTC_RAIL_ID, type BtcCapture } from "./rails/btc-evidence.js";
 import { checkBtcRailConfig, type BtcRailConfig } from "./rails/btc-htlc.js";
 import { evmEvidence, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.js";
@@ -48,6 +48,9 @@ import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
 import { nearEvidence, nearCaptureKey, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
 import { checkNearRailConfig, type NearRailConfig } from "./rails/near-htlc.js";
 import { parseNearRef } from "./rails/near-ref.js";
+import { createSolRailRegistry, SOL_RAIL_ID } from "./rails/custom-rails.js";
+import { solEvidence, solCaptureKey, type SolCapture } from "./rails/sol-evidence.js";
+import { checkSolRailConfig, parseSolRef, type SolRailConfig } from "./rails/sol-htlc.js";
 import { isGenuineAccept, offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, LegEvidence, LockEvidence, RailObservation, SwapLeg } from "./types.js";
 
@@ -300,12 +303,19 @@ export interface FoldCapturedInput {
    *  treatment as every other captured-but-absent case in this file. Absent entirely behaves
    *  exactly like an empty map. */
   nearChain?: ReadonlyMap<string, NearCapture>;
+  /** SB3a (P6-SOL-SPEC.md section 3): captured Solana chain reads, keyed by `solCaptureKey(hashLock,
+   *  legContract)` - the same per-leg-contract key as NEAR's (E1), never the bare hash lock. The hash lock half
+   *  is the hash-lock part of a Solana lock frame's own `.ref` (`0x<hash lock>:<payer base58>`), which must
+   *  equal the leg's `terms.statement`; the capture's own index ref must then equal the frame's full ref. A
+   *  candidate whose deal room shows an accepted Solana lock but has no entry here gets no evidence for that
+   *  leg. Absent entirely behaves exactly like an empty map. */
+  solChain?: ReadonlyMap<string, SolCapture>;
   /** The chain rails this fold may draw evidence from. Absent (the default — and what the
    *  live watch passes when it isn't given `RunSweepOptions.rails`): neither the `evm-htlc` nor
    *  the `btc-htlc` nor the `near-htlc` branch below ever runs, so `foldCaptured` is exactly the
    *  paper-only fold it always was, byte-for-byte (tests/replay.test.ts's "no rails configured"
    *  cases pin this). */
-  rails?: { evm?: EvmRailConfig; btc?: BtcRailConfig; near?: NearRailConfig };
+  rails?: { evm?: EvmRailConfig; btc?: BtcRailConfig; near?: NearRailConfig; sol?: SolRailConfig };
   nowMs: number;
   board?: (input: BoardInput) => Board;
 }
@@ -348,6 +358,12 @@ export function foldCaptured(input: FoldCapturedInput): Board {
   // rule.
   const nearConfig = input.rails?.near;
   const nearConfigCheck = nearConfig === undefined ? null : checkNearRailConfig(nearConfig);
+  // SB3a: the Solana twin of the above. Its rail id is an owner-namespaced custom id that
+  // tclk's closed registry does not know, so a caller-owned registry (built here, only when a Solana rail is
+  // configured; never global) admits it for the account lines and for the board's orientation check.
+  const solConfig = input.rails?.sol;
+  const solConfigCheck = solConfig === undefined ? null : checkSolRailConfig(solConfig);
+  const railRegistry = solConfig === undefined ? undefined : createSolRailRegistry();
 
   for (const candidate of candidates) {
     const room = dealRoom(candidate.contract);
@@ -547,6 +563,78 @@ export function foldCaptured(input: FoldCapturedInput): Board {
           };
         }
       }
+    } else if (accepted.rail === SOL_RAIL_ID && parseSolRef(accepted.railRef)?.hashLock === terms.statement) {
+      // SB3a: `accepted.railRef` is `0x<hash lock>:<payer base58>` (known before any write); its hash-lock
+      // part must equal `terms.statement`.
+      if (solConfigCheck === null) continue; // no chain rail configured: no evidence at all
+      if (!solConfigCheck.ok) {
+        result = {
+          lock: {
+            rail: SOL_RAIL_ID,
+            ref: accepted.railRef,
+            terms,
+            railVerified: null,
+            checkedAtMs: input.nowMs,
+            reason: `sol-htlc: rail config invalid: ${solConfigCheck.reason}`,
+          },
+        };
+      } else {
+        // E1: keyed by (hashLock, legContract) - see `solChain`'s own doc above.
+        const solRefParts = parseSolRef(accepted.railRef);
+        const capture = input.solChain?.get(solCaptureKey(solRefParts?.hashLock ?? accepted.railRef, candidate.contract));
+        if (capture === undefined) continue; // not captured (yet, or ever): evidence absent
+        // Proven Solana account lines (P7: ed25519), resolved fresh from the same deal room and bounded to
+        // lines posted before the accepted lock frame. BOTH the payer's and the payee's proven line are
+        // required by `solEvidence` (P7 fix F1).
+        const accounts = resolveSolAccounts(dealRoomRecords, {
+          contract: candidate.contract,
+          payerDid: terms.payer,
+          payeeDid: terms.payee,
+          caip2: solConfigCheck.config.pin.caip2,
+          beforeSeq: accepted.seq,
+          ...(railRegistry === undefined ? {} : { railRegistry }),
+        });
+        // D4-style defense in depth: this call sits inside a loop that folds every candidate in one pass, so an
+        // unanticipated throw must still fail only this one leg closed, never the whole replay.
+        try {
+          if (capture.index.ref !== accepted.railRef) {
+            // The capture is keyed by (hash lock, leg contract) only, so it must also name the very ref the
+            // accepted lock frame names: a capture of another payer's lock under the same hash lock never
+            // stands in for this leg's own.
+            result = {
+              lock: {
+                rail: SOL_RAIL_ID,
+                ref: accepted.railRef,
+                terms,
+                railVerified: null,
+                checkedAtMs: input.nowMs,
+                reason: "sol-htlc: the capture's ref differs from the accepted lock frame's ref (payer mismatch)",
+              },
+            };
+          } else {
+            result = solEvidence({
+              terms,
+              config: solConfigCheck.config,
+              accounts: {
+                ...(accounts.payee === undefined ? {} : { payee: accounts.payee }),
+                ...(accounts.payer === undefined ? {} : { payer: accounts.payer }),
+              },
+              capture,
+            });
+          }
+        } catch (error) {
+          result = {
+            lock: {
+              rail: SOL_RAIL_ID,
+              ref: accepted.railRef,
+              terms,
+              railVerified: null,
+              checkedAtMs: input.nowMs,
+              reason: `sol-htlc: evidence check threw unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          };
+        }
+      }
     } else {
       continue; // an unrecognised rail, or a rail this build has no evidence reader for
     }
@@ -559,6 +647,7 @@ export function foldCaptured(input: FoldCapturedInput): Board {
     dealRooms: input.dealRooms,
     evidence: evidenceByContract,
     nowMs: input.nowMs,
+    ...(railRegistry === undefined ? {} : { railRegistry }),
   });
 }
 

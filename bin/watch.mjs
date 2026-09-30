@@ -24,12 +24,15 @@ Options:
   --max-deal-rooms N     Cap on deal rooms fetched per sweep (default 50).
   --timeout SEC          Per-request timeout in seconds (default 45).
   --rails FILE           A JSON file shaped { "evm"?: EvmRailConfig, "btc"?: BtcRailConfig,
-                          "near"?: NearRailConfig } naming the chain rail(s) to capture live
-                          evidence from (P22-P24-EVM-SPEC.md §5; P4-BTC-SPEC.md §7;
-                          P5-NEAR-SPEC.md §4). Absent (the default): no RPC endpoint is ever
-                          touched, unchanged from before this option existed. A "near" config
-                          needs no out-of-band auth (unlike "btc") — every near-htlc read is a
-                          public JSON-RPC view call.
+                          "near"?: NearRailConfig, "sol"?: SolRailConfig } naming the chain
+                          rail(s) to capture live evidence from (P22-P24-EVM-SPEC.md §5;
+                          P4-BTC-SPEC.md §7; P5-NEAR-SPEC.md §4; P6-SOL-SPEC.md §3). Absent (the
+                          default): no RPC endpoint is ever touched, unchanged from before this
+                          option existed. A "near" or "sol" config needs no out-of-band auth
+                          (unlike "btc") — every read is a public JSON-RPC call. A "sol" config
+                          also admits the Solana leg's own rail id for this sweep's board and
+                          account lines (a local registry, never global); without it a Solana
+                          leg reads as an unregistered rail.
   --btc-rpc-cookie FILE  P4-BTC-SPEC.md §1/§4/§7: bitcoind's own cookie file (its regtest/
                           signet datadir's ".cookie") — read once, turned into an HTTP Basic
                           auth header, and used ONLY for the "btc" rail's own RPC calls.
@@ -118,11 +121,14 @@ function summarize(report) {
   const chainSkipPart = report.chainReadsSkipped !== undefined ? ` chainReadsSkipped=${report.chainReadsSkipped.length}` : "";
   const btcChainSkipPart = report.btcChainReadsSkipped !== undefined ? ` btcChainReadsSkipped=${report.btcChainReadsSkipped.length}` : "";
   const nearChainSkipPart = report.nearChainReadsSkipped !== undefined ? ` nearChainReadsSkipped=${report.nearChainReadsSkipped.length}` : "";
+  // SB3a: the Solana twin - same omission rule: absent unless --rails named a "sol" config.
+  const solChainPart = report.solChainReads !== undefined ? ` solChainReads=${report.solChainReads}` : "";
+  const solChainSkipPart = report.solChainReadsSkipped !== undefined ? ` solChainReadsSkipped=${report.solChainReadsSkipped.length}` : "";
   return (
     `offers=${report.offerRecords} swapLegs=${report.swapLegOffers} ` +
     `dealRooms=${report.dealRoomsFetched} notes=${report.noteFetches} swaps[${statusPart}] ` +
     `swapsWritten=${report.swapsWritten} hit=${report.hitCreated} ok=${report.ok}` +
-    `${chainPart}${chainSkipPart}${btcChainPart}${btcChainSkipPart}${nearChainPart}${nearChainSkipPart}`
+    `${chainPart}${chainSkipPart}${btcChainPart}${btcChainSkipPart}${nearChainPart}${nearChainSkipPart}${solChainPart}${solChainSkipPart}`
   );
 }
 

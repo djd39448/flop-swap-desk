@@ -47,6 +47,8 @@ import { loadEvmCapture } from "../dist/rails/evm-evidence.js";
 import { checkEvmRailConfig } from "../dist/rails/evm-htlc.js";
 import { loadNearCapture, nearCaptureKey } from "../dist/rails/near-evidence.js";
 import { checkNearRailConfig } from "../dist/rails/near-htlc.js";
+import { loadSolCapture, solCaptureKey } from "../dist/rails/sol-evidence.js";
+import { checkSolRailConfig } from "../dist/rails/sol-htlc.js";
 
 const USAGE = `Usage: node examples/audit-export.mjs --root DIR [--expect <swapId>=<status>] [--rails FILE] [--json]
 
@@ -89,11 +91,20 @@ Offline: reads DIR/raw/ (and DIR/rails.json) only. Opens no network connection.
                                     leg's own finalizedRef, which names a real block hash and
                                     height anyone with their own RPC access to that chain can
                                     re-query.
+  DIR/raw/sol/<hashLock>/<legContract>/*.json  one or more Solana chain-read capture indexes per
+                                    (hash lock, leg contract) pair (P6-SOL-SPEC.md §3, the same
+                                    per-pair key as raw/near: newest per pair only, never falls
+                                    back; raw bytes re-verified from DIR/raw/rpc/<sha256>.json).
+                                    Folded only when DIR/rails.json carries a "sol" config: that
+                                    config also admits the Solana leg's own rail id for this
+                                    replay (a local registry, never global). Both parties'
+                                    PROVEN account lines (ed25519) are required for a verified
+                                    lock. Same honesty limit as F3 above.
   DIR/rails.json                   { "evm"?: EvmRailConfig, "btc"?: BtcRailConfig,
-                                    "near"?: NearRailConfig } the sweep that captured DIR used
-                                    (P22-P24-EVM-SPEC.md §5; P4-BTC-SPEC.md §7;
-                                    P5-NEAR-SPEC.md §4) — absent unless a chain rail was
-                                    configured for that sweep.
+                                    "near"?: NearRailConfig, "sol"?: SolRailConfig } the sweep
+                                    that captured DIR used (P22-P24-EVM-SPEC.md §5;
+                                    P4-BTC-SPEC.md §7; P5-NEAR-SPEC.md §4; P6-SOL-SPEC.md §3) —
+                                    absent unless a chain rail was configured for that sweep.
 
 Options:
   --root DIR              Required. A watch root written by src/watcher.ts (or a fixture
@@ -456,6 +467,62 @@ async function loadNearCaptures(root, notes = []) {
   return chain;
 }
 
+/** Every `raw/sol/<hashLock>/<legContract>/*.json` capture index (SB3a), the newest one per (hashLock,
+ *  legContract) pair - the Solana twin of `loadNearCaptures` above, over `loadSolCapture`
+ *  (src/rails/sol-evidence.ts). Directory names are the hash lock / leg contract id as-is (`0x` + hex, no
+ *  `:`); the index records the full ref (`0x<hash lock>:<payer base58>`) and the fold requires it to equal the
+ *  accepted lock frame's own. A hash lock directory holding more than one leg-contract subdirectory is
+ *  reported as a note, never an error. */
+async function loadSolCaptures(root, notes = []) {
+  const solDir = join(root, "raw", "sol");
+  const chain = new Map();
+  let hashLockEntries;
+  try {
+    hashLockEntries = readdirSync(solDir, { withFileTypes: true });
+  } catch {
+    return chain;
+  }
+  for (const hashLockEntry of hashLockEntries) {
+    if (!hashLockEntry.isDirectory()) continue;
+    const hashLock = hashLockEntry.name;
+    let legContractEntries;
+    try {
+      legContractEntries = readdirSync(join(solDir, hashLock), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    const legContracts = legContractEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    if (legContracts.length > 1) {
+      notes.push(
+        `raw/sol/${hashLock}: ${legContracts.length} different leg contracts captured under this hash lock ` +
+          `(${[...legContracts].sort().join(", ")}) - kept separate, per-leg, never folded together`,
+      );
+    }
+    for (const legContract of legContracts) {
+      // the capture index names its own full ref; loadSolCapture wants it to read the newest index
+      const indexNames = readdirSync(join(solDir, hashLock, legContract)).filter((name) => name.endsWith(".json") && !name.includes(".tmp-")).sort();
+      const newestName = indexNames.at(-1);
+      if (newestName === undefined) continue;
+      let ref;
+      try {
+        ref = JSON.parse(readFileSync(join(solDir, hashLock, legContract, newestName), "utf8")).ref;
+      } catch {
+        ref = undefined;
+      }
+      if (typeof ref !== "string") {
+        notes.push(`raw/sol/${hashLock}/${legContract}/${newestName}: invalid newest capture index, skipped; this leg has no chain evidence`);
+        continue;
+      }
+      const { capture, skipped } = await loadSolCapture(root, ref, legContract);
+      if (capture !== null) chain.set(solCaptureKey(hashLock, legContract), capture);
+      for (const name of skipped) {
+        notes.push(`raw/sol/${hashLock}/${legContract}/${name}: invalid newest capture index, skipped; this leg has no chain evidence`);
+      }
+    }
+  }
+  return chain;
+}
+
 /** `{ "evm": EvmRailConfig }` for the fold's `rails` input (P22-P24-EVM-SPEC.md §5):
  *  `railsFileOverride` (`--rails FILE`) when given, else `DIR/rails.json`. `undefined` when
  *  neither exists — a watch root a chain rail was never configured for, folded exactly as
@@ -496,6 +563,12 @@ function loadRails(root, railsFileOverride) {
     const check = checkNearRailConfig(parsed.near);
     if (!check.ok) {
       throw new Error(`${path}: near rail config is invalid: ${check.reason}`);
+    }
+  }
+  if (parsed !== null && typeof parsed === "object" && parsed.sol !== undefined) {
+    const check = checkSolRailConfig(parsed.sol);
+    if (!check.ok) {
+      throw new Error(`${path}: sol rail config is invalid: ${check.reason}`);
     }
   }
   return parsed;
@@ -652,7 +725,9 @@ async function main() {
   const btcChain = await loadBtcCaptures(args.root, btcCaptureNotes);
   const nearCaptureNotes = [];
   const nearChain = await loadNearCaptures(args.root, nearCaptureNotes);
-  const board = foldCaptured({ offers, dealRooms, notes, chain, btcChain, nearChain, rails, nowMs: Date.now() });
+  const solCaptureNotes = [];
+  const solChain = await loadSolCaptures(args.root, solCaptureNotes);
+  const board = foldCaptured({ offers, dealRooms, notes, chain, btcChain, nearChain, solChain, rails, nowMs: Date.now() });
   const swaps = board.swaps.map(describeSwap);
 
   if (args.json) {
@@ -666,6 +741,7 @@ async function main() {
           evmCaptureNotes,
           btcCaptureNotes,
           nearCaptureNotes,
+          solCaptureNotes,
         },
         null,
         2,
@@ -681,6 +757,7 @@ async function main() {
     for (const note of evmCaptureNotes) process.stdout.write(`${note}\n`);
     for (const note of btcCaptureNotes) process.stdout.write(`${note}\n`);
     for (const note of nearCaptureNotes) process.stdout.write(`${note}\n`);
+    for (const note of solCaptureNotes) process.stdout.write(`${note}\n`);
     printReport(swaps, board.unpaired);
   }
 
@@ -708,6 +785,7 @@ export {
   loadEvmCaptures,
   loadBtcCaptures,
   loadNearCaptures,
+  loadSolCaptures,
   loadRails,
   describeSwap,
   parseArgs,

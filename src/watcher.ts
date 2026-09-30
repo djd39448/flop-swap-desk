@@ -34,7 +34,10 @@ import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
 import { captureNearLeg, nearCaptureKey, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
 import { checkNearRailConfig, type NearRailConfig } from "./rails/near-htlc.js";
 import { parseNearRef } from "./rails/near-ref.js";
-import { resolveAccounts } from "./rails/account-line.js";
+import { resolveAccounts, resolveSolAccounts } from "./rails/account-line.js";
+import { createSolRailRegistry, SOL_RAIL_ID } from "./rails/custom-rails.js";
+import { captureSolLeg, solCaptureKey, type SolCapture } from "./rails/sol-evidence.js";
+import { checkSolRailConfig, parseSolRef, type SolRailConfig } from "./rails/sol-htlc.js";
 import { CapturingRpc, verifiedExchangeBytes, writeCapture } from "./rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, SwapStatus } from "./types.js";
@@ -98,6 +101,10 @@ export interface SweepReport {
    *  ones, so a sweep configuring only one rail reports exactly that rail's own counts). */
   nearChainReads?: number;
   nearChainReadsSkipped?: ChainReadSkip[];
+  /** SB3a: the Solana twin of `nearChainReads` - present only when `options.rails.sol` is configured, its own
+   *  fields (never merged into another rail's counts). */
+  solChainReads?: number;
+  solChainReadsSkipped?: ChainReadSkip[];
   swapsByStatus?: Record<string, number>; // board.swaps grouped by status
   swapsWritten: number; // lines appended to swaps.jsonl this sweep (status changes only)
   hitCreated: boolean;
@@ -126,7 +133,10 @@ export interface RunSweepOptions {
    *  rule (no `near-htlc` chain read, no `raw/near/`/rewritten `rails.json` entry, no
    *  `nearChainReads` field on the report). NEAR needs no out-of-band RPC auth (unlike
    *  `btcRpcHeaders`): every read is a public JSON-RPC view call, no key or cookie involved. */
-  rails?: { evm?: EvmRailConfig; btc?: BtcRailConfig; near?: NearRailConfig };
+  /** SB3a: the Solana twin of `rails.near` - same absence rule (no Solana chain read, no `raw/sol/`/rewritten
+   *  `rails.json` entry, no `solChainReads` field on the report). Like NEAR it needs no out-of-band RPC auth:
+   *  every read is a public JSON-RPC call, no key involved. */
+  rails?: { evm?: EvmRailConfig; btc?: BtcRailConfig; near?: NearRailConfig; sol?: SolRailConfig };
   /** P4-BTC-SPEC.md §1/§4/§7: the bitcoind RPC's own HTTP auth headers (the node's cookie),
    *  supplied out of band by the caller (`bin/watch.mjs`'s `--btc-rpc-cookie` reads the file and
    *  builds this) and read fresh on every call — never persisted anywhere this sweep writes
@@ -425,6 +435,16 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
       return report;
     }
   }
+  // SB3a: the same A3 rule for `rails.sol`.
+  const solConfig = options.rails?.sol;
+  if (solConfig !== undefined) {
+    const check = checkSolRailConfig(solConfig);
+    if (!check.ok) {
+      report.railsConfigError = check.reason;
+      notes.push(`rails.sol config is invalid, sweep aborted: ${check.reason}`);
+      return report;
+    }
+  }
 
   // Step 1: fetch and persist the offer-room export, byte-exact, before any parsing.
   const exportUrl = `${baseUrl}/r/${OFFER_ROOM}/export`;
@@ -571,8 +591,9 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   const chainCaptures = new Map<string, EvmCapture>();
   const btcChainCaptures = new Map<string, BtcCapture>();
   const nearChainCaptures = new Map<string, NearCapture>();
+  const solChainCaptures = new Map<string, SolCapture>();
 
-  if (evmConfig !== undefined || btcConfig !== undefined || nearConfig !== undefined) {
+  if (evmConfig !== undefined || btcConfig !== undefined || nearConfig !== undefined || solConfig !== undefined) {
     // The pinned config(s) (endpoints included; nothing secret ever lives in an EvmRailConfig,
     // BtcRailConfig or NearRailConfig — the bitcoind RPC cookie is `options.btcRpcHeaders`,
     // never written here) — written once per sweep, atomically, and only rewritten when it
@@ -584,6 +605,7 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
         ...(evmConfig === undefined ? {} : { evm: evmConfig }),
         ...(btcConfig === undefined ? {} : { btc: btcConfig }),
         ...(nearConfig === undefined ? {} : { near: nearConfig }),
+        ...(solConfig === undefined ? {} : { sol: solConfig }),
       },
       null,
       2,
@@ -803,6 +825,80 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
     }
   }
 
+  // Step 2.6d (SB3a, P6-SOL-SPEC.md section 3): the Solana twin of Step 2.6c above - same A6 dispatch, same
+  // "nothing runs unless the caller configured this rail" rule. The lock ref is `0x<hash lock>:<payer base58>`
+  // (known before any write), so the captured index is keyed and pathed by its hash-lock part (= `terms
+  // .statement`) plus the leg contract (E1) and records the full ref.
+  if (solConfig !== undefined) {
+    report.solChainReads = 0;
+    report.solChainReadsSkipped = [];
+    const solRpc = new CapturingRpc({ endpoint: solConfig.endpoint, fetch: fetchImpl, clock: () => nowMs, timeoutMs });
+    const solRegistry = createSolRailRegistry();
+    const solHashLockLegContracts = new Map<string, Set<string>>();
+
+    for (const candidate of cappedCandidates) {
+      const room = roomByContract.get(candidate.contract);
+      if (room === undefined) continue; // deal room wasn't fetched this sweep (404/error)
+      const dealRoomRecords = dealRooms.get(room) ?? [];
+      const terms = offerAcceptLockTerms(candidate.offer, candidate.accept);
+      const accepted = foldAcceptedLock(candidate.offerRecord, candidate.acceptRecord, dealRoomRecords);
+      const solRefParts = accepted === null || accepted.rail !== SOL_RAIL_ID ? null : parseSolRef(accepted.railRef);
+      if (accepted === null || solRefParts === null || solRefParts.hashLock !== terms.statement) {
+        continue;
+      }
+      const hashLock = solRefParts.hashLock;
+      const legContracts = solHashLockLegContracts.get(hashLock) ?? new Set<string>();
+      legContracts.add(candidate.contract);
+      solHashLockLegContracts.set(hashLock, legContracts);
+      // Proven Solana lines (P7, ed25519) before the accepted lock frame: the payee's decides whether/whom
+      // captureSolLeg reads a token account for; both are passed on to the reader.
+      const resolved = resolveSolAccounts(dealRoomRecords, {
+        contract: candidate.contract,
+        payerDid: terms.payer,
+        payeeDid: terms.payee,
+        caip2: solConfig.pin.caip2,
+        beforeSeq: accepted.seq,
+        railRegistry: solRegistry,
+      });
+      const accounts = {
+        ...(resolved.payee === undefined ? {} : { payee: resolved.payee }),
+        ...(resolved.payer === undefined ? {} : { payer: resolved.payer }),
+      };
+
+      try {
+        // captureSolLeg never throws for a chain-state reason: only a genuine transport failure sets
+        // `index.error`, and that capture is still written and fed into this sweep's own fold.
+        const { index, exchanges } = await captureSolLeg(solRpc, solConfig, terms, accounts, accepted.railRef, nowMs);
+        await writeCapture(root, exchanges);
+        await writeFileAtomic(
+          underRoot(root, "raw", "sol", hashLock, candidate.contract, `${sweepIso}.json`),
+          `${JSON.stringify(index, null, 2)}\n`,
+        );
+        const bytes = verifiedExchangeBytes(exchanges);
+        solChainCaptures.set(solCaptureKey(hashLock, candidate.contract), { index, bytes });
+        if (index.error === undefined) {
+          report.solChainReads += 1;
+        } else {
+          report.solChainReadsSkipped.push({ contract: candidate.contract, reason: index.error });
+        }
+      } catch (error) {
+        report.solChainReadsSkipped.push({
+          contract: candidate.contract,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    for (const [hashLock, legContracts] of solHashLockLegContracts) {
+      if (legContracts.size > 1) {
+        notes.push(
+          `sol-htlc: hash lock ${hashLock} was accepted by ${legContracts.size} different leg contracts this sweep ` +
+            `(${[...legContracts].sort().join(", ")}) - captures kept separate, per-leg`,
+        );
+      }
+    }
+  }
+
   // Step 3: fold the board — the same code path an offline replay uses.
   const board = foldCaptured({
     offers: offerRoomRecords,
@@ -811,15 +907,17 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
     chain: chainCaptures,
     btcChain: btcChainCaptures,
     nearChain: nearChainCaptures,
+    solChain: solChainCaptures,
     nowMs,
     board: buildBoard,
-    ...(evmConfig === undefined && btcConfig === undefined && nearConfig === undefined
+    ...(evmConfig === undefined && btcConfig === undefined && nearConfig === undefined && solConfig === undefined
       ? {}
       : {
           rails: {
             ...(evmConfig === undefined ? {} : { evm: evmConfig }),
             ...(btcConfig === undefined ? {} : { btc: btcConfig }),
             ...(nearConfig === undefined ? {} : { near: nearConfig }),
+            ...(solConfig === undefined ? {} : { sol: solConfig }),
           },
         }),
   });

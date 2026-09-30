@@ -44,6 +44,9 @@ import type { EvmRailConfig } from "../rails/evm-htlc.js";
 import { nearEvidence, captureNearLeg, nearCaptureKey, NEAR_RAIL_ID, type NearAccounts, type NearCapture } from "../rails/near-evidence.js";
 import type { NearRailConfig } from "../rails/near-htlc.js";
 import { parseNearRef } from "../rails/near-ref.js";
+import { SOL_RAIL_ID } from "../rails/custom-rails.js";
+import { captureSolLeg, solCaptureKey, solEvidence, type SolAccounts, type SolCapture } from "../rails/sol-evidence.js";
+import { parseSolRef, type SolRailConfig } from "../rails/sol-htlc.js";
 import { verifiedExchangeBytes, writeCapture, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import type { SwapView } from "../types.js";
 
@@ -155,6 +158,18 @@ export interface NearBundleCapture {
   accounts: NearAccounts;
 }
 
+/** The Solana twin of `NearBundleCapture` (SB3a, P6-SOL-SPEC.md section 3): omitted entirely for a swap whose
+ *  leg A never locked on-chain. `ref` is `0x<hash lock>:<payer base58>` (known before any write); a full
+ *  evidence check needs the leg's PROVEN resolved accounts (both the payer's and the payee's, P7 fix F1).
+ *  The capture lands under `raw/sol/<hash lock>/<leg contract>/`, keyed per leg contract (E1). */
+export interface SolBundleCapture {
+  config: SolRailConfig;
+  rpc: CapturingRpc;
+  ref: string;
+  terms: LockTerms;
+  accounts: SolAccounts;
+}
+
 export interface WriteBundleInput {
   root: string;
   /** Wall-clock ms this bundle is written at — every stamped filename and the live EVM
@@ -179,6 +194,7 @@ export interface WriteBundleInput {
   evm?: EvmBundleCapture;
   btc?: BtcBundleCapture;
   near?: NearBundleCapture;
+  sol?: SolBundleCapture;
   evidence: BundleEvidenceSummary;
 }
 
@@ -263,9 +279,11 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
   const chainForFold = new Map<string, EvmCapture>();
   const btcChainForFold = new Map<string, BtcCapture>();
   const nearChainForFold = new Map<string, NearCapture>();
+  const solChainForFold = new Map<string, SolCapture>();
   let evmRailConfig: EvmRailConfig | undefined;
   let btcRailConfig: BtcRailConfig | undefined;
   let nearRailConfig: NearRailConfig | undefined;
+  let solRailConfig: SolRailConfig | undefined;
 
   if (input.evm !== undefined) {
     const { config, rpc, hashLock } = input.evm;
@@ -326,11 +344,35 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
     if (nearRef !== undefined) finalizedRefs.push(nearRef);
   }
 
-  if (evmRailConfig !== undefined || btcRailConfig !== undefined || nearRailConfig !== undefined) {
-    const railsJson: { evm?: EvmRailConfig; btc?: BtcRailConfig; near?: NearRailConfig } = {
+  // SB3a: the Solana twin of the NEAR block above - `raw/sol/<hashLock>/<legContract>/*.json` (E1: keyed by the
+  // PAIR), and this lock's own `finalizedRef`. The leg contract is whichever of `input.evidence`'s two legs is
+  // actually on this rail; a bundle whose evidence names no Solana leg refuses to write a capture under a
+  // guessed contract.
+  if (input.sol !== undefined) {
+    const { config, rpc, ref, terms, accounts } = input.sol;
+    solRailConfig = config;
+    const solRefParts = parseSolRef(ref);
+    if (solRefParts === null) throw new Error("bundle: the Solana capture's ref is not 0x<hash lock>:<payer>");
+    const solLegContract = input.evidence.legA.rail === SOL_RAIL_ID ? input.evidence.legA.contract : input.evidence.legB.rail === SOL_RAIL_ID ? input.evidence.legB.contract : undefined;
+    if (solLegContract === undefined) throw new Error("bundle: a Solana capture was given but neither leg of the evidence is on the Solana rail");
+    const { index, exchanges } = await captureSolLeg(rpc, config, terms, accounts, ref, input.nowMs);
+    await writeCapture(input.root, exchanges);
+    await writeFileAtomic(join(input.root, "raw", "sol", solRefParts.hashLock, solLegContract, `${stamp}.json`), `${JSON.stringify(index, null, 2)}\n`);
+
+    const bytes = verifiedExchangeBytes(exchanges);
+    const capture: SolCapture = { index, bytes };
+    solChainForFold.set(solCaptureKey(solRefParts.hashLock, solLegContract), capture);
+    const result = solEvidence({ terms, config, accounts, capture });
+    const solRef = result.lock.finalizedRef ?? result.rail?.finalizedRef;
+    if (solRef !== undefined) finalizedRefs.push(solRef);
+  }
+
+  if (evmRailConfig !== undefined || btcRailConfig !== undefined || nearRailConfig !== undefined || solRailConfig !== undefined) {
+    const railsJson: { evm?: EvmRailConfig; btc?: BtcRailConfig; near?: NearRailConfig; sol?: SolRailConfig } = {
       ...(evmRailConfig === undefined ? {} : { evm: evmRailConfig }),
       ...(btcRailConfig === undefined ? {} : { btc: btcRailConfig }),
       ...(nearRailConfig === undefined ? {} : { near: nearRailConfig }),
+      ...(solRailConfig === undefined ? {} : { sol: solRailConfig }),
     };
     await writeFileAtomic(join(input.root, "rails.json"), `${JSON.stringify(railsJson, null, 2)}\n`);
   }
@@ -345,13 +387,15 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
     chain: chainForFold,
     btcChain: btcChainForFold,
     nearChain: nearChainForFold,
-    ...(evmRailConfig === undefined && btcRailConfig === undefined && nearRailConfig === undefined
+    solChain: solChainForFold,
+    ...(evmRailConfig === undefined && btcRailConfig === undefined && nearRailConfig === undefined && solRailConfig === undefined
       ? {}
       : {
           rails: {
             ...(evmRailConfig === undefined ? {} : { evm: evmRailConfig }),
             ...(btcRailConfig === undefined ? {} : { btc: btcRailConfig }),
             ...(nearRailConfig === undefined ? {} : { near: nearRailConfig }),
+            ...(solRailConfig === undefined ? {} : { sol: solRailConfig }),
           },
         }),
     nowMs: input.nowMs,
