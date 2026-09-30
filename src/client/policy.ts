@@ -124,3 +124,32 @@ export const NEAR_LOCAL_POLICY: NearLocalPolicy = Object.freeze({
   finalityAMs: 20 * 60_000,
   claimInclusionMarginMs: 5 * 60_000,
 });
+
+// P6-SOL-SPEC.md section 3 / SB3a: the Solana-local twin of `NEAR_LOCAL_POLICY`, sized for this build's local
+// pin (`SOL_LOCAL_PIN`, commitment "finalized": about 32 slots, roughly 13 s, a gadget like NEAR's rather than
+// Bitcoin's confirmations-and-MTP lag) and for the one thing Solana has that NEAR does not: a signed claim can
+// still LAND for a whole blockhash lifetime after it is sent.
+//
+// `minRevealWindowMs` / `finalityAMs` reuse EVM's own 45 min / 20 min (Solana finalizes in seconds, far inside
+// either budget; nothing Solana-specific needs widening, the same reasoning as NEAR D-N8).
+//
+// `claimInclusionMarginMs` (5 min) is NOT merely a courtesy here. The adapter refuses to sign a claim whose
+// `notAfterMs` leaves less than `SOL_CLAIM_LANDING_MARGIN_MS` before `refund_after_ms` (150 blocks at the slow
+// 600 ms estimate plus a 30 s expiry margin = 120 s: a transaction signed now can land as late as that, and a
+// claim that lands at or after `refund_after_ms` FAILS while still publishing the secret, which the Buyer then
+// uses to claim leg B). The shared flow hands the rail `notAfterMs = refundAfterMs - claimInclusionMarginMs`,
+// so the margin must exceed the landing margin or no claim could ever be signed. 5 min is 2.5 times the 120 s
+// landing margin (headroom for a slow `verifyLockFinal` read between the flow's last guard and the signature,
+// and for a mis-estimated block time), and it equals EVM's and NEAR's own value, so the Seller's accept-time
+// rule (`claimByMs..refundAfterMs` must be at least one margin wide) is not narrower than it is for them. A
+// test (tests/client-flows-sol.test.ts) pins `claimInclusionMarginMs > SOL_CLAIM_LANDING_MARGIN_MS`.
+export interface SolLocalPolicy extends DeadlinePolicy {
+  claimInclusionMarginMs: number;
+}
+
+export const SOL_LOCAL_POLICY: SolLocalPolicy = Object.freeze({
+  ...DEFAULT_POLICY_EXAMPLE,
+  minRevealWindowMs: 45 * 60_000,
+  finalityAMs: 20 * 60_000,
+  claimInclusionMarginMs: 5 * 60_000,
+});

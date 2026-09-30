@@ -43,15 +43,23 @@
 // approve/lock ever run, so a failed evidence capture or a failed lock-frame post becomes
 // "locked, evidence pending" to this flow, never "never locked".
 //
+// SB3a (P6-SOL-SPEC.md): the Solana leg runs through this same class. Its rail id is an owner-namespaced custom
+// id tclk's closed registry does not know, so the leg A offer (`bid`), the `lock` frame and the `refunded`
+// receipt are built and encoded through the rail's OWN registry (`CounterAssetRail.railRegistry`, never
+// global; `src/rails/custom-frames.ts`). Everything else is the rail-agnostic flow: the lock frame is posted
+// only after the adapter confirmed the escrow at FINALIZED, a refund is refused once the chain (the escrow's
+// own stored preimage OR the history of a FAILED claim, which leaks the secret) shows the lock claimed, and
+// the Buyer then learns the secret from the chain and claims leg B.
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
-// P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3; P4-BTC-SPEC.md §7a.
+// P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3; P4-BTC-SPEC.md §7a;
+// P6-SOL-SPEC.md sections 3-5.
 
 import {
   contractId,
   dealRoom,
   encodeFrame,
   makeAccept,
-  makeOffer,
   PaperRail,
   tryDecodeFrame,
   verifySecret,
@@ -64,6 +72,7 @@ import {
 
 import { checkSwapDeadlines } from "../deadlines.js";
 import { checkLegBMatchesWant, checkOrientation, classifySwapOffer, legAContext } from "../profile.js";
+import { encodeFrameWith, makeOfferWith } from "../rails/custom-frames.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "../swap.js";
 import { belowMinLockable, type CounterAssetRail, type RailAccounts, type RailBlockMarker, type RailWriteEvidence } from "./counter-rail.js";
@@ -197,7 +206,7 @@ export class BuyerFlow {
           `${this.rail.minLockableAmount} (G6)`,
       );
     }
-    const offerA = makeOffer({
+    const offerA = makeOfferWith({
       from: this.identity.did,
       role: "payer",
       amount: params.amount,
@@ -212,8 +221,8 @@ export class BuyerFlow {
         id: params.swapId,
         context: legAContext({ wantAsset: params.wantAsset, wantAmount: params.wantAmount, wantRail: params.wantRail, feeBps: 0 }),
       },
-    });
-    await this.venue.post("tclk-offers", encodeFrame(offerA), this.identity);
+    }, this.rail.railRegistry);
+    await this.venue.post("tclk-offers", encodeFrameWith(offerA, this.rail.railRegistry), this.identity);
     this.offerA = offerA;
     return offerA;
   }
@@ -529,7 +538,7 @@ export class BuyerFlow {
     if (this.lockFramePosted) return;
     await this.venue.post(
       dealRoom(contract),
-      encodeFrame({ type: "lock", from: this.identity.did, contract, rail: this.rail.railId, ref }),
+      encodeFrameWith({ type: "lock", from: this.identity.did, contract, rail: this.rail.railId, ref }, this.rail.railRegistry),
       this.identity,
     );
     this.lockFramePosted = true;
@@ -762,7 +771,7 @@ export class BuyerFlow {
       );
       await this.venue.post(
         dealRoom(acceptA.contract),
-        encodeFrame({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "refunded", rail: this.rail.railId, ref: railRef }),
+        encodeFrameWith({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "refunded", rail: this.rail.railId, ref: railRef }, this.rail.railRegistry),
         this.identity,
       );
       this.legARefundFramesPosted = true;

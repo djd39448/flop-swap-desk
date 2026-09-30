@@ -62,8 +62,20 @@
 // after `verifyLockFinal` returns (which can itself take a long time on a slow RPC), and passes
 // the leg-A rail's `claim` a `notAfterMs` bound for its own last-moment check.
 //
+// SB3a (P6-SOL-SPEC.md): the Solana leg runs through this same class. the Solana rail id (`SOL_RAIL_ID`) is an owner-
+// namespaced custom rail id tclk's closed registry does not know, so every frame this class emits for leg A
+// (the `claimed` receipt) and the orientation check of leg A's offer read the rail id through the rail's OWN
+// registry (`CounterAssetRail.railRegistry`, never global). Like NEAR, a Solana lock's ref is
+// `0x<hash lock>:<payer>` (checked against this Seller's own hash lock, the payer taken from the authenticated
+// lock frame), and `claimLegA` first reads whether this flow's own secret is already public on chain (a claim
+// that landed, or one that FAILED and leaked it in its instruction data, contracts-sol/README.md S1). A claim
+// that fails with the secret public is never just rethrown: the reveal is posted (the secret is public
+// regardless) and the claim is retried at once through `options.retryPublicSecret`, which the rail allows only
+// after proving on chain that the secret is public.
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
-// B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a.
+// B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a;
+// P6-SOL-SPEC.md sections 3-5.
 
 import {
   contractId,
@@ -85,10 +97,13 @@ import {
 
 import { checkSwapDeadlines } from "../deadlines.js";
 import { checkOrientation, classifySwapOffer, legBContext } from "../profile.js";
+import { encodeFrameWith } from "../rails/custom-frames.js";
+import { SOL_RAIL_ID } from "../rails/custom-rails.js";
 import { EVM_RAIL_ID } from "../rails/evm-evidence.js";
 import { NEAR_RAIL_ID } from "../rails/near-evidence.js";
 import { parseNearRef } from "../rails/near-ref.js";
 import { NearPayoutFailedError } from "../rails/near-htlc.js";
+import { SolClaimFailedError, parseSolRef } from "../rails/sol-htlc.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
 import { offerAcceptLockTerms } from "../swap.js";
@@ -159,6 +174,19 @@ export class RevealNotPostedError extends Error {
 
 /** Bounded immediate retries for the reveal post (G6). */
 const REVEAL_POST_ATTEMPTS = 3;
+
+/** SB3a: how many times `claimLegA` retries, at once, a Solana claim that FAILED with the secret already
+ *  public (each retry is a fresh signed transaction; the rail proves the secret is public before it skips the
+ *  deadline bounds, and refuses once chain time reaches `refund_after_ms`). */
+const SOL_PUBLIC_SECRET_RETRIES = 2;
+
+/** The rails whose lock ref is `0x<hash lock>:<payer>` (payer-keyed locks): how each parses it. `undefined` for
+ *  a rail with another ref shape. */
+function payerKeyedRefParser(railId: string): ((ref: string) => { hashLock: string } | null) | undefined {
+  if (railId === NEAR_RAIL_ID) return parseNearRef;
+  if (railId === SOL_RAIL_ID) return parseSolRef;
+  return undefined;
+}
 
 export class SellerFlow {
   private readonly identity: Signer;
@@ -264,9 +292,16 @@ export class SellerFlow {
     if (classification === null || classification.context.leg !== "a") {
       throw new Error("seller: refusing to accept — offer is not a leg-A swap offer");
     }
-    const orientation = checkOrientation(offerA, classification.context);
+    const orientation = checkOrientation(offerA, classification.context, this.rail.railRegistry);
     if (!orientation.ok) {
       throw new Error(`seller: refusing to accept an unsafe leg A offer: ${orientation.reason}`);
+    }
+    // SB3a: a rail with a custom id (Solana) only ever accepts a leg A that OFFERS it: an offer whose own
+    // rail list does not name this rail can never be locked on it.
+    if (this.rail.railRegistry !== undefined && !offerA.rails.includes(this.rail.railId)) {
+      throw new Error(
+        `seller: refusing to accept leg A - its rails (${offerA.rails.join(", ")}) do not include this rail's own "${this.rail.railId}"`,
+      );
     }
 
     // P4-BTC-FIXES-R3.md K3: refuse an offer whose declared asset does not match this rail's own
@@ -554,8 +589,9 @@ export class SellerFlow {
         // `0x<hash lock>:<payer>`; the Seller checks the hash-lock part against its own and takes
         // the payer part from the ref (authenticated: the lock frame is a signed record from the
         // Buyer, and the contract keys each lock by (payer, hash lock)).
-        if (this.rail.railId === NEAR_RAIL_ID) {
-          const parsedRef = parseNearRef(accepted.railRef);
+        const payerKeyed = payerKeyedRefParser(this.rail.railId);
+        if (payerKeyed !== undefined) {
+          const parsedRef = payerKeyed(accepted.railRef);
           if (parsedRef === null || parsedRef.hashLock !== hashLockHex) {
             throw new Error(
               `seller: refusing to claim leg A — the accepted lock frame's own ref is not 0x<this flow's own hash lock>:<payer> (G5/G8, rail "${this.rail.railId}")`,
@@ -577,15 +613,16 @@ export class SellerFlow {
         }
       } else if (legacyLockFrame !== null && legacyLockFrame.rail === this.rail.railId) {
         railRef = legacyLockFrame.ref;
-        if (this.rail.railId === NEAR_RAIL_ID && parseNearRef(railRef)?.hashLock !== hashLockHex) {
+        const legacyParser = payerKeyedRefParser(this.rail.railId);
+        if (legacyParser !== undefined && legacyParser(railRef)?.hashLock !== hashLockHex) {
           throw new Error(
             `seller: refusing to claim leg A — the lock frame's own ref is not 0x<this flow's own hash lock>:<payer> (G5, rail "${this.rail.railId}")`,
           );
         }
-      } else if (this.rail.railId === NEAR_RAIL_ID) {
+      } else if (payerKeyedRefParser(this.rail.railId) !== undefined) {
         // No accepted lock frame names a payer, so there is no ref to read the lock by.
         throw new Error(
-          "seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): no accepted lock frame carries a near-htlc ref (0x<hash lock>:<payer>) yet",
+          `seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): no accepted lock frame carries a ${this.rail.railId} ref (0x<hash lock>:<payer>) yet`,
         );
       } else {
         railRef = hashLockHex;
@@ -617,7 +654,10 @@ export class SellerFlow {
     // revealed-retry concept for this to protect against — a lost-reply retry on those rails is
     // already handled by their own rail-level idempotency/simulation, unchanged by this build.
     let skipDeadlineGuards = false;
-    if (this.rail.railId === NEAR_RAIL_ID) {
+    // SB3a: the same read for the Solana rail: its `findClaimedPreimage` also finds a secret leaked by a FAILED
+    // claim (S1), and a retry of such a claim is the rail's own public-secret mode, never a fresh private claim.
+    const isSol = this.rail.railId === SOL_RAIL_ID;
+    if (this.rail.railId === NEAR_RAIL_ID || isSol) {
       const priorPreimage = await connected.findClaimedPreimage(railRef);
       const revealedIsOwn = priorPreimage !== null && priorPreimage === this.hashLock.preimage;
 
@@ -704,29 +744,49 @@ export class SellerFlow {
     // against however long its own preimage-free pre-checks (E5) themselves take) — skipped
     // internally by the adapter itself on a revealed retry (H2/G3).
     const notAfterMs = offerA.refundAfterMs - this.rail.policy.claimInclusionMarginMs;
-    const before = connected.exchanges.length;
     let writeEvidence: RailWriteEvidence;
-    try {
-      writeEvidence = await connected.claim(railRef, this.hashLock.preimage, notAfterMs);
-    } catch (error) {
-      this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
-      // P5-NEAR-FIXES.md G1 (the flow-side twin of the adapter's own H1): a write's own
-      // chain-level failure is never silently treated as success. `NearPayoutFailedError` means
-      // the claim call itself ran and revealed the preimage on chain (the contract's own F4
-      // rule) but the inner payout promise failed — the secret is now public regardless, so the
-      // reveal frame is safe (and useful, it helps the Buyer learn `s` sooner) to post, but there
-      // is no receipt to post: this flow does not know the payout landed, and must not claim it
-      // did. Any other failure (`NearTxFailedError`: the transaction itself never took effect,
-      // or any other rail's own claim failure) posts nothing at all.
-      if (error instanceof NearPayoutFailedError && options?.skipReveal !== true) {
-        // G6: the secret is public on chain now, so the tclk reveal must still land before
-        // refundAfterMs. Retried, and if it still fails the distinct RevealNotPostedError (its
-        // message carries the payout failure) replaces the bare payout error.
-        await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, `payout failed: ${error.message}`);
+    // SB3a: on Solana a claim retried because the chain already showed this flow's own secret public uses the
+    // rail's public-secret mode (the rail proves that on chain again before it skips the bounds).
+    let retryPublicSecret = isSol && skipDeadlineGuards;
+    for (let retries = 0; ; retries += 1) {
+      const before = connected.exchanges.length;
+      try {
+        writeEvidence = retryPublicSecret
+          ? await connected.claim(railRef, this.hashLock.preimage, notAfterMs, { retryPublicSecret: true })
+          : await connected.claim(railRef, this.hashLock.preimage, notAfterMs);
+        this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+        break;
+      } catch (error) {
+        this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+        // S1 (contracts-sol/README.md): a Solana claim that landed and FAILED published the secret in its
+        // instruction data. The reveal is posted (the secret is public regardless; it must land before
+        // refundAfterMs, G6), and the claim is retried AT ONCE: the Buyer can read the secret off that failed
+        // transaction and claim leg B, so the Seller's only protection is to be paid before the window closes.
+        if (error instanceof SolClaimFailedError && error.secretPublic) {
+          if (options?.skipReveal !== true) {
+            await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, `claim failed on chain and the secret is public: ${error.message}`);
+          }
+          if (retries >= SOL_PUBLIC_SECRET_RETRIES) throw error;
+          retryPublicSecret = true;
+          continue;
+        }
+        // P5-NEAR-FIXES.md G1 (the flow-side twin of the adapter's own H1): a write's own
+        // chain-level failure is never silently treated as success. `NearPayoutFailedError` means
+        // the claim call itself ran and revealed the preimage on chain (the contract's own F4
+        // rule) but the inner payout promise failed — the secret is now public regardless, so the
+        // reveal frame is safe (and useful, it helps the Buyer learn `s` sooner) to post, but there
+        // is no receipt to post: this flow does not know the payout landed, and must not claim it
+        // did. Any other failure (`NearTxFailedError`: the transaction itself never took effect,
+        // or any other rail's own claim failure) posts nothing at all.
+        if (error instanceof NearPayoutFailedError && options?.skipReveal !== true) {
+          // G6: the secret is public on chain now, so the tclk reveal must still land before
+          // refundAfterMs. Retried, and if it still fails the distinct RevealNotPostedError (its
+          // message carries the payout failure) replaces the bare payout error.
+          await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, `payout failed: ${error.message}`);
+        }
+        throw error;
       }
-      throw error;
     }
-    this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
 
     // vendor/tclk/src/machine.ts's own "reveal" transition requires the frame's `ref`, when
     // present, to equal the contract's own accepted `railRef` (identical rule to refund/receipt
@@ -772,7 +832,7 @@ export class SellerFlow {
     if (this.receiptPosted?.key === key) return this.receiptPosted.record;
     const record = await this.venue.post(
       dealRoom(contract),
-      encodeFrame({ type: "receipt", from: this.identity.did, contract, outcome: "claimed", rail: this.rail.railId, ref }),
+      encodeFrameWith({ type: "receipt", from: this.identity.did, contract, outcome: "claimed", rail: this.rail.railId, ref }, this.rail.railRegistry),
       this.identity,
     );
     this.receiptPosted = { key, record };

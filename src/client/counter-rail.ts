@@ -26,6 +26,7 @@
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
 import type { AccountProof } from "../rails/account-proof.js";
+import type { CustomRailRegistry } from "../rails/custom-rails.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import type { LockEvidence, RailObservation } from "../types.js";
 import type { RailLocalPolicy } from "./policy.js";
@@ -85,6 +86,9 @@ export interface RailWriteEvidence {
    *  (`ConnectedCounterAssetRail.resendRefundIfDropped`), never rebuilding or re-signing. Absent
    *  for every other write (fund/claim never need a retry-resend path; EVM has no such concept). */
   rawTx?: string;
+  /** Solana only (SOL-A4): a claim whose own transaction FAILED, but the escrow is Claimed with this claim's
+   *  own preimage because another transaction landed first; the payee was paid and nothing needs retrying. */
+  claimedByAnotherTransaction?: true;
 }
 
 /** D-11's "capture live, then decide" contract (mirrors `src/rails/evm-evidence.ts`'s
@@ -99,6 +103,18 @@ export interface RailEvidenceResult {
  *  search start (an EVM block number today; a Bitcoin block height once that adapter lands) —
  *  a flow only ever stores and replays this value, never inspects it. */
 export type RailBlockMarker = unknown;
+
+/**
+ * SB3a, Solana only: `retryPublicSecret` asks the rail to retry a claim whose secret is ALREADY public (an
+ * earlier claim landed and failed, so the preimage sits in that transaction's instruction data). The rail
+ * itself proves on chain that this secret is public before it skips the deadline and landing bounds (they
+ * protect a still-private secret and would only stop the Seller from being paid); a rail with no such concept
+ * ignores the option. The flow passes it only for a rail that has one, and only after the chain showed the
+ * secret public.
+ */
+export interface RailClaimOptions {
+  retryPublicSecret?: boolean;
+}
 
 /**
  * P4-BTC-FIXES.md G3 (client half of H2)/G2's own "record before sending" rule, generalised
@@ -149,7 +165,7 @@ export interface ConnectedCounterAssetRail {
    *  simulation alone runs its own preimage-free pre-checks before ever risking it on a wire
    *  (E5) — both already true of `src/rails/evm-htlc.ts`'s `EvmHtlcRail.claim`, which this
    *  rail's own adapter wraps unchanged. */
-  claim(ref: string, secret: string, notAfterMs: number): Promise<RailWriteEvidence>;
+  claim(ref: string, secret: string, notAfterMs: number, options?: RailClaimOptions): Promise<RailWriteEvidence>;
   refund(ref: string): Promise<RailWriteEvidence>;
   /** P4-BTC-FIXES-R2.md R2-1: on a refund retry (this connected handle's own `refund()` already
    *  broadcast once), re-check the chain and re-send `priorEvidence`'s own EXACT bytes
@@ -262,6 +278,13 @@ export interface CounterAssetRail {
    *  offer whose declared asset differs from this, before ever touching the network, whenever a
    *  rail declares one. */
   readonly assetId?: string;
+
+  /** SB3a: this rail's OWN custom rail registry (`src/rails/custom-rails.ts`), when its rail id is an
+   *  owner-namespaced custom id that tclk's closed registry does not know (the Solana leg). Every frame the
+   *  flows emit for this rail (the leg A offer, the lock and receipt frames) and every orientation check
+   *  reads its rail ids through it, so the id is admitted per rail object, never process-global. `undefined`
+   *  for every rail tclk already knows: no behaviour change for EVM, Bitcoin or NEAR. */
+  readonly railRegistry?: CustomRailRegistry;
 }
 
 /** P4-BTC-FIXES.md G6: `true` iff `amount` (a decimal-integer string, this rail's own smallest
