@@ -843,16 +843,23 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
   const newLines: string[] = [];
   let reachedPairedOrLater = false;
 
-  // tclk#194 finding 2: `swapId` is not unique (a buyer picks the nonce), so two swaps sharing one
-  // are tracked under distinct state keys rather than overwriting each other's last-seen status.
+  // tclk#194 finding 2 / V7: `swapId` is not unique (a buyer picks the nonce), so every swap is
+  // tracked under its own key from the start: its pairKey once both legs are accepted, else the
+  // leg-A offer id it hangs off (unique per swap slot). The key never depends on whether another
+  // swap happens to share the swapId, so nothing re-keys, and no extra line is emitted, when a
+  // duplicate appears or goes away. A state file from before this change is keyed by the bare
+  // swapId; that entry is read (never written) as the previous status for a swap whose swapId is
+  // unique on the board, so upgrading does not re-emit every swap once.
   const swapIdCounts = new Map<string, number>();
   for (const swap of board.swaps) {
     if (swap.swapId !== null) swapIdCounts.set(swap.swapId, (swapIdCounts.get(swap.swapId) ?? 0) + 1);
   }
   for (const swap of board.swaps) {
     if (swap.swapId === null) continue;
-    const stateKey = (swapIdCounts.get(swap.swapId) ?? 0) > 1 ? `${swap.swapId}@${swap.legAOfferId ?? ""}` : swap.swapId;
-    if (state.statuses[stateKey] !== swap.status) {
+    const stateKey = swap.pairKey !== null ? `pair:${swap.pairKey}` : `offer:${swap.legAOfferId ?? ""}|${swap.swapId}`;
+    const legacy = (swapIdCounts.get(swap.swapId) ?? 0) === 1 ? state.statuses[swap.swapId] : undefined;
+    const previous = Object.hasOwn(state.statuses, stateKey) ? state.statuses[stateKey] : legacy;
+    if (previous !== swap.status) {
       state.statuses[stateKey] = swap.status;
       newLines.push(
         JSON.stringify({

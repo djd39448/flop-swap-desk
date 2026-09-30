@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -2009,5 +2009,42 @@ describe("runSweep", () => {
       expect(calls).toEqual([]); // nothing was ever fetched — not even the offer-room export
       expect(existsSync(join(root, "board.json"))).toBe(false);
     });
+  });
+});
+
+// V7 (P5-NEAR-FIXES-R2): watcher status state is keyed per pair from the start (the real board).
+describe("runSweep: per-pair state keys (V7)", () => {
+  const notFound = (url: string, body: string) => (url.endsWith("/r/tclk-offers/export") ? { status: 200, body } : { status: 404, body: "" });
+
+  it("a second swap sharing the swapId adds exactly its own line; the first swap is never re-emitted or re-keyed", async () => {
+    const one = buildSwap("cccc0007", 1, NOW - 100_000);
+    const two = buildSwap("cccc0007", 10, NOW - 50_000);
+    expect(two.swapId).toBe(one.swapId);
+    const sweep = (rows: unknown[], nowMs: number) =>
+      runSweep({ ...baseOptions({ nowMs: () => nowMs, board: buildBoard }), fetch: makeFetch((url) => notFound(url, ndjson(rows)), []) });
+
+    const r1 = await sweep(one.rows, NOW);
+    expect(r1.ok).toBe(true);
+    expect(r1.swapsWritten).toBe(1);
+    const r2 = await sweep([...one.rows, ...two.rows], NOW + 1000);
+    expect(r2.swapsWritten).toBe(1);
+    const r3 = await sweep([...one.rows, ...two.rows], NOW + 2000);
+    expect(r3.swapsWritten).toBe(0);
+
+    const lines = (await readFile(join(root, "swaps.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l));
+    expect(lines).toHaveLength(2);
+    expect(lines[0].pairKey).not.toBe(lines[1].pairKey);
+    expect(lines[1].pairKey).toBe(`${two.legAOffer.id}|${two.legAAccept.contract}|${two.legBAccept.contract}`);
+    // and going back to one swap emits nothing either (no downgrade line from a re-key)
+    const r4 = await sweep(one.rows, NOW + 3000);
+    expect(r4.swapsWritten).toBe(0);
+  });
+
+  it("a state file from before (keyed by the bare swapId) does not re-emit a unique swap", async () => {
+    const one = buildSwap("cccc0008", 1, NOW - 100_000);
+    await writeFile(join(root, "state.json"), JSON.stringify({ statuses: { [one.swapId]: "paired" }, hitCreated: true }));
+    const report = await runSweep({ ...baseOptions({ board: buildBoard }), fetch: makeFetch((url) => notFound(url, ndjson(one.rows)), []) });
+    expect(report.ok).toBe(true);
+    expect(report.swapsWritten).toBe(0);
   });
 });

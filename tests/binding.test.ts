@@ -18,9 +18,13 @@ import {
   type LockFrame,
   type RevealFrame,
 } from "@flop-labs/tclk";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { buildBoard } from "../src/board.js";
+import { writeBundle } from "../src/client/bundle.js";
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
 import { findSwapLegCandidates, foldCaptured } from "../src/replay.js";
 import { foldSwap } from "../src/swap.js";
@@ -28,6 +32,8 @@ import type { RailObservation } from "../src/types.js";
 import { identity, record } from "./helpers/identity.js";
 import { observe } from "./helpers/observations.js";
 import { scenario } from "./helpers/scenario.js";
+// @ts-expect-error plain .mjs, no type declarations
+import { statusForExpectation } from "../examples/audit-export.mjs";
 
 const T0 = 1_758_000_000_000;
 const MIN = 60_000;
@@ -412,5 +418,74 @@ describe("V4: the paper rail keeps folding a refund frame on its own", () => {
     const view = foldSwap({ legA: [offers[0]!, offers[1]!, one.dealRooms.get(roomA)![0]!, refund], legB: [], nowMs: T0 + 62 * MIN });
     expect(view.status).toBe("refunded-a");
     expect(view.reasons.some((r) => r.includes("not corroborated by chain evidence"))).toBe(false);
+  });
+});
+
+describe("V7: bundle and audit-export name a swap by its pair, not its swapId", () => {
+  it("writeBundle folds the bundle's own pair even when another pair shares the swapId", async () => {
+    const one = paperPair("aa01");
+    const two = paperPair("bb02");
+    const root = await mkdtemp(join(tmpdir(), "bundle-pair-"));
+    try {
+      const notes = two.notes();
+      await writeBundle({
+        root,
+        nowMs: T0 + 9 * MIN,
+        offerRoomRecords: [...one.offerRecords(1, 0), ...two.offerRecords(5, 10)],
+        dealRooms: new Map([...one.dealRooms, ...two.dealRooms]),
+        paperNotes: new Map([...notes].map(([contract, note]) => [contract, note.body])),
+        evidence: {
+          swapId: two.swapId,
+          legA: { contract: two.legAAccept.contract, rail: "paper" },
+          legB: { contract: two.legBAccept.contract, rail: "paper" },
+          feeBps: 0,
+          writes: [],
+          startedAtMs: T0,
+          finishedAtMs: T0 + MIN,
+        },
+      });
+      const written = JSON.parse(await readFile(join(root, "evidence", `${two.swapId}.json`), "utf8"));
+      expect(written.status).toBe("settled");
+
+      // A bundle naming a pair that is not on the board folds to "unpaired", never to a stranger's status.
+      await writeBundle({
+        root,
+        nowMs: T0 + 9 * MIN,
+        offerRoomRecords: [...one.offerRecords(1, 0), ...two.offerRecords(5, 10)],
+        dealRooms: new Map([...one.dealRooms, ...two.dealRooms]),
+        paperNotes: new Map(),
+        evidence: {
+          swapId: two.swapId,
+          legA: { contract: "0x" + "1".repeat(64), rail: "paper" },
+          legB: { contract: "0x" + "2".repeat(64), rail: "paper" },
+          feeBps: 0,
+          writes: [],
+          startedAtMs: T0,
+          finishedAtMs: T0 + MIN,
+        },
+      });
+      expect(JSON.parse(await readFile(join(root, "evidence", `${two.swapId}.json`), "utf8")).status).toBe("unpaired");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("audit-export --expect: a shared swapId is ambiguous, its pairKey names one pair", () => {
+    const one = paperPair("aa01");
+    const two = paperPair("bb02");
+    const board = foldCaptured({
+      offers: [...one.offerRecords(1, 0), ...two.offerRecords(5, 10)],
+      dealRooms: new Map([...one.dealRooms, ...two.dealRooms]),
+      notes: one.notes(),
+      nowMs: T0 + 9 * MIN,
+    });
+    const swaps = board.swaps;
+    expect(statusForExpectation(swaps, one.swapId)).toMatch(/^\(ambiguous: swapId shared by 2 swaps/);
+    const key1 = `${one.legAOffer.id}|${one.legAAccept.contract}|${one.legBAccept.contract}`;
+    const key2 = `${two.legAOffer.id}|${two.legAAccept.contract}|${two.legBAccept.contract}`;
+    expect(statusForExpectation(swaps, key1)).toBe("settled");
+    expect(statusForExpectation(swaps, key2)).not.toBe("settled");
+    expect(statusForExpectation(swaps, "0xnothing")).toBe("(swap not found)");
+    expect(statusForExpectation([swaps[0]!], one.swapId)).toBe(swaps[0]!.status);
   });
 });

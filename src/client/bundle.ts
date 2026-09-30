@@ -45,6 +45,7 @@ import { nearEvidence, captureNearLeg, nearCaptureKey, NEAR_RAIL_ID, type NearAc
 import type { NearRailConfig } from "../rails/near-htlc.js";
 import { parseNearRef } from "../rails/near-ref.js";
 import { verifiedExchangeBytes, writeCapture, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
+import type { SwapView } from "../types.js";
 
 /** The exact banner text `stripNoteBanner` (src/paper-evidence.ts) strips before decoding a
  *  paper note's last non-empty line — copied verbatim from the real
@@ -179,6 +180,25 @@ export interface WriteBundleInput {
   btc?: BtcBundleCapture;
   near?: NearBundleCapture;
   evidence: BundleEvidenceSummary;
+}
+
+/**
+ * V7 (P5-NEAR-FIXES-R2): the swap a bundle is about. `swapId` is not unique (a buyer picks the
+ * nonce), so a pair is named by its two leg contract ids: the swap whose folded leg-A and leg-B
+ * contracts are this bundle's own. Only when exactly one swap carries the bundle's swapId and
+ * none matches by contract does that one stand in; with several sharing the swapId and none
+ * matching, there is no swap (the caller reports "unpaired"), never a stranger's status.
+ */
+export function selectBundleSwap(
+  swaps: readonly SwapView[],
+  evidence: Pick<BundleEvidenceSummary, "swapId" | "legA" | "legB">,
+): SwapView | undefined {
+  const byContract = swaps.find(
+    (swap) => swap.legA?.state?.contract === evidence.legA.contract && swap.legB?.state?.contract === evidence.legB.contract,
+  );
+  if (byContract !== undefined) return byContract;
+  const sameSwapId = swaps.filter((swap) => swap.swapId === evidence.swapId);
+  return sameSwapId.length === 1 ? sameSwapId[0] : undefined;
 }
 
 /**
@@ -327,13 +347,7 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
         }),
     nowMs: input.nowMs,
   });
-  // tclk#194 finding 2: `swapId` is not unique; when several swaps share it, the one whose leg-A
-  // contract is this bundle's own leg A is the one this bundle is about.
-  const sameSwapId = board.swaps.filter((swap) => swap.swapId === input.evidence.swapId);
-  const ownSwap =
-    sameSwapId.length > 1
-      ? sameSwapId.find((swap) => swap.legA?.state?.contract === input.evidence.legA.contract)
-      : sameSwapId[0];
+  const ownSwap = selectBundleSwap(board.swaps, input.evidence);
   const status = ownSwap?.status ?? "unpaired";
 
   const evidence: BundleEvidenceSummary = { ...input.evidence, status, finalizedRefs };

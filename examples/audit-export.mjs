@@ -98,7 +98,9 @@ Offline: reads DIR/raw/ (and DIR/rails.json) only. Opens no network connection.
 Options:
   --root DIR              Required. A watch root written by src/watcher.ts (or a fixture
                            shaped like one — see fixtures/rehearsal-2026-09-18/).
-  --expect S=STATUS        May repeat. Exit 1 unless swap S folds to exactly STATUS.
+  --expect S=STATUS        May repeat. Exit 1 unless swap S folds to exactly STATUS. S is a swapId or,
+                           when several swaps share one, a pairKey (leg A offer id|leg A contract|leg B
+                           contract, printed in the report); an ambiguous swapId never passes.
   --rails FILE             Use this JSON file ({ "evm": EvmRailConfig }) instead of
                            DIR/rails.json — e.g. to replay a capture against a config it
                            wasn't written next to.
@@ -575,6 +577,22 @@ function printReport(swaps, unpaired) {
   }
 }
 
+/**
+ * V7 (P5-NEAR-FIXES-R2): the status an `--expect KEY=STATUS` is checked against. KEY is a pairKey
+ * (unique per pair) or a swapId; `swapId` is not unique (a buyer picks the nonce), so a swapId
+ * shared by several swaps is reported as ambiguous instead of naming one of them. A pairKey is
+ * tried first because it can never be ambiguous.
+ */
+export function statusForExpectation(swaps, key) {
+  const byPair = swaps.filter((s) => s.pairKey !== null && s.pairKey === key);
+  if (byPair.length === 1) return byPair[0].status;
+  const matches = swaps.filter((s) => s.swapId === key);
+  if (matches.length > 1) {
+    return `(ambiguous: swapId shared by ${matches.length} swaps, name one by pairKey: ${matches.map((s) => s.status).join(", ")})`;
+  }
+  return matches[0] ? matches[0].status : "(swap not found)";
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args === null) {
@@ -662,9 +680,7 @@ async function main() {
 
   let ok = true;
   for (const expectation of args.expect) {
-    const matches = swaps.filter((s) => s.swapId === expectation.swapId);
-    // tclk#194 finding 2: a swapId shared by several swaps cannot name one of them.
-    const actual = matches.length > 1 ? `(ambiguous: swapId shared by ${matches.length} swaps: ${matches.map((s) => s.status).join(", ")})` : matches[0] ? matches[0].status : "(swap not found)";
+    const actual = statusForExpectation(swaps, expectation.swapId);
     if (actual !== expectation.status) {
       ok = false;
       process.stderr.write(`expect failed: ${expectation.swapId} = ${expectation.status}, got ${actual}\n`);
