@@ -93,11 +93,21 @@ Two rules the fold enforces on every rail (paper, `evm-htlc`, `btc-htlc`, `near-
    must likewise name the accepted rail and ref before a leg counts as locked.
 2. **`swapId` is not a unique key.** It is a hash of the buyer's DID and a nonce the buyer
    picks, so one buyer can sign two different pairs with the same one. Board evidence
-   (`BoardInput.evidence`) is keyed by each leg's own contract id, and each swap gets a
-   `pairKey` (`<leg A offer id>|<leg A contract>|<leg B contract>`). When two active swaps
-   share a `swapId`, no evidence is looked up for either: both are reported with a reason and
-   fold only as far as their own frames prove. The watcher tracks such swaps under separate
-   state keys, and `audit-export --expect` reports a shared `swapId` as ambiguous.
+   (`BoardInput.evidence`) is keyed by each leg's own contract id (the contract the tclk fold
+   itself accepted), and each swap gets a `pairKey` (`<leg A offer id>|<leg A contract>|<leg B
+   contract>`); two pairs never share evidence. A shared `swapId` is information only: when
+   several leg-A offers signed by the same buyer carry one `swapId`, each of those swaps gets a
+   reason saying so, and nothing is blanked. Another signer copying a swap's public `swapId`
+   into an offer of their own is not reported and changes nothing for the victim. Only genuine
+   accepts (the contract id tclk derives from the offer and the accept's own core, not signed
+   by the offerer) key candidates and evidence, and leg B pairs with the DID that accepted leg
+   A (the earliest leg B stands in, marked coordination-only, only while leg A has no accept).
+   The watcher tracks each swap under its own pair key, and `audit-export --expect` accepts a
+   `pairKey` and reports a shared `swapId` as ambiguous.
+3. **A refund frame never folds a chain leg on its own.** For a leg on a chain rail (anything
+   but `paper`), `refunded`, `refunded-a` and `refunded-b` need a bound rail observation that is
+   `refunded` and final; a refund frame without one is reported as "not corroborated by chain
+   evidence" and does not fold, on every path.
 
 The capture and evidence file formats are unchanged (the binding is computed at replay time
 from the same terms), so no fixture was recaptured.

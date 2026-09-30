@@ -227,4 +227,4 @@ independently of tclk's own choreography status (H3, tclk#180/#181). Vendored tc
 observation folded a swap to `settled`, and two pairs with the same buyer and nonce shared one
 evidence entry. Both are first-party changes; nothing is vendored or copied from that review beyond
 the two reproductions, which are regression tests in `tests/binding.test.ts`. No capture or
-evidence file format changed, so no fixture was recaptured.
+evidence file format changed, so no fixture was recaptured. Round 2 of the review (V3-V8, P5-NEAR-FIXES-R2.md) removed the shared-swapId evidence blanking, kept only genuine accepts for candidates and evidence keys, paired leg B with leg A's accepter, made a refund frame insufficient for chain legs, and keyed the watcher, bundle and audit-export by pair; all first-party.
