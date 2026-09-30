@@ -268,31 +268,34 @@ describe("foldSwap — SPEC §4 states", () => {
     expect(view.reasons).toContain("paper rail: rehearsal only, no value");
   });
 
-  it("refunded-a: leg A refunded via tclk state", () => {
+  it("refunded-a: leg A refunded via tclk state corroborated by a final refunded chain observation", () => {
     const s = build();
     const view = foldSwap({
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: { aRail: observe(s, "a", "refunded", T0 + 61 * MIN) },
       nowMs: s.frames.offerA.refundAfterMs + 2 * MIN,
     });
     expect(view.status).toBe("refunded-a");
   });
 
-  it("refunded-b: leg B refunded via tclk state", () => {
+  it("refunded-b: leg B refunded via tclk state corroborated by a final refunded chain observation", () => {
     const s = build();
     const view = foldSwap({
       legA: [s.records.offerA, s.records.acceptA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.refundB],
+      evidence: { bRail: observe(s, "b", "refunded", T0 + 181 * MIN) },
       nowMs: s.frames.offerB.refundAfterMs + 2 * MIN,
     });
     expect(view.status).toBe("refunded-b");
   });
 
-  it("refunded: both legs refunded", () => {
+  it("refunded: both legs refunded, each corroborated by its own final refunded chain observation", () => {
     const s = build();
     const view = foldSwap({
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
       legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.refundB],
+      evidence: { aRail: observe(s, "a", "refunded", T0 + 61 * MIN), bRail: observe(s, "b", "refunded", T0 + 181 * MIN) },
       nowMs: s.frames.offerB.refundAfterMs + 2 * MIN,
     });
     expect(view.status).toBe("refunded");
@@ -309,10 +312,60 @@ describe("foldSwap — SPEC §4 states", () => {
     expect(view.status).toBe("refunded-a");
   });
 
+  // P5-NEAR-FIXES-R2.md V4: a refund frame never folds a chain leg on its own.
+  it("V4: a refund frame with no chain observation does not fold a chain leg (both legs, no leg B, paired legs)", () => {
+    const s = build();
+    const both = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.refundB],
+      nowMs: s.frames.offerB.refundAfterMs + 2 * MIN,
+    });
+    expect(both.status).not.toMatch(/^refunded/);
+    expect(both.reasons.filter((r) => r.includes("refund frame not corroborated by chain evidence"))).toHaveLength(2);
+
+    const noB = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
+      legB: [],
+      nowMs: s.frames.offerA.refundAfterMs + 2 * MIN,
+    });
+    expect(noB.status).not.toBe("refunded-a");
+    expect(noB.reasons).toContain("leg A refund frame not corroborated by chain evidence — not folded to refunded");
+
+    const onlyB = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.refundB],
+      nowMs: s.frames.offerB.refundAfterMs + 2 * MIN,
+    });
+    expect(onlyB.status).not.toBe("refunded-b");
+  });
+
+  it("V4: a refund frame with a refused (unbound) observation does not fold either", () => {
+    const s = build();
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: { aRail: observe(s, "a", "refunded", T0 + 61 * MIN, { ref: "0xother" }) },
+      nowMs: s.frames.offerA.refundAfterMs + 2 * MIN,
+    });
+    expect(view.status).not.toBe("refunded-a");
+    expect(view.reasons.some((r) => r.includes("refund frame not corroborated by chain evidence"))).toBe(true);
+  });
+
+  it("V4: a refund frame with a non-final refunded observation does not fold", () => {
+    const s = build();
+    const view = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: { aRail: observe(s, "a", "refunded", T0 + 61 * MIN, { final: false }) },
+      nowMs: s.frames.offerA.refundAfterMs + 2 * MIN,
+    });
+    expect(view.status).not.toBe("refunded-a");
+  });
+
   // P5-NEAR-FIXES.md E3: a refund frame conflicting with a chain rail's own `claimed`/`locked`
   // observation must never fold to refunded-a/refunded-b/refunded — only that leg's own rail
   // (when one is watching) decides, and the frame's disagreement is reported, not trusted.
-  it("E3: leg A's refund frame conflicts with its own chain evidence (claimed) — falls through to refunded-b, not refunded", () => {
+  it("E3: leg A's refund frame conflicts with its own chain evidence (claimed) — never refunded", () => {
     const s = build();
     const view = foldSwap({
       legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
@@ -321,9 +374,9 @@ describe("foldSwap — SPEC §4 states", () => {
       nowMs: s.frames.offerB.refundAfterMs + 2 * MIN,
     });
     // Leg A's own frame says refunded but its own chain rail says claimed+final — never trusted
-    // on the frame's say alone; leg B has no rail evidence at all, so its own frunded frame
-    // still folds the old (unaffected) way.
-    expect(view.status).toBe("refunded-b");
+    // on the frame's say alone; and (V4) leg B has no rail evidence at all, so its refund frame
+    // alone does not fold it either.
+    expect(view.status).not.toBe("refunded-b");
     expect(view.status).not.toBe("refunded");
     expect(view.reasons.some((r) => r.includes("leg A refund frame conflicts with its own chain evidence"))).toBe(true);
   });
