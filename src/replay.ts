@@ -48,7 +48,7 @@ import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
 import { nearEvidence, nearCaptureKey, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
 import { checkNearRailConfig, type NearRailConfig } from "./rails/near-htlc.js";
 import { parseNearRef } from "./rails/near-ref.js";
-import { offerAcceptLockTerms } from "./swap.js";
+import { isGenuineAccept, offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, LegEvidence, LockEvidence, RailObservation, SwapLeg } from "./types.js";
 
 // An offer/accept authenticated for the signed lane in tclk-offers (the same checks as
@@ -134,8 +134,13 @@ export function findSwapLegCandidates(offerRoomRecords: readonly TranscriptRecor
     if (frame.type === "accept") {
       const legOffer = swapLegOfferIds.get(frame.ref);
       if (legOffer === undefined) continue;
+      // V5 (P5-NEAR-FIXES-R2, tclk#194 review C3): only a genuine accept counts (its contract is
+      // the id tclk derives from this offer and the accept's own core; not signed by the
+      // offerer), and one candidate never displaces another — the first genuine accept for a
+      // contract stands.
+      if (!isGenuineAccept(legOffer.offer, frame)) continue;
       const existing = byContract.get(frame.contract);
-      if (existing === undefined || legOffer.seq < existing.offerSeq) {
+      if (existing === undefined) {
         byContract.set(frame.contract, {
           contract: frame.contract,
           offerSeq: legOffer.seq,

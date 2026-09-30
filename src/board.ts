@@ -20,7 +20,7 @@ import {
 } from "@flop-labs/tclk";
 
 import { classifySwapOffer } from "./profile.js";
-import { foldSwap } from "./swap.js";
+import { foldSwap, isGenuineAccept } from "./swap.js";
 import type { Board, BoardInput, LegAContext, LegBContext, SwapEvidence, SwapView } from "./types.js";
 
 interface AuthenticatedFrame {
@@ -94,15 +94,16 @@ function chooseAccept(
 }
 
 /** Assemble one pair's `SwapEvidence` from per-leg evidence keyed by each leg's own accepted
- *  contract id; `undefined` when neither leg has any. */
+ *  contract id (V5: the contract the tclk fold itself accepted, not a raw accept frame); `undefined`
+ *  when neither leg has any. */
 function pairEvidence(
   byContract: BoardInput["evidence"],
-  acceptA: AuthenticatedFrame | undefined,
-  acceptB: AuthenticatedFrame | undefined,
+  contractA: string | undefined,
+  contractB: string | undefined,
 ): SwapEvidence | undefined {
   if (byContract === undefined) return undefined;
-  const legA = acceptA === undefined ? undefined : byContract.get((acceptA.frame as AcceptFrame).contract);
-  const legB = acceptB === undefined ? undefined : byContract.get((acceptB.frame as AcceptFrame).contract);
+  const legA = contractA === undefined ? undefined : byContract.get(contractA);
+  const legB = contractB === undefined ? undefined : byContract.get(contractB);
   if (legA === undefined && legB === undefined) return undefined;
   const out: SwapEvidence = {};
   if (legA !== undefined) {
@@ -122,7 +123,7 @@ export function buildBoard(input: BoardInput): Board {
 
   const legAByOfferId = new Map<string, LegACandidate>();
   const legBCandidates: LegBCandidate[] = [];
-  const seenOfferIds = new Set<string>();
+  const offersById = new Map<string, OfferFrame>();
   // First accept seen (in venue order) per `ref`, provided its offer already appeared —
   // mirrors tclk's own handshake rule: an accept cannot rewrite board history.
   // Every authenticated accept per offer id, in venue order. A busy board accepts a bid within
@@ -134,7 +135,7 @@ export function buildBoard(input: BoardInput): Board {
   for (const authenticated of authed) {
     const { record, frame } = authenticated;
     if (frame.type === "offer") {
-      seenOfferIds.add(frame.id);
+      if (!offersById.has(frame.id)) offersById.set(frame.id, frame);
       const classification = classifySwapOffer(frame);
       if (classification === null) continue; // non-swap traffic: ignored silently
       if (classification.context.leg === "a") {
@@ -157,14 +158,21 @@ export function buildBoard(input: BoardInput): Board {
       continue;
     }
     if (frame.type === "accept") {
-      if (!seenOfferIds.has(frame.ref)) continue;
+      // V5: only a genuine accept (its contract is the id tclk derives from this offer and this
+      // accept's own core; not signed by the offerer) can take part in pairing or key evidence.
+      const acceptedOffer = offersById.get(frame.ref);
+      if (acceptedOffer === undefined || !isGenuineAccept(acceptedOffer, frame)) continue;
       const list = acceptsByRef.get(frame.ref);
       if (list === undefined) acceptsByRef.set(frame.ref, [authenticated]);
       else list.push(authenticated);
     }
   }
 
+  // V6: leg B belongs to the DID that accepted leg A. Among the leg-B offers naming a leg A, the
+  // earliest-seq one signed by an accepter of that leg A pairs with it; when leg A has no accept
+  // at all, the earliest-seq leg B stands in (coordination-only, on export row order).
   const legBByLegAOfferId = new Map<string, LegBCandidate>();
+  const legBPairedByRowOrder = new Set<string>();
   const unpaired: Array<{ offerId: string; reason: string }> = [];
 
   const orderedLegB = [...legBCandidates].sort((left, right) => left.record.seq - right.record.seq);
@@ -181,15 +189,31 @@ export function buildBoard(input: BoardInput): Board {
       unpaired.push({ offerId: candidate.offer.id, reason: "leg A already paired" });
       continue;
     }
+    const accepts = acceptsByRef.get(legAOfferId);
+    if (accepts === undefined || accepts.length === 0) {
+      legBByLegAOfferId.set(legAOfferId, candidate);
+      legBPairedByRowOrder.add(legAOfferId);
+      continue;
+    }
+    if (!accepts.some((accept) => accept.frame.from === candidate.offer.from)) {
+      unpaired.push({ offerId: candidate.offer.id, reason: "leg B is not signed by the DID that accepted leg A" });
+      continue;
+    }
     legBByLegAOfferId.set(legAOfferId, candidate);
   }
 
   const swaps: SwapView[] = [];
+  // V3: a shared swapId is information only. It is defined per buyer (a hash of the buyer's DID
+  // and a nonce), so it can repeat only among leg-A offers signed by the same DID; another
+  // signer copying a swapId into an offer of their own is not reported and changes nothing.
   const swapIdCount = new Map<string, number>();
-  for (const legA of legAByOfferId.values()) swapIdCount.set(legA.swapId, (swapIdCount.get(legA.swapId) ?? 0) + 1);
+  const sameBuyerKey = (legA: LegACandidate): string => `${legA.offer.from}|${legA.swapId}`;
+  for (const legA of legAByOfferId.values()) {
+    const key = sameBuyerKey(legA);
+    swapIdCount.set(key, (swapIdCount.get(key) ?? 0) + 1);
+  }
 
   for (const [legAOfferId, legA] of legAByOfferId) {
-    const duplicated = (swapIdCount.get(legA.swapId) ?? 0) > 1;
     const legB = legBByLegAOfferId.get(legAOfferId);
     const acceptAChoice = chooseAccept(acceptsByRef.get(legAOfferId), legB?.offer.from);
     const legARecords = buildLegRecords(legA.record, acceptAChoice.accept, input.dealRooms);
@@ -197,19 +221,26 @@ export function buildBoard(input: BoardInput): Board {
       ? chooseAccept(acceptsByRef.get(legB.offer.id), legA.offer.from)
       : { accept: undefined, coordinationOnly: false };
     const legBRecords = legB ? buildLegRecords(legB.record, acceptBChoice.accept, input.dealRooms) : [];
-    // tclk#194 finding 2: `swapId` is not unique (a buyer picks the nonce), so evidence is looked
-    // up by the two accepted contract ids of THIS pair — and not at all when the swapId is
-    // shared by more than one active swap, so neither can fold past what its own frames prove.
-    const evidence = duplicated ? undefined : pairEvidence(input.evidence, acceptAChoice.accept, acceptBChoice.accept);
-    const view = foldSwap(
+    // tclk#194: `swapId` is not unique, so evidence is looked up by the two contract ids the
+    // fold itself accepted for THIS pair, never by swapId. Fold once without evidence to learn
+    // them; only when some evidence exists under those ids is the pair folded again with it.
+    const bare = foldSwap({ legA: legARecords, legB: legBRecords, nowMs: input.nowMs });
+    const evidence = pairEvidence(input.evidence, bare.legA?.state?.contract, bare.legB?.state?.contract);
+    const view =
       evidence === undefined
-        ? { legA: legARecords, legB: legBRecords, nowMs: input.nowMs }
-        : { legA: legARecords, legB: legBRecords, evidence, nowMs: input.nowMs },
-    );
-    if (duplicated) {
+        ? bare
+        : foldSwap({ legA: legARecords, legB: legBRecords, evidence, nowMs: input.nowMs });
+    const sharedCount = swapIdCount.get(sameBuyerKey(legA)) ?? 0;
+    if (sharedCount > 1) {
       view.reasons.push(
-        `swapId ${legA.swapId} is shared by ${swapIdCount.get(legA.swapId)} active swaps (same buyer and nonce) — no rail evidence is looked up for any of them; each folds only as far as its own frames prove`,
+        `swapId ${legA.swapId} is shared by ${sharedCount} leg-A offers signed by the same buyer (the swapId is defined per buyer) - information only: rail evidence is keyed per leg contract, so no swap uses another's evidence`,
       );
+    }
+    if (legB !== undefined && legBPairedByRowOrder.has(legAOfferId)) {
+      view.coordinationOnly.push({
+        basis: "coordination-only",
+        reason: "leg B paired to a leg A with no accept by export row order (earliest seq), not by its accepter",
+      });
     }
     // H4: foldSwap has no visibility into how an accept was chosen among several candidates
     // for the same offer id — that choice happens here, before folding — so it is appended

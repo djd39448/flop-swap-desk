@@ -8,6 +8,7 @@
 
 import {
   OFFER_ROOM,
+  contractId,
   dealRoom,
   encodeFrame,
   encodePaperRecord,
@@ -21,7 +22,7 @@ import { describe, expect, it } from "vitest";
 
 import { buildBoard } from "../src/board.js";
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
-import { foldCaptured } from "../src/replay.js";
+import { findSwapLegCandidates, foldCaptured } from "../src/replay.js";
 import { foldSwap } from "../src/swap.js";
 import type { RailObservation } from "../src/types.js";
 import { identity, record } from "./helpers/identity.js";
@@ -223,7 +224,36 @@ function paperPair(tag: string) {
 }
 
 describe("finding 2: swapId is not a unique key for evidence", () => {
-  it("REPRODUCTION: two distinct pairs with the same buyer and nonce, one pair's evidence: neither is 'settled'", () => {
+  it("V3: a stranger copying a settled swap's public swapId into an offer of their own changes nothing for the victim", () => {
+    const one = paperPair("aa01");
+    const stranger = identity("c3".repeat(32));
+    const copied = makeOffer({
+      from: stranger.did,
+      role: "payer",
+      amount: "1000",
+      asset: "USDC",
+      lock: "hash",
+      rails: ["paper"],
+      claimByMs: T0 + 45 * MIN,
+      refundAfterMs: T0 + 60 * MIN,
+      expiresMs: T0 + 30 * MIN,
+      job: { proto: "swap", id: one.swapId, context: legAContext({ wantAsset: "FLOP", wantAmount: "1", wantRail: "flop-htlc" }) },
+      nonce: "5eed5eed5eed5eed",
+    });
+    const offers = [...one.offerRecords(1, 0), record(OFFER_ROOM, 5, T0 + 20 * MIN, stranger, encodeFrame(copied))];
+    const board = foldCaptured({ offers, dealRooms: one.dealRooms, notes: one.notes(), nowMs: T0 + 9 * MIN });
+    const victim = board.swaps.find((view) => view.legAOfferId === one.legAOffer.id)!;
+    expect(victim.status).toBe("settled");
+    expect(victim.evidence.aRail).toBeDefined();
+    expect(victim.evidence.bRail).toBeDefined();
+    // A different signer's copy is not the same buyer's reuse: nothing is reported on the victim.
+    expect(victim.reasons.some((r) => r.includes("shared by"))).toBe(false);
+    const copy = board.swaps.find((view) => view.legAOfferId === copied.id)!;
+    expect(copy.status).toBe("bid");
+    expect(copy.evidence.aRail).toBeUndefined();
+  });
+
+  it("two distinct pairs with the same buyer and nonce, one pair's evidence: only that pair settles (V3), both report the shared swapId as information", () => {
     const one = paperPair("aa01");
     const two = paperPair("bb02");
     expect(two.swapId).toBe(one.swapId);
@@ -234,11 +264,16 @@ describe("finding 2: swapId is not a unique key for evidence", () => {
     // Evidence (claimed paper notes) exists for pair 1 ONLY.
     const board = foldCaptured({ offers, dealRooms, notes: one.notes(), nowMs: T0 + 9 * MIN });
     expect(board.swaps).toHaveLength(2);
+    const byOffer = new Map(board.swaps.map((view) => [view.legAOfferId, view]));
+    const v1 = byOffer.get(one.legAOffer.id)!;
+    const v2 = byOffer.get(two.legAOffer.id)!;
+    // Pair 1 folds from its own evidence; pair 2 never borrows it.
+    expect(v1.status).toBe("settled");
+    expect(v2.status).not.toBe("settled");
+    expect(v2.evidence.aRail).toBeUndefined();
+    expect(v2.evidence.bRail).toBeUndefined();
     for (const view of board.swaps) {
-      expect(view.status).not.toBe("settled");
-      expect(view.reasons.some((r) => r.includes("shared by 2 active swaps"))).toBe(true);
-      expect(view.evidence.aRail).toBeUndefined();
-      expect(view.evidence.bRail).toBeUndefined();
+      expect(view.reasons.some((r) => r.includes("shared by 2 leg-A offers signed by the same buyer") && r.includes("information only"))).toBe(true);
     }
   });
 
@@ -266,5 +301,116 @@ describe("finding 2: swapId is not a unique key for evidence", () => {
       nowMs: T0 + 9 * MIN,
     });
     expect(board.swaps[0]!.evidence.b).toBeUndefined();
+  });
+});
+
+describe("V5: only genuine accepts key candidates and evidence", () => {
+  const other = identity("d4".repeat(32));
+
+  it("a forged accept (real contract id, another signer) cannot displace the genuine candidate or borrow its evidence", () => {
+    const one = paperPair("aa01");
+    const forged = { ...one.legAAccept, from: other.did };
+    // The forged accept arrives first in row order.
+    const rows = [
+      record(OFFER_ROOM, 1, T0, buyer, encodeFrame(one.legAOffer)),
+      record(OFFER_ROOM, 2, T0 + 30_000, other, encodeFrame(forged)),
+      record(OFFER_ROOM, 3, T0 + 1 * MIN, seller, encodeFrame(one.legAAccept)),
+      record(OFFER_ROOM, 4, T0 + 2 * MIN, seller, encodeFrame(one.legBOffer)),
+      record(OFFER_ROOM, 5, T0 + 3 * MIN, buyer, encodeFrame(one.legBAccept)),
+    ];
+    const { candidates } = findSwapLegCandidates(rows);
+    const forA = candidates.filter((c) => c.contract === one.legAAccept.contract);
+    expect(forA).toHaveLength(1);
+    expect(forA[0]!.accept.from).toBe(seller.did);
+    expect(forA[0]!.acceptSeq).toBe(3);
+
+    const board = foldCaptured({ offers: rows, dealRooms: one.dealRooms, notes: one.notes(), nowMs: T0 + 9 * MIN });
+    expect(board.swaps).toHaveLength(1);
+    expect(board.swaps[0]!.status).toBe("settled");
+  });
+
+  it("a self-accept (accept signed by the offerer) is not a candidate and buildBoard never keys evidence by it", () => {
+    const one = paperPair("aa01");
+    const core = { from: buyer.did, ref: one.legAOffer.id, statement: generateHashLock().hash, nonce: "5e1f5e1f5e1f5e1f" };
+    const selfAccept = { type: "accept" as const, ...core, contract: contractId(one.legAOffer, core) };
+    const only = [record(OFFER_ROOM, 1, T0, buyer, encodeFrame(one.legAOffer)), record(OFFER_ROOM, 2, T0 + MIN, buyer, encodeFrame(selfAccept))];
+    expect(findSwapLegCandidates(only).candidates).toHaveLength(0);
+    const board = buildBoard({
+      offers: only,
+      dealRooms: new Map(),
+      evidence: new Map([[selfAccept.contract, { lock: { rail: "paper", ref: selfAccept.contract, terms: {} as never, railVerified: true, checkedAtMs: T0 } }]]),
+      nowMs: T0 + 2 * MIN,
+    });
+    expect(board.swaps[0]!.status).toBe("bid");
+    expect(board.swaps[0]!.evidence.a).toBeUndefined();
+  });
+
+  it("an accept whose contract does not match its own offer/accept core is dropped", () => {
+    const one = paperPair("aa01");
+    const bogus = { ...one.legAAccept, contract: "0x" + "7".repeat(64) };
+    const only = [record(OFFER_ROOM, 1, T0, buyer, encodeFrame(one.legAOffer)), record(OFFER_ROOM, 2, T0 + MIN, seller, encodeFrame(bogus))];
+    expect(findSwapLegCandidates(only).candidates).toHaveLength(0);
+    expect(buildBoard({ offers: only, dealRooms: new Map(), nowMs: T0 + 2 * MIN }).swaps[0]!.status).toBe("bid");
+  });
+});
+
+describe("V6: leg B belongs to the DID that accepted leg A", () => {
+  const stranger = identity("c3".repeat(32));
+  const strangerLegB = (one: ReturnType<typeof paperPair>) =>
+    makeOffer({
+      from: stranger.did,
+      role: "payer",
+      amount: "52070000",
+      asset: "FLOP",
+      lock: "hash",
+      rails: ["paper"],
+      claimByMs: T0 + 70 * MIN,
+      refundAfterMs: T0 + 180 * MIN,
+      expiresMs: T0 + 40 * MIN,
+      job: { proto: "swap", id: one.swapId, context: legBContext(one.legAOffer.id) },
+      nonce: "5747a4ce5747a4ce",
+    });
+
+  it("an earlier leg-B offer from a stranger does not pair; the accepter's leg B does", () => {
+    const one = paperPair("aa01");
+    const squat = strangerLegB(one);
+    const offers = [
+      record(OFFER_ROOM, 1, T0, buyer, encodeFrame(one.legAOffer)),
+      record(OFFER_ROOM, 2, T0 + 30_000, stranger, encodeFrame(squat)), // earliest leg B
+      record(OFFER_ROOM, 3, T0 + 1 * MIN, seller, encodeFrame(one.legAAccept)),
+      record(OFFER_ROOM, 4, T0 + 2 * MIN, seller, encodeFrame(one.legBOffer)),
+      record(OFFER_ROOM, 5, T0 + 3 * MIN, buyer, encodeFrame(one.legBAccept)),
+    ];
+    const board = buildBoard({ offers, dealRooms: one.dealRooms, nowMs: T0 + 9 * MIN });
+    expect(board.swaps).toHaveLength(1);
+    expect(board.swaps[0]!.legBOfferId).toBe(one.legBOffer.id);
+    expect(board.swaps[0]!.sellerDid).toBe(seller.did);
+    expect(board.unpaired.find((u) => u.offerId === squat.id)?.reason).toBe("leg B is not signed by the DID that accepted leg A");
+  });
+
+  it("with no accept on leg A, the earliest leg B stands in and is marked coordination-only", () => {
+    const one = paperPair("aa01");
+    const offers = [record(OFFER_ROOM, 1, T0, buyer, encodeFrame(one.legAOffer)), record(OFFER_ROOM, 2, T0 + MIN, seller, encodeFrame(one.legBOffer))];
+    const board = buildBoard({ offers, dealRooms: new Map(), nowMs: T0 + 2 * MIN });
+    expect(board.swaps[0]!.legBOfferId).toBe(one.legBOffer.id);
+    expect(board.swaps[0]!.coordinationOnly.some((c) => c.reason.includes("no accept"))).toBe(true);
+  });
+});
+
+describe("V4: the paper rail keeps folding a refund frame on its own", () => {
+  it("a paper leg A with a refund frame and no chain observation is still refunded-a", () => {
+    const one = paperPair("aa01");
+    const offers = one.offerRecords(1, 0);
+    const roomA = dealRoom(one.legAAccept.contract);
+    const refund = record(
+      roomA,
+      2,
+      T0 + 61 * MIN,
+      buyer,
+      encodeFrame({ type: "refund", from: buyer.did, contract: one.legAAccept.contract, ref: one.legAAccept.contract }),
+    );
+    const view = foldSwap({ legA: [offers[0]!, offers[1]!, one.dealRooms.get(roomA)![0]!, refund], legB: [], nowMs: T0 + 62 * MIN });
+    expect(view.status).toBe("refunded-a");
+    expect(view.reasons.some((r) => r.includes("not corroborated by chain evidence"))).toBe(false);
   });
 });
