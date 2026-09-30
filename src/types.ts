@@ -121,7 +121,7 @@ export interface RailObservation {
   finalizedRef?: string;
   /** Binding (tclk#194 review, finding 1): what this observation is an observation OF. The fold
    *  (`src/swap.ts`) uses an observation only when every one of these equals the leg's own
-   *  accepted offer/accept pair and its accepted lock frame — a bare `{status, final}` proves
+   *  accepted offer/accept pair and its accepted lock frame â€” a bare `{status, final}` proves
    *  nothing about which swap it belongs to, so it is treated as absent. Filled by every
    *  evidence reader (paper, evm-htlc, btc-htlc, near-htlc) from the very terms/ref it checked. */
   /** The rail id the observation was read from (the accepted lock frame's `rail`). */
@@ -245,7 +245,7 @@ export interface BoardInput {
   offers: readonly TranscriptRecord[];
   /** Deal-room records keyed by room name (`mb-p-tclk-<16 hex>`). */
   dealRooms: ReadonlyMap<string, readonly TranscriptRecord[]>;
-  /** Per-leg rail evidence keyed by the leg's own tclk contract id — unique per offer/accept
+  /** Per-leg rail evidence keyed by the leg's own tclk contract id â€” unique per offer/accept
    *  pair (tclk#194 finding 2). Never keyed by `swapId`, which a buyer can reuse across
    *  distinct pairs. The board assembles a swap's `SwapEvidence` from the contract ids of the
    *  two accepts it actually paired, and looks nothing up at all for a `swapId` shared by more

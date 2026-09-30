@@ -122,7 +122,7 @@ function evaluateLock(
 
 /**
  * tclk#194 finding 1: a `RailObservation` is used only when it is bound to THIS leg's accepted
- * offer/accept pair and accepted lock frame — its rail id, ref and contract equal the lock the
+ * offer/accept pair and accepted lock frame â€” its rail id, ref and contract equal the lock the
  * tclk machine accepted, and its copy of the nine `LockTerms` equals the leg's own
  * `lockTerms()`. Anything else (missing binding fields, a leg with no accepted lock, any field
  * that differs) is refused: a reason is pushed and the observation is treated as absent, so it

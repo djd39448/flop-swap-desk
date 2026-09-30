@@ -198,7 +198,7 @@ export function buildBoard(input: BoardInput): Board {
       : { accept: undefined, coordinationOnly: false };
     const legBRecords = legB ? buildLegRecords(legB.record, acceptBChoice.accept, input.dealRooms) : [];
     // tclk#194 finding 2: `swapId` is not unique (a buyer picks the nonce), so evidence is looked
-    // up by the two accepted contract ids of THIS pair — and not at all when the swapId is
+    // up by the two accepted contract ids of THIS pair â€” and not at all when the swapId is
     // shared by more than one active swap, so neither can fold past what its own frames prove.
     const evidence = duplicated ? undefined : pairEvidence(input.evidence, acceptAChoice.accept, acceptBChoice.accept);
     const view = foldSwap(
@@ -208,7 +208,7 @@ export function buildBoard(input: BoardInput): Board {
     );
     if (duplicated) {
       view.reasons.push(
-        `swapId ${legA.swapId} is shared by ${swapIdCount.get(legA.swapId)} active swaps (same buyer and nonce) — no rail evidence is looked up for any of them; each folds only as far as its own frames prove`,
+        `swapId ${legA.swapId} is shared by ${swapIdCount.get(legA.swapId)} active swaps (same buyer and nonce) â€” no rail evidence is looked up for any of them; each folds only as far as its own frames prove`,
       );
     }
     // H4: foldSwap has no visibility into how an accept was chosen among several candidates

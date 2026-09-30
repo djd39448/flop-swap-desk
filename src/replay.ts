@@ -327,7 +327,7 @@ export function foldCaptured(input: FoldCapturedInput): Board {
   const buildBoardFn = input.board ?? defaultBuildBoard;
   const { candidates } = findSwapLegCandidates(input.offers);
   // tclk#194 finding 2: keyed by the leg's own contract id (unique per offer/accept pair), never
-  // by `swapId`, which a buyer can reuse across distinct pairs — the board assembles each swap's
+  // by `swapId`, which a buyer can reuse across distinct pairs â€” the board assembles each swap's
   // evidence from the two contracts it actually paired.
   const evidenceByContract = new Map<string, LegEvidence>();
   const evmConfig = input.rails?.evm;
