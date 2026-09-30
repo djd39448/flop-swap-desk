@@ -16,8 +16,11 @@
 // adapter really sends.
 //
 // Modelled contract rules (P5-NEAR-SPEC.md §2/§4, H1/H2/F4's own doc in src/rails/near-htlc.ts):
-//   - `ft_transfer_call` creates a `Locked` row unless one already exists under that hash lock
-//     (S3: the transfer call itself still reports `Success`; `ft_on_transfer` simply refuses).
+//   - Squatting fix: locks are keyed by (payer, hash lock). `ft_transfer_call` creates a `Locked`
+//     row unless one already exists for that SAME pair (S3: the transfer call itself still
+//     reports `Success`; `ft_on_transfer` simply refuses). `get_lock`/`claim` name the payer;
+//     `refund` is keyed by the signer. `squat()` lands another payer's lock under a public hash
+//     lock first, exactly what a third party holding the token can do.
 //   - `claim` reveals the preimage (sets it, moves to `Claiming`) BEFORE the payout promise runs,
 //     synchronously within the same `send_tx` (`wait_until: "FINAL"` always waits for the whole
 //     receipt chain) — the payout then either lands (`Claimed`) or fails (F4: reverts to `Locked`
@@ -193,8 +196,24 @@ class StatefulNearRpc {
   armPayoutFailureAfterReads(accountId: string, reads: number): void {
     this.readsRemainingBeforeUnregister.set(accountId, reads);
   }
-  getLockRow(hashLockHex: string): LockRow | undefined {
-    return this.locks.get(hashLockHex);
+  private key(payer: string, hashLockHex: string): string {
+    return `${payer}:${hashLockHex}`;
+  }
+  getLockRow(hashLockHex: string, payer: string = BUYER_ACCOUNT): LockRow | undefined {
+    return this.locks.get(this.key(payer, hashLockHex));
+  }
+  /** A third party's own `ft_transfer_call` lock landing first, under a public hash lock. */
+  squat(payer: string, hashLockHex: string, terms: { payee: string; amount: string; claimByMs: number; refundAfterMs: number }): void {
+    this.locks.set(this.key(payer, hashLockHex), {
+      status: "Locked",
+      payer,
+      payee: terms.payee,
+      token: this.token,
+      amount: terms.amount,
+      claimByMs: terms.claimByMs,
+      refundAfterMs: terms.refundAfterMs,
+      preimage: null,
+    });
   }
 
   private blockHashFor(height: number): string {
@@ -203,8 +222,8 @@ class StatefulNearRpc {
   private currentBlock(): { height: number; hash: string; timestampNs: string } {
     return { height: this.blockHeight, hash: this.blockHashFor(this.blockHeight), timestampNs: `${BigInt(Math.round(this.nowMs)) * 1_000_000n}` };
   }
-  private lockViewJson(hashLockHex: string): string {
-    const row = this.locks.get(hashLockHex);
+  private lockViewJson(hashLockHex: string, payer: string): string {
+    const row = this.locks.get(this.key(payer, hashLockHex));
     if (row === undefined) return "null";
     return JSON.stringify({
       status: row.status,
@@ -243,7 +262,7 @@ class StatefulNearRpc {
       const argsBase64 = params.args_base64 as string;
       const args = JSON.parse(Buffer.from(argsBase64, "base64").toString("utf8")) as Record<string, unknown>;
       if (methodName === "get_lock") {
-        return this.callFunctionResult(this.lockViewJson(args.hash_lock as string));
+        return this.callFunctionResult(this.lockViewJson(args.hash_lock as string, args.payer as string));
       }
       if (methodName === "storage_balance_of") {
         const accountId = args.account_id as string;
@@ -272,10 +291,10 @@ class StatefulNearRpc {
     if (decoded.methodName === "ft_transfer_call") {
       const amount = decoded.argsJson.amount as string;
       const msg = JSON.parse(decoded.argsJson.msg as string) as { hash_lock: string; payee: string; claim_by_ms: string; refund_after_ms: string };
-      const alreadyExists = this.locks.has(msg.hash_lock);
+      const alreadyExists = this.locks.has(this.key(decoded.signerId, msg.hash_lock));
       const refused = alreadyExists || msg.payee === this.contract || msg.payee === this.token || BigInt(amount) <= 0n;
       if (!refused) {
-        this.locks.set(msg.hash_lock, {
+        this.locks.set(this.key(decoded.signerId, msg.hash_lock), {
           status: "Locked",
           payer: decoded.signerId,
           payee: msg.payee,
@@ -292,7 +311,7 @@ class StatefulNearRpc {
       this.claimSendTxCalls += 1;
       const hashLockHex = decoded.argsJson.hash_lock as string;
       const preimageHex = decoded.argsJson.preimage as string;
-      const row = this.locks.get(hashLockHex);
+      const row = this.locks.get(this.key(decoded.argsJson.payer as string, hashLockHex));
       const digestHex = Buffer.from(sha256(Uint8Array.from(Buffer.from(preimageHex, "hex")))).toString("hex");
       if (this.forceNextClaimTxFailure) {
         this.forceNextClaimTxFailure = false;
@@ -310,7 +329,7 @@ class StatefulNearRpc {
     } else if (decoded.methodName === "refund") {
       this.refundSendTxCalls += 1;
       const hashLockHex = decoded.argsJson.hash_lock as string;
-      const row = this.locks.get(hashLockHex);
+      const row = this.locks.get(this.key(decoded.signerId, hashLockHex));
       if (this.forceNextRefundTxFailure) {
         this.forceNextRefundTxFailure = false;
         failure = { ActionError: { kind: { FunctionCallError: "forced test failure (top-level)" } } };
@@ -460,6 +479,77 @@ function dealRoomOf(acceptA: { contract: string }): string {
 function framesIn(records: readonly TranscriptRecord[], type: string): TranscriptRecord[] {
   return records.filter((r) => tryDecodeFrame(r.line)?.type === type);
 }
+
+// ── squatting fix: a third party locking under the public hash lock first ───────────────────
+
+describe("squatting fix — a squatter's lock under the swap's hash lock never blocks the real one", () => {
+  const SQUATTER = "squatter.near-sandbox-flop";
+
+  /** Everything `lockedFlow` does, but a squatter's own lock lands under the (public) hash lock
+   *  right before the Buyer's `lockLegA`. */
+  async function lockedFlowWithSquat(h: ReturnType<typeof harness>) {
+    h.node.registerStorage(BUYER_ACCOUNT);
+    h.node.registerStorage(SELLER_ACCOUNT);
+    const legA = legADeadlines(6 * 60 * 60_000);
+    const swapId = computeSwapId(h.buyer.did, "00000001");
+    const offerA = await h.buyerFlow.bid({
+      swapId,
+      wantAsset: "FLOP",
+      wantAmount: "52070000",
+      wantRail: "flop-htlc",
+      amount: "1000000",
+      asset: "USDC",
+      claimByMs: legA.claimByMs,
+      refundAfterMs: legA.refundAfterMs,
+      expiresMs: T0 + 10 * 60_000,
+    });
+    const { acceptA, acceptARecord, offerBRecord } = await h.sellerFlow.acceptLegA(offerA, legBDeadlines(), legA.lockTimeMs);
+    const { acceptBRecord } = await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, legA.lockTimeMs);
+    await h.sellerFlow.lockLegB(acceptBRecord);
+    await h.buyerFlow.verifyLegBLocked();
+    await h.sellerFlow.postAccountLineA(SELLER_ACCOUNT);
+    await h.buyerFlow.postAccountLineA(BUYER_ACCOUNT);
+    const statement = h.sellerFlow.statement;
+    if (statement === undefined) throw new Error("test setup: seller's own statement was never minted");
+    // The squat: same hash lock, 1 unit, the same payee and windows a copycat would read off the offer.
+    h.node.squat(SQUATTER, statement.slice(2), { payee: SELLER_ACCOUNT, amount: "1", claimByMs: legA.claimByMs, refundAfterMs: legA.refundAfterMs });
+    await h.buyerFlow.lockLegA();
+    return { offerA, acceptA, statement };
+  }
+
+  it("lockLegA succeeds with a squat in place, the lock frame carries the payer-keyed ref, and the Seller claims exactly the Buyer's own lock", async () => {
+    const h = harness();
+    const { acceptA, statement } = await lockedFlowWithSquat(h);
+
+    const lockFrames = framesIn(await h.venue.read(dealRoomOf(acceptA)), "lock");
+    expect(lockFrames).toHaveLength(1);
+    expect((tryDecodeFrame(lockFrames[0]!.line) as { ref: string }).ref).toBe(`${statement}:${BUYER_ACCOUNT}`);
+
+    const result = await h.sellerFlow.claimLegA(statement);
+    expect(result.receipt).toBeDefined();
+    expect(h.node.getLockRow(statement.slice(2), BUYER_ACCOUNT)?.status).toBe("Claimed");
+    // The squatter's own row is untouched: nobody but its payer (or a claim naming it) can move it.
+    expect(h.node.getLockRow(statement.slice(2), SQUATTER)?.status).toBe("Locked");
+    expect(h.node.getLockRow(statement.slice(2), SQUATTER)?.amount).toBe("1");
+
+    // The Buyer still learns the secret from the chain.
+    const secret = await h.buyerFlow.learnSecret();
+    expect(`0x${Buffer.from(sha256(Uint8Array.from(Buffer.from(secret.slice(2), "hex")))).toString("hex")}`).toBe(statement);
+  });
+
+  it("refundLegA refunds exactly the Buyer's own lock; the squatter's row stays for its own payer to refund", async () => {
+    const h = harness();
+    const { offerA, acceptA, statement } = await lockedFlowWithSquat(h);
+
+    h.clockRef.ms = offerA.refundAfterMs;
+    h.node.nowMs = h.clockRef.ms;
+    const refund = await h.buyerFlow.refundLegA();
+    expect(refund.ref).toBe(`${statement}:${BUYER_ACCOUNT}`);
+    expect(h.node.getLockRow(statement.slice(2), BUYER_ACCOUNT)?.status).toBe("Refunded");
+    expect(h.node.getLockRow(statement.slice(2), SQUATTER)?.status).toBe("Locked");
+    expect(framesIn(await h.venue.read(dealRoomOf(acceptA)), "refund")).toHaveLength(1);
+  });
+});
 
 // ── G1/G3: a payout that fails after revealing the preimage, then a successful revealed retry ──
 

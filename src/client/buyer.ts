@@ -126,7 +126,7 @@ export class BuyerFlow {
   private legALockAttempted = false;
   private lockedHashLock?: string;
   /** P4-BTC-SPEC.md §7a: the leg-A rail's own write ref for this flow's lock — `hashLock` for
-   *  `evm-htlc` (`WriteEvidence.ref === terms.statement`), the funding outpoint
+   *  `evm-htlc` (`WriteEvidence.ref === terms.statement`), `0x<hash lock>:<payer>` for `near-htlc`, the funding outpoint
    *  (`"<txid>:<vout>"`) for `btc-htlc`. `refundLegA`/`learnSecret` must use THIS, never
    *  `lockedHashLock`, wherever the rail's own interface asks for a `ref` — the two happen to be
    *  the same value for `evm-htlc` today, which is exactly why this distinction was invisible

@@ -87,6 +87,7 @@ import { checkSwapDeadlines } from "../deadlines.js";
 import { checkOrientation, classifySwapOffer, legBContext } from "../profile.js";
 import { EVM_RAIL_ID } from "../rails/evm-evidence.js";
 import { NEAR_RAIL_ID } from "../rails/near-evidence.js";
+import { parseNearRef } from "../rails/near-ref.js";
 import { NearPayoutFailedError } from "../rails/near-htlc.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
@@ -514,11 +515,22 @@ export class SellerFlow {
       const legacyLockFrame = accepted === null ? findAuthenticatedLock(dealRoomARecords, acceptA.contract, termsA.payer) : null;
 
       if (accepted !== null && accepted.rail === this.rail.railId) {
-        // For EVM (and, P5-NEAR-FIXES.md G5, near-htlc) the rail ref IS the hashLock this Seller
-        // already knows authoritatively — never trust the frame's own copy of it. For every
-        // other rail (btc-htlc: a funding outpoint this Seller has no other way to learn) the
-        // frame's own accepted ref is the only source.
-        if (this.rail.railId === EVM_RAIL_ID || this.rail.railId === NEAR_RAIL_ID) {
+        // For EVM the rail ref IS the hashLock this Seller already knows authoritatively — never
+        // trust the frame's own copy of it. For every other rail (btc-htlc: a funding outpoint
+        // this Seller has no other way to learn) the frame's own accepted ref is the only source.
+        // near-htlc (squatting fix, replacing D-N4/G5's "ref = hash lock"): the ref is
+        // `0x<hash lock>:<payer>`; the Seller checks the hash-lock part against its own and takes
+        // the payer part from the ref (authenticated: the lock frame is a signed record from the
+        // Buyer, and the contract keys each lock by (payer, hash lock)).
+        if (this.rail.railId === NEAR_RAIL_ID) {
+          const parsedRef = parseNearRef(accepted.railRef);
+          if (parsedRef === null || parsedRef.hashLock !== hashLockHex) {
+            throw new Error(
+              `seller: refusing to claim leg A — the accepted lock frame's own ref is not 0x<this flow's own hash lock>:<payer> (G5/G8, rail "${this.rail.railId}")`,
+            );
+          }
+          railRef = accepted.railRef;
+        } else if (this.rail.railId === EVM_RAIL_ID) {
           // G5: an accepted lock frame naming a DIFFERENT ref for one of these rails is not "the
           // frame is more current" — it is wrong. Refuse rather than silently prefer this
           // Seller's own value while ignoring the disagreement.
@@ -533,6 +545,16 @@ export class SellerFlow {
         }
       } else if (legacyLockFrame !== null && legacyLockFrame.rail === this.rail.railId) {
         railRef = legacyLockFrame.ref;
+        if (this.rail.railId === NEAR_RAIL_ID && parseNearRef(railRef)?.hashLock !== hashLockHex) {
+          throw new Error(
+            `seller: refusing to claim leg A — the lock frame's own ref is not 0x<this flow's own hash lock>:<payer> (G5, rail "${this.rail.railId}")`,
+          );
+        }
+      } else if (this.rail.railId === NEAR_RAIL_ID) {
+        // No accepted lock frame names a payer, so there is no ref to read the lock by.
+        throw new Error(
+          "seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): no accepted lock frame carries a near-htlc ref (0x<hash lock>:<payer>) yet",
+        );
       } else {
         railRef = hashLockHex;
       }

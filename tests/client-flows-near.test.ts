@@ -21,7 +21,7 @@
 // bitcoind connection either); `near-rail.ts`'s own wiring onto the real `NearHtlcRail`/
 // `nearEvidence` is exercised by tests/near-htlc.test.ts and tests/near-evidence.test.ts (mocked
 // JSON-RPC, no network) instead — this file's own job is the RAIL-AGNOSTIC flow logic, configured
-// to near-htlc's own shape (D-N4's ref-is-the-hashLock convention, D-N5's account-id accounts,
+// to near-htlc's own shape (the squatting-fix ref 0x<hash lock>:<payer>, D-N5's account-id accounts,
 // D-N6's `checkPendingClaim`-yes/`resendRefundIfDropped`-no rail shape, D-N8's policy numbers).
 //
 // P5-NEAR-SPEC.md §4's own storage-registration pre-check (near-htlc.ts's own `claim()`: a
@@ -61,9 +61,13 @@ import { identity, type Identity } from "./helpers/identity.js";
 const T0 = 1_700_000_000_000;
 const DUMMY_PAYER_ACCOUNT = "buyer.near-sandbox-flop";
 const DUMMY_PAYEE_ACCOUNT = "seller.near-sandbox-flop";
-// D-N4: near-htlc's own write ref IS the hash lock — 0x + 64 lowercase hex, unlike BTC's own
-// funding outpoint (`"<txid>:<vout>"`).
-const REF = `0x${"aa".repeat(32)}`;
+// Squatting fix (replacing D-N4): near-htlc's own write ref is `0x<hash lock>:<payer account>` —
+// the payer here is the Buyer's own dummy account.
+const REF = `0x${"aa".repeat(32)}:${DUMMY_PAYER_ACCOUNT}`;
+/** The ref the real near-rail adapter returns for a Buyer locking under `statement`. */
+function nearRefOf(statement: string): string {
+  return `${statement}:${DUMMY_PAYER_ACCOUNT}`;
+}
 
 function ident(tag: number): Identity {
   return identity(tag.toString(16).padStart(2, "0").repeat(32));
@@ -89,7 +93,7 @@ function unimplemented(name: string): never {
 interface FakeRailScript {
   prepareLock?: () => Promise<PreparedLock>;
   commitLock?: () => Promise<RailWriteEvidence>;
-  claim?: () => Promise<RailWriteEvidence>;
+  claim?: (ref?: string) => Promise<RailWriteEvidence>;
   refund?: () => Promise<RailWriteEvidence>;
   /** D-N6: near-htlc's real adapter never implements this (see near-rail.ts's own header
    *  comment) — a script that omits this leaves the field entirely absent on the connected
@@ -130,8 +134,8 @@ class FakeConnectedRail implements ConnectedCounterAssetRail {
   async commitLock(): Promise<RailWriteEvidence> {
     return (this.script.commitLock ?? (() => unimplemented("commitLock")))();
   }
-  async claim(): Promise<RailWriteEvidence> {
-    return (this.script.claim ?? (() => unimplemented("claim")))();
+  async claim(ref?: string): Promise<RailWriteEvidence> {
+    return (this.script.claim ?? (() => unimplemented("claim")))(ref);
   }
   async refund(): Promise<RailWriteEvidence> {
     return (this.script.refund ?? (() => unimplemented("refund")))();
@@ -344,7 +348,7 @@ describe("G5 — near-htlc's own rail ref IS the Seller's minted hash lock", () 
     // Unlike every other test in this file (which echoes the Seller's real statement, per G5),
     // this fake buyer rail deliberately locks under a DIFFERENT ref — modelling a Buyer (buggy
     // or malicious) whose accepted lock frame names a ref that isn't this Seller's own hash lock.
-    const WRONG_REF = `0x${"bb".repeat(32)}`;
+    const WRONG_REF = `0x${"bb".repeat(32)}:${DUMMY_PAYER_ACCOUNT}`;
     const buyerRail = new FakeCounterAssetRail({
       currentBlockMarker: async () => 0,
       prepareLock: async () => ({ ref: WRONG_REF }),
@@ -356,7 +360,58 @@ describe("G5 — near-htlc's own rail ref IS the Seller's minted hash lock", () 
     await h.buyerFlow.lockLegA();
     const statement = h.sellerFlow.statement;
     if (statement === undefined) throw new Error("test setup: seller's own statement was never minted");
-    await expect(h.sellerFlow.claimLegA(statement)).rejects.toThrow(/accepted lock frame's own ref does not match this flow's own hash lock \(G5/);
+    await expect(h.sellerFlow.claimLegA(statement)).rejects.toThrow(/accepted lock frame's own ref is not 0x<this flow's own hash lock>:<payer> \(G5/);
+  });
+
+  it("claimLegA refuses a lock frame whose ref is the bare hash lock (the pre-fix shape: no payer)", async () => {
+    const hBox: { h?: ReturnType<typeof harness> } = {};
+    const buyerRail = new FakeCounterAssetRail({
+      currentBlockMarker: async () => 0,
+      prepareLock: async () => ({ ref: hBox.h!.sellerFlow.statement! }),
+      commitLock: async () => ({ ref: hBox.h!.sellerFlow.statement!, raw: [] }),
+    });
+    const h = harness(buyerRail, new FakeCounterAssetRail({}));
+    hBox.h = h;
+    await pairLockBAndAccountLines(h);
+    await h.buyerFlow.lockLegA();
+    const statement = h.sellerFlow.statement;
+    if (statement === undefined) throw new Error("test setup: seller's own statement was never minted");
+    await expect(h.sellerFlow.claimLegA(statement)).rejects.toThrow(/not 0x<this flow's own hash lock>:<payer>/);
+  });
+
+  it("claimLegA accepts a ref naming its own hash lock and takes the payer from the ref: the rail is asked to claim under exactly that ref", async () => {
+    const hBox: { h?: ReturnType<typeof harness> } = {};
+    const PAYER_FROM_FRAME = "someone-paying.near-sandbox-flop"; // not the harness dummy payer: proves the ref is taken from the frame
+    const frameRef = () => `${hBox.h!.sellerFlow.statement!}:${PAYER_FROM_FRAME}`;
+    const buyerRail = new FakeCounterAssetRail({
+      currentBlockMarker: async () => 0,
+      prepareLock: async () => ({ ref: frameRef() }),
+      commitLock: async () => ({ ref: frameRef(), raw: [] }),
+    });
+    const claimedWith: string[] = [];
+    const sellerRail = new FakeCounterAssetRail({});
+    const h = harness(buyerRail, sellerRail);
+    hBox.h = h;
+    (sellerRail as unknown as { connect: () => Promise<ConnectedCounterAssetRail> }).connect = async () =>
+      new FakeConnectedRail({
+        findClaimedPreimage: async () => null,
+        currentBlockMarker: async () => 0,
+        chainTimeMs: async () => T0,
+        verifyLockFinal: async () => ({
+          lock: { rail: "near-htlc", ref: frameRef(), terms: {} as never, railVerified: true, checkedAtMs: 0 },
+          rail: { status: claimedWith.length === 0 ? "locked" : "claimed", final: true, checkedAtMs: 0, finalizedRef: "near-sandbox:final:1:x" },
+        }),
+        claim: async (ref: string) => {
+          claimedWith.push(ref);
+          return { ref, raw: [] };
+        },
+      });
+    await pairLockBAndAccountLines(h);
+    await h.buyerFlow.lockLegA();
+    const statement = h.sellerFlow.statement;
+    if (statement === undefined) throw new Error("test setup: seller's own statement was never minted");
+    await h.sellerFlow.claimLegA(statement);
+    expect(claimedWith).toEqual([frameRef()]);
   });
 });
 
@@ -510,8 +565,8 @@ describe("B2/C3/E4 — the last-moment claim guard is judged against max(chain t
     const hBox: { h?: ReturnType<typeof harness> } = {};
     const buyerRail = new FakeCounterAssetRail({
       currentBlockMarker: async () => 0,
-      prepareLock: async () => ({ ref: hBox.h!.sellerFlow.statement! }),
-      commitLock: async () => ({ ref: hBox.h!.sellerFlow.statement!, raw: [] }),
+      prepareLock: async () => ({ ref: nearRefOf(hBox.h!.sellerFlow.statement!) }),
+      commitLock: async () => ({ ref: nearRefOf(hBox.h!.sellerFlow.statement!), raw: [] }),
     });
     const sellerRail = new FakeCounterAssetRail({});
     const h = harness(buyerRail, sellerRail);
@@ -718,8 +773,8 @@ describe("learnSecret — from a posted reveal frame, or from a Claiming/Claimed
     const hBox: { h?: ReturnType<typeof harness> } = {};
     const buyerRail = new FakeCounterAssetRail({
       currentBlockMarker: async () => 0,
-      prepareLock: async () => ({ ref: hBox.h!.sellerFlow.statement! }),
-      commitLock: async () => ({ ref: hBox.h!.sellerFlow.statement!, raw: [] }),
+      prepareLock: async () => ({ ref: nearRefOf(hBox.h!.sellerFlow.statement!) }),
+      commitLock: async () => ({ ref: nearRefOf(hBox.h!.sellerFlow.statement!), raw: [] }),
     });
     const sellerRail = new FakeCounterAssetRail({});
     const h = harness(buyerRail, sellerRail);
@@ -798,8 +853,8 @@ describe("claim refused when the payee is unregistered (near-htlc's own storage-
     const hBox: { h?: ReturnType<typeof harness> } = {};
     const buyerRail = new FakeCounterAssetRail({
       currentBlockMarker: async () => 0,
-      prepareLock: async () => ({ ref: hBox.h!.sellerFlow.statement! }),
-      commitLock: async () => ({ ref: hBox.h!.sellerFlow.statement!, raw: [] }),
+      prepareLock: async () => ({ ref: nearRefOf(hBox.h!.sellerFlow.statement!) }),
+      commitLock: async () => ({ ref: nearRefOf(hBox.h!.sellerFlow.statement!), raw: [] }),
     });
     const sellerRail = new FakeCounterAssetRail({});
     const h = harness(buyerRail, sellerRail);

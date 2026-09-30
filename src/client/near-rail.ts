@@ -6,8 +6,8 @@
 // src/rails/near-evidence.ts (the pure, synchronous "capture live, then decide" evidence
 // reader). Mirrors src/client/evm-rail.ts's own split exactly, not src/client/btc-rail.ts's:
 // like EVM (and unlike Bitcoin's dual-pubkey P2WSH script), a near-htlc leg posts a single
-// account-id line per party (D-N5), and the write path's own `ref` (the hash lock) is known
-// before any write happens at all (D-N4), so `prepareLock` needs no network call of its own —
+// account-id line per party (D-N5), and the write path's own `ref` (`0x<hash lock>:<payer>`,
+// near-ref.ts) is known before any write happens at all (D-N4), so `prepareLock` needs no network call of its own —
 // exactly EVM's own G3 shortcut, not Bitcoin's "build+sign a whole PSBT to learn the outpoint"
 // one.
 //
@@ -38,6 +38,7 @@ import {
   type NearSigner,
   type NearWriteEvidence,
 } from "../rails/near-htlc.js";
+import { parseNearRef } from "../rails/near-ref.js";
 import { NearRpc } from "../rails/near-rpc.js";
 import { verifiedExchangeBytes, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import type {
@@ -106,7 +107,7 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
   }
 
   /** G3/D-N4: builds and signs the Buyer's `ft_transfer_call` lock (via `NearHtlcRail
-   *  .prepareLock`) WITHOUT broadcasting it — `ref` (the hash lock) is already fully known
+   *  .prepareLock`) WITHOUT broadcasting it — `ref` (`0x<hash lock>:<payer>`, near-ref.ts) is already fully known
    *  before this ever touches the network, exactly like `evm-rail.ts`'s own `prepareLock`, never
    *  Bitcoin's own PSBT-building shortcut for the same reason EVM doesn't need one either. */
   async prepareLock(terms: LockTerms, feeBps: number): Promise<PreparedLock> {
@@ -172,8 +173,8 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
   }
 
   /** How the Buyer learns `s` when the Seller claims on chain without ever posting a reveal
-   *  frame — `ref` is the hash lock itself (D-N4: unlike Bitcoin, where `ref` is the funding
-   *  outpoint, never the hashLock). `fromMarker` is accepted for interface symmetry with the
+   *  frame — `ref` is `0x<hash lock>:<payer>` (near-ref.ts; unlike Bitcoin, where `ref` is the
+   *  funding outpoint). `fromMarker` is accepted for interface symmetry with the
    *  other rails but unused: near-htlc's own `findClaimedPreimage` is a single `get_lock` read,
    *  not a bounded block scan (NEAR has no equivalent of "search N blocks of logs"). */
   async findClaimedPreimage(ref: string, _fromMarker?: RailBlockMarker): Promise<string | null> {
@@ -202,13 +203,17 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
    *  whether the payout could actually land (that is exactly the question this check is NOT
    *  answering; `verifyLockFinal`'s own `railVerified`/`rail` remain the only source for that). */
   async lockRecorded(ref: string): Promise<{ exists: boolean; reason?: string }> {
-    if (this.terms.lock !== "hash" || ref !== this.terms.statement) {
-      return { exists: false, reason: "near-rail: ref does not match this leg's own hash lock (G4)" };
+    const refParts = parseNearRef(ref);
+    if (this.terms.lock !== "hash" || refParts === null || refParts.hashLock !== this.terms.statement) {
+      return { exists: false, reason: "near-rail: ref is not 0x<hash lock>:<payer> for this leg's own hash lock (G4)" };
+    }
+    if (refParts.payer !== this.options.signer.accountId) {
+      return { exists: false, reason: "near-rail: the ref's payer is not this signer's own account" };
     }
     const near = new NearRpc(this.options.rpc);
     let resultText: string;
     try {
-      const result = await near.callFunction(this.options.config.contract, "get_lock", { hash_lock: ref.slice(2) });
+      const result = await near.callFunction(this.options.config.contract, "get_lock", { hash_lock: refParts.hashLock.slice(2), payer: refParts.payer });
       resultText = result.resultText;
     } catch (error) {
       return { exists: false, reason: `near-rail: lockRecorded could not read get_lock: ${error instanceof Error ? error.message : String(error)}` };
