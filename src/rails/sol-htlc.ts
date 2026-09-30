@@ -231,6 +231,22 @@ function pinReference(pin: SolChainPin): string {
   return pin.caip2.slice("solana:".length);
 }
 
+/** Judges a genesis hash against a pin (the connect-time check, shared with the evidence reader): mainnet is
+ *  refused by genesis; the local pin refuses every public cluster's genesis; any other pin needs the genesis
+ *  to start with its CAIP-2 reference. `null` when the genesis is acceptable, else the reason. */
+export function solGenesisProblem(pin: SolChainPin, genesis: string): string | null {
+  const prefix = genesis.slice(0, 32);
+  if (prefix === MAINNET_GENESIS_PREFIX) return "sol-htlc: this endpoint is mainnet (genesis hash); refusing by genesis";
+  if (pin.caip2 === SOL_LOCAL_PIN.caip2) {
+    if (PUBLIC_GENESIS_PREFIXES.includes(prefix)) {
+      return `sol-htlc: pin "${pin.name}" is a local validator but the endpoint reports a public cluster's genesis hash`;
+    }
+  } else if (prefix !== pinReference(pin)) {
+    return `sol-htlc: connected genesis "${genesis}" does not match pin "${pin.name}" (expected reference "${pinReference(pin)}")`;
+  }
+  return null;
+}
+
 function isMainnetish(pin: { name?: unknown; caip2?: unknown }): boolean {
   const name = typeof pin.name === "string" ? pin.name : "";
   const caip2 = typeof pin.caip2 === "string" ? pin.caip2 : "";
@@ -589,17 +605,8 @@ export class SolHtlcRail {
    *  anywhere but the pinned chain is cheap insurance against an endpoint that started answering for a
    *  different chain). Mainnet is refused by genesis; the local pin refuses every public cluster's genesis. */
   private async assertPinnedChain(): Promise<void> {
-    const genesis = await this.sol.getGenesisHash();
-    const prefix = genesis.slice(0, 32);
-    if (prefix === MAINNET_GENESIS_PREFIX) throw new Error("sol-htlc: this endpoint is mainnet (genesis hash); refusing by genesis");
-    const pin = this.config.pin;
-    if (pin.caip2 === SOL_LOCAL_PIN.caip2) {
-      if (PUBLIC_GENESIS_PREFIXES.includes(prefix)) {
-        throw new Error(`sol-htlc: pin "${pin.name}" is a local validator but the endpoint reports a public cluster's genesis hash`);
-      }
-    } else if (prefix !== pinReference(pin)) {
-      throw new Error(`sol-htlc: connected genesis "${genesis}" does not match pin "${pin.name}" (expected reference "${pinReference(pin)}")`);
-    }
+    const problem = solGenesisProblem(this.config.pin, await this.sol.getGenesisHash());
+    if (problem !== null) throw new Error(problem);
   }
 
   /**

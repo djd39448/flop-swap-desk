@@ -49,7 +49,7 @@ import {
   type AccountProof,
   type ProofPolicy,
 } from "./account-proof.js";
-import { normalizeRailIdWith, type CustomRailRegistry } from "./custom-rails.js";
+import { SOL_RAIL_ID, createSolRailRegistry, normalizeRailIdWith, type CustomRailRegistry } from "./custom-rails.js";
 
 /** Rail → CAIP-2 namespace (SPEC §3): `evm-htlc` ↔ `eip155` is the only pair with a
  *  chain-specific address grammar in this build (see `validateEip155Address`); `btc-htlc`/
@@ -761,4 +761,54 @@ export function resolveAccounts(
     ...(payer?.key === undefined ? {} : { payerKey: payer.key }),
     ...(payee?.key === undefined ? {} : { payeeKey: payee.key }),
   };
+}
+
+// -- the Solana leg's account line (SB2b) --------------------------------------------------------------------
+//
+// `swap1 account <SOL_RAIL_ID> solana:<reference>:<base58 wallet address>`, through the custom-rails
+// registry (the vendored tclk registry stays closed). The address is the payee's (or payer's) WALLET: the
+// payee's claim is paid to that wallet's associated token account for the configured mint, which the claim
+// derives, so the line never names a token account. Everything the EVM/NEAR lines guarantee applies through
+// `resolveAccounts`: only lines before the accepted lock (`beforeSeq`), sender-bound, room-scoped, other
+// rails and chains ignored with a reason, and conflicting lines from one party leave it unresolved.
+
+/** The schemes that may prove a Solana account line: `ed25519` only (P7). */
+const SOL_PROOF_SCHEMES: readonly string[] = ["ed25519"];
+
+/** Builds the Solana account line to post (with the wallet's `ed25519` proof, `accountProofMessage`). Throws on a malformed address or a caip2 that is not `solana:`. */
+export function formatSolAccountLine(input: { caip2: string; address: string; proof?: AccountProof }, registry: CustomRailRegistry = createSolRailRegistry()): string {
+  return formatAccountLine(
+    {
+      railId: SOL_RAIL_ID,
+      caip2: input.caip2,
+      address: input.address,
+      ...(input.proof === undefined ? {} : { proof: input.proof }),
+    },
+    registry,
+  );
+}
+
+/** `resolveAccounts` for the Solana rail: the registry defaults to a fresh one admitting only the Solana id,
+ *  and the proof policy defaults to P7's `required` with the `ed25519` scheme allowed for `SOL_RAIL_ID` (the
+ *  Solana address is the public key, so the proof is the wallet's own signature). A caller may pass a
+ *  stricter `required` policy (its own verifiers), never `legacy-unproven` on a production path. */
+export function resolveSolAccounts(
+  records: readonly TranscriptRecord[],
+  input: Omit<ResolveAccountsInput, "rail" | "railRegistry" | "proof"> & {
+    railRegistry?: CustomRailRegistry;
+    proof?: ProofPolicy;
+  },
+): ResolvedAccounts {
+  const proof: ProofPolicy =
+    input.proof === undefined
+      ? { mode: "required", allowedSchemes: SOL_PROOF_SCHEMES }
+      : input.proof.mode === "required" && input.proof.allowedSchemes === undefined
+        ? { ...input.proof, allowedSchemes: SOL_PROOF_SCHEMES }
+        : input.proof;
+  return resolveAccounts(records, {
+    ...input,
+    rail: SOL_RAIL_ID,
+    railRegistry: input.railRegistry ?? createSolRailRegistry(),
+    proof,
+  });
 }
