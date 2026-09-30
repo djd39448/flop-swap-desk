@@ -472,8 +472,8 @@ export interface ResolvePubkeysInput {
   beforeSeq?: number;
   /** P7: how proofs are treated. Required (no default) so every call site states its choice:
    *  `{ mode: "required" }` counts only lines whose proof verifies for this sender, contract,
-   *  rail and account; `{ mode: "legacy-unproven" }` is the pre-P7 fold, left in only at the
-   *  call sites the Rails stage has not migrated yet. */
+   *  rail and account; `{ mode: "legacy-unproven" }` is the pre-P7 fold, kept for tests only (no
+   *  production call site uses it; a test pins that). */
   proof: ProofPolicy;
 }
 
