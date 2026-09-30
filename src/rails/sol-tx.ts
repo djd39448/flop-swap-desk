@@ -411,6 +411,20 @@ export function isOnCurve(bytes: Uint8Array): boolean {
   }
 }
 
+/** True for an encoding that is NOT a usable wallet key: small-order points (the identity, its torsion
+ *  neighbours) and any non-canonical encoding (re-encoding differs). Nobody can sign for these under Solana's
+ *  strict signature verification, so a token account owned by one could never be spent from. Malformed
+ *  encodings count as unusable too. */
+export function isSmallOrderOrNonCanonical(bytes: Uint8Array): boolean {
+  if (bytes.length !== 32) return true;
+  try {
+    const point = ed25519.Point.fromBytes(bytes);
+    return point.isSmallOrder() || !bytesEqual(point.toBytes(), bytes);
+  } catch {
+    return true;
+  }
+}
+
 /** `sha256(seeds || programId || "ProgramDerivedAddress")`; `null` when the result is ON the curve (a
  *  program-derived address must be off it). At most 16 seeds of at most 32 bytes each. */
 export function createProgramAddress(seeds: readonly Uint8Array[], programId: Uint8Array): Uint8Array | null {

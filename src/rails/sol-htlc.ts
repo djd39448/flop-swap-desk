@@ -57,6 +57,7 @@ import {
   concatBytes,
   findProgramAddress,
   isOnCurve,
+  isSmallOrderOrNonCanonical,
   isValidPubkeyBase58,
   pubkeyFromBase58,
   pubkeyToBase58,
@@ -396,6 +397,9 @@ function validateTerms(terms: SolHtlcTerms, config: SolRailConfig, payer: string
   if (!isOnCurve(payeeBytes)) {
     throw new Error("sol-htlc: payee must be a wallet key (an on-curve address); an off-curve address such as a program-derived one has no key that can spend from it");
   }
+  if (isSmallOrderOrNonCanonical(payeeBytes)) {
+    throw new Error("sol-htlc: payee must not be a small-order or non-canonical ed25519 point (an on-curve encoding nobody can sign for under strict verification, so the payout could never be spent)");
+  }
   if (!NONNEG_DECIMAL.test(terms.amount) || BigInt(terms.amount) < BigInt(SOL_AMOUNT_FLOOR) || BigInt(terms.amount) > U64_MAX) {
     throw new Error(`sol-htlc: amount must be a decimal-integer string from ${SOL_AMOUNT_FLOOR} to 2^64-1`);
   }
@@ -516,6 +520,10 @@ export interface SolWriteEvidence {
   /** The slot the transaction was included in. */
   slot: number;
   raw: string[];
+  /** Claim only (SOL-A4): the claim transaction itself FAILED, but the escrow is Claimed with this claim's
+   *  own preimage (another transaction, for example a relayer's or a duplicate send from another fee payer,
+   *  landed first). The payee was paid; there is nothing to retry. */
+  claimedByAnotherTransaction?: true;
 }
 
 interface SolPreparedWrite {
@@ -541,6 +549,19 @@ export interface SolHtlcRailOptions {
   /** Harness-only override of the landing-bound estimate (see `SOL_SLOW_BLOCK_MS`, `SOL_EXPIRY_MARGIN_MS`).
    *  Loosening these weakens the claim guard; the defaults are the reviewed ones. */
   timing?: { slowBlockMs?: number; expiryMarginMs?: number };
+}
+
+export interface SolClaimOptions {
+  /**
+   * SOL-A2: retry a claim whose secret is ALREADY public (an earlier claim landed and failed, so the
+   * preimage sits in that transaction's instruction data). Allowed only when the escrow's own on-chain
+   * history proves this preimage is public (`findClaimedPreimage`); then `notAfterMs`, the landing margin and
+   * the landing bound are skipped (they protect a secret that is still private and would only stop the Seller
+   * from being paid) and only "the escrow is Locked, the payee's token account is usable, the simulation
+   * passes and chain time is before `refund_after_ms`" remain. Never for a claim that was only possibly seen
+   * (`SolNotLandedError`): that stays a decision for a person.
+   */
+  retryPublicSecret?: boolean;
 }
 
 /**
@@ -810,7 +831,13 @@ export class SolHtlcRail {
   /** The chain-confirmed check for one write, given the finalized status. Throws the kind's typed error. */
   private async confirmWrite(record: SolPreparedRecord, status: SolSignatureStatus, raw: () => string[], claimPreimage?: string): Promise<SolWriteEvidence> {
     const { kind, signature } = record;
-    if (status.err !== null) throw this.txFailure(kind, signature, status.err, raw());
+    if (status.err !== null) {
+      if (kind === "claim") {
+        const settled = await this.claimSettledByAnotherTransaction(record, status, raw, claimPreimage);
+        if (settled !== null) return settled;
+      }
+      throw this.txFailure(kind, signature, status.err, raw());
+    }
     const parsed = this.requireRef(record.ref);
     const { escrow, vault } = this.escrowKeys(parsed);
     const read = await this.readFinalized([escrow, vault], status.slot);
@@ -833,7 +860,10 @@ export class SolHtlcRail {
         view.refundAfterMs === terms.refundAfterMs &&
         view.hashLock === terms.hashLock &&
         vaultBalance !== null &&
-        vaultBalance === BigInt(terms.amount);
+        // SOL-A1: the vault is an ordinary token account, so anyone can add to it (the program adopts a stray
+        // donation and pays the whole balance out). "At least the amount", the same rule the evidence reader
+        // applies; an exact match would report a landed lock as "nothing was locked" after a 1-unit donation.
+        vaultBalance >= BigInt(terms.amount);
       if (!matches) throw new SolLockRefusedError(signature, null, raw(), "the escrow does not hold the terms that were sent");
       return evidence;
     }
@@ -847,6 +877,30 @@ export class SolHtlcRail {
 
     if (view !== null && view.status === "Refunded") return evidence;
     throw new SolRefundFailedError(signature, null, raw(), `the escrow is ${view?.status ?? "missing"} after a successful transaction`);
+  }
+
+  /** SOL-A4: a claim transaction that failed only because the escrow was already Claimed (a duplicate send,
+   *  a relayer that won the race) is not "failed, retry at once": read the escrow at finalized, and when it is
+   *  Claimed with a stored preimage that opens the hash lock (and equals this claim's own, when known) the
+   *  payee was paid. Any read failure or any other state falls back to the typed failure (fail closed). */
+  private async claimSettledByAnotherTransaction(
+    record: SolPreparedRecord,
+    status: SolSignatureStatus,
+    raw: () => string[],
+    claimPreimage?: string,
+  ): Promise<SolWriteEvidence | null> {
+    try {
+      const parsed = this.requireRef(record.ref);
+      const { escrow } = this.escrowKeys(parsed);
+      const read = await this.readFinalized([escrow], status.slot);
+      const view = this.viewEscrow(read.accounts[0] ?? null, parsed);
+      if (view === null || view.status !== "Claimed" || !view.revealed || view.preimage === null) return null;
+      if (!bytesEqual(sha256(hexToBytes(view.preimage.slice(2))), hexToBytes(parsed.hashLock.slice(2)))) return null;
+      if (claimPreimage !== undefined && view.preimage !== claimPreimage) return null;
+      return { ref: record.ref, signature: record.signature, slot: status.slot, raw: raw(), claimedByAnotherTransaction: true };
+    } catch {
+      return null;
+    }
   }
 
   /** Simulate at `confirmed` (a `finalized` bank's clock is stale for the program's window checks); a set
@@ -947,9 +1001,22 @@ export class SolHtlcRail {
    * the signature; awaited before anything is sent), simulate (a claim the runtime would refuse is never
    * sent, so a refusal here does not publish the secret), the last-moment guard with
    * `max(chain time, clock)` against `notAfterMs` and the landing bound, send, wait FINALIZED, confirm
-   * Claimed on chain. A claim that landed and failed is `SolClaimFailedError` (the secret is public).
+   * Claimed on chain. A claim that landed and failed is `SolClaimFailedError` (the secret is public), except
+   * when the escrow is Claimed with this preimage (another transaction won; SOL-A4).
+   *
+   * `notAfterMs` must still be in the future (SOL-A3): a claim past its own deadline is refused before it is
+   * signed. NOTE: `simulateTransaction` carries the signed claim, and so the secret, to the configured
+   * endpoint; the Seller's endpoint must be a node it trusts, as for the send path. For a secret that is
+   * already public (an earlier claim landed and failed) `options.retryPublicSecret` retries without the
+   * deadline and landing bounds (`SolClaimOptions`, SOL-A2).
    */
-  async claim(ref: string, preimage: string, notAfterMs: number, onSigned?: (record: SolPreparedRecord) => void | Promise<void>): Promise<SolWriteEvidence> {
+  async claim(
+    ref: string,
+    preimage: string,
+    notAfterMs: number,
+    onSigned?: (record: SolPreparedRecord) => void | Promise<void>,
+    options: SolClaimOptions = {},
+  ): Promise<SolWriteEvidence> {
     const parsed = this.requireRef(ref);
     if (!SECRET_SHAPE.test(preimage)) throw new Error("sol-htlc: preimage must be 0x + 64 lowercase hex");
     const preimageBytes = hexToBytes(preimage.slice(2));
@@ -977,19 +1044,34 @@ export class SolHtlcRail {
     const payeeProblem = this.tokenAccountProblem(second.accounts[1] ?? null, this.mint, payeeBytes);
     if (payeeProblem !== null) throw new Error(`sol-htlc: refusing to claim - the payee's associated token account ${payeeProblem} (the payout would fail)`);
 
+    const retry = options.retryPublicSecret === true;
+    if (retry) {
+      // SOL-A2: the retry mode exists only for a secret that is ALREADY public, and that is proven on chain,
+      // never taken on the caller's word.
+      const proven = await this.findClaimedPreimage(ref);
+      if (proven !== preimage) {
+        throw new Error("sol-htlc: refusing a public-secret retry - no claim carrying this preimage was found in this escrow's on-chain history");
+      }
+    }
+
     const nowMs = Math.max(await this.chainTimeMs(), this.clock());
     if (!(nowMs < view.refundAfterMs)) throw new Error("sol-htlc: refusing to claim - the clock is already at/after refundAfterMs");
-    if (notAfterMs > view.refundAfterMs - SOL_CLAIM_LANDING_MARGIN_MS) {
+    if (!retry && notAfterMs > view.refundAfterMs - SOL_CLAIM_LANDING_MARGIN_MS) {
       throw new Error(
         `sol-htlc: refusing to claim - notAfterMs (${notAfterMs}) leaves less than the ${SOL_CLAIM_LANDING_MARGIN_MS}ms landing margin before refundAfterMs (${view.refundAfterMs})`,
       );
     }
     const plan = await this.blockhashPlan();
     const bound = this.latestLandingMs(nowMs, plan.lastValidBlockHeight, plan.finalizedHeight) + this.expiryMarginMs;
-    if (bound > view.refundAfterMs) {
+    if (!retry && bound > view.refundAfterMs) {
       throw new SolClaimTooLateError(
         `sol-htlc: refusing to claim - a transaction signed now could still land as late as ${bound} ms, after refundAfterMs ${view.refundAfterMs} minus the ${this.expiryMarginMs}ms margin (the secret would be published by a claim that fails late)`,
       );
+    }
+    // SOL-A3: nothing is signed, handed to `onSigned` or sent to `simulateTransaction` (which carries the
+    // signed claim, and so the secret, to the endpoint) for a claim whose own deadline has already passed.
+    if (!retry && !(nowMs < notAfterMs)) {
+      throw new Error(`sol-htlc: refusing to claim - the deadline notAfterMs (${notAfterMs}) has already passed (chain time/clock ${nowMs})`);
     }
 
     const instruction: SolInstruction = {
@@ -1008,6 +1090,12 @@ export class SolHtlcRail {
     // bound and against the landing bound of THIS blockhash.
     const guard = async (): Promise<void> => {
       const finalNowMs = Math.max(await this.chainTimeMs(), this.clock());
+      if (retry) {
+        // The secret is already public, so a claim that lands late and fails leaks nothing new; only stop
+        // once the window is closed (the program would refuse it and the Buyer may refund).
+        if (finalNowMs >= refundAfterMs) throw new Error(`sol-htlc: refusing to broadcast the retry - chain time ${finalNowMs} is at/after refundAfterMs ${refundAfterMs}`);
+        return;
+      }
       if (finalNowMs >= notAfterMs) {
         throw new Error(`sol-htlc: refusing to broadcast claim - chain time ${finalNowMs} is at/after the given deadline (notAfterMs ${notAfterMs})`);
       }
