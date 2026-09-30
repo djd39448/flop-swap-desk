@@ -1587,7 +1587,7 @@ describe("runSweep", () => {
 
     /** Same shape as `buildSwap`, but leg A's own deal room also carries its `near-htlc` lock
      *  frame (posted by its payer, the Buyer) and both parties' D-N5 account lines. */
-    function buildNearSwap(nonceHex: string, baseSeq: number, baseMs: number, sharedLock?: ReturnType<typeof generateHashLock>) {
+    function buildNearSwap(nonceHex: string, baseSeq: number, baseMs: number, sharedLock?: ReturnType<typeof generateHashLock>, lockRef?: (hash: string) => string) {
       const swapId = makeSwapId(buyer.did, nonceHex);
       // E1: a caller building a "copycat pair" test (two different leg contracts, one shared
       // hash lock) passes the same HashLock into two separate buildNearSwap calls.
@@ -1631,7 +1631,7 @@ describe("runSweep", () => {
       const dealRoomA = dealRoom(legAAccept.contract);
       const dealRoomB = dealRoom(legBAccept.contract);
       const legATerms = offerAcceptLockTerms(legAOffer, legAAccept);
-      const lockA: LockFrame = { type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "near-htlc", ref: lock.hash };
+      const lockA: LockFrame = { type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "near-htlc", ref: lockRef === undefined ? `${lock.hash}:${BUYER_ACCOUNT}` : lockRef(lock.hash) };
 
       function dealRowsA(baseDealMs: number) {
         const sellerLine = formatAccountLine({ railId: "near-htlc", caip2: NEAR_SANDBOX_PIN.caip2, address: SELLER_ACCOUNT });
@@ -1722,6 +1722,36 @@ describe("runSweep", () => {
       };
     }
 
+    // Squatting fix: only a lock frame whose ref parses as 0x<hash lock>:<payer> AND whose
+    // hash-lock part equals the leg's own statement is ever captured — a bare hash lock (the
+    // pre-fix shape) or a ref naming another hash lock triggers no chain read at all.
+    it.each([
+      ["the pre-fix bare hash lock", (hash: string) => hash],
+      ["another hash lock", () => `0x${"99".repeat(32)}:${BUYER_ACCOUNT}`],
+      ["a ref with no payer", (hash: string) => `${hash}:`],
+    ])("a lock frame whose ref is %s is not captured (no near chain read)", async (_label, lockRef) => {
+      const swap = buildNearSwap("bbbb1301", 1, NOW - 100_000, undefined, lockRef);
+      const exportBody = ndjson(swap.offerRows);
+      const dealARows = swap.dealRowsA(NOW - 50_000);
+      const calls: Array<{ url: string; body?: string }> = [];
+      const fetchImpl = makeNearFetch({
+        technocore: (url) => {
+          if (url.endsWith("/r/tclk-offers/export")) return { status: 200, body: exportBody };
+          if (url.includes(swap.dealRoomA)) return { status: 200, body: dealRoomBody(dealARows) };
+          if (url.includes(swap.dealRoomB)) return { status: 200, body: dealRoomBody([]) };
+          return { status: 404, body: "" };
+        },
+        rpcEndpoint: NEAR_CONFIG.endpoint,
+        rpcResult: nearRpcResponder(lockedLockView(swap.legATerms)),
+        calls,
+      });
+      const report = await runSweep({ ...baseOptions({ board: buildBoard, rails: { near: NEAR_CONFIG } }), fetch: fetchImpl });
+      expect(report.ok).toBe(true);
+      expect(report.nearChainReads).toBe(0);
+      expect(report.nearChainReadsSkipped).toEqual([]);
+      expect(existsSync(join(root, "raw", "near"))).toBe(false);
+    });
+
     it("captures a locked near-htlc leg live, writes raw/rpc + raw/near/<hashLock>/<legContract> + rails.json, and reports nearChainReads", async () => {
       const swap = buildNearSwap("bbbb1001", 1, NOW - 100_000);
       const exportBody = ndjson(swap.offerRows);
@@ -1753,8 +1783,16 @@ describe("runSweep", () => {
       const nearFiles = await readdir(nearDir);
       expect(nearFiles.length).toBe(1);
       const index = JSON.parse(await readFile(join(nearDir, nearFiles[0]!), "utf8"));
-      expect(index.ref).toBe(swap.lock.hash);
+      // Squatting fix: the index records the full ref (0x<hash lock>:<payer>) from the accepted
+      // lock frame, and the live get_lock read names that payer next to the hash lock.
+      expect(index.ref).toBe(`${swap.lock.hash}:${BUYER_ACCOUNT}`);
       expect(index.exchanges).toHaveLength(4);
+      const lockRead = index.exchanges[2].params as { method_name: string; args_base64: string };
+      expect(lockRead.method_name).toBe("get_lock");
+      expect(JSON.parse(Buffer.from(lockRead.args_base64, "base64").toString("utf8"))).toEqual({
+        hash_lock: swap.lock.hash.slice(2),
+        payer: BUYER_ACCOUNT,
+      });
 
       const rpcFiles = await readdir(join(root, "raw", "rpc"));
       expect(rpcFiles.length).toBe(4);

@@ -413,7 +413,9 @@ async function loadBtcCaptures(root, notes = []) {
  *  TWO-level scan: a hash lock directory holding more than one leg-contract subdirectory means
  *  more than one leg accepted that exact hash lock this watch root ever saw (a copycat pair, or
  *  H7's own hash-lock-squatting scenario) — reported as a note, never an error; each leg's own
- *  capture is folded from its own subdirectory, untouched by the other's. */
+ *  capture is folded from its own subdirectory, untouched by the other's. The directory carries
+ *  only the hash-lock part of the ref (squatting fix: the ref is `0x<hash lock>:<payer>`); each
+ *  index records the full ref, and the fold requires it to equal the accepted lock frame's own. */
 async function loadNearCaptures(root, notes = []) {
   const nearDir = join(root, "raw", "near");
   const chain = new Map();

@@ -47,6 +47,7 @@ import { evmEvidence, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidence.
 import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
 import { nearEvidence, nearCaptureKey, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
 import { checkNearRailConfig, type NearRailConfig } from "./rails/near-htlc.js";
+import { parseNearRef } from "./rails/near-ref.js";
 import { offerAcceptLockTerms } from "./swap.js";
 import type { Board, BoardInput, LockEvidence, RailObservation, SwapEvidence, SwapLeg } from "./types.js";
 
@@ -285,8 +286,9 @@ export interface FoldCapturedInput {
    *  legContract)` (E1: NOT the bare hash lock — `src/rails/near-evidence.ts`'s own doc explains
    *  why: two different leg contracts can genuinely share one hash lock, and keying by the pair
    *  means neither's capture can ever overwrite or be folded into the other's). The hash lock
-   *  half is a `near-htlc` lock frame's own `.ref`, which must equal the leg's `terms.statement`
-   *  to be picked up at all (D-N4, the same convention as `chain` above); the leg-contract half
+   *  half is the hash-lock part of a `near-htlc` lock frame's own `.ref` (`0x<hash lock>:<payer>`),
+   *  which must equal the leg's `terms.statement` to be picked up at all; the capture's own index
+   *  ref must then equal the frame's full ref (a squatter's pair never stands in); the leg-contract half
    *  is the candidate's own `.contract` (tclk's offer/deal-room contract id — not the NEAR HTLC
    *  contract account, which is fixed per rail config). A candidate whose deal room shows an
    *  accepted `near-htlc` lock but has no entry here gets no evidence for that leg, the same
@@ -465,9 +467,9 @@ export function foldCaptured(input: FoldCapturedInput): Board {
           };
         }
       }
-    } else if (accepted.rail === NEAR_RAIL_ID && accepted.railRef === terms.statement) {
-      // P5-NEAR-SPEC.md §4/D-N4: like evm-htlc, `accepted.railRef` is the hash lock itself
-      // (known before any write), so the same equality-to-`terms.statement` gate applies.
+    } else if (accepted.rail === NEAR_RAIL_ID && parseNearRef(accepted.railRef)?.hashLock === terms.statement) {
+      // P5-NEAR-SPEC.md §4, squatting fix: `accepted.railRef` is `0x<hash lock>:<payer>` (known
+      // before any write); its hash-lock part must equal `terms.statement`.
       if (nearConfigCheck === null) continue; // no chain rail configured: no evidence at all
       if (!nearConfigCheck.ok) {
         // A3 (mirrored for NEAR): a bad config fails every near-htlc leg closed, with the
@@ -484,7 +486,8 @@ export function foldCaptured(input: FoldCapturedInput): Board {
         };
       } else {
         // E1: keyed by (hashLock, legContract) — see `nearChain`'s own doc above.
-        const capture = input.nearChain?.get(nearCaptureKey(accepted.railRef, candidate.contract));
+        const nearRefParts = parseNearRef(accepted.railRef);
+        const capture = input.nearChain?.get(nearCaptureKey(nearRefParts?.hashLock ?? accepted.railRef, candidate.contract));
         if (capture === undefined) continue; // not captured (yet, or ever): evidence absent
         // D-N5: a near-htlc leg posts account-id lines (mirrors evm-htlc's resolveAccounts, not
         // btc-htlc's pubkey resolution) — resolved fresh from the same deal room, never cached
@@ -502,7 +505,23 @@ export function foldCaptured(input: FoldCapturedInput): Board {
         // sits inside a loop that folds *every* candidate in one pass, so an unanticipated throw
         // here must still fail only this one leg closed, never the whole replay.
         try {
-          result = nearEvidence({ terms, config: nearConfigCheck.config, accounts, capture });
+          if (capture.index.ref !== accepted.railRef) {
+            // The capture is keyed by (hash lock, leg contract) only, so it must also name the
+            // very ref the accepted lock frame names — a capture of another payer's lock under
+            // the same hash lock never stands in for this leg's own.
+            result = {
+              lock: {
+                rail: NEAR_RAIL_ID,
+                ref: accepted.railRef,
+                terms,
+                railVerified: null,
+                checkedAtMs: input.nowMs,
+                reason: "near-htlc: the capture's ref differs from the accepted lock frame's ref (payer mismatch)",
+              },
+            };
+          } else {
+            result = nearEvidence({ terms, config: nearConfigCheck.config, accounts, capture });
+          }
         } catch (error) {
           result = {
             lock: {

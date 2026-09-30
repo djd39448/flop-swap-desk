@@ -33,6 +33,7 @@ import { captureEvmLeg, EVM_RAIL_ID, type EvmCapture } from "./rails/evm-evidenc
 import { checkEvmRailConfig, type EvmRailConfig } from "./rails/evm-htlc.js";
 import { captureNearLeg, nearCaptureKey, NEAR_RAIL_ID, type NearCapture } from "./rails/near-evidence.js";
 import { checkNearRailConfig, type NearRailConfig } from "./rails/near-htlc.js";
+import { parseNearRef } from "./rails/near-ref.js";
 import { resolveAccounts } from "./rails/account-line.js";
 import { CapturingRpc, verifiedExchangeBytes, writeCapture } from "./rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "./swap.js";
@@ -711,9 +712,9 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
 
   // Step 2.6c (P5-NEAR-SPEC.md §4): the `near-htlc` twin of Step 2.6 above — same A6 dispatch,
   // same "nothing runs unless the caller configured this rail" rule. Like EVM (and unlike BTC),
-  // near-htlc's own `ref` IS the hash lock (D-N4: known before any write), so the captured index
-  // is keyed and pathed by `terms.statement` exactly like Step 2.6, never a value chosen only at
-  // fund time.
+  // near-htlc's own `ref` is `0x<hash lock>:<payer>` (known before any write; squatting fix), so
+  // the captured index is keyed and pathed by its hash-lock part (= `terms.statement`, E1: plus
+  // the leg contract) and records the full ref, never a value chosen only at fund time.
   if (nearConfig !== undefined) {
     report.nearChainReads = 0;
     report.nearChainReadsSkipped = [];
@@ -732,15 +733,11 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
       const dealRoomRecords = dealRooms.get(room) ?? [];
       const terms = offerAcceptLockTerms(candidate.offer, candidate.accept);
       const accepted = foldAcceptedLock(candidate.offerRecord, candidate.acceptRecord, dealRoomRecords);
-      if (
-        accepted === null ||
-        accepted.rail !== NEAR_RAIL_ID ||
-        accepted.railRef !== terms.statement ||
-        !HASH_LOCK_SHAPE.test(accepted.railRef)
-      ) {
+      const nearRefParts = accepted === null || accepted.rail !== NEAR_RAIL_ID ? null : parseNearRef(accepted.railRef);
+      if (accepted === null || nearRefParts === null || nearRefParts.hashLock !== terms.statement) {
         continue;
       }
-      const hashLock = accepted.railRef;
+      const hashLock = nearRefParts.hashLock;
       // E1: record which leg contract(s) this sweep saw accept this exact hash lock — the
       // collision detector below reports it once every candidate for this sweep has been seen.
       const legContracts = nearHashLockLegContracts.get(hashLock) ?? new Set<string>();
@@ -766,7 +763,7 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
         // capture is still written and fed into this sweep's own live fold, so a later replay's
         // "latest capture" for this hashLock is this sweep's own attempt, never a stale earlier
         // success.
-        const { index, exchanges } = await captureNearLeg(nearRpc, nearConfig, terms, accounts, hashLock, nowMs);
+        const { index, exchanges } = await captureNearLeg(nearRpc, nearConfig, terms, accounts, accepted.railRef, nowMs);
         await writeCapture(root, exchanges);
         // E1: pathed by (hashLock, legContract) — never by hashLock alone — so a copycat pair
         // sharing the same hash lock writes to (and can only ever overwrite within) its own
