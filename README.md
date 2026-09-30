@@ -738,32 +738,80 @@ per-caller registry (no module state) that admits this one id with the `solana` 
 namespace and refuses every id tclk already knows. The id is spelled in exactly one constant
 (`SOL_RAIL_ID`); a test scans `src/` for a second occurrence.
 
-Run the live suite (needs WSL Ubuntu with Rust and Agave v4.3.0 under
+Run the live suites (needs WSL Ubuntu with Rust and Agave v4.3.0 under
 `~/.local/share/agave/v4.3.0/bin`, see `handoff/research/sol-probe/README.md`):
 
 ```bash
 npm run test:sol
 ```
 
-This builds `dist/`, runs `contracts-sol/build.sh` (host tests, the SBF build, the litesvm tests) once,
-requires the built `htlc.so` to hash to the reviewed pin, spawns one throwaway `solana-test-validator`
-through `wsl.exe` (ledger under WSL `/tmp`, killed by pid only), funds fresh in-memory keys through the
-faucet and drives `tests-sol/sol-htlc.sol.test.ts` on real transactions. It takes several minutes: this
-validator finalizes about 13-15 s behind the tip and every write waits for FINALIZED. `npm test`
-(hermetic, `tests/sol-*.test.ts` on a scripted fake node) never starts a process.
+This builds `dist/`, then runs two files one after the other, each with its own throwaway validator:
+`tests-sol/sol-htlc.sol.test.ts` (the adapter and the evidence reader on real transactions) and
+`tests-sol/client-flows.sol.test.ts` (the Seller and Buyer flows end to end). For each it runs
+`contracts-sol/build.sh` (host tests, the SBF build, the litesvm tests) once per process, requires the built
+`htlc.so` to hash to the reviewed pin, spawns one `solana-test-validator` through `wsl.exe` (ledger under WSL
+`/tmp`, killed by pid only), and funds fresh in-memory keys through the faucet. It takes about 25 minutes
+(the client-flow file alone about 13): this validator finalizes about 13-15 s behind the tip, every write
+waits for FINALIZED, and chain time is wall time, so the one scenario that must cross `refundAfterMs` really
+waits about 7 minutes. `npm test` (hermetic, `tests/sol-*.test.ts` on a scripted fake node and the committed
+fixtures) never starts a process.
 
 What is built: the program, the adapter, the evidence reader, the Solana account-line helpers and the
-custom-rails registry, all proven by the hermetic suite and the live suite, and (stage SB3a) the client
-side: `src/client/sol-rail.ts` (`createSolCounterRail`, the `CounterAssetRail` over the adapter, with
+custom-rails registry, all proven by the hermetic suite and the live suite, and the client side:
+`src/client/sol-rail.ts` (`createSolCounterRail`, the `CounterAssetRail` over the adapter, with
 `SOL_LOCAL_POLICY`: 45 min reveal window, 20 min finality, a 5 min claim margin, which must exceed the
 adapter's 120 s claim landing margin or no claim could ever be signed), the Seller/Buyer flows running
 on it, `src/rails/custom-frames.ts` (frame emission for the custom rail id) and the watcher, replay,
 bundle, `bin/watch.mjs` and `examples/audit-export.mjs` wiring (`rails.sol`, `raw/sol/<hash lock>/<leg
-contract>/`). All of it is proven hermetically (`tests/client-flows-sol.test.ts` drives the real flows and
-the real adapter over a stateful fake Solana node that applies the escrow program's own state machine to
-the transactions the adapter sends; `tests/audit-export-sol.test.ts`, `tests/custom-frames.test.ts`).
-**Not built yet (stage SB3b):** client scenarios on the live validator and the `fixtures/sol-localnet-*`
-captures; until then nothing in this repository drives a Solana swap end to end on a real validator.
+contract>/`). The flows are proven twice: hermetically (`tests/client-flows-sol.test.ts` drives the real flows
+and the real adapter over a stateful fake Solana node that applies the escrow program's own state machine to
+the transactions the adapter sends; `tests/audit-export-sol.test.ts`, `tests/custom-frames.test.ts`) and on
+the real validator with the real program (`tests-sol/client-flows.sol.test.ts`, below).
+
+**What the live client-flow suite proves** (real `solana-test-validator`, reviewed `htlc.so`, real signed
+transactions, leg B on tclk's paper rail; one scenario each):
+
+- *settled*: bid, accept, both proven `ed25519` account lines, lock, claim, the Buyer learns the secret from
+  the Seller's reveal frame and claims leg B; balances move by exactly the amount.
+- *refunded*: the Seller never claims; the Buyer's refund is refused by the flow while its clock is early, and
+  by the adapter while the chain's own finalized time has not reached `refundAfterMs` even though wall time
+  has (nothing is sent); once the real chain time passes it the refund lands, the Buyer is repaid in full and
+  the Seller refunds leg B.
+- *refunded-b*: the Buyer never locks; the Seller refunds leg B; no escrow exists on chain.
+- *a claim before the lock is final*: refused with no lock frame at all, and refused with a lock frame posted
+  while the lock is only `confirmed` (the claim reads at FINALIZED); nothing is sent; once final, the same
+  claim goes through.
+- *no reveal frame*: the Seller claims with the reveal suppressed and the Buyer learns the secret from the
+  chain alone.
+- *a claim that lands and fails*: the Seller's claim is made to land and fail on the real chain (the payee's
+  token account is closed just before the claim is forwarded, with its preflight skipped, which is the only way
+  a claim can land and fail). The secret is then public in a failed transaction. Either the Seller posts the
+  reveal and retries at once in public-secret mode and is paid (the escrow's history shows exactly one failed
+  claim with program error 17 and the successful retry), or, when no retry can land, the Buyer refuses to
+  refund (every time it is asked, nothing is sent), learns the secret from the failed transaction and claims
+  leg B.
+- *a squat*: another payer locks under the public hash lock first; the Buyer's own lock and the swap are
+  unaffected and the squatter's escrow stays Locked.
+- *lost replies*: a lock whose send reply was lost is found by `reconcileLockA` (the lock frame posts once);
+  a claim whose reply was lost is recognised from the chain once final, sent only once, frames posted once.
+- *a mirror pair*: a stranger's copy of the victim's two proven lines does not resolve, so the victim's real
+  on-chain lock is never verified for the mirror (and without the proof requirement it would be).
+
+Three fixtures, `fixtures/sol-localnet-2026-09-30/{settled,refunded,refunded-b}/`, are captured from these
+runs and replayed hermetically by `tests/sol-localnet-fixtures.test.ts` through `examples/audit-export.mjs`,
+which also scans every committed file for key material (base58 and base64 64-byte keypairs, 64-number JSON
+arrays, seeds that derive a public key present in the fixture; each shape has a planted-leak test). To
+recapture them:
+
+```bash
+CAPTURE_SOL_FIXTURES=1 npm run test:sol
+```
+
+Commit the result, then confirm that `tests/sol-localnet-fixtures.test.ts` replays it and that a plain
+`npm run test:sol` afterwards leaves `git status` clean (bundles go to `mkdtemp` directories removed at the end;
+`KEEP_SOL_BUNDLES=1` keeps them, `KEEP_SOL_VALIDATOR_HOME=1` keeps the validator's home). `refunded-b`
+carries a live read of the chain for the lock's ref that shows no escrow, and the `rails.json` the replay
+needs to read a swap on the custom rail id at all; it has no Solana write.
 
 **How the custom rail id reaches frames.** tclk's `makeOffer` and `encodeFrame` refuse any rail id outside
 its closed registry, while its decoder, `foldTranscript` and contract machine already read a rail by the
@@ -826,6 +874,20 @@ Only what the tests prove is claimed; the rest is written down.
   verification. The payee comes from the counterparty's own account line.
 - **`claim_by_ms` is enforced by the client only** (the program gates a claim on `refund_after_ms`), so
   leg safety is derived from `refund_after_ms`; see `contracts-sol/README.md`.
+- **The live client-flow suite compresses one window and injects one failure (tests, not product).** A
+  validator has no fast-forward, so the "refunded" scenario sets `refundAfterMs` about 7 real minutes away and
+  runs the flow clock 41 minutes behind wall time, so the flows' own "45 minutes from the declared lock time to
+  refund" rule is still satisfied; the declared lock time is an input of the flows and is never compared with
+  the clock. Everything the chain decides is not compressed (the adapter judges windows against the chain's own
+  finalized time, the program against its own clock; a scenario shows the adapter refusing a refund when wall
+  time has passed `refundAfterMs` but the chain has not). The "claim lands and fails" scenarios close the
+  payee's token account just before the claim is forwarded, with its preflight skipped, because that is the
+  only way a claim can land and fail; nothing in the product does that.
+- **Not exercised end to end live:** a lost reply on a refund (hermetic: `tests/client-flows-sol.test.ts`;
+  the adapter's own recovery by signature is live in `tests-sol/sol-htlc.sol.test.ts`), a claim whose blockhash
+  expires (adapter live suite), and evidence capture under network latency (see the limit above). Timing
+  measured: the client-flow file ran in 779 s on the first full run (11 tests including the 7-minute refund
+  wait; one claim or lock is 15-30 s).
 - **The program is unaudited and localnet-only.** The devnet pin (`SOL_DEVNET_PIN`) has never met a real
   devnet and is marked UNVERIFIED; mainnet is refused by name and by genesis hash. Every write waits for
   FINALIZED (about 15-30 s here); a real cluster's timing was not measured.

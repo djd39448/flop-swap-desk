@@ -1,0 +1,15 @@
+{
+  "sol": {
+    "pin": {
+      "name": "solana-localnet-flop",
+      "caip2": "solana:localnet-flop",
+      "commitment": "finalized"
+    },
+    "endpoint": "http://127.0.0.1:62679",
+    "programId": "GedsjashYAxaoETcwBZQR1YgBbuEaK8QiiKu2qi6xe6C",
+    "programHash": "ae1a357bc2efd927e8538b6a56ef469085f63d7f486bda142af40b65448f1967",
+    "assets": {
+      "USDC": "91cjWuWZvm24ttxccaWHkAcXQcDw1jce4PNqknzRNSMz"
+    }
+  }
+}

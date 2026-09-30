@@ -1,0 +1,27 @@
+{
+  "swapId": "0x7a1e900409c90ef1a824e323ce36b20d769c37b93a1eda6e0430130054577f5b",
+  "legA": {
+    "contract": "0x871295c371887e8a106c1261e8e53f77e4caee110ad57fca6d09f4f88e2ebb6b",
+    "rail": "trustcore.sol-htlc-v1"
+  },
+  "legB": {
+    "contract": "0xddf59860554a9f9ef044466d777dc2e2521c75cd51bd9fb34aaec5e36693a923",
+    "rail": "paper"
+  },
+  "feeBps": 0,
+  "writes": [
+    {
+      "leg": "b",
+      "step": "refund",
+      "rail": "paper",
+      "evidence": {}
+    }
+  ],
+  "startedAtMs": 1790800194744,
+  "finishedAtMs": 1790890194777,
+  "status": "refunded-b",
+  "finalizedRefs": [
+    "paper:sha256:f6ae5af50ed357134cd8188f7310f62fbdc314a843bf18d7735996cb5c9834c8",
+    "solana-localnet-flop:final:1125"
+  ]
+}

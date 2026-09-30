@@ -218,6 +218,57 @@ each shape has a planted-leak test) additionally pins this for the committed fix
 on every `npm test` run. `refunded-b` contains no NEAR bytes at all (the Buyer never locked leg
 A), so it carries no chain evidence of its own.
 
+## First-party Solana-leg files (P6-SOL-SPEC.md) - unaudited, localnet-only
+
+Not vendored: original to this repo, written for the local, keyless Solana leg (`handoff/P6-SOL-SPEC.md`,
+`handoff/P7-ACCOUNT-PROOF-SPEC.md`). Listed per that spec's own instruction, not because anything below
+reuses outside code. **Unaudited, localnet-only**: no deployment this repo drives carries mainnet value
+(mainnet is refused by name and by genesis hash, the devnet pin is marked UNVERIFIED and has never met a real
+devnet), and no private key, seed or keypair for any Solana account exists anywhere in this build: every key
+is generated in process memory (`InMemorySolSigner`, an ES `#private` field) and never written, printed or
+committed. No `@solana/*` npm dependency was added; the Rust crates the program and its tests use
+(`solana-program`, `spl-token-interface`, `litesvm` and their siblings, pinned in `contracts-sol/Cargo.lock` and
+`contracts-sol/htlc-tests/Cargo.lock`) are fetched by cargo under their own licences and are not copied into
+this repository.
+
+- `contracts-sol/htlc/` - the hashed-timelock escrow program (native Rust, no Anchor); `contracts-sol/htlc-tests/`
+  its litesvm tests, run against the built `.so`; `contracts-sol/build.sh`, `smoke.sh`, `smoke_check.py` the WSL
+  build and smoke scripts. See `contracts-sol/README.md` for the guarantees and the client duties.
+- `scripts/cargo-target-dir.sh` - prints a per-worktree `CARGO_TARGET_DIR` (a hash of the worktree path) so two
+  worktrees never overwrite each other's build; the NEAR and Solana build scripts and harnesses all call it.
+- `src/rails/sol-tx.ts`, `sol-spl.ts`, `sol-rpc.ts` - the legacy-transaction codec, the SPL Token encoders and
+  the JSON-RPC client; `sol-htlc.ts` - the adapter (chain pin, program pin, keyless writes, chain-confirmed
+  writes with typed errors); `sol-evidence.ts` - the pure finalized-view evidence reader and the one live
+  capture function; `sol-signer-memory.ts` - the only concrete signer.
+- `src/rails/custom-rails.ts`, `custom-frames.ts` - the per-caller registry that admits the namespaced Solana
+  rail id (`SOL_RAIL_ID`, spelled once) without editing `vendor/tclk`, and frame emission through it.
+  `src/rails/account-line.ts` and `account-proof.ts` gained the Solana helpers and the registry-aware proof
+  message (`ed25519`, P7).
+- `src/client/sol-rail.ts` and `src/client/policy.ts`'s `SOL_LOCAL_POLICY` - the `CounterAssetRail` over the
+  adapter and its deadline policy; the Solana branches of `seller.ts`, `buyer.ts`, `bundle.ts`, `replay.ts`,
+  `watcher.ts`, `bin/watch.mjs` and `examples/audit-export.mjs` (`rails.sol`, `raw/sol/<hash lock>/<leg contract>/`).
+- `tests-sol/helpers/validator.ts`, `run-validator.sh` - the live harness: spawns one throwaway
+  `solana-test-validator` inside WSL with the reviewed `htlc.so` loaded at genesis, creates the mock USDC mint
+  (public data only) and funds fresh in-memory keys through the validator faucet.
+  `tests-sol/sol-htlc.sol.test.ts` - the adapter and evidence reader on the real validator.
+  `tests-sol/client-flows.sol.test.ts` - the Seller/Buyer flows end to end on the real validator (settled,
+  refunded, refunded-b, a claim refused before the lock is final, a secret learned with no reveal frame, a claim
+  that lands and fails, a squat, lost replies, a mirror pair); the hermetic twins are
+  `tests/client-flows-sol.test.ts` and `tests/audit-export-sol.test.ts` on a stateful fake node.
+
+`fixtures/sol-localnet-2026-09-30/{settled,refunded,refunded-b}/` are first-party: real capture bytes from a
+real, local, ephemeral `solana-test-validator` this repo itself starts and stops
+(`tests-sol/client-flows.sol.test.ts`, regenerated only with `CAPTURE_SOL_FIXTURES=1`), not from any external
+service. They hold public chain reads, signed transactions and account-line proofs (signatures), and no key
+material: every account and key they name is a freshly generated, zero-value, in-memory keypair of that run.
+`tests/sol-localnet-fixtures.test.ts` replays them hermetically through `examples/audit-export.mjs` and scans
+every file for key material on every `npm test` run: field names, PEM and mnemonic shapes, a base58 or base64
+token that decodes to 64 bytes whose first 32 bytes derive its last 32 (a Solana keypair), any JSON array of 64
+numbers (the `solana-keygen` file format), and any bare 32-byte base58 or hex token that derives a public key
+already present in the same fixture (each shape has a planted-leak test, and the real captured signatures, the
+same length as a keypair, are shown not to be flagged). `refunded-b` carries no Solana bytes at all (the Buyer
+never locked leg A).
+
 ## Settlement-view vocabulary — pinned to tclk PR #173
 
 `none | unverified | unfunded | funded | claimed | refunded` (per-leg `SwapView.settlementView`,

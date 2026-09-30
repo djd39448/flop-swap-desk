@@ -1,0 +1,49 @@
+{
+ "room": "mb-p-tclk-be2e279bd3bed8b5",
+ "count": 5,
+ "first_seq": 1,
+ "last_seq": 5,
+ "generation": 1,
+ "messages": [
+  {
+   "seq": 1,
+   "ts": "2026-09-30T20:21:55.544Z",
+   "from": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "text": "swap1 account trustcore.sol-htlc-v1 solana:localnet-flop:CMuxSxHEkEUrhMFy3FFwHqm76UwkTMMgDGQSFqnBeABU proof ed25519:881e3ad0e061580dcae8adb2f8145b851c5e39fc9fce711a9179cb34ef2f76ca629065b7c747983c7268584e3eae7000e217d8ca9622d976dfc0ec31a8475501",
+   "nonce": "10001",
+   "sig": "RoiceC1lys_kSeA81yWIJbnn7GvktwCF_UvJUiT7h5Bl9bt_HRa7udkre-S54WO3jAilNmnvL3ypTiwxaBv_CQ"
+  },
+  {
+   "seq": 2,
+   "ts": "2026-09-30T20:21:55.551Z",
+   "from": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+   "text": "swap1 account trustcore.sol-htlc-v1 solana:localnet-flop:CSBU6hnx6LsBZXxpqCqoKZ5su7MPkjMFK3PUj45srMhi proof ed25519:d062d2f4354da5e428e92520d7c6174c1751d28edafc90b3e91370c08b2cd068f1168362cb034fc779c771fcedadeaaa18cbfebfe642a2a7d5beaaf05bdaa109",
+   "nonce": "10002",
+   "sig": "Xb_LwP6ufSoU8WT00P_cc0jaISAdH4v9nO9HGJD-koiX7Vv2FOTkh3rCxq_YFIVE4lzoaMqHC2xwG4WfYlLZCQ"
+  },
+  {
+   "seq": 3,
+   "ts": "2026-09-30T20:22:09.878Z",
+   "from": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+   "text": "tclk1 {\"contract\":\"0xbe2e279bd3bed8b550d8f007433dddc054e3afef657aba529ace69c31c8f5dae\",\"from\":\"did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX\",\"rail\":\"trustcore.sol-htlc-v1\",\"ref\":\"0xfddfa86cf0ab6d528843aa090f2c84219eeecad923031f9e7cd66247aebdd39a:CSBU6hnx6LsBZXxpqCqoKZ5su7MPkjMFK3PUj45srMhi\",\"type\":\"lock\"}",
+   "nonce": "10003",
+   "sig": "VXmWt49ZBVNmJHi7SWr6qqzV3llg5Bvu-hgVebMmj8hNakn-i866yfO6nRK8cEZW--X7S5yOmd-KNyKOLuVoDQ"
+  },
+  {
+   "seq": 4,
+   "ts": "2026-09-30T20:22:24.747Z",
+   "from": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "text": "tclk1 {\"contract\":\"0xbe2e279bd3bed8b550d8f007433dddc054e3afef657aba529ace69c31c8f5dae\",\"from\":\"did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH\",\"ref\":\"0xfddfa86cf0ab6d528843aa090f2c84219eeecad923031f9e7cd66247aebdd39a:CSBU6hnx6LsBZXxpqCqoKZ5su7MPkjMFK3PUj45srMhi\",\"secret\":\"0x0531bb6c9d6c1da0aa6df0c2f1dece503b3017efb5d75b6ceca204205738e812\",\"type\":\"reveal\"}",
+   "nonce": "10004",
+   "sig": "mV6xvhXYHYbQ37U1Z5ZyclyoEVotDaB12uXbsBPyn3Ngg-9hYBG2L6qWvDA8UDhdJxHHb2DyVEXspxCyFf3vCw"
+  },
+  {
+   "seq": 5,
+   "ts": "2026-09-30T20:22:24.749Z",
+   "from": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "text": "tclk1 {\"contract\":\"0xbe2e279bd3bed8b550d8f007433dddc054e3afef657aba529ace69c31c8f5dae\",\"from\":\"did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH\",\"outcome\":\"claimed\",\"rail\":\"trustcore.sol-htlc-v1\",\"ref\":\"0xfddfa86cf0ab6d528843aa090f2c84219eeecad923031f9e7cd66247aebdd39a:CSBU6hnx6LsBZXxpqCqoKZ5su7MPkjMFK3PUj45srMhi\",\"type\":\"receipt\"}",
+   "nonce": "10005",
+   "sig": "U74BsFZ4k8r4o-wjZXQIZwhQRweAXRGdfb-Hv6qCyQv5Lae6gmoeD362s3iF_Y8sMtcx0JHQcQzG3OHkWpaYAw"
+  }
+ ]
+}
