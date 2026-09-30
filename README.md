@@ -402,7 +402,10 @@ completed write, called on the rail directly in a client-flow scenario). Recover
 flows is by hash-lock state (`get_lock`, the reader the flows re-derive their evidence from), not
 by transaction hash: `recoverByTxHash` is a rail primitive pinned against a write that did
 complete, and neither flow calls it. The lock is the only two-step write
-(`prepareLock` signs and records the ref and transaction hash, `commitLock` broadcasts);
+(`prepareLock` signs and records the ref and transaction hash, `commitLock` broadcasts; the
+sandbox suites also run the squat scenario at adapter level and through the client flows: a third
+account locks under the swap's hash lock first, the Buyer's lock still lands, the Seller claims it
+and the squatter refunds only its own unit);
 `claim` and `refund` are single calls. `npm test` never spawns `near-sandbox`, builds no contract and opens no WSL process — a
 missing toolchain or sandbox binary fails `test:near` loudly instead (P4-BTC-SPEC.md §7a's own
 lessons checklist, reused here).
@@ -436,6 +439,23 @@ is a deliberately narrower exception than the Bitcoin/EVM legs' own fully keyles
 has no node-side signer the way a bitcoind wallet or anvil's own accounts do), approved by Dave
 specifically for the sandboxed build (`handoff/P5-NEAR-SPEC.md` §1: "yes, in-memory throwaway
 keys are fine").
+
+**The ref names the payer, so hash-lock squatting is fixed.** The contract keys each lock by
+(payer, hash lock) and the NEAR ref is `0x<hash lock hex>:<payer account id>` (`src/rails/
+near-ref.ts`: `0x` + 64 lowercase hex + `:` + a valid NEAR account id, anything else is invalid).
+It is known before any write (the payer is the Buyer's own signer), so record-before-send still
+holds. Any holder of the configured token can still lock 1 unit under a public hash lock first,
+but that lock sits under the squatter's own key and no longer blocks the Buyer's. The adapter's
+`claim`, `refund`, `findClaimedPreimage`, `checkPendingClaim` and post-write re-reads take the ref
+and pass the payer through (`refund` requires the ref's payer to equal the signer); the evidence
+reader requires the captured `get_lock` request to name exactly the ref's hash lock and payer
+(`{hash_lock, payer}`, nothing else) and the on-chain payer to equal the ref's payer, and a payer
+account line, when present, must agree too; the Seller's G5 rule is now "the accepted lock frame's
+ref must parse and its hash-lock part must equal my own hash lock", taking the payer from the ref
+(the lock frame is the Buyer's signed record). Captures stay keyed by (hash lock, leg contract);
+each index records the full ref, and the fold requires it to equal the accepted lock frame's own.
+Contract signatures and the storage-key layout: `contracts-near/README.md`. A pre-fix bare
+hash-lock ref, or one naming another hash lock, is rejected everywhere.
 
 **A claim is checked before it is ever broadcast.** `NearHtlcRail.claim()` verifies the preimage
 actually opens the hash lock, reads a fresh `Locked` state still inside its window, and confirms
@@ -514,12 +534,6 @@ Each is written down instead of hidden, per the same discipline the EVM and Bitc
   adapter mirrors this: a revealed-but-`Locked` lock is retried without the deadline guards (H2)
   but only after verifying the preimage opens the hash lock, and the evidence reader reports it as
   revealed rather than `locked` (E4).
-- **Hash-lock squatting is not prevented (H7).** Any holder of the configured token can lock 1
-  unit under a public hash lock before the Buyer's real lock lands; the Buyer's lock is then
-  refused and returned, the adapter reports that honestly (`NearLockRefusedError`, so no lock
-  frame is posted), and the swap ends with the Seller refunding leg B. No funds move. The EVM rail
-  has the same property. Keying locks by (payer, hash lock) would fix it but changes the contract
-  API, the ref and the evidence; that is an open decision, not done.
 - **The capture filename stamp is not bound.** `raw/near/<hashLock>/<legContract>/<stamp>.json`:
   the evidence reader sees only the parsed index, never the filename, so the stamp is a sort
   convention. It is not evidence of when a read was taken; the index's own fields are checked

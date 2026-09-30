@@ -145,6 +145,8 @@ comment).
   `send_tx`, `EXPERIMENTAL_tx_status`, `viewAccessKey`) through `CapturingRpc`, including
   `NearUnknownTransactionError`'s own recognition of near-sandbox's real tx-status timeout shape
   (confirmed live against the sandbox, NB-int).
+- `src/rails/near-ref.ts` — the shared NEAR ref helper: `0x<hash lock hex>:<payer account id>`
+  (squatting fix, replacing D-N4's "ref = hash lock"), one parser/formatter every caller uses.
 - `src/rails/near-htlc.ts` — the desk-facing `near-htlc` adapter: chain pin (allow list
   `near-sandbox-flop`/`testnet`), keyless writes via an in-memory `NearSigner` (§1/§4), the
   sign-and-record-then-broadcast split (D-N4; the lock is the only two-step write, `claim` and

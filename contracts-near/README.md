@@ -5,7 +5,8 @@ First-party, unaudited, testnet-only NEAR contracts for the FLOP swap desk's NEA
 
 - **`htlc`** — the hashed-timelock contract. Any configured NEP-141 token's `ft_transfer_call`
   locks funds behind a sha256 hash lock; a payee reveals the 32-byte preimage to `claim`, or
-  the payer `refund`s after a deadline.
+  the payer `refund`s after a deadline. Locks are keyed by (payer, hash lock) — see "Lock keys and
+  method signatures" below.
 - **`mock-ft`** — a test-only NEP-141 + NEP-145 token standing in for Circle's NEAR USDC (6
   decimals, symbol `USDC`, owner-minted), exactly like `MockERC20` on the EVM leg.
 
@@ -13,6 +14,23 @@ This directory went through an NB1 fix pass (2026-09-29) against an opus review 
 one critical, one high, two medium and four low fund-safety/hygiene findings (F1–F8). All
 eight are fixed or documented below; see the git log (`NB1 fix F1`..`F8`) for the detailed
 per-finding rationale and the test that fails without each fix.
+
+## Lock keys and method signatures
+
+Locks are keyed by **(payer, hash lock)**: the storage key is `"<payer account>:<hash_lock hex>"`
+(helper `lock_key`; a NEAR account id never contains `:`, so the key is unambiguous). The payer is
+the account that sent the `ft_transfer_call` (`sender_id` in `ft_on_transfer`).
+
+| Method | Signature | Notes |
+|---|---|---|
+| `ft_on_transfer` | `(sender_id, amount, msg)` | stores the lock under `(sender_id, hash_lock)`; refuses a duplicate only for that same pair |
+| `get_lock` | `(hash_lock, payer)` | view; `null` when that pair has no lock |
+| `claim` | `(hash_lock, payer, preimage)` | still permissionless; pays the stored payee; names the lock's payer |
+| `refund` | `(hash_lock)` | keyed by `(predecessor_account_id, hash_lock)`: only the payer's own account can reach its own lock |
+| `on_transfer_complete` | `(hash_lock, payer, exit, result)` | private callback |
+
+The desk's NEAR ref is `0x<hash lock hex>:<payer account id>` (`src/rails/near-ref.ts`); it is
+known before any write, and every adapter call derives `hash_lock` and `payer` from it.
 
 ## What the `htlc` contract guarantees
 
@@ -27,9 +45,7 @@ per-finding rationale and the test that fails without each fix.
   account (F3). This closes direct-call storage-spam (a non-token account can no longer occupy or
   drain the contract's own storage staking by calling `ft_on_transfer` directly with no real
   transfer behind it), at the cost of making the contract single-token per deployment — see
-  "Known limits" below. It does NOT close hash-lock squatting: any holder of the configured token
-  can still lock 1 unit under a public hash lock before the real payer's own lock lands — see
-  "Known limits".
+  "Known limits" below.
   `ft_on_transfer` also validates `msg` strictly: unknown JSON fields are refused
   (`deny_unknown_fields`), and `claim_by_ms`/`refund_after_ms` must be a plain digit string
   with no leading `+` or leading zero (F8).
@@ -42,6 +58,12 @@ per-finding rationale and the test that fails without each fix.
   lock time; `claim` only overwrites it in place, never changes the entry's serialized size
   (F2). A `claim` can never fail on storage staking that a lock's own creation didn't already
   cover.
+- **Hash-lock squatting is closed.** A third party who locks 1 unit under a public hash lock
+  first occupies only its own `(squatter, hash_lock)` key: the real payer's lock, under
+  `(payer, hash_lock)`, still succeeds, is claimed and refunded on its own, and a squatter's lock
+  can be neither claimed against nor refunded through the real payer's key (`claim` names the
+  payer, `refund` is keyed by the caller). The squatter can only refund its own unit after its own
+  window. (Before this fix, locks were keyed by the hash lock alone and the first writer won.)
 - **A revealed lock can't be refunded out from under the payee.** Once `claim` has verified a
   preimage (even if the payout callback then fails and `status` reverts to `Locked`), `refund`
   is refused and `claim` may keep retrying regardless of `refund_after_ms` (F4). The payer is
@@ -95,12 +117,11 @@ per-finding rationale and the test that fails without each fix.
   deposit from their caller — anyone may call `claim` permissionlessly by design (the payee
   doesn't need a NEAR balance to be paid), and `refund` is restricted to the payer by account
   id instead.
-- **Hash-lock squatting is possible (H7, not fixed).** Locks are keyed by the hash lock alone.
-  Any holder of the configured token can lock 1 unit under a public hash lock first; the real
-  payer's own lock is then refused as a duplicate and returned in full. No funds move; the swap
-  ends with the other side refunding. The EVM rail has the same property. Keying locks by
-  (payer, hash lock) would close it but changes the contract API, the ref and the evidence, so it
-  is left as a decision.
+- **Storage per lock grows with the payer's account id.** The key is `"<payer>:<hash lock hex>"`,
+  so a lock costs the payer-account length plus one byte more storage than a bare hash-lock key.
+  (The F2 reserve check still covers it.) A squatter's 1-unit lock still costs the contract
+  storage staking; the F2 reserve check refuses new locks when the contract can no longer afford
+  them, exactly as before.
 - **A revealed lock cannot be refunded (F4).** If the payee named in a lock never registers
   storage on the token, a revealed lock can neither pay out nor be refunded; the payer's funds stay
   in it. The payer keeps the preimage for the other leg.
