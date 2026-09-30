@@ -202,20 +202,55 @@ real block on the chain it was read from, so anyone with their own RPC access to
 re-query `locks(hashLock)` at that exact block hash and compare against what this build
 reported, independent of this repository entirely.
 
-### Known limits of chain evidence (all three chain legs; recorded 2026-09-30, R3-1)
+### Proof-of-control account lines (all three chain legs; closes R3-1, 2026-09-30)
 
-- **Chain evidence proves that a lock with these terms exists and was claimed or refunded on
-  chain, not which tclk contract it belongs to.** The on-chain HTLC does not commit to the tclk
-  contract id, and the account/pubkey lines in the evidence are claims, not proof of control. A
-  stranger can therefore build a mirror pair (their own offers and accepts) that borrows a real
-  swap's on-chain evidence and folds to `settled`. The victim's own status is unaffected and no
-  funds move: the client flows never read a board status. The Seller checks leg A against the hash
-  lock it minted itself, and each party resolves its counterparty's chain accounts only from
-  deal-room lines whose signed record's sender is that counterparty's DID, posted before the
-  accepted lock. Two fixes are under consideration:
-  the lock committing to the contract id (a contract/script change; the EVM contract is vendored),
-  or proof-of-control account lines signed by the chain key. Neither is done in this build; the
-  lock format and the contracts are unchanged.
+The on-chain HTLC does not commit to the tclk contract id, so chain evidence alone shows that a lock
+with these terms exists, not which tclk contract it belongs to. Before this change a stranger could
+build a mirror pair (their own offers and accepts, a different contract id per leg) that re-posted a
+real swap's account or pubkey lines and borrowed its on-chain evidence to fold to `settled`. The
+account and pubkey lines are now proofs of control (`handoff/P7-ACCOUNT-PROOF-SPEC.md`).
+
+**The guarantee.** Every D-08 account or pubkey line carries `proof <scheme>:<signature>[ <key>]`, a
+signature by the chain key that controls the account over the exact message
+`FLOP::swap::account-proof::v1|<did>|<contract id>|<rail id>|<account>`, where `did` is the sender
+of the record that carries the line and `contract id` is the leg's tclk contract. A line counts only
+if its record verifies, its sender is the party's DID, it precedes the accepted lock, and its proof
+verifies for that sender, that contract, that rail and that account. A line without a verifying
+proof is unresolved and fails closed, in the Buyer and Seller flows (`postAccountLineA` posts the
+proven line, through the party's own connected handle; each side resolves only proven lines), the
+evidence readers, the live watcher, the replay, the bundle and `audit-export`. A mirror pair has
+other DIDs and other contract ids, so the victim's proofs do not verify for it: its payee stays
+unresolved, its chain leg reads `railVerified` null with the reason and is never attributed the
+victim's observation, it does not fold to `settled`, and the victim still does
+(`tests/mirror-pair.test.ts`, over the committed settled fixture of each chain). A capture whose
+lines lack proofs replays the same way, with the payee unresolved. Schemes by rail:
+
+- `evm-htlc`: `eip191`, an EIP-191 `personal_sign` by the account; verified by recovering the
+  address. Anvil's node-held accounts sign over RPC, so no key is in this repo's code.
+- `btc-htlc`: `bip322`, a BIP-322 simple signature for the P2WPKH address of the pubkey line's key,
+  signed keylessly by the node wallet (`walletprocesspsbt`) and verified with `@scure/btc-signer`;
+  the BIP's published vectors are pinned in `tests/btc-proof.test.ts`.
+- `near-htlc`: `nep413`, a NEP-413 signed message by a key of the account; the line carries the
+  public key, and the capture reads `view_access_key(account, key)` at the same finalized block as
+  the rest of the evidence and requires a FullAccess permission (a function-call key, a key the
+  account does not hold, another account's key, a missing or mismatched read all give
+  `railVerified` null). The key lives in an in-memory signer (D-N2).
+
+**Its exact scope.**
+
+- It proves that the party who posted a line controls the named chain account (or key) and meant it
+  for this contract and this DID. It does not make the chain lock itself commit to the contract id:
+  the on-chain lock format, the contracts and the vendored files are unchanged.
+- It stops the mirror pair that does not control the victim's accounts. A stranger who does control
+  the accounts it names (its own real lock, or a party colluding with the victim) is not stopped
+  by this and is not claimed to be: that is a swap, not a mirror of someone else's.
+- EVM proofs are EOA signatures. A contract account (EIP-1271) has no `eip191` proof and is
+  refused. The Bitcoin proof is for the P2WPKH address of the key, not for the funded P2WSH.
+- NEAR's key-on-account check is a read at the capture's finalized block. A later key deletion is
+  not seen, and a capture taken before this change has no key read and replays unverified.
+- The `rails.json` and capture formats gained the key reads for NEAR only; every chain fixture was
+  recaptured once for this change (the deal-room lines changed). The 2026-09-18 paper rehearsal is
+  unaffected. Solana adopts the same rule (`ed25519`) when its branch is rebased onto this one.
 
 ### Known limits of the EVM leg (recorded 2026-09-28 after three review rounds)
 
@@ -259,7 +294,7 @@ same `CounterAssetRail` interface `src/client/evm-rail.ts` does (`src/client/cou
 "one client, many rails"), so `src/client/seller.ts`/`buyer.ts` drive a `btc-htlc` leg through the
 identical Seller/Buyer flow, with a P2WSH script committing to **both** parties' public keys
 (unlike an EVM EOA lock) exchanged as a D-08 pubkey line (`swap1 pubkey btc-htlc bip122:<genesis
-prefix> <pubkey>`, `src/rails/account-line.ts`) rather than an address line.
+prefix> <pubkey> proof bip322:<sig>`, `src/rails/account-line.ts`) rather than an address line.
 
 Run it:
 
@@ -418,7 +453,7 @@ reader, the NEAR twin of `src/rails/evm-evidence.ts`/`src/rails/btc-evidence.ts`
 near-rail.ts` implements the same `CounterAssetRail` interface the EVM/Bitcoin legs do, so `src/
 client/seller.ts`/`buyer.ts` drive a `near-htlc` leg through the identical Seller/Buyer flow.
 Unlike Bitcoin's dual-pubkey script, a `near-htlc` leg posts a single D-08 ACCOUNT-id line per
-party (`swap1 account near-htlc near:<chain id>:<account id>`, D-N5) — the contract authorizes
+party (`swap1 account near-htlc near:<chain id>:<account id> proof nep413:<sig> <key>`, D-N5) — the contract authorizes
 by NEAR account id (`predecessor_account_id`), not by a pubkey the script itself commits to.
 
 Run it:
@@ -515,8 +550,9 @@ hash; the result must itself name that block). It reports a verdict only when th
 `railVerified` is null with the reason. `htlcCodeHash` also joins the captured-versus-auditor config
 comparison, so a capture taken under a different pin never replays under the auditor's. The fixed
 read order is now status, block, `get_lock`, `view_account`, `view_access_key_list`, then
-`storage_balance_of` (only when a payee account line exists); fixtures taken before H8 lack the two
-reads and replay as unverified until recaptured.
+`storage_balance_of` (only when a payee account line exists), then one `view_access_key` per proven
+line's key (see "Proof-of-control account lines"); fixtures taken before H8 lack the two reads and
+replay as unverified until recaptured.
 
 **A claim is checked before it is ever broadcast.** `NearHtlcRail.claim()` verifies the preimage
 actually opens the hash lock, reads a fresh `Locked` state still inside its window, and confirms

@@ -237,7 +237,25 @@ independently of tclk's own choreography status (H3, tclk#180/#181). Vendored tc
 observation folded a swap to `settled`, and two pairs with the same buyer and nonce shared one
 evidence entry. Both are first-party changes; nothing is vendored or copied from that review beyond
 the two reproductions, which are regression tests in `tests/binding.test.ts`. No capture or
-evidence file format changed, so no fixture was recaptured. Round 2 of the review (V3-V8, P5-NEAR-FIXES-R2.md) removed the shared-swapId evidence blanking, kept only genuine accepts for candidates and evidence keys, paired leg B with leg A's accepter, made a refund frame insufficient for chain legs, and keyed the watcher, bundle and audit-export by pair; all first-party. Round 3 (R3-2, R3-3) made the board prefer the crossing pair and kept a stranger's copy of a swapId out of the bundle and `--expect`; the evidence section of the README records (R3-1) that chain evidence does not bind a lock to a tclk contract, so a mirror pair can borrow it - nothing here claims otherwise, and no contract or lock format changed.
+evidence file format changed, so no fixture was recaptured. Round 2 of the review (V3-V8, P5-NEAR-FIXES-R2.md) removed the shared-swapId evidence blanking, kept only genuine accepts for candidates and evidence keys, paired leg B with leg A's accepter, made a refund frame insufficient for chain legs, and keyed the watcher, bundle and audit-export by pair; all first-party. Round 3 (R3-2, R3-3) made the board prefer the crossing pair and kept a stranger's copy of a swapId out of the bundle and `--expect`; the R3-1 limit it recorded (chain evidence does not bind a lock to a tclk contract, so a mirror pair could borrow it) is closed by the proof-of-control lines described below; no contract or lock format changed.
+
+## Proof-of-control account lines (P7, handoff/P7-ACCOUNT-PROOF-SPEC.md)
+
+`src/rails/account-proof.ts` (message, `proof` field grammar, verifier registry, `eip191` and
+`ed25519`), `src/rails/btc-proof.ts` (`bip322`), `src/rails/near-proof.ts` (`nep413`) and the
+`proof` field of `src/rails/account-line.ts` close R3-1 (the mirror-pair limit). All first-party
+code written from public specifications, none copied: EIP-191 (personal_sign), BIP-322
+(`bitcoin/bips` bip-0322.mediawiki; its published test vectors, the `L3VFeEuj...` key and the
+messages "" and "Hello World", are pinned in `tests/btc-proof.test.ts`) and NEP-413
+(`near/NEPs` nep-0413.md; the Borsh payload is cross-checked against an independent encoding in
+`tests/near-proof.test.ts`). Verification uses `viem`, `@scure/btc-signer` and the `@noble/*`
+packages already in the tree; no dependency was added. The message string
+`FLOP::swap::account-proof::v1|<did>|<contract>|<rail>|<account>` is this desk's own. No contract,
+lock format or vendored file changed, and no key material is committed: the fixtures carry proofs
+(signatures and public keys) and on-chain reads only. Every chain fixture was recaptured once for
+this change because the deal-room lines changed; the swap ids and statuses are unchanged
+(`tests/evm-anvil-fixtures.test.ts`, `tests/btc-regtest-fixtures.test.ts`,
+`tests/near-sandbox-fixtures.test.ts`; the NEAR squat fixture settles).
 
 ## Reveal latches and signer error text (P5-NEAR-FIXES-R2.md G6, D4)
 

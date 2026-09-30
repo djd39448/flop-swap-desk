@@ -307,6 +307,11 @@ export interface NearSandboxHandle {
    *  rather than unregistering when the caller's balance is nonzero, so `sandbox.seller` — reused
    *  and credited across this whole file's own tests — is never safe to reuse for that). */
   createFundedAccount(accountId: string): Promise<{ accountId: string; signer: NearSigner }>;
+  /** Test support only (P7): a fresh, funded sub-account of `test.near` with its own in-memory
+   *  FullAccess key that is deliberately NOT storage-registered on the token -- the payee of a
+   *  payout that cannot land. Under proof-of-control the payee's account line must be signed by a
+   *  key of that account, so a test that needs an unregistered payee needs a signer for it. */
+  createUnregisteredAccount(accountId: string): Promise<{ accountId: string; signer: NearSigner }>;
   /** Test support only: mints `amount` micro-USDC to an already storage-registered account (the
    *  token is self-owned, so the setup signer can mint) — e.g. a squatter that needs a unit to lock. */
   mintUsdc(accountId: string, amount: string): Promise<void>;
@@ -511,6 +516,11 @@ export async function startNearSandbox(options: StartNearSandboxOptions = {}): P
         const result = await near.callFunction("usdc.test.near", "ft_balance_of", { account_id: accountId });
         setupRpc.drain();
         return JSON.parse(result.resultText) as string;
+      },
+      createUnregisteredAccount: async (accountId) => {
+        const signer = await createSubAccount(near, rootSigner, accountId, 20n * ONE_NEAR);
+        setupRpc.drain();
+        return { accountId, signer };
       },
       createFundedAccount: async (accountId) => {
         const signer = await createSubAccount(near, rootSigner, accountId, 20n * ONE_NEAR);

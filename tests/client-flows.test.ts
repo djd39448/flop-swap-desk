@@ -29,6 +29,7 @@
 
 import {
   MemoryNoteStore,
+  dealRoom,
   OFFER_ROOM,
   PaperRail,
   encodeFrame,
@@ -53,6 +54,7 @@ import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { swapId as computeSwapId } from "../src/profile.js";
+import { formatAccountLine, parseAccountLine, resolveAccounts } from "../src/rails/account-line.js";
 import { evmSigner } from "./helpers/proven-lines.js";
 import { identity, record, unsignedRecord, type Identity } from "./helpers/identity.js";
 
@@ -489,6 +491,40 @@ describe("BuyerFlow.lockLegA — refusals never touch the network", () => {
     await h.buyerFlow.verifyLegBLocked();
     // Deliberately never call sellerFlow.postAccountLineA.
     await expect(h.buyerFlow.lockLegA()).rejects.toThrow(/Seller's account line has not resolved/);
+  });
+
+  // P7: a line with no proof, or a proof for another DID, contract or account, is never resolved.
+  it.each([
+    ["an unproven line", (_contract: string, _did: string) => formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: SELLER_ACCOUNT })],
+    ["a line proven for another contract", (_contract: string, did: string) => SELLER_SIGNER.line({ did, contract: `0x${"ab".repeat(32)}`, caip2: ANVIL_LOCAL_PIN.caip2 })],
+    ["a line proven for another DID", (contract: string, _did: string) => SELLER_SIGNER.line({ did: `did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK`, contract, caip2: ANVIL_LOCAL_PIN.caip2 })],
+  ])("refuses to lock when the Seller's only line is %s (P7)", async (_label, makeLine) => {
+    const h = harness(40, 41);
+    const { offerBRecord, acceptARecord, acceptA } = await bidAndAcceptA(h, "00000001");
+    const { acceptBRecord } = await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0);
+    await h.sellerFlow.lockLegB(acceptBRecord);
+    await h.buyerFlow.verifyLegBLocked();
+    await h.venue.post(dealRoom(acceptA.contract), makeLine(acceptA.contract, h.seller.did), h.seller);
+    await expect(h.buyerFlow.lockLegA()).rejects.toThrow(/Seller's account line has not resolved/);
+  });
+
+  it("the flows post proven lines: each line carries an eip191 proof that verifies for its sender, this leg's contract and its own account, and resolves", async () => {
+    const h = harness(42, 43);
+    const { acceptA } = await pairLockBAndAccountLines(h, "00000001");
+    const records = await h.venue.read(dealRoom(acceptA.contract));
+    const lines = records.map((r) => ({ sender: r.sender, parsed: parseAccountLine(r.line) }));
+    expect(lines).toHaveLength(2);
+    for (const { parsed } of lines) expect(parsed?.proof?.scheme).toBe("eip191");
+    const resolved = resolveAccounts(records, {
+      contract: acceptA.contract,
+      payerDid: h.buyer.did,
+      payeeDid: h.seller.did,
+      rail: "evm-htlc",
+      caip2: ANVIL_LOCAL_PIN.caip2,
+      proof: { mode: "required" },
+    });
+    expect(resolved.payee).toBe(SELLER_ACCOUNT.toLowerCase());
+    expect(resolved.payer).toBe(BUYER_ACCOUNT.toLowerCase());
   });
 });
 

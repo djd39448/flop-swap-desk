@@ -24,6 +24,7 @@ import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.j
 import { offerAcceptLockTerms } from "../src/swap.js";
 import { NEAR_SANDBOX_PIN, type NearRailConfig } from "../src/rails/near-htlc.js";
 import { nearCaptureKey } from "../src/rails/near-evidence.js";
+import { formatAccountLine } from "../src/rails/account-line.js";
 import { identity, record } from "./helpers/identity.js";
 import { nearSigner } from "./helpers/proven-lines.js";
 // @ts-expect-error plain .mjs, no type declarations
@@ -452,6 +453,24 @@ describe("examples/audit-export.mjs — near-htlc leg end to end", () => {
     const swap = parsed.swaps.find((s: { swapId: string }) => s.swapId === fixture.swapId);
     expect(swap).toBeDefined();
     expect(swap.settlementView.a).toBe("funded");
+  });
+
+  // P7: only proven lines resolve. The same capture with unproven account lines replays with the
+  // payee unresolved, railVerified null with the reason, and leg A is never reported funded.
+  it("P7: a capture whose account lines lack proofs replays with the payee unresolved (railVerified null with the reason)", async () => {
+    const fixture = buildNearFixture();
+    fixture.dealRoomARows[0] = record(fixture.dealRoomA, 1, T0 + 4 * MIN, seller, formatAccountLine({ railId: "near-htlc", caip2: NEAR_SANDBOX_PIN.caip2, address: PAYEE_ACCOUNT }));
+    fixture.dealRoomARows[1] = record(fixture.dealRoomA, 2, T0 + 4 * MIN + 1, buyer, formatAccountLine({ railId: "near-htlc", caip2: NEAR_SANDBOX_PIN.caip2, address: PAYER_ACCOUNT }));
+    await writeWatchRoot(root, fixture, { rails: { near: NEAR_CONFIG } });
+
+    const result = run(["--root", root, "--json"]);
+    expect(result.status).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    const swap = parsed.swaps.find((s: { swapId: string }) => s.swapId === fixture.swapId);
+    expect(swap).toBeDefined();
+    expect(swap.settlementView.a).not.toBe("funded");
+    expect(swap.evidence.a.railVerified).toBeNull();
+    expect(swap.evidence.a.reason).toMatch(/payee/);
   });
 
   it("a genuine response from a DIFFERENT capture (the donor's own nonce id) leaves leg A without chain evidence, naming the capture binding", async () => {

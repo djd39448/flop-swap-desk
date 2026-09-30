@@ -156,14 +156,14 @@ interface Party {
   rpc: CapturingRpc;
 }
 
-function setupSwap(sandbox: NearSandboxHandle, config: NearRailConfig, buyer: Party, seller: Party, t0: number) {
+function setupSwap(sandbox: NearSandboxHandle, config: NearRailConfig, buyer: Party, seller: Party, t0: number, sellerSigner: NearSigner = sandbox.seller.signer) {
   const clockRef = { ms: t0 };
   const clock = () => clockRef.ms;
   const venue = new MemoryVenue(clock);
   const noteStore = new MemoryNoteStore();
 
   const buyerRail: CounterAssetRail = createNearCounterRail({ config, rpc: buyer.rpc, signer: sandbox.buyer.signer, clock });
-  const sellerRail: CounterAssetRail = createNearCounterRail({ config, rpc: seller.rpc, signer: sandbox.seller.signer, clock });
+  const sellerRail: CounterAssetRail = createNearCounterRail({ config, rpc: seller.rpc, signer: sellerSigner, clock });
 
   const buyerFlow = new BuyerFlow({ identity: buyer.identity, venue, paperRail: new PaperRail(noteStore, clock), rail: buyerRail, clock });
   const sellerFlow = new SellerFlow({ identity: seller.identity, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock });
@@ -275,6 +275,9 @@ describe("Seller/Buyer client flows against a real near-sandbox node", () => {
     return {
       ...(resolved.payee === undefined ? {} : { payee: resolved.payee }),
       ...(resolved.payer === undefined ? {} : { payer: resolved.payer }),
+      // P7: the proven lines' keys ride along so the bundle's capture reads them on chain.
+      ...(resolved.payeeKey === undefined ? {} : { payeeKey: resolved.payeeKey }),
+      ...(resolved.payerKey === undefined ? {} : { payerKey: resolved.payerKey }),
     };
   }
 
@@ -583,16 +586,15 @@ describe("Seller/Buyer client flows against a real near-sandbox node", () => {
     const buyer = ident(13);
     const seller = ident(14);
     const t0 = await chainNowMs();
-    const h = setupSwap(sandbox, sandbox.config, freshParty(buyer), freshParty(seller), t0);
-
-    // near-htlc's own payout is permissionless and pays whatever account the ACCEPTED account
-    // line named (D-N5), never the caller's own signer account -- so the Seller posting a
-    // deliberately unregistered account here (never created, never storage_deposit'd on the
-    // token) is enough to reproduce P5-NEAR-SPEC.md §4's own no-secret storage_balance_of
-    // pre-check, using only this sandbox's own existing accounts (no new account creation
-    // needed). Mirrors tests-near/near-htlc.near.test.ts's own `unregisteredPayee` at the rail
-    // level, here exercised through the real client flow.
-    const unregisteredPayee = "nobody.test.near";
+    // near-htlc's own payout pays whatever account the ACCEPTED account line named (D-N5). Under
+    // proof-of-control (P7) that line must be signed by a key of the account, so the Seller here IS
+    // a funded account that was never storage_deposit'd on the token: the payout cannot land,
+    // which reproduces P5-NEAR-SPEC.md §4's own no-secret storage_balance_of pre-check. Mirrors
+    // tests-near/near-htlc.near.test.ts's own `unregisteredPayee` at the rail level, here
+    // exercised through the real client flow.
+    const unregistered = await sandbox.createUnregisteredAccount("nobody.test.near");
+    const h = setupSwap(sandbox, sandbox.config, freshParty(buyer), freshParty(seller), t0, unregistered.signer);
+    const unregisteredPayee = unregistered.accountId;
     const { offerA, acceptA } = await pairAndLockB("00000007", buyer, h, t0, unregisteredPayee);
 
     const lockA = await h.buyerFlow.lockLegA();
@@ -685,7 +687,10 @@ describe("Seller/Buyer client flows against a real near-sandbox node", () => {
       const buyer = ident(17);
       const seller = ident(18);
       const t0 = await chainNowMs();
-      const h = setupSwap(sandbox, sandbox.config, freshParty(buyer), freshParty(seller), t0);
+      // P7: the payee is a funded account with a key of its own (the Seller's signer), never
+      // storage_deposit'd on the token -- see scenario 6.
+      const unregistered = await sandbox.createUnregisteredAccount("nobody-g3.test.near");
+      const h = setupSwap(sandbox, sandbox.config, freshParty(buyer), freshParty(seller), t0, unregistered.signer);
 
       // Mirrors scenario 6's own setup (the accepted account line names a payee that was never
       // storage_deposit'd on the token) — G3's own sandbox scenario is this same starting point,
@@ -694,7 +699,7 @@ describe("Seller/Buyer client flows against a real near-sandbox node", () => {
       // (findClaimedPreimage first, for near-htlc) neither block nor mis-route an ordinary retry
       // that never actually revealed anything on its failed first attempt (the adapter's own
       // no-secret storage_balance_of pre-check refuses BEFORE ever signing — P5-NEAR-SPEC.md §4).
-      const unregisteredPayee = "nobody-g3.test.near";
+      const unregisteredPayee = unregistered.accountId;
       const { acceptA } = await pairAndLockB("00000009", buyer, h, t0, unregisteredPayee);
 
       const lockA = await h.buyerFlow.lockLegA();

@@ -30,6 +30,7 @@ import type { EvmCapture, EvmCaptureIndex } from "../src/rails/evm-evidence.js";
 import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
+import { formatAccountLine, formatPubkeyLine } from "../src/rails/account-line.js";
 import { btcSigner, evmSigner } from "./helpers/proven-lines.js";
 import { identity, record } from "./helpers/identity.js";
 
@@ -368,6 +369,76 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     expect(view!.evidence.a?.railVerified).toBe(true);
     expect(view!.evidence.aRail).toMatchObject({ status: "locked", final: true, checkedAtMs: T0, finalizedRef: `anvil-local:finalized:5:${BLOCK_HASH}` });
     expect(view!.status).toBe("a-locked");
+  });
+
+  // P7 (handoff/P7-ACCOUNT-PROOF-SPEC.md): only proven lines resolve. The same a-locked capture, with
+  // each kind of line that must NOT resolve, replays with the payee unresolved: railVerified null
+  // with the reason (the lock is still seen on chain, but no payee is attributed to it).
+  const unprovenEvmCases: Array<[string, (contract: string) => string[]]> = [
+    [
+      "lines with no proof",
+      () => [
+        formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: SELLER_ADDR }),
+        formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: BUYER_ADDR }),
+      ],
+    ],
+    [
+      "lines proven for another contract",
+      () => {
+        const other = `0x${"ab".repeat(32)}`;
+        return [
+          SELLER_EVM.line({ did: seller.did, contract: other, caip2: ANVIL_LOCAL_PIN.caip2 }),
+          BUYER_EVM.line({ did: buyer.did, contract: other, caip2: ANVIL_LOCAL_PIN.caip2 }),
+        ];
+      },
+    ],
+    [
+      "lines proven for another DID",
+      (contract) => [
+        SELLER_EVM.line({ did: buyer.did, contract, caip2: ANVIL_LOCAL_PIN.caip2 }),
+        BUYER_EVM.line({ did: seller.did, contract, caip2: ANVIL_LOCAL_PIN.caip2 }),
+      ],
+    ],
+    [
+      "a line naming an account whose key did not sign it",
+      (contract) => [
+        // The Seller's key signs a message for its own address, then the line names the Buyer's.
+        SELLER_EVM.line({ did: seller.did, contract, caip2: ANVIL_LOCAL_PIN.caip2, address: BUYER_ADDR }),
+        BUYER_EVM.line({ did: buyer.did, contract, caip2: ANVIL_LOCAL_PIN.caip2 }),
+      ],
+    ],
+  ];
+  it.each(unprovenEvmCases)("P7: a capture with %s replays with the payee unresolved (railVerified null with the reason)", (_label, makeLines) => {
+    const s = buildMixedSwapBase("f0a1f0a1f0a1f0a1");
+    const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: s.lock.hash };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const [sellerLine, buyerLine] = makeLines(s.legAAccept.contract);
+    const dealRoomsA = [
+      record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
+      record(s.dealRoomA, 2, T0 + 4.5 * MIN, seller, sellerLine!),
+      record(s.dealRoomA, 3, T0 + 4.5 * MIN + 1, buyer, buyerLine!),
+    ];
+    const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+    const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+    const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
+
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal
+
+${noteBValue}
+`, endpoint: "kv:test" }]]),
+      chain: new Map([[s.lock.hash, capture]]),
+      rails: { evm: EVM_CONFIG },
+      nowMs: T0 + 6 * MIN,
+    });
+
+    const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+    expect(view).toBeDefined();
+    expect(view!.evidence.a?.railVerified).toBeNull();
+    expect(view!.evidence.a?.reason).toMatch(/payee has no account line/);
+    expect(view!.status).not.toBe("a-locked");
   });
 
   it("settled: both legs reveal, and both rails report a final claim", async () => {
@@ -1042,6 +1113,74 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     expect(view!.evidence.a?.railVerified).toBe(true);
     expect(view!.evidence.aRail).toMatchObject({ status: "locked", final: true, checkedAtMs: T0, finalizedRef: `btc-regtest:confirmations-1:109:${FUNDING_BLOCK_HASH}` });
     expect(view!.status).toBe("a-locked");
+  });
+
+  // P7: only proven pubkey lines resolve (see the evm-htlc block's twin above).
+  const unprovenBtcCases: Array<[string, (contract: string) => string[]]> = [
+    [
+      "lines with no proof",
+      () => [
+        formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYEE_PUBKEY }),
+        formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYER_PUBKEY }),
+      ],
+    ],
+    [
+      "lines proven for another contract",
+      () => {
+        const other = `0x${"ab".repeat(32)}`;
+        return [
+          SELLER_BTC.line({ did: seller.did, contract: other, caip2: BTC_REGTEST_PIN.caip2 }),
+          BUYER_BTC.line({ did: buyer.did, contract: other, caip2: BTC_REGTEST_PIN.caip2 }),
+        ];
+      },
+    ],
+    [
+      "lines proven for another DID",
+      (contract) => [
+        SELLER_BTC.line({ did: buyer.did, contract, caip2: BTC_REGTEST_PIN.caip2 }),
+        BUYER_BTC.line({ did: seller.did, contract, caip2: BTC_REGTEST_PIN.caip2 }),
+      ],
+    ],
+    [
+      "a line naming a pubkey whose key did not sign it",
+      (contract) => [
+        SELLER_BTC.line({ did: seller.did, contract, caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYER_PUBKEY }),
+        BUYER_BTC.line({ did: buyer.did, contract, caip2: BTC_REGTEST_PIN.caip2 }),
+      ],
+    ],
+  ];
+  it.each(unprovenBtcCases)("P7: a capture with %s replays with the pubkeys unresolved (railVerified null with the reason)", (_label, makeLines) => {
+    const s = buildBtcSwapBase("b0a1b0a1b0a1b0a1");
+    const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const [sellerLine, buyerLine] = makeLines(s.legAAccept.contract);
+    const dealRoomsA = [
+      record(s.dealRoomA, 1, T0 + 4 * MIN, seller, sellerLine!),
+      record(s.dealRoomA, 2, T0 + 4 * MIN + 1, buyer, buyerLine!),
+      record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
+    ];
+    const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+    const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+    const locktime = s.legATerms.refundAfterMs / 1000;
+    const capture = buildBtcCapture({ exchanges: unspentExchanges(s.lock.hash, locktime, 2) });
+
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal
+
+${noteBValue}
+`, endpoint: "kv:test" }]]),
+      btcChain: new Map([[REF, capture]]),
+      rails: { btc: BTC_CONFIG },
+      nowMs: T0 + 6 * MIN,
+    });
+
+    const view = board.swaps.find((sw) => sw.swapId === s.swapId);
+    expect(view).toBeDefined();
+    expect(view!.evidence.a?.railVerified).toBeNull();
+    expect(view!.evidence.a?.reason).toMatch(/pubkey/i);
+    expect(view!.status).not.toBe("a-locked");
   });
 
   it("settled: both legs reveal, and both rails report a final claim", async () => {
