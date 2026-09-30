@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// examples/audit-export.mjs against the three committed near-sandbox capture fixtures
+// examples/audit-export.mjs against the four committed near-sandbox capture fixtures
 // (P5-NEAR-SPEC.md §5): byte-exact, watch-root-shaped bundles of a real Seller/Buyer client-flow
 // run (tests-near/client-flows.near.test.ts) against a real, local `near-sandbox` node (chain id
 // `near-sandbox-flop`, D-N3) — captured once (`CAPTURE_NEAR_FIXTURES=1 npm run test:near`),
@@ -41,7 +41,7 @@ interface Case {
 }
 
 // One entry per fixture directory under fixtures/near-sandbox-2026-09-29/ — swapId and expected
-// status/settlementView as tests-near/client-flows.near.test.ts's own scenarios 1-3 produced them
+// status/settlementView as tests-near/client-flows.near.test.ts's own scenarios produced them
 // (re-derive by running `node examples/audit-export.mjs --root <dir> --json` if the fixtures are
 // ever recaptured, `CAPTURE_NEAR_FIXTURES=1 npm run test:near`).
 const CASES: Case[] = [
@@ -62,6 +62,14 @@ const CASES: Case[] = [
     swapId: "0x7a1e900409c90ef1a824e323ce36b20d769c37b93a1eda6e0430130054577f5b",
     status: "refunded-b",
     settlementView: { a: "none", b: "refunded" },
+  },
+  {
+    // The squatting-fix scenario (tclk#194): a third account locked under the swap's hash lock
+    // first, and the swap still settled.
+    scenario: "squat",
+    swapId: "0x8a6d360403e80468bde046a1062f6850356f39bac3536c1c56e7e5791fcb42e9",
+    status: "settled",
+    settlementView: { a: "claimed", b: "claimed" },
   },
 ];
 

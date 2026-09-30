@@ -1,11 +1,11 @@
 {
   "swapId": "0x4096f1d32d53d44c63b4554ea849511ce01895e6de56d86ab3a257f4bc1fb80e",
   "legA": {
-    "contract": "0x78cdc359da1ade0eaa86a94a120e0dc2c16d6c958725dacd3dadcef5c1d0f833",
+    "contract": "0x484026fb367a193d64844e6f67e03a2183df8344fe52e0393945682cd1ecbdd1",
     "rail": "near-htlc"
   },
   "legB": {
-    "contract": "0xe1d1f339e963844ae39434c507e7273d13a9b62d7972b52c9316c033edb0cdeb",
+    "contract": "0xf660bb0f0c5983a7bd3f25c2d075e4bdca2b827cf0d6a512d2942ee0fc9f633c",
     "rail": "paper"
   },
   "feeBps": 0,
@@ -15,14 +15,14 @@
       "step": "lock",
       "rail": "near-htlc",
       "evidence": {
-        "ref": "0xe218cc0a584a2288f7e8eaecdb6dd792fd3629dd07e11ab431ceeb2eef4cb569:buyer.test.near",
-        "txHash": "FQAL5fDXE9m6tK5aFk5ySy2Xz5zS3nwF6zPqQ5opiquQ",
+        "ref": "0x74a129e05e516a7d691f21197bbe08a1e2704ba6eddd86eb2dd3dac3f90e918b:buyer.test.near",
+        "txHash": "G5etXjAX8zUXxNbSQ5dM39G1zQZWeNE9bkoMmLxMsVf4",
         "blockHeight": 62,
-        "blockHash": "2m2ZqWcN3gSXvjih9YW3agFoLzQELzbok5DgHwwTjR43",
+        "blockHash": "93EbrKgVs11wkBDKKscngUx7Zpk2RsTWZGwLHkZ94EXf",
         "raw": [
-          "fdd9400f268eed3c07d9dcee495b59dd9d39d1daf720e6ecd9ab8838b80861a0",
-          "3aeb6fbed5736370c0b609b20d4024c09315dd9d67c5e7bb30d5dfcfd8059189",
-          "c80c3d8e3c9df24ba16ad3bfee32364ac0efeabc6c764d76cee5710653bd3d9e"
+          "5aeae7fe154b91dfb2764e8d10088ac3b67115b30a1a745aa23f18f69b5bdda2",
+          "bc79a99fa1fceecfcb165d1c6d82563293206bd6d909541bc0879fda08a6edf9",
+          "32566392dccc0a2686dcb2c1108ed13e9cc2ccf3028167a1430ba844c73b38ff"
         ]
       }
     },
@@ -31,23 +31,23 @@
       "step": "claim",
       "rail": "near-htlc",
       "evidence": {
-        "ref": "0xe218cc0a584a2288f7e8eaecdb6dd792fd3629dd07e11ab431ceeb2eef4cb569:buyer.test.near",
-        "txHash": "J9L3DQyCZqc1evoejEwRRQzoPUJP8LcPGi7eo9xqvRhZ",
+        "ref": "0x74a129e05e516a7d691f21197bbe08a1e2704ba6eddd86eb2dd3dac3f90e918b:buyer.test.near",
+        "txHash": "3oiVskA1AH5DXMsVTWE3sW3h7XsEJk3m67xxuerEZD4g",
         "blockHeight": 70,
-        "blockHash": "DiSKKMspFeLRKtD1MDG7UgoPULVReRoMcE8NkD3Fomr2",
+        "blockHash": "CC9sxR9SQH1ySBVCvcvizDqtbQwv1VPHHyKMCDE3Drc1",
         "raw": [
-          "5aa2e59d9f8131494cd04fceac746dccc903d9ac572aed9a8b0c342bf7aac95f",
-          "1b372f5d290b1ea0bc1ba88c0c2362fdd6c915c2573d6faee7cd0a903639e20f",
-          "26e7177454097b8a4b96b11c072e0c5935b7410dc4b38447acddd0f73c3bef6b"
+          "569725074c67500d1b97c47a28d03bc29c705900139207a6f7986a1acb123064",
+          "253caba68d00057d43c2523350ff4f5041682da9acad6c1d60d8763b7da6a540",
+          "c6c3ee621c58fbf8650b6c1ce796302223f3eb2a253cc8909db54a3d56c498ed"
         ]
       }
     }
   ],
-  "startedAtMs": 1790780744270,
-  "finishedAtMs": 1790780744270,
+  "startedAtMs": 1790785320538,
+  "finishedAtMs": 1790785320538,
   "status": "settled",
   "finalizedRefs": [
-    "paper:sha256:d8001499b663a8becc2b7bcebdfbdbc89275a12f58fe74c14db8b47e833987c9",
-    "near-sandbox:final:74:D7AUu5EJso4V5uGz6rB1KwSJ3JkZESC35QFSNFE1yjFB"
+    "paper:sha256:e2b1cdf19e99f32d7c32e244e6477dee920e011367d522354753b423f2a41520",
+    "near-sandbox:final:74:E6PnJjqtqrzSD3prR1XEzqoGuwE4dL63oHSYHGWuhTGo"
   ]
 }

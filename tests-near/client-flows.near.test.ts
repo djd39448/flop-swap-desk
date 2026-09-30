@@ -424,7 +424,7 @@ describe("Seller/Buyer client flows against a real near-sandbox node", () => {
     const termsA = offerAcceptLockTerms(offerA, acceptA);
     const accounts = await resolveNearAccounts(h, h.buyerRail, acceptA.contract, termsA);
     await writeAndReplay({
-      scenario: "squat-settled",
+      scenario: "squat",
       swapId,
       status: "settled",
       venue: h.venue,

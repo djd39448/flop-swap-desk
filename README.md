@@ -159,7 +159,7 @@ evidence bundle shape, or the client flows themselves) is a deliberate, separate
 CAPTURE_EVM_FIXTURES=1 npm run test:anvil
 ```
 
-which overwrites `fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b}/` in place. Commit
+which overwrites `fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b,squat}/` in place. Commit
 the result and then confirm both that `tests/evm-anvil-fixtures.test.ts` (hermetic, `npm test`)
 replays it and that a plain `npm run test:anvil` afterward leaves `git status` clean.
 
@@ -186,7 +186,7 @@ preimage at that final step. The endpoint a deployment's `EvmRailConfig.endpoint
 therefore be one the operator trusts with that; this build never sends a claim before it has to.
 
 **What this proves, and what it does not.** The three committed fixtures
-(`fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b}/`, replayed hermetically by
+(`fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b,squat}/`, replayed hermetically by
 `tests/evm-anvil-fixtures.test.ts`) show a real ERC20 escrowed, claimed or refunded on a real
 EVM contract, with every verdict re-derivable from the exact captured RPC bytes — but on
 `anvil-local` (chain id `31337`), an ephemeral node this repo itself starts and stops, never a
@@ -268,14 +268,14 @@ missing binary fails `test:regtest` loudly instead.
 
 **Fixture capture is opt-in**, identical in shape to the EVM leg's own `CAPTURE_EVM_FIXTURES`:
 every client-flow scenario writes its watch-root bundle to a fresh `mkdtemp` directory by
-default, so an ordinary `npm run test:regtest` never touches the three committed fixtures below.
+default, so an ordinary `npm run test:regtest` never touches the four committed fixtures below.
 Regenerating them is a deliberate, separate step:
 
 ```bash
 CAPTURE_BTC_FIXTURES=1 npm run test:regtest
 ```
 
-which overwrites `fixtures/btc-regtest-2026-09-28/{settled,refunded,refunded-b}/` in place.
+which overwrites `fixtures/btc-regtest-2026-09-28/{settled,refunded,refunded-b,squat}/` in place.
 Commit the result and then confirm both that `tests/btc-regtest-fixtures.test.ts` (hermetic,
 `npm test`) replays it and that a plain `npm run test:regtest` afterward leaves `git status`
 clean. An ordinary (non-capture) run removes its own `mkdtemp` bundle directories once the suite
@@ -302,7 +302,7 @@ spent by a refund, as scenario 6 above exercises; a policy the local mempool wou
 reject) is refused with the node's own reject-reason and never sent.
 
 **What this proves, and what it does not.** The three committed fixtures
-(`fixtures/btc-regtest-2026-09-28/{settled,refunded,refunded-b}/`, replayed hermetically by
+(`fixtures/btc-regtest-2026-09-28/{settled,refunded,refunded-b,squat}/`, replayed hermetically by
 `tests/btc-regtest-fixtures.test.ts`) show a real P2WSH HTLC funded, claimed or refunded on a
 real Bitcoin Core 31.1 node, with every verdict re-derivable from the exact captured RPC bytes —
 but on `regtest`, an ephemeral node this repo itself starts and stops, never a real network, and
@@ -448,13 +448,13 @@ lessons checklist, reused here).
 **Fixture capture is opt-in**, identical in shape to the EVM/Bitcoin legs' own
 `CAPTURE_EVM_FIXTURES`/`CAPTURE_BTC_FIXTURES`: every client-flow scenario writes its watch-root
 bundle to a fresh `mkdtemp` directory by default, so an ordinary `npm run test:near` never
-touches the three committed fixtures below. Regenerating them is a deliberate, separate step:
+touches the four committed fixtures below. Regenerating them is a deliberate, separate step:
 
 ```bash
 CAPTURE_NEAR_FIXTURES=1 npm run test:near
 ```
 
-which overwrites `fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b}/` in place.
+which overwrites `fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b,squat}/` in place.
 Commit the result and then confirm both that `tests/near-sandbox-fixtures.test.ts` (hermetic,
 `npm test`) replays it and that a plain `npm run test:near` afterward leaves `git status` clean.
 An ordinary (non-capture) run removes its own `mkdtemp` bundle directories once the suite
@@ -538,12 +538,10 @@ client-side and never sent at all.
   The read timeout abandons the call rather than cancelling it: an abandoned request may still
   complete and appear in the capture log.
 
-**What this proves, and what it does not.** The three committed fixtures
-(`fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b}/`, replayed hermetically by
-`tests/near-sandbox-fixtures.test.ts`) were captured before H8 (the code-hash and access-key
-reads), so until they are recaptured (`CAPTURE_NEAR_FIXTURES=1 npm run test:near`, pending) the six
-replay checks in that test do not pass and nothing in this section claims they do. Once recaptured
-they show a real `htlc` contract funded, claimed or refunded on
+**What this proves, and what it does not.** The four committed fixtures
+(`fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b,squat}/`, replayed hermetically by
+`tests/near-sandbox-fixtures.test.ts`) were recaptured once after H8 (the code-hash and access-key
+reads are in the captured bytes), and the replay checks in that test pass. They show a real `htlc` contract funded, claimed or refunded on
 a real near-sandbox 2.13.4 node (`refunded-b` carries no NEAR bytes at all: the Buyer never locked
 leg A, so it shows only the paper-rail fold and the absence of any NEAR write), with every verdict re-derivable from the exact captured RPC
 bytes — but on a throwaway sandbox this repo itself starts and stops, never a real network, and

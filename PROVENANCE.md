@@ -74,7 +74,7 @@ today carries mainnet value (D-09/D-10: a mainnet chain-id deny list, no private
 - `src/client/bundle.ts` — the watch-root-shaped evidence bundle writer `examples/audit-export.
   mjs` replays unmodified (§6).
 
-`fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b}/` are also first-party: real
+`fixtures/evm-anvil-2026-09-28/{settled,refunded,refunded-b,squat}/` are also first-party: real
 capture bytes from a real, local, ephemeral `anvil` node this repo itself starts and stops
 (`tests-anvil/client-flows.anvil.test.ts`) — not from any external service, and containing no
 private key material (nothing in this build holds one to begin with).
@@ -110,7 +110,7 @@ no private key, WIF, xprv, seed or mnemonic for any Bitcoin key exists anywhere 
   exactly the way the `evm-htlc` branch already existed, dispatching on the tclk contract
   machine's own accepted lock rail/ref (§7).
 
-`fixtures/btc-regtest-2026-09-28/{settled,refunded,refunded-b}/` are also first-party: real
+`fixtures/btc-regtest-2026-09-28/{settled,refunded,refunded-b,squat}/` are also first-party: real
 capture bytes from a real, local, ephemeral `bitcoind -regtest` node this repo itself starts and
 stops (`tests-regtest/client-flows.regtest.test.ts`) — not from any external service, and
 containing no private key material (nothing in this build holds one to begin with; every key
@@ -204,7 +204,7 @@ comment).
 - `tests-near/probe/` — the NB0 wasm-compatibility probe (contract, script, findings) this leg's
   every later stage builds on.
 
-`fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b}/` are also first-party: real
+`fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b,squat}/` are also first-party: real
 capture bytes from a real, local, ephemeral `near-sandbox` node this repo itself starts and stops
 (`tests-near/client-flows.near.test.ts`) — not from any external service, and containing no
 private key material (this build never holds a real NEAR secret key to begin with beyond the
@@ -214,7 +214,7 @@ zero-value, in-memory keypair). `tests/near-sandbox-fixtures.test.ts`'s own exte
 scan (the Bitcoin fixture scan's patterns, the literal `"secret_key"` and `"private_key"` field
 names, any base58 token decoding to 64 bytes whose first 32 bytes derive its last 32, and any
 32-byte hex or base58 token whose derived public key is one of the fixture's own public keys —
-each shape has a planted-leak test) additionally pins this for the three committed directories
+each shape has a planted-leak test) additionally pins this for the committed fixture directories
 on every `npm test` run. `refunded-b` contains no NEAR bytes at all (the Buyer never locked leg
 A), so it carries no chain evidence of its own.
 

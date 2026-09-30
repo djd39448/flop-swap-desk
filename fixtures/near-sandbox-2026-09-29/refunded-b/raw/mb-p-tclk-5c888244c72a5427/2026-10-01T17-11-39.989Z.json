@@ -1,0 +1,25 @@
+{
+ "room": "mb-p-tclk-5c888244c72a5427",
+ "count": 2,
+ "first_seq": 1,
+ "last_seq": 2,
+ "generation": 1,
+ "messages": [
+  {
+   "seq": 1,
+   "ts": "2026-09-30T17:10:39.989Z",
+   "from": "did:key:z6Mkon22vwz9JoNpGDxCrGZRgeNFTdRTwXYYN3fvAhA3K19x",
+   "text": "swap1 account near-htlc near:near-sandbox-flop:seller.test.near",
+   "nonce": "10001",
+   "sig": "316sQqeuF9hYYvA8SIrSxcg7P70F-CwJ6YUiCiTWsi6th2IGLi7bZE9W6U1JEFRj-CwingFLxgvzivhD58O9Bg"
+  },
+  {
+   "seq": 2,
+   "ts": "2026-09-30T17:10:39.989Z",
+   "from": "did:key:z6MkmtWtY63GQVBrpMyRJWEzsnxfsGkemu6CtMDwGTv4RYj2",
+   "text": "swap1 account near-htlc near:near-sandbox-flop:buyer.test.near",
+   "nonce": "10002",
+   "sig": "NHhb1MU01iV_8SGXUVlyK0hMxhAr5uXbJ8sDpCuk1n9UJCvq7jy6G1WZ80wH9lSkrq6ISFL5WuGoluZMyh-ADg"
+  }
+ ]
+}
