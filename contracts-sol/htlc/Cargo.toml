@@ -1,0 +1,23 @@
+[package]
+name = "htlc"
+version = "0.1.0"
+edition = "2021"
+description = "First-party, unaudited hashed-timelock escrow for an SPL token (FLOP swap desk Solana leg)"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "=5.1.0"
+spl-token-interface = "=3.0.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+
+[features]
+custom-heap = []
+custom-panic = []
+
+[dev-dependencies]
+solana-program-pack = "3"
