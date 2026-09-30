@@ -5,11 +5,13 @@
 // run (tests-near/client-flows.near.test.ts) against a real, local `near-sandbox` node (chain id
 // `near-sandbox-flop`, D-N3) — captured once (`CAPTURE_NEAR_FIXTURES=1 npm run test:near`),
 // replayed here with no network and no sandbox (hermetic `npm test`). Mirrors
-// tests/btc-regtest-fixtures.test.ts's own pattern exactly, but these three also exercise the
-// `near-htlc` chain-evidence path (`raw/near/`, `raw/rpc/`, `rails.json`) end to end: `settled`
-// needs both legs' rail evidence final, `refunded`/`refunded-b` need the NEAR leg's own on-chain
-// refund (or its complete absence) to fold correctly. `npm test` builds `dist/` first
-// (package.json's "test" script), which this spawn depends on.
+// tests/btc-regtest-fixtures.test.ts's own pattern, but `settled` and `refunded` also exercise
+// the `near-htlc` chain-evidence path (`raw/near/`, `raw/rpc/`, `rails.json`) end to end:
+// `settled` needs both legs' rail evidence final, `refunded` the NEAR leg's own on-chain refund
+// to fold. `refunded-b` (the Buyer never locks leg A) carries NO NEAR bytes at all -- no
+// `raw/near/`, no `raw/rpc/`, no `rails.json` -- so it proves only the paper-rail fold and the
+// absence of any NEAR write; it does not exercise the NEAR evidence reader. `npm test` builds
+// `dist/` first (package.json's "test" script), which this spawn depends on.
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
