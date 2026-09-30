@@ -32,6 +32,7 @@
 // docs/PROFILE.md §3.5 documents this for a profile reader.
 
 import { isAddress, type Address } from "viem";
+import { base58 } from "@scure/base";
 import {
   dealRoom,
   MAX_FRAME_CHARS,
@@ -48,6 +49,7 @@ import {
   type AccountProof,
   type ProofPolicy,
 } from "./account-proof.js";
+import { normalizeRailIdWith, type CustomRailRegistry } from "./custom-rails.js";
 
 /** Rail → CAIP-2 namespace (SPEC §3): `evm-htlc` ↔ `eip155` is the only pair with a
  *  chain-specific address grammar in this build (see `validateEip155Address`); `btc-htlc`/
@@ -55,8 +57,9 @@ import {
  *  (namespace mismatch, not "unknown rail"), and their accounts still parse under the generic
  *  CAIP-10 grammar (`validateGenericCaip10`) so a line naming one of them is a real, resolvable
  *  account line — just without that chain's own semantic checks, which is that rail's own build
- *  stage's job. Solana has no tclk rail id yet (`CANONICAL_RAIL_IDS` has none), so it cannot
- *  appear here at all. */
+ *  stage's job. Solana has no tclk rail id (`CANONICAL_RAIL_IDS` has none) and never gets one here: its
+ *  owner-namespaced custom id reaches this module only through a caller-owned registry
+ *  (`src/rails/custom-rails.ts`), never through this closed map. */
 export const RAIL_NAMESPACES: Readonly<Record<string, string>> = {
   "evm-htlc": "eip155",
   "btc-htlc": "bip122",
@@ -65,6 +68,14 @@ export const RAIL_NAMESPACES: Readonly<Record<string, string>> = {
 
 /** CAIP-2 `eip155` reference: a decimal chain id, no leading zeros (SPEC §3). */
 const EIP155_REFERENCE = /^(0|[1-9][0-9]*)$/;
+
+/** The CAIP-2 namespace for a rail: the built-in closed map first, then (only for a configured custom
+ *  id) the caller-owned registry. A registry cannot override a built-in rail (`createCustomRailRegistry`
+ *  refuses ids tclk knows, and the built-in map is consulted first regardless). */
+function namespaceForRail(railId: string, registry?: CustomRailRegistry): string | undefined {
+  if (Object.prototype.hasOwnProperty.call(RAIL_NAMESPACES, railId)) return RAIL_NAMESPACES[railId];
+  return registry?.namespaceOf(railId);
+}
 
 /** `swap1 account <rail-id> <caip-10 account>` — single ASCII spaces, no trailing space. Two
  *  captured tokens; each is further decomposed (rail id; namespace:reference:address) below. */
@@ -133,11 +144,29 @@ function validateNearAccountId(reference: string, address: string): string | nul
   return address;
 }
 
+/** Solana's own address grammar (SB2a; reachable only through a caller-owned custom rail registry whose
+ *  rail maps to the `solana` namespace): a base58 string that decodes to exactly 32 bytes and is the
+ *  canonical spelling of them (re-encoding gives the same text, so a padded or aliased spelling is
+ *  refused). The reference is the generic CAIP-2 reference grammar (a localnet name or a genesis-hash
+ *  prefix). Case is significant in base58, so there is no normalization. */
+function validateSolanaAddress(reference: string, address: string): string | null {
+  if (!CAIP2_REFERENCE.test(reference)) return null;
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) return null;
+  try {
+    const bytes = base58.decode(address);
+    if (bytes.length !== 32 || base58.encode(bytes) !== address) return null;
+  } catch {
+    return null;
+  }
+  return address;
+}
+
 /** Shared core of `formatAccountLine`/`parseAccountLine`: validate one namespace's
  *  reference+address grammar. */
 function validateChainAddress(namespace: string, reference: string, address: string): string | null {
   if (namespace === "eip155") return validateEip155Address(reference, address);
   if (namespace === "near") return validateNearAccountId(reference, address);
+  if (namespace === "solana") return validateSolanaAddress(reference, address);
   return validateGenericCaip10(reference, address);
 }
 
@@ -147,19 +176,22 @@ function validateChainAddress(namespace: string, reference: string, address: str
  * grammar — this produces a line that is about to be signed and posted, so the same
  * fail-loud-on-write rule `src/profile.ts`'s `legAContext`/`legBContext` use applies here too.
  */
-export function formatAccountLine(input: {
-  railId: string;
-  caip2: string;
-  address: string;
-  /** P7: the chain key's proof over `accountProofMessage(...)`; omitted only for a line that is
-   *  deliberately unproven (it will not resolve under a `required` proof policy). */
-  proof?: AccountProof;
-}): string {
-  const railId = normalizeRailId(input.railId);
+export function formatAccountLine(
+  input: {
+    railId: string;
+    caip2: string;
+    address: string;
+    /** P7: the chain key's proof over `accountProofMessage(...)`; omitted only for a line that is
+     *  deliberately unproven (it will not resolve under a `required` proof policy). */
+    proof?: AccountProof;
+  },
+  registry?: CustomRailRegistry,
+): string {
+  const railId = normalizeRailIdWith(input.railId, registry);
   if (railId !== input.railId) {
     throw new Error(`account-line: non-canonical rail id: ${input.railId}; use ${railId}`);
   }
-  const namespace = RAIL_NAMESPACES[railId];
+  const namespace = namespaceForRail(railId, registry);
   if (namespace === undefined) {
     throw new Error(`account-line: rail "${railId}" has no chain-account namespace (D-08, SPEC §3)`);
   }
@@ -191,15 +223,18 @@ export function formatAccountLine(input: {
  * rail and the account as the line will spell it (normalized). Throws on a non-canonical input,
  * like `formatAccountLine`.
  */
-export function accountProofMessage(input: {
-  did: string;
-  contract: string;
-  railId: string;
-  caip2: string;
-  address: string;
-}): string {
-  const line = formatAccountLine({ railId: input.railId, caip2: input.caip2, address: input.address });
-  const parsed = parseAccountLine(line);
+export function accountProofMessage(
+  input: {
+    did: string;
+    contract: string;
+    railId: string;
+    caip2: string;
+    address: string;
+  },
+  registry?: CustomRailRegistry,
+): string {
+  const line = formatAccountLine({ railId: input.railId, caip2: input.caip2, address: input.address }, registry);
+  const parsed = parseAccountLine(line, registry);
   if (parsed === null) throw new Error("account-line: cannot build a proof message for this account");
   return buildAccountProofMessage({
     did: input.did,
@@ -218,7 +253,7 @@ export function accountProofMessage(input: {
  * leading zero, or an address that is neither all-lowercase nor a valid EIP-55 checksum; any
  * other mapped namespace: the generic CAIP-2/CAIP-10 reference/address grammar).
  */
-export function parseAccountLine(line: string): ParsedAccountLine | null {
+export function parseAccountLine(line: string, registry?: CustomRailRegistry): ParsedAccountLine | null {
   if (typeof line !== "string") return null;
   const match = LINE_PATTERN.exec(line);
   if (match === null) return null;
@@ -237,13 +272,13 @@ export function parseAccountLine(line: string): ParsedAccountLine | null {
 
   let railId: string;
   try {
-    railId = normalizeRailId(railToken);
+    railId = normalizeRailIdWith(railToken, registry);
   } catch {
     return null;
   }
   if (railId !== railToken) return null; // must already be canonical on the wire
 
-  const namespace = RAIL_NAMESPACES[railId];
+  const namespace = namespaceForRail(railId, registry);
   if (namespace === undefined) return null; // not a rail this module maps to a chain namespace
 
   const parts = caipToken.split(":");
@@ -601,6 +636,9 @@ export interface ResolveAccountsInput {
   beforeSeq?: number;
   /** P7: see `ResolvePubkeysInput.proof`. */
   proof: ProofPolicy;
+  /** SB2a: a caller-owned registry of custom rail ids (`src/rails/custom-rails.ts`), e.g. the Solana
+   *  leg's. Omitted (the default): tclk's closed registry only, exactly as before. */
+  railRegistry?: CustomRailRegistry;
 }
 
 export interface ResolvedAccounts {
@@ -637,7 +675,7 @@ export function resolveAccounts(
 
   let rail: string;
   try {
-    rail = normalizeRailId(input.rail);
+    rail = normalizeRailIdWith(input.rail, input.railRegistry);
   } catch {
     return { reasons: [`account-line: "${input.rail}" is not a registered rail id`] };
   }
@@ -656,7 +694,7 @@ export function resolveAccounts(
     if (!verifyTranscriptRecord(candidate).ok) continue; // unsigned or forged: not authenticated
     if (candidate.room !== room) continue; // not this leg's own deal room
 
-    const parsed = parseAccountLine(candidate.line);
+    const parsed = parseAccountLine(candidate.line, input.railRegistry);
     if (parsed === null) continue; // not an account line at all (some other frame/line)
 
     if (parsed.railId !== rail) {
