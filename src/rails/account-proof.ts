@@ -157,6 +157,9 @@ function bytesToHex(bytes: Uint8Array): string {
 
 // ── eip191 ──────────────────────────────────────────────────────────────────────────────────
 
+/** secp256k1 n/2: signatures with s above it are the malleable twin and are refused (F5). */
+const SECP256K1_HALF_ORDER = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
+
 /** `eip191`: `personal_sign` (EIP-191 version 0x45) of the message. Signature token: 65 bytes
  *  r||s||v as 130 bare lowercase hex chars, v = 27 or 28. The recovered address must equal the
  *  line's (lowercase) address. */
@@ -168,6 +171,9 @@ export const eip191Verifier: AccountProofVerifier = {
       if (sig === null || sig.length !== 65 || ctx.proof.publicKey !== undefined) return false;
       const v = sig[64]!;
       if (v !== 27 && v !== 28) return false;
+      // P7 fix pass (F5): canonical proofs only; the high-s twin (r, n-s, v xor 1) also recovers the same
+      // address, so refuse it.
+      if (BigInt(`0x${bytesToHex(sig.slice(32, 64))}`) > SECP256K1_HALF_ORDER) return false;
       const digest = hexToBytes(hashMessage(ctx.message).slice(2));
       if (digest === null) return false;
       const point = secp256k1.Signature.fromBytes(sig.slice(0, 64), "compact")
@@ -230,8 +236,8 @@ export const DEFAULT_PROOF_VERIFIERS: ProofVerifierRegistry = createProofVerifie
 /**
  * How a resolver treats proofs. `required` is the binding rule: a line counts only if its proof
  * verifies for this sender DID, contract, rail and account. `legacy-unproven` is the pre-P7
- * behaviour (proofs ignored), kept ONLY so the not-yet-migrated call sites keep working until the
- * Rails stage moves them to `required`; a test pins the exact list of sites that still use it.
+ * behaviour (proofs ignored), kept only for tests that need an unproven fold; no production call
+ * site uses it (a test pins that).
  */
 export type ProofPolicy =
   | {

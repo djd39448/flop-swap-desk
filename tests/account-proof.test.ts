@@ -213,6 +213,17 @@ describe("eip191 verifier", () => {
     expect(eip191Verifier.verify(ctx("ab", chainKey.address.toLowerCase()))).toBe(false);
     expect(eip191Verifier.verify(ctx(`0x${signature}`, chainKey.address.toLowerCase()))).toBe(false); // canonical form is bare hex
   });
+
+  it("F5: refuses the high-s twin of a valid signature (proofs are canonical)", async () => {
+    const signature = toHexNoPrefix(await chainKey.signMessage({ message }));
+    const n = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+    const s = BigInt(`0x${signature.slice(64, 128)}`);
+    expect(s <= n / 2n).toBe(true); // the signer produces low-s
+    const v = parseInt(signature.slice(128), 16);
+    const twin = `${signature.slice(0, 64)}${(n - s).toString(16).padStart(64, "0")}${(v === 27 ? 28 : 27).toString(16)}`;
+    expect(eip191Verifier.verify(ctx(signature, chainKey.address.toLowerCase()))).toBe(true);
+    expect(eip191Verifier.verify(ctx(twin, chainKey.address.toLowerCase()))).toBe(false);
+  });
 });
 
 describe("ed25519 verifier (Solana-style address = key, and NEAR's signature step)", () => {
