@@ -463,8 +463,10 @@ describe("near-htlc (sandbox)", () => {
   it("H1 S2 (sandbox): refunding a revealed-but-Locked lock is refused by the contract itself — refund() throws NearTxFailedError", async () => {
     const { preimageHex, preimage0x, hashLock0x, hashLockHex } = randomHashLock();
     const now = await chainNowMs();
-    const claimByMs = now + 2_000;
-    const refundAfterMs = now + 4_000;
+    // windows wide enough that the forced raw claim below lands before claimByMs even when the
+    // sandbox chain clock runs ahead of wall time; fastForward(600) still crosses refundAfterMs.
+    const claimByMs = now + 15_000;
+    const refundAfterMs = now + 30_000;
     const amount = "222";
     const unregisteredPayee = "nobody-s2.test.near"; // syntactically valid, never storage_deposit'd
 
@@ -482,7 +484,7 @@ describe("near-htlc (sandbox)", () => {
     expect(preClaim?.status).toBe("Locked");
     expect(preClaim?.preimage).toBe(preimageHex);
 
-    await sandbox.fastForward(150); // past refundAfterMs
+    await sandbox.fastForward(600); // past refundAfterMs
 
     await expect(buyerRail.refund(hashLock0x)).rejects.toThrow(NearTxFailedError);
     // the preimage is still public and the lock is untouched by the refused refund attempt.
@@ -520,8 +522,10 @@ describe("near-htlc (sandbox)", () => {
   it("H2 (sandbox): a revealed-but-Locked claim retried past refundAfterMs succeeds once the payee is registered", async () => {
     const { preimageHex, preimage0x, hashLock0x, hashLockHex } = randomHashLock();
     const now = await chainNowMs();
-    const claimByMs = now + 2_000;
-    const refundAfterMs = now + 4_000;
+    // windows wide enough that the forced raw claim below lands before claimByMs even when the
+    // sandbox chain clock runs ahead of wall time; fastForward(600) still crosses refundAfterMs.
+    const claimByMs = now + 15_000;
+    const refundAfterMs = now + 30_000;
     const amount = "321";
     const unregisteredPayee = "nobody-h2.test.near";
 
@@ -534,9 +538,11 @@ describe("near-htlc (sandbox)", () => {
     await sendRawTx(sandbox.createCapturingRpc(), sandbox.seller.signer, sandbox.seller.accountId, sandbox.htlcContract, [
       { type: "FunctionCall", methodName: "claim", args: new TextEncoder().encode(JSON.stringify({ hash_lock: hashLockHex, preimage: preimageHex })), gas: 60n * TGAS, deposit: 0n },
     ]);
-    expect((await getLockView(hashLock0x))?.status).toBe("Locked");
+    const forced = await getLockView(hashLock0x);
+    expect(forced?.status).toBe("Locked");
+    expect(forced?.preimage).toBe(preimageHex);
 
-    await sandbox.fastForward(150); // now well past refundAfterMs
+    await sandbox.fastForward(600); // now well past refundAfterMs
 
     // An UNREVEALED retry would be refused here (H2 never applies) — proven hermetically
     // (tests/near-htlc.test.ts); this scenario is already revealed, so the retry exemption does
