@@ -218,30 +218,38 @@ describe("NEAR error mapping", () => {
       expect(error).not.toBeInstanceOf(NearUnknownTransactionError);
     });
 
-    it("maps cause.name INVALID_TRANSACTION whose info names InvalidNonce to NearInvalidNonceError", async () => {
-      const { near } = rpcNear([
-        structuredErrBody(
-          1,
-          "HANDLER_ERROR",
-          { name: "INVALID_TRANSACTION", info: { InvalidTxError: { InvalidNonce: { tx_nonce: 5, ak_nonce: 10 } } } },
-          -32000,
-          "Invalid tx",
-          "Server error",
-        ),
-      ]);
+    // H11: these two bodies are the node's REAL replies, captured from a near-sandbox run
+    // (near-sandbox 2.x, chain near-sandbox-flop, 2026-09-30, tests-near probe): a `send_tx` whose
+    // nonce is not above the access key's, and one whose block hash is older than the validity
+    // window (after sandbox_fast_forward). Only the JSON-RPC "id" is rewritten to fit this mock.
+    // The reason sits in error.data.TxExecutionError.InvalidTxError; cause.info is EMPTY.
+    const REAL_INVALID_NONCE =
+      '{"jsonrpc":"2.0","error":{"name":"HANDLER_ERROR","cause":{"info":{},"name":"INVALID_TRANSACTION"},"code":-32000,"message":"Server error","data":{"TxExecutionError":{"InvalidTxError":{"InvalidNonce":{"ak_nonce":20000001,"tx_nonce":20000001}}}}},"id":1}';
+    const REAL_EXPIRED =
+      '{"jsonrpc":"2.0","error":{"name":"HANDLER_ERROR","cause":{"info":{},"name":"INVALID_TRANSACTION"},"code":-32000,"message":"Server error","data":{"TxExecutionError":{"InvalidTxError":"Expired"}}},"id":1}';
+
+    it("maps the node's real InvalidNonce reply (data.TxExecutionError.InvalidTxError.InvalidNonce) to NearInvalidNonceError (H11)", async () => {
+      const { near } = rpcNear([REAL_INVALID_NONCE]);
       await expect(near.sendTx("x")).rejects.toBeInstanceOf(NearInvalidNonceError);
     });
 
-    it("maps cause.name INVALID_TRANSACTION whose info names Expired to NearExpiredTransactionError", async () => {
-      const { near } = rpcNear([
-        structuredErrBody(1, "HANDLER_ERROR", { name: "INVALID_TRANSACTION", info: { InvalidTxError: "Expired" } }, -32000, "Invalid tx", "Server error"),
-      ]);
+    it("maps the node's real Expired reply (data.TxExecutionError.InvalidTxError = \"Expired\") to NearExpiredTransactionError (H11)", async () => {
+      const { near } = rpcNear([REAL_EXPIRED]);
       await expect(near.sendTx("x")).rejects.toBeInstanceOf(NearExpiredTransactionError);
+    });
+
+    it("H11: the old invented shape (reason only in cause.info) is no longer recognised as a nonce/expiry error", async () => {
+      const { near } = rpcNear([
+        structuredErrBody(1, "HANDLER_ERROR", { name: "INVALID_TRANSACTION", info: { InvalidTxError: { InvalidNonce: { tx_nonce: 5, ak_nonce: 10 } } } }, -32000, "Invalid tx", "Server error"),
+      ]);
+      const error: unknown = await near.sendTx("x").catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(NearRpcError);
+      expect(error).not.toBeInstanceOf(NearInvalidNonceError);
     });
 
     it("an INVALID_TRANSACTION cause naming neither InvalidNonce nor Expired falls back to the base NearRpcError", async () => {
       const { near } = rpcNear([
-        structuredErrBody(1, "HANDLER_ERROR", { name: "INVALID_TRANSACTION", info: { InvalidTxError: "InvalidSignature" } }, -32000, "Invalid tx", "Server error"),
+        structuredErrBody(1, "HANDLER_ERROR", { name: "INVALID_TRANSACTION", info: {} }, -32000, { TxExecutionError: { InvalidTxError: "InvalidSignature" } }, "Server error"),
       ]);
       const error: unknown = await near.sendTx("x").catch((e: unknown) => e);
       expect(error).toBeInstanceOf(NearRpcError);

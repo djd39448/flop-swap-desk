@@ -98,6 +98,15 @@ function causeName(cause: unknown): string | undefined {
   return typeof name === "string" ? name : undefined;
 }
 
+/** H11: `error.data.TxExecutionError.InvalidTxError` -- `null` when any step of that path is
+ *  missing or not an object. */
+function invalidTxError(data: unknown): unknown {
+  if (data === null || typeof data !== "object") return null;
+  const txExecutionError = (data as Record<string, unknown>).TxExecutionError;
+  if (txExecutionError === null || typeof txExecutionError !== "object") return null;
+  return (txExecutionError as Record<string, unknown>).InvalidTxError ?? null;
+}
+
 /** Wraps an `RpcCaptureError` into the most specific typed error this module recognises. H4:
  *  reads the STRUCTURED cause (`error.errorName`/`error.errorCause`, populated by
  *  `rpc-capture.ts`'s own `RpcCaptureErrorExtra` straight from the response's `error.name`/
@@ -124,9 +133,15 @@ function mapNearRpcError(error: unknown): never {
     if (inner === "UNKNOWN_TRANSACTION") throw new NearUnknownTransactionError(error.message, error.code);
     if (inner === "TIMEOUT_ERROR") throw new NearTimeoutError(error.message, error.code);
     if (inner === "INVALID_TRANSACTION") {
-      const blob = JSON.stringify(error.errorCause ?? error.errorData ?? "");
-      if (/InvalidNonce/i.test(blob)) throw new NearInvalidNonceError(error.message, error.code);
-      if (/Expired/i.test(blob)) throw new NearExpiredTransactionError(error.message, error.code);
+      // H11: the node's real shape (captured from a near-sandbox run, see tests/near-rpc.test.ts):
+      // `cause` is `{ name: "INVALID_TRANSACTION", info: {} }` (info EMPTY) and the actual reason
+      // sits in `error.data.TxExecutionError.InvalidTxError` -- the string "Expired" or an object
+      // keyed `InvalidNonce`. Walk exactly that path; never regex a serialised blob.
+      const invalid = invalidTxError(error.errorData);
+      if (invalid === "Expired") throw new NearExpiredTransactionError(error.message, error.code);
+      if (invalid !== null && typeof invalid === "object" && "InvalidNonce" in invalid) {
+        throw new NearInvalidNonceError(error.message, error.code);
+      }
       throw new NearRpcError(error.message, error.code);
     }
     if (inner !== undefined) throw new NearRpcError(error.message, error.code);
