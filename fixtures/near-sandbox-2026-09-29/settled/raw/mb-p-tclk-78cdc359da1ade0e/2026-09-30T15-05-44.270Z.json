@@ -1,0 +1,49 @@
+{
+ "room": "mb-p-tclk-78cdc359da1ade0e",
+ "count": 5,
+ "first_seq": 1,
+ "last_seq": 5,
+ "generation": 1,
+ "messages": [
+  {
+   "seq": 1,
+   "ts": "2026-09-30T15:05:44.270Z",
+   "from": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "text": "swap1 account near-htlc near:near-sandbox-flop:seller.test.near",
+   "nonce": "10001",
+   "sig": "3CaelTlkKIN2YbZ4oSZ6Jyl5OYqLTbV0ZmVDv54Nr03V4AiTpLkaO_9E5tbEkURKX_gSUEgxZKnMrbraNpg6DA"
+  },
+  {
+   "seq": 2,
+   "ts": "2026-09-30T15:05:44.270Z",
+   "from": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+   "text": "swap1 account near-htlc near:near-sandbox-flop:buyer.test.near",
+   "nonce": "10002",
+   "sig": "Ktv1sHAJnq7ujaO3MsFGJPvlVJrEfcQZcSQzDgGtnToqPHPTWGUgQAhm83sc-7P3Guv79fmDy-Fs7Ms6bUDdBQ"
+  },
+  {
+   "seq": 3,
+   "ts": "2026-09-30T15:05:44.270Z",
+   "from": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+   "text": "tclk1 {\"contract\":\"0x78cdc359da1ade0eaa86a94a120e0dc2c16d6c958725dacd3dadcef5c1d0f833\",\"from\":\"did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX\",\"rail\":\"near-htlc\",\"ref\":\"0xe218cc0a584a2288f7e8eaecdb6dd792fd3629dd07e11ab431ceeb2eef4cb569:buyer.test.near\",\"type\":\"lock\"}",
+   "nonce": "10003",
+   "sig": "mHq7Hh75Ua0oqTWlEEMdo7PoUB7Ted0j2-lYKfjSFOn2MonY3zoDMsqy4pFjTW-8v3HHS7g5BwVnS48CQgMGAw"
+  },
+  {
+   "seq": 4,
+   "ts": "2026-09-30T15:05:44.270Z",
+   "from": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "text": "tclk1 {\"contract\":\"0x78cdc359da1ade0eaa86a94a120e0dc2c16d6c958725dacd3dadcef5c1d0f833\",\"from\":\"did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH\",\"ref\":\"0xe218cc0a584a2288f7e8eaecdb6dd792fd3629dd07e11ab431ceeb2eef4cb569:buyer.test.near\",\"secret\":\"0x92e429dffabdb1308f54f830d5f81ed7025e850e556257835766882eed58be1f\",\"type\":\"reveal\"}",
+   "nonce": "10004",
+   "sig": "hKpPbn4WYLYWZVtad26gupVUrdjRHeaXN90j0s5-Nyz8YjtwStxHVgkmVfxeXesZGM7SXAlht82QISNcZhcjAg"
+  },
+  {
+   "seq": 5,
+   "ts": "2026-09-30T15:05:44.270Z",
+   "from": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+   "text": "tclk1 {\"contract\":\"0x78cdc359da1ade0eaa86a94a120e0dc2c16d6c958725dacd3dadcef5c1d0f833\",\"from\":\"did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH\",\"outcome\":\"claimed\",\"rail\":\"near-htlc\",\"ref\":\"0xe218cc0a584a2288f7e8eaecdb6dd792fd3629dd07e11ab431ceeb2eef4cb569:buyer.test.near\",\"type\":\"receipt\"}",
+   "nonce": "10005",
+   "sig": "kC-vpC2CmoIzpOMkXG5CXQyU_gR0YjCBaFgFMJWIxYjlaZmRUhYadODbwS9og4T3NSgjttfITdRV2bqMbst8BQ"
+  }
+ ]
+}

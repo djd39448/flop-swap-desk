@@ -1,0 +1,68 @@
+{
+  "v": 1,
+  "rail": "near-htlc",
+  "ref": "0xe218cc0a584a2288f7e8eaecdb6dd792fd3629dd07e11ab431ceeb2eef4cb569:buyer.test.near",
+  "pin": "near-sandbox",
+  "caip2": "near:near-sandbox-flop",
+  "endpoint": "http://127.0.0.1:65113",
+  "checkedAtMs": 1790780744270,
+  "config": {
+    "pin": {
+      "name": "near-sandbox",
+      "chainId": "near-sandbox-flop",
+      "caip2": "near:near-sandbox-flop",
+      "finality": "final"
+    },
+    "endpoint": "http://127.0.0.1:65113",
+    "contract": "htlc.test.near",
+    "assets": {
+      "USDC": "usdc.test.near"
+    },
+    "htlcCodeHash": "6ezqvtePdkD2V71gS32GoCSREYGGrEcAkwunnPTotSza"
+  },
+  "nonce": "5864a7b6fe814a83",
+  "exchanges": [
+    {
+      "method": "status",
+      "params": [],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xe218cc0a584a2288f7e8eaecdb6dd792fd3629dd07e11ab431ceeb2eef4cb569:buyer.test.near:1790780744270:5864a7b6fe814a83:1\",\"method\":\"status\",\"params\":[]}",
+      "responseSha256": "1ca3cca68d4eb6bdea7b4d7c023704b0386d6423c31864e74e742c5d2cfca0bd",
+      "atMs": 1790780744417
+    },
+    {
+      "method": "block",
+      "params": {
+        "finality": "final"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xe218cc0a584a2288f7e8eaecdb6dd792fd3629dd07e11ab431ceeb2eef4cb569:buyer.test.near:1790780744270:5864a7b6fe814a83:2\",\"method\":\"block\",\"params\":{\"finality\":\"final\"}}",
+      "responseSha256": "5f7c83e2a796f4f3c2bdd49243d89b10bbf80e6a83afe37ac24af68b10ff4486",
+      "atMs": 1790780744418
+    },
+    {
+      "method": "query",
+      "params": {
+        "request_type": "call_function",
+        "account_id": "htlc.test.near",
+        "method_name": "get_lock",
+        "args_base64": "eyJoYXNoX2xvY2siOiJlMjE4Y2MwYTU4NGEyMjg4ZjdlOGVhZWNkYjZkZDc5MmZkMzYyOWRkMDdlMTFhYjQzMWNlZWIyZWVmNGNiNTY5IiwicGF5ZXIiOiJidXllci50ZXN0Lm5lYXIifQ==",
+        "block_id": "D7AUu5EJso4V5uGz6rB1KwSJ3JkZESC35QFSNFE1yjFB"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xe218cc0a584a2288f7e8eaecdb6dd792fd3629dd07e11ab431ceeb2eef4cb569:buyer.test.near:1790780744270:5864a7b6fe814a83:3\",\"method\":\"query\",\"params\":{\"request_type\":\"call_function\",\"account_id\":\"htlc.test.near\",\"method_name\":\"get_lock\",\"args_base64\":\"eyJoYXNoX2xvY2siOiJlMjE4Y2MwYTU4NGEyMjg4ZjdlOGVhZWNkYjZkZDc5MmZkMzYyOWRkMDdlMTFhYjQzMWNlZWIyZWVmNGNiNTY5IiwicGF5ZXIiOiJidXllci50ZXN0Lm5lYXIifQ==\",\"block_id\":\"D7AUu5EJso4V5uGz6rB1KwSJ3JkZESC35QFSNFE1yjFB\"}}",
+      "responseSha256": "460c9741ee3d073708d4c1dc692b9173ef29b54280682c64e5d01d1cb9acb6da",
+      "atMs": 1790780744419
+    },
+    {
+      "method": "query",
+      "params": {
+        "request_type": "call_function",
+        "account_id": "usdc.test.near",
+        "method_name": "storage_balance_of",
+        "args_base64": "eyJhY2NvdW50X2lkIjoic2VsbGVyLnRlc3QubmVhciJ9",
+        "block_id": "D7AUu5EJso4V5uGz6rB1KwSJ3JkZESC35QFSNFE1yjFB"
+      },
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xe218cc0a584a2288f7e8eaecdb6dd792fd3629dd07e11ab431ceeb2eef4cb569:buyer.test.near:1790780744270:5864a7b6fe814a83:4\",\"method\":\"query\",\"params\":{\"request_type\":\"call_function\",\"account_id\":\"usdc.test.near\",\"method_name\":\"storage_balance_of\",\"args_base64\":\"eyJhY2NvdW50X2lkIjoic2VsbGVyLnRlc3QubmVhciJ9\",\"block_id\":\"D7AUu5EJso4V5uGz6rB1KwSJ3JkZESC35QFSNFE1yjFB\"}}",
+      "responseSha256": "14acc3375d3491343f27323a71ecea937ae18f4e15eb9a4c51e223ab08a6a596",
+      "atMs": 1790780744420
+    }
+  ]
+}
