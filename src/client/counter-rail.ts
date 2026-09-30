@@ -114,6 +114,8 @@ export type RailBlockMarker = unknown;
  */
 export interface RailClaimOptions {
   retryPublicSecret?: boolean;
+  /** Solana only (SOL-C1): the signature of this flow's own failed claim, the retry's proof of a public secret. */
+  proofSignature?: string;
 }
 
 /**

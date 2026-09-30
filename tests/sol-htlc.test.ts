@@ -20,7 +20,8 @@ import {
   SOL_DEVNET_PIN,
   SOL_HTLC_PROGRAM_ID,
   SOL_LOCAL_PIN,
-  SOL_PREIMAGE_SCAN_MAX_TRANSACTIONS,
+  SOL_PREIMAGE_SCAN_HARD_LIMIT_TRANSACTIONS,
+  SolHistoryTooLongError,
   SolClaimFailedError,
   SolClaimTooLateError,
   SolHtlcRail,
@@ -894,17 +895,40 @@ describe("findClaimedPreimage (S1: a failed claim publishes the secret)", () => 
     expect(await rail.findClaimedPreimage(w.ref)).toBeNull();
   });
 
-  it("is bounded: at most 100 transactions are fetched, so a claim buried under padding is missed rather than scanned forever", async () => {
+  it("SOL-C1: scans the whole history: a claim buried under 150 padding entries is still found", async () => {
     const w = makeWorld();
     putLockedEscrow(w);
     const spam: Array<{ tx: SolTransaction; err: unknown }> = [];
-    for (let i = 0; i < SOL_PREIMAGE_SCAN_MAX_TRANSACTIONS; i += 1) spam.push({ tx: await claimTx(w, new Uint8Array(32).fill(i + 1)), err: CUSTOM(20) });
+    for (let i = 0; i < 150; i += 1) spam.push({ tx: await claimTx(w, new Uint8Array(32).fill(i + 1)), err: CUSTOM(20) });
     const buried = await claimTx(w, w.preimage);
     history(w, [...spam, { tx: buried, err: CUSTOM(19) }]);
     const rail = await railFor(w);
-    expect(await rail.findClaimedPreimage(w.ref)).toBeNull();
-    expect(w.chain.count("getTransaction")).toBe(SOL_PREIMAGE_SCAN_MAX_TRANSACTIONS);
-    expect(w.chain.count("getSignaturesForAddress")).toBe(4); // 25 per page
+    expect(await rail.findClaimedPreimage(w.ref)).toBe(w.preimageHex);
+    expect(w.chain.count("getTransaction")).toBe(151);
+  });
+
+  it("SOL-C1: a history beyond the runaway guard throws; it never answers 'no secret'", async () => {
+    const w = makeWorld();
+    putLockedEscrow(w);
+    const spam: Array<{ tx: SolTransaction; err: unknown }> = [];
+    const one = await claimTx(w, new Uint8Array(32).fill(9));
+    for (let i = 0; i < SOL_PREIMAGE_SCAN_HARD_LIMIT_TRANSACTIONS + 1; i += 1) spam.push({ tx: one, err: CUSTOM(20) });
+    history(w, spam);
+    const rail = await railFor(w);
+    await expect(rail.findClaimedPreimage(w.ref)).rejects.toBeInstanceOf(SolHistoryTooLongError);
+  });
+
+  it("SOL-C1: preimageFromSignature reads exactly the named transaction: no scan, the preimage only if it opens the lock", async () => {
+    const w = makeWorld();
+    putLockedEscrow(w);
+    const good = await claimTx(w, w.preimage);
+    const wrong = await claimTx(w, new Uint8Array(32).fill(3));
+    history(w, [{ tx: wrong, err: CUSTOM(20) }, { tx: good, err: CUSTOM(19) }]);
+    const rail = await railFor(w);
+    expect(await rail.preimageFromSignature(w.ref, good.signature)).toBe(w.preimageHex);
+    expect(await rail.preimageFromSignature(w.ref, wrong.signature)).toBeNull();
+    expect(await rail.preimageFromSignature(w.ref, "missing")).toBeNull();
+    expect(w.chain.count("getSignaturesForAddress")).toBe(0);
   });
 
   it("skips a transaction the node no longer has or that is not a legacy transaction, and finds the claim after it", async () => {

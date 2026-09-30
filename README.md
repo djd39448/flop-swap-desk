@@ -826,8 +826,11 @@ without `rails.sol` is reported as an unregistered rail.
 **What the flows do on Solana that they do not on the other rails.** A claim that lands and fails publishes
 the secret in its instruction data: the Seller then posts the reveal (the secret is public regardless) and
 retries at once through `claim(..., { retryPublicSecret: true })`, at most twice; the Buyer's pending-claim
-check and `learnSecret` read the escrow's own history, so the Buyer learns the secret from the failed
-transaction and does not refund into it. Before signing, the client rail checks who the escrow pays and its
+check and `learnSecret` read the escrow's own history (the whole history, not a fixed window), so the Buyer
+learns the secret from the failed transaction and does not refund into it while leg B is still claimable; it
+also latches the secret it learned and never refunds leg A after claiming leg B. The Seller records the
+signature of its own failed claim and proves its retry from that one transaction, so padding the escrow's
+history cannot stop it. If the retry cannot land and the reveal cannot be posted, the retry still goes first. Before signing, the client rail checks who the escrow pays and its
 mint, amount and times against this leg's own terms, and refuses a claim with no resolved payee line.
 Both parties' proven `ed25519` lines are required, for the Seller's claim and for every evidence reader.
 
@@ -849,6 +852,17 @@ Only what the tests prove is claimed; the rest is written down.
   allowed only when the escrow's own on-chain history proves the preimage is public. It is NOT offered
   for `SolNotLandedError` (a claim that was sent but never landed): there the secret is only possibly
   seen, which stays a decision for a person.
+- **Leak detection reads the escrow's history, and that has limits.** A failed claim leaves no account
+  state, so "the secret is public" is read from the escrow's transaction history. The scan has no fixed
+  window (padding the escrow with failing transactions, about 0.0005 SOL per 100, cannot bury a claim), but
+  it needs an RPC node that retains the escrow's history (a pruned node can miss it), and a history longer
+  than `SOL_PREIMAGE_SCAN_HARD_LIMIT_TRANSACTIONS` (5000) makes the scan throw instead of answering "none".
+  The Seller's own retry does not depend on the scan (it fetches the recorded failing transaction); a
+  restarted Seller or any reader without a recorded signature does. The Buyer's refusal to refund a leaked
+  lock holds only while leg B is still claimable (it verifies on the paper rail and is before its
+  `refundAfterMs`) or after this flow claimed leg B; once leg B is refunded or past its window and never
+  claimed, leg A is refunded (the program refuses every claim at/after `refund_after_ms`, so refusing would
+  freeze it forever).
 - **`simulateTransaction` receives the signed claim.** The claim is simulated first so a claim the
   runtime would refuse is never sent, but the simulation request carries the signed transaction and so
   the secret. Use an endpoint you trust for the Seller, as for the send path. A claim past its own

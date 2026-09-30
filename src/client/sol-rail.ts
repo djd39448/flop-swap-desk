@@ -169,7 +169,7 @@ class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
     if (escrow === null) throw new Error("sol-rail: refusing to claim - no escrow exists for this ref");
     const problem = escrowTermsProblem(escrow, expected, this.options.config.assets.USDC, this.accounts.payer);
     if (problem !== null) throw new Error(`sol-rail: refusing to claim - ${problem}`);
-    const evidence = await this.solRail.claim(ref, secret, notAfterMs, undefined, options?.retryPublicSecret === true ? { retryPublicSecret: true } : {});
+    const evidence = await this.solRail.claim(ref, secret, notAfterMs, undefined, options?.retryPublicSecret === true ? { retryPublicSecret: true, ...(options.proofSignature === undefined ? {} : { proofSignature: options.proofSignature }) } : {});
     return toWriteEvidence(evidence);
   }
 

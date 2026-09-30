@@ -691,7 +691,7 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     h.node.midFlight = undefined;
     h.setTime(p.offerA.refundAfterMs);
     // the refund window is open, yet the Buyer refuses to refund into a lock whose secret is public
-    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/the lock has been claimed \(on chain or already broadcast\); call learnSecret\(\) then claimLegB\(\)/);
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/the secret is public and leg B is still claimable; call learnSecret\(\) then claimLegB\(\)/);
     expect(h.node.sent.refund).toBe(0);
     const secret = await h.buyerFlow.learnSecret();
     expect(secret).toBe(sellerSecret(h));
@@ -709,6 +709,116 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/call learnSecret/);
     expect(h.node.sent.refund).toBe(0);
   });
+  /** Anyone can push an address's history around: entries the escrow's scan must page through (SOL-C1). */
+  function padEscrowHistory(h: SolHarness, statement: string, count: number): void {
+    const escrow = base58.encode(escrowAddress(SOL_HTLC_PROGRAM_ID, h.buyerWallet.publicKey, statement).address);
+    const list = h.node.chain.addressSignatures.get(escrow) ?? [];
+    for (let i = 0; i < count; i += 1) list.unshift({ signature: base58.encode(new Uint8Array(64).fill(1 + (i % 250)).map((b, j) => (j === 0 ? (i >> 8) & 255 : j === 1 ? i & 255 : b))), slot: 1, err: CUSTOM(20) });
+    h.node.chain.addressSignatures.set(escrow, list);
+  }
+
+  it("SOL-C1: a failed claim buried under 150 padding entries does not block the Seller's public-secret retry past claimByMs", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    armFailedClaim(h, { recreate: false });
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/payee's associated token account/);
+    h.node.midFlight = undefined;
+    h.node.afterLand = undefined;
+    padEscrowHistory(h, p.statement, 150);
+    h.node.fundToken(h.sellerWallet.publicKeyBytes, 0n);
+    h.setTime(p.offerA.claimByMs + 60_000); // past claimByMs, well before refundAfterMs
+    const result = await h.sellerFlow.claimLegA(p.statement);
+    expect(result.receipt).toBeDefined();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
+    expect(h.node.tokenBalance(h.sellerWallet.publicKey)).toBe(1_000_000n);
+  });
+
+  it("SOL-C1: the Seller's own retry needs no history scan at all: a history past the scan guard does not stop it (recorded signature)", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    armFailedClaim(h, { recreate: false });
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/payee's associated token account/);
+    h.node.midFlight = undefined;
+    h.node.afterLand = undefined;
+    padEscrowHistory(h, p.statement, 5100);
+    h.node.fundToken(h.sellerWallet.publicKeyBytes, 0n);
+    h.setTime(p.offerA.claimByMs + 60_000);
+    await h.sellerFlow.claimLegA(p.statement);
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
+  });
+
+  it("SOL-C1: a Buyer (no recorded signature) finds the failed claim under 150 padding entries", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    armFailedClaim(h, { recreate: false });
+    await expect(h.sellerFlow.claimLegA(p.statement, { skipReveal: true })).rejects.toThrow();
+    padEscrowHistory(h, p.statement, 150);
+    expect(await h.buyerFlow.learnSecret()).toBe(sellerSecret(h));
+  });
+
+  it("SOL-C2: a Buyer that claimed leg B never refunds leg A, even when the chain scan no longer sees the leak", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    armFailedClaim(h, { recreate: false });
+    await expect(h.sellerFlow.claimLegA(p.statement, { skipReveal: true })).rejects.toThrow();
+    h.node.midFlight = undefined;
+    await h.buyerFlow.claimLegB(await h.buyerFlow.learnSecret());
+    h.node.chain.addressSignatures.clear(); // a node that pruned the history
+    h.setTime(p.offerA.refundAfterMs);
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/already claimed leg B/);
+    expect(h.node.sent.refund).toBe(0);
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Locked");
+  });
+
+  it("SOL-C2: a valid reveal frame alone (empty chain history) also stops the refund while leg B is claimable", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    armFailedClaim(h, { recreate: false });
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(); // posts the reveal
+    h.node.midFlight = undefined;
+    h.node.chain.addressSignatures.clear();
+    h.setTime(p.offerA.refundAfterMs);
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/leg B is still claimable/);
+    expect(h.node.sent.refund).toBe(0);
+  });
+
+  it("SOL-C3: once leg B is refunded and unclaimed, the public secret no longer blocks the refund of leg A", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    armFailedClaim(h, { recreate: false });
+    await expect(h.sellerFlow.claimLegA(p.statement, { skipReveal: true })).rejects.toThrow();
+    h.node.midFlight = undefined;
+    h.setTime(legBDeadlines().refundAfterMs + 60 * 60_000);
+    await h.sellerFlow.refundLegB();
+    await expect(h.buyerFlow.claimLegB(sellerSecret(h))).rejects.toThrow();
+    await h.buyerFlow.refundLegA();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Refunded");
+    expect(h.node.sent.refund).toBe(1);
+  });
+
+  it("SOL-C4: a reveal post that keeps failing does not stop the retry claim; the Seller is paid, then RevealNotPostedError", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    armFailedClaim(h, { recreate: true });
+    failPosts(h, "reveal", 6);
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toBeInstanceOf(RevealNotPostedError);
+    expect(h.node.history.filter((t) => t.kind === "claim").map((t) => t.err !== null)).toEqual([true, false]);
+    expect(h.node.tokenBalance(h.sellerWallet.publicKey)).toBe(1_000_000n);
+  });
+
+  it("SOL-C5: a failed claim whose reply was lost still gets its reveal frame once the next call sees it on chain", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    armFailedClaim(h, { recreate: false });
+    h.node.dropNextSendReplyFor = "claim";
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow();
+    expect(framesIn(await h.venue.read(dealRoomOf(p.acceptA)), "reveal")).toHaveLength(0);
+    h.node.midFlight = undefined;
+    h.node.afterLand = undefined;
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/payee's associated token account/);
+    expect(framesIn(await h.venue.read(dealRoomOf(p.acceptA)), "reveal")).toHaveLength(1);
+  });
+
 });
 
 // -- refunds: confirmed only, pending claims route to learnSecret ------------------------------------------------

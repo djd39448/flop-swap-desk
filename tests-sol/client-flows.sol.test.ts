@@ -690,7 +690,7 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     // public secret), and nothing is sent.
     h.skew.ms = 48 * MINUTE;
     const sendsBefore = h.buyerSends();
-    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/the lock has been claimed \(on chain or already broadcast\); call learnSecret\(\) then claimLegB\(\)/);
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/the secret is public and leg B is still claimable; call learnSecret\(\) then claimLegB\(\)/);
     await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/call learnSecret/); // on every retry, not only the first
     expect(h.buyerSends()).toBe(sendsBefore);
 

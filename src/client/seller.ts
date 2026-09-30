@@ -215,6 +215,8 @@ export class SellerFlow {
    *  has already posted (per contract + ref), so a retry of `claimLegA` (the G2 path, or a claim
    *  whose reveal post failed) re-posts only what is still missing and never doubles a frame. */
   private revealPosted?: { key: string; record: TranscriptRecord };
+  // SOL-C1: the signature of this flow's own claim that landed and failed on Solana (its instruction data holds the secret).
+  private publicClaimSignature?: string;
   private receiptPosted?: { key: string; record: TranscriptRecord };
   private offerB?: OfferFrame;
   private hashLock?: HashLock;
@@ -658,7 +660,9 @@ export class SellerFlow {
     // claim (S1), and a retry of such a claim is the rail's own public-secret mode, never a fresh private claim.
     const isSol = this.rail.railId === SOL_RAIL_ID;
     if (this.rail.railId === NEAR_RAIL_ID || isSol) {
-      const priorPreimage = await connected.findClaimedPreimage(railRef);
+      // SOL-C1: a failed claim this flow itself sent is remembered (with its signature), so the retry never
+      // depends on a bounded or pruned history read that someone else could have pushed it out of.
+      const priorPreimage = isSol && this.publicClaimSignature !== undefined ? this.hashLock.preimage : await connected.findClaimedPreimage(railRef);
       const revealedIsOwn = priorPreimage !== null && priorPreimage === this.hashLock.preimage;
 
       if (revealedIsOwn) {
@@ -679,6 +683,8 @@ export class SellerFlow {
         // G3: revealed, but not (or no longer) finally claimed — fall through to a claim retry
         // below, skipping the deadline guards the adapter's own H2 rule already permits skipping.
         skipDeadlineGuards = true;
+        // SOL-C5: the secret is public on chain, so the reveal frame is owed now, whether or not the retry lands.
+        if (isSol && options?.skipReveal !== true) await this.tryPostRevealForRetry(acceptA.contract, railRef, offerA.refundAfterMs);
       }
     }
 
@@ -752,7 +758,10 @@ export class SellerFlow {
       const before = connected.exchanges.length;
       try {
         writeEvidence = retryPublicSecret
-          ? await connected.claim(railRef, this.hashLock.preimage, notAfterMs, { retryPublicSecret: true })
+          ? await connected.claim(railRef, this.hashLock.preimage, notAfterMs, {
+              retryPublicSecret: true,
+              ...(this.publicClaimSignature === undefined ? {} : { proofSignature: this.publicClaimSignature }),
+            })
           : await connected.claim(railRef, this.hashLock.preimage, notAfterMs);
         this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
         break;
@@ -763,8 +772,11 @@ export class SellerFlow {
         // refundAfterMs, G6), and the claim is retried AT ONCE: the Buyer can read the secret off that failed
         // transaction and claim leg B, so the Seller's only protection is to be paid before the window closes.
         if (error instanceof SolClaimFailedError && error.secretPublic) {
+          this.publicClaimSignature = error.signature; // SOL-C1
+          // SOL-C4: the retry is what pays the Seller; a reveal post that keeps failing must not stop it. A reveal
+          // still unposted when the claim lands is raised by the post after the loop.
           if (options?.skipReveal !== true) {
-            await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, `claim failed on chain and the secret is public: ${error.message}`);
+            await this.tryPostRevealForRetry(acceptA.contract, railRef, offerA.refundAfterMs);
           }
           if (retries >= SOL_PUBLIC_SECRET_RETRIES) throw error;
           retryPublicSecret = true;
@@ -802,6 +814,16 @@ export class SellerFlow {
     const receipt = await this.postReceiptLatched(acceptA.contract, railRef);
 
     return { evidence: writeEvidence, ...(reveal === undefined ? {} : { reveal }), receipt };
+  }
+
+  /** SOL-C4/C5: post the reveal, but let a `RevealNotPostedError` pass (the secret is already public and the retry
+   *  claim is what pays the Seller); the post after a landed claim raises it if it is still missing. */
+  private async tryPostRevealForRetry(contract: string, ref: string, refundAfterMs: number): Promise<void> {
+    try {
+      await this.postRevealLatched(contract, ref, refundAfterMs, "the secret is public on chain");
+    } catch (error) {
+      if (!(error instanceof RevealNotPostedError)) throw error;
+    }
   }
 
   /** G6: post the leg-A reveal once per (contract, ref); retried a bounded number of times, then

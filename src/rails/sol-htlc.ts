@@ -93,8 +93,10 @@ export const SOL_EXPIRY_MARGIN_MS = 30_000;
  *  Mainnet-like clusters need the same; the localnet harness uses windows longer than this. */
 export const SOL_CLAIM_LANDING_MARGIN_MS = SOL_BLOCKHASH_VALIDITY_BLOCKS * SOL_SLOW_BLOCK_MS + SOL_EXPIRY_MARGIN_MS;
 
-/** `findClaimedPreimage` looks at no more than this many transactions of an escrow's history. */
-export const SOL_PREIMAGE_SCAN_MAX_TRANSACTIONS = 100;
+/** `findClaimedPreimage` scans an escrow's whole finalized history (SOL-C1: a fixed small window let anyone bury a
+ *  failed claim under padding). This is only a runaway guard: a history longer than this makes the scan THROW
+ *  (`SolHistoryTooLongError`), never return "no secret found". */
+export const SOL_PREIMAGE_SCAN_HARD_LIMIT_TRANSACTIONS = 5000;
 const SCAN_PAGE = 25;
 
 // --- typed write errors ---------------------------------------------------------------------------------------
@@ -161,6 +163,14 @@ export class SolClaimFailedError extends SolTxFailedError {
   constructor(signature: string, err: unknown, raw: readonly string[], detail?: string) {
     super(`sol-htlc: claim failed on chain and the secret is now public, retry at once${detail === undefined ? "" : ` (${detail})`}`, signature, err, raw);
     this.name = "SolClaimFailedError";
+  }
+}
+
+/** The escrow's history is longer than the scan guard, so "no claim found" cannot be concluded (SOL-C1). */
+export class SolHistoryTooLongError extends Error {
+  constructor(limit: number) {
+    super(`sol-htlc: the escrow's transaction history is longer than ${limit} entries, so a public secret cannot be ruled out by scanning it`);
+    this.name = "SolHistoryTooLongError";
   }
 }
 
@@ -562,6 +572,9 @@ export interface SolClaimOptions {
    * (`SolNotLandedError`): that stays a decision for a person.
    */
   retryPublicSecret?: boolean;
+  /** SOL-C1: the signature of the claim that landed and failed (`SolClaimFailedError.signature`). The retry is then
+   *  proven by fetching exactly that transaction, not by scanning the escrow's history, which anyone can pad. */
+  proofSignature?: string;
 }
 
 /**
@@ -1048,7 +1061,10 @@ export class SolHtlcRail {
     if (retry) {
       // SOL-A2: the retry mode exists only for a secret that is ALREADY public, and that is proven on chain,
       // never taken on the caller's word.
-      const proven = await this.findClaimedPreimage(ref);
+      const proven =
+        options.proofSignature !== undefined
+          ? ((await this.preimageFromSignature(ref, options.proofSignature)) ?? (await this.findClaimedPreimage(ref)))
+          : await this.findClaimedPreimage(ref);
       if (proven !== preimage) {
         throw new Error("sol-htlc: refusing a public-secret retry - no claim carrying this preimage was found in this escrow's on-chain history");
       }
@@ -1188,12 +1204,11 @@ export class SolHtlcRail {
   /**
    * The secret, if it is public: from the escrow's stored preimage (a Claimed escrow), or, because a claim
    * that FAILS still publishes it in its instruction data (S1), from the escrow's own transaction history
-   * (`getSignaturesForAddress` on the escrow, then `getTransaction` for each, both at finalized and bounded
-   * by `SOL_PREIMAGE_SCAN_MAX_TRANSACTIONS`). Only a preimage that actually opens the hash lock is returned;
-   * a Claim instruction is recognised only when it names this program, has the 33-byte claim shape, and its
-   * first account is this escrow. A history longer than the bound is not exhaustively scanned (anyone can
-   * pad an address's history); a claim buried under that padding is missed, which is why the Buyer also
-   * reads the escrow itself first.
+   * (`getSignaturesForAddress` on the escrow, then `getTransaction` for each, both at finalized) over the WHOLE
+   * history: padding cannot hide a claim (SOL-C1). A history beyond `SOL_PREIMAGE_SCAN_HARD_LIMIT_TRANSACTIONS`
+   * throws rather than returns null. Only a preimage that actually opens the hash lock is returned; a Claim
+   * instruction is recognised only when it names this program, has the 33-byte claim shape, and its first
+   * account is this escrow. Needs an RPC node that retains the escrow's history (a pruned node can miss it).
    */
   async findClaimedPreimage(ref: string): Promise<string | null> {
     const parsed = this.requireRef(ref);
@@ -1206,21 +1221,32 @@ export class SolHtlcRail {
     const escrowText = pubkeyToBase58(escrow);
     let inspected = 0;
     let before: string | undefined;
-    while (inspected < SOL_PREIMAGE_SCAN_MAX_TRANSACTIONS) {
-      const limit = Math.min(SCAN_PAGE, SOL_PREIMAGE_SCAN_MAX_TRANSACTIONS - inspected);
-      const page = await this.sol.getSignaturesForAddress(escrowText, { commitment: "finalized", limit, ...(before === undefined ? {} : { before }) });
+    for (;;) {
+      const page = await this.sol.getSignaturesForAddress(escrowText, { commitment: "finalized", limit: SCAN_PAGE, ...(before === undefined ? {} : { before }) });
       for (const info of page) {
         inspected += 1;
+        if (inspected > SOL_PREIMAGE_SCAN_HARD_LIMIT_TRANSACTIONS) throw new SolHistoryTooLongError(SOL_PREIMAGE_SCAN_HARD_LIMIT_TRANSACTIONS);
         const fetched = await this.sol.getTransaction(info.signature, "finalized");
         if (fetched === null || fetched.transaction === null) continue;
         const found = this.preimageFromTransaction(fetched.transaction, escrow, opens);
         if (found !== null) return found;
       }
       const last = page[page.length - 1];
-      if (page.length < limit || last === undefined) break;
+      if (page.length < SCAN_PAGE || last === undefined) return null;
       before = last.signature;
     }
-    return null;
+  }
+
+  /** SOL-C1: the preimage carried by ONE named finalized transaction (a Claim on this escrow that opens this hash
+   *  lock), or null. No scan: the caller recorded the signature of its own failed claim. */
+  async preimageFromSignature(ref: string, signature: string): Promise<string | null> {
+    const parsed = this.requireRef(ref);
+    const hashLockBytes = hexToBytes(parsed.hashLock.slice(2));
+    const opens = (bytes: Uint8Array): boolean => bytes.length === 32 && bytesEqual(sha256(bytes), hashLockBytes);
+    const { escrow } = this.escrowKeys(parsed);
+    const fetched = await this.sol.getTransaction(signature, "finalized");
+    if (fetched === null || fetched.transaction === null) return null;
+    return this.preimageFromTransaction(fetched.transaction, escrow, opens);
   }
 
   private preimageFromTransaction(tx: SolTransaction, escrow: Uint8Array, opens: (bytes: Uint8Array) => boolean): string | null {
