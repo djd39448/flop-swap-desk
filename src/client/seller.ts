@@ -139,6 +139,27 @@ export interface LegBDeadlines {
  * step, meant to be called in the order SPEC §6 lists: `acceptLegA` → `postAccountLineA` →
  * `lockLegB` → (`claimLegA` | `refundLegB`).
  */
+/** P5-NEAR-FIXES-R2.md G6: the reveal frame could not be posted after the secret was already
+ *  public on chain (or the chain claim already landed). tclk's machine only accepts a reveal
+ *  while the contract is still `locked`; once the buyer's `refund` frame lands after
+ *  `refundAfterMs` the reveal is rejected and the claim can never be recorded in the transcript.
+ *  So the reveal MUST land before `refundAfterMs`: call `claimLegA` again (it re-posts only what
+ *  is missing) before that time. */
+export class RevealNotPostedError extends Error {
+  readonly refundAfterMs: number;
+  constructor(refundAfterMs: number, cause: unknown, detail: string) {
+    super(
+      `seller: the reveal frame did not post after ${REVEAL_POST_ATTEMPTS} attempts - the reveal must land before refundAfterMs (${refundAfterMs}); retry claimLegA before then (${detail}): ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause },
+    );
+    this.name = "RevealNotPostedError";
+    this.refundAfterMs = refundAfterMs;
+  }
+}
+
+/** Bounded immediate retries for the reveal post (G6). */
+const REVEAL_POST_ATTEMPTS = 3;
+
 export class SellerFlow {
   private readonly identity: Signer;
   private readonly venue: Venue;
@@ -162,6 +183,11 @@ export class SellerFlow {
    *  a pubkey/account line posted after that point can neither help nor hinder a later call. */
   private frozenLegAAccounts?: RailAccounts;
   private frozenLegARailRef?: string;
+  /** P5-NEAR-FIXES-R2.md G6: latches for the leg-A reveal and receipt frames this flow instance
+   *  has already posted (per contract + ref), so a retry of `claimLegA` (the G2 path, or a claim
+   *  whose reveal post failed) re-posts only what is still missing and never doubles a frame. */
+  private revealPosted?: { key: string; record: TranscriptRecord };
+  private receiptPosted?: { key: string; record: TranscriptRecord };
   private offerB?: OfferFrame;
   private hashLock?: HashLock;
   private lockedLegBContract?: string;
@@ -600,16 +626,8 @@ export class SellerFlow {
           // flow instance) and send nothing.
           const reveal = options?.skipReveal === true
             ? undefined
-            : await this.venue.post(
-                dealRoom(acceptA.contract),
-                encodeFrame({ type: "reveal", from: this.identity.did, contract: acceptA.contract, ref: railRef, secret: this.hashLock.preimage }),
-                this.identity,
-              );
-          const receipt = await this.venue.post(
-            dealRoom(acceptA.contract),
-            encodeFrame({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "claimed", rail: this.rail.railId, ref: railRef }),
-            this.identity,
-          );
+            : await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, "claim already landed on chain");
+          const receipt = await this.postReceiptLatched(acceptA.contract, railRef);
           return { evidence: { ref: railRef, raw: [] }, ...(reveal === undefined ? {} : { reveal }), receipt };
         }
         // G3: revealed, but not (or no longer) finally claimed — fall through to a claim retry
@@ -695,11 +713,10 @@ export class SellerFlow {
       // did. Any other failure (`NearTxFailedError`: the transaction itself never took effect,
       // or any other rail's own claim failure) posts nothing at all.
       if (error instanceof NearPayoutFailedError && options?.skipReveal !== true) {
-        await this.venue.post(
-          dealRoom(acceptA.contract),
-          encodeFrame({ type: "reveal", from: this.identity.did, contract: acceptA.contract, ref: railRef, secret: this.hashLock.preimage }),
-          this.identity,
-        );
+        // G6: the secret is public on chain now, so the tclk reveal must still land before
+        // refundAfterMs. Retried, and if it still fails the distinct RevealNotPostedError (its
+        // message carries the payout failure) replaces the bare payout error.
+        await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, `payout failed: ${error.message}`);
       }
       throw error;
     }
@@ -712,21 +729,48 @@ export class SellerFlow {
     // the machine, leaving leg A stuck at `"locked"` forever despite a real, valid claim).
     const reveal = options?.skipReveal === true
       ? undefined
-      : await this.venue.post(
-          dealRoom(acceptA.contract),
-          encodeFrame({ type: "reveal", from: this.identity.did, contract: acceptA.contract, ref: railRef, secret: this.hashLock.preimage }),
-          this.identity,
-        );
+      : await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, "claim landed on chain");
     // tclk's own machine requires a receipt frame's `ref`, when present, to equal the contract's
     // own accepted `railRef` (vendor/tclk/src/machine.ts) — `railRef`, never `hashLockHex` (only
     // ever the same value by coincidence for evm-htlc).
-    const receipt = await this.venue.post(
-      dealRoom(acceptA.contract),
-      encodeFrame({ type: "receipt", from: this.identity.did, contract: acceptA.contract, outcome: "claimed", rail: this.rail.railId, ref: railRef }),
-      this.identity,
-    );
+    const receipt = await this.postReceiptLatched(acceptA.contract, railRef);
 
     return { evidence: writeEvidence, ...(reveal === undefined ? {} : { reveal }), receipt };
+  }
+
+  /** G6: post the leg-A reveal once per (contract, ref); retried a bounded number of times, then
+   *  a distinct `RevealNotPostedError` (never a silent skip). */
+  private async postRevealLatched(contract: string, ref: string, refundAfterMs: number, detail: string): Promise<TranscriptRecord> {
+    const key = `${contract}|${ref}`;
+    if (this.revealPosted?.key === key) return this.revealPosted.record;
+    let last: unknown;
+    for (let attempt = 0; attempt < REVEAL_POST_ATTEMPTS; attempt++) {
+      try {
+        const record = await this.venue.post(
+          dealRoom(contract),
+          encodeFrame({ type: "reveal", from: this.identity.did, contract, ref, secret: this.hashLock!.preimage }),
+          this.identity,
+        );
+        this.revealPosted = { key, record };
+        return record;
+      } catch (error) {
+        last = error;
+      }
+    }
+    throw new RevealNotPostedError(refundAfterMs, last, detail);
+  }
+
+  /** G6: post the leg-A `claimed` receipt once per (contract, ref). */
+  private async postReceiptLatched(contract: string, ref: string): Promise<TranscriptRecord> {
+    const key = `${contract}|${ref}`;
+    if (this.receiptPosted?.key === key) return this.receiptPosted.record;
+    const record = await this.venue.post(
+      dealRoom(contract),
+      encodeFrame({ type: "receipt", from: this.identity.did, contract, outcome: "claimed", rail: this.rail.railId, ref }),
+      this.identity,
+    );
+    this.receiptPosted = { key, record };
+    return record;
   }
 
   /** Refund leg B only at/after `B.refundAfterMs` (the tclk `PaperRail` itself also enforces

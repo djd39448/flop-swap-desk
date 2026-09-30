@@ -607,7 +607,86 @@ describe("G1/G3 — NearPayoutFailedError posts a reveal but no receipt, then a 
     expect(result.receipt).toBeDefined();
     const afterRetry = await h.venue.read(dealRoomA);
     expect(framesIn(afterRetry, "receipt")).toHaveLength(1);
+    // G6: the reveal was already posted by the first call; the retry must not post a second one.
+    expect(framesIn(afterRetry, "reveal")).toHaveLength(1);
     expect(h.node.getLockRow(hashLockHex)?.status).toBe("Claimed");
+  });
+});
+
+// ── G6: the reveal must land before refundAfterMs ───────────────────────────────────────────
+
+/** Make `h.venue.post` throw for the next `count` reveal frames (all other posts pass through). */
+function failRevealPosts(h: { venue: { post: (...a: never[]) => Promise<unknown> } }, count: number): { failed: () => number } {
+  const venue = h.venue as unknown as { post: (room: string, line: string, id: unknown) => Promise<unknown> };
+  const original = venue.post.bind(venue);
+  let failed = 0;
+  venue.post = async (room, line, id) => {
+    const frame = tryDecodeFrame(line) as { type?: string } | null;
+    if (frame?.type === "reveal" && failed < count) {
+      failed++;
+      throw new Error("venue unreachable (test)");
+    }
+    return original(room, line, id);
+  };
+  return { failed: () => failed };
+}
+
+describe("G6 - the reveal must land before refundAfterMs", () => {
+  it("a payout failure whose reveal post keeps failing throws RevealNotPostedError (not the bare payout error) and posts nothing", async () => {
+    const h = harness();
+    const { acceptA, statement } = await lockedFlow(h);
+    h.node.armPayoutFailureAfterReads(SELLER_ACCOUNT, 2);
+    const fails = failRevealPosts(h as never, 99);
+
+    let thrown: unknown;
+    try {
+      await h.sellerFlow.claimLegA(statement);
+    } catch (error) {
+      thrown = error;
+    }
+    expect((thrown as Error).name).toBe("RevealNotPostedError");
+    expect((thrown as Error).message).toMatch(/reveal must land before refundAfterMs/);
+    expect((thrown as Error).message).toMatch(/payout failed/);
+    expect(fails.failed()).toBe(3); // bounded retries
+    expect(framesIn(await h.venue.read(dealRoomOf(acceptA)), "reveal")).toHaveLength(0);
+  });
+
+  it("a payout failure whose reveal post fails twice is retried and lands; the payout error still surfaces", async () => {
+    const h = harness();
+    const { acceptA, statement } = await lockedFlow(h);
+    h.node.armPayoutFailureAfterReads(SELLER_ACCOUNT, 2);
+    failRevealPosts(h as never, 2);
+
+    let thrown: unknown;
+    try {
+      await h.sellerFlow.claimLegA(statement);
+    } catch (error) {
+      thrown = error;
+    }
+    expect((thrown as Error).name).toBe("NearPayoutFailedError");
+    expect(framesIn(await h.venue.read(dealRoomOf(acceptA)), "reveal")).toHaveLength(1);
+  });
+
+  it("a claim that landed but whose reveal post failed: the G2 retry posts the missing reveal and receipt exactly once, and a third call posts nothing", async () => {
+    const h = harness();
+    const { acceptA, statement } = await lockedFlow(h);
+    failRevealPosts(h as never, 3);
+
+    await expect(h.sellerFlow.claimLegA(statement)).rejects.toMatchObject({ name: "RevealNotPostedError" });
+    expect(h.node.claimSendTxCalls).toBe(1);
+    const room = dealRoomOf(acceptA);
+    expect(framesIn(await h.venue.read(room), "reveal")).toHaveLength(0);
+    expect(framesIn(await h.venue.read(room), "receipt")).toHaveLength(0);
+
+    const second = await h.sellerFlow.claimLegA(statement);
+    expect(second.reveal).toBeDefined();
+    expect(h.node.claimSendTxCalls).toBe(1); // no second claim transaction
+    expect(framesIn(await h.venue.read(room), "reveal")).toHaveLength(1);
+    expect(framesIn(await h.venue.read(room), "receipt")).toHaveLength(1);
+
+    const length = (await h.venue.read(room)).length;
+    await h.sellerFlow.claimLegA(statement);
+    expect((await h.venue.read(room)).length).toBe(length); // latched: nothing re-posted
   });
 });
 
@@ -637,7 +716,7 @@ describe("G1 — NearTxFailedError posts nothing", () => {
 // ── G2 (claim half): a retry after the chain already agrees the claim landed ────────────────
 
 describe("G2 — a retry after an already-successful claim recognises success from the chain and sends nothing", () => {
-  it("a second claimLegA call posts the frames again but never re-signs/re-sends a claim transaction", async () => {
+  it("a second claimLegA call posts nothing new (latched) and never re-signs/re-sends a claim transaction", async () => {
     const h = harness();
     const { acceptA, statement } = await lockedFlow(h);
     const dealRoomA = dealRoomOf(acceptA);
@@ -653,7 +732,10 @@ describe("G2 — a retry after an already-successful claim recognises success fr
     // adapter's own claim() is never called a second time.
     expect(h.node.claimSendTxCalls).toBe(1);
     const after = await h.venue.read(dealRoomA);
-    expect(after.length).toBeGreaterThan(before); // it still (idempotently) posts the frames
+    // G6: the frames the first call posted are latched per flow instance, so nothing is doubled.
+    expect(after.length).toBe(before);
+    expect(framesIn(after, "reveal")).toHaveLength(1);
+    expect(framesIn(after, "receipt")).toHaveLength(1);
   });
 });
 
