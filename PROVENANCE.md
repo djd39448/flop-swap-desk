@@ -144,7 +144,11 @@ comment).
 - `src/rails/near-rpc.ts` — the thin fetch JSON-RPC client (`status`, `block`, `call_function`,
   `send_tx`, `EXPERIMENTAL_tx_status`, `viewAccessKey`) through `CapturingRpc`, including
   `NearUnknownTransactionError`'s own recognition of near-sandbox's real tx-status timeout shape
-  (confirmed live against the sandbox, NB-int).
+  (confirmed live against the sandbox, NB-int). H11: nonce and expiry errors are read from the node's
+  real shape (`error.data.TxExecutionError.InvalidTxError`), pinned by two reply bodies captured from
+  a sandbox run (`tests/near-rpc.test.ts`) and re-forced live (`tests-near/near-rpc-errors.near.test.ts`).
+  H10/H13: `txStatus` takes object params with `wait_until` (default `FINAL`) and returns the
+  transaction body; `withReadTimeout` bounds reads (not `send_tx`/`txStatus`).
 - `src/rails/near-ref.ts` — the shared NEAR ref helper: `0x<hash lock hex>:<payer account id>`
   (squatting fix, replacing D-N4's "ref = hash lock"), one parser/formatter every caller uses.
 - `src/rails/near-htlc.ts` — the desk-facing `near-htlc` adapter: chain pin (allow list
@@ -152,10 +156,16 @@ comment).
   sign-and-record-then-broadcast split (D-N4; the lock is the only two-step write, `claim` and
   `refund` are single calls), `FT_TRANSFER_CALL_GAS`/`CLAIM_REFUND_GAS`
   corrected from their provisional 100/60 Tgas to 20/40 Tgas against real measured gas burn on
-  the sandbox (D-N9, NB-int).
+  the sandbox (D-N9, NB-int). H9: a lock is accepted only on the transaction's own used amount
+  (`SuccessValue`, `"0"` = refused) plus a `Locked` lock with the exact terms; unsettled cases throw
+  `NearLockUnknownError`. H10: `recoverByTxHash` decodes and matches the transaction to this rail's
+  own write for the ref. H12: `claim` checks payee, token, amount and times before signing. H13:
+  bounded reads, and the claim's deadline guard is the last read.
 - `src/rails/near-evidence.ts` — the pure, fail-closed finalized-view evidence decoder shared by
   the live rail and the offline replay, the NEAR twin of `src/rails/evm-evidence.ts`/
-  `src/rails/btc-evidence.ts` (D-N10).
+  `src/rails/btc-evidence.ts` (D-N10). H8: it also binds `view_account` and `view_access_key_list` of
+  the contract at the finalized block (reviewed code hash, zero access keys); the NEAR fixtures
+  taken before H8 lack those reads and replay unverified until recaptured.
 - `src/rails/near-signer-memory.ts` — `InMemoryNearSigner`, the ONLY concrete `NearSigner`
   implementation in this build (test/harness code only — §1/D-N2/D-10): the secret key is an ES
   `#secretKey` private field, and `toJSON`/`util.inspect` expose only the account id and public

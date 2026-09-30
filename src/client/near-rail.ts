@@ -133,7 +133,10 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
    *  chain time as the LAST read before broadcast (P22-P24-EVM-FIXES-R3.md E4's rule, reused
    *  here) — this wrapper adds no behaviour of its own. */
   async claim(ref: string, secret: string, notAfterMs: number): Promise<RailWriteEvidence> {
-    const evidence = await this.nearRail.claim(ref, secret, notAfterMs);
+    // H12: the adapter checks who the lock pays and its token, amount and times against THIS
+    // leg's own terms (the payee is the account line resolved for this leg) before signing.
+    const expected = this.accounts.payee === undefined ? undefined : toNearHtlcTerms(this.terms, this.accounts);
+    const evidence = await this.nearRail.claim(ref, secret, notAfterMs, expected);
     return toWriteEvidence(evidence);
   }
 

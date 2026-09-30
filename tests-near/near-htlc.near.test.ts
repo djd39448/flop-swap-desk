@@ -27,6 +27,7 @@ import {
   NearLockRefusedError,
   NearPayoutFailedError,
   NearTxFailedError,
+  NearUnexpectedTransactionError,
   type NearHtlcTerms,
   type NearSigner,
 } from "../src/rails/near-htlc.js";
@@ -345,7 +346,9 @@ describe("near-htlc (sandbox)", () => {
     // Pre-check: NearHtlcRail.claim's own no-secret storage_balance_of check refuses before ever
     // signing or sending — proven by asserting no send_tx exchange happened.
     const { rail: sellerRail, rpc: sellerRpc } = await connect(sandbox.seller.signer);
-    await expect(sellerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs - 1000)).rejects.toThrow(/is not storage-registered/);
+    // H12: this test's lock pays a third account, so the claim names that payee as the expected one.
+    const expectedTerms: NearHtlcTerms = { hashLock: hashLock0x, amount, payee: unregisteredPayee, claimByMs, refundAfterMs };
+    await expect(sellerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs - 1000, expectedTerms)).rejects.toThrow(/is not storage-registered/);
     expect(sellerRpc.exchanges().some((e) => e.method === "send_tx")).toBe(false);
 
     // Forced past the pre-check: build and send the claim transaction directly, bypassing
@@ -453,7 +456,7 @@ describe("near-htlc (sandbox)", () => {
       // H3: notAfterMs must clear the 30s landing margin before refundAfterMs on an unrevealed
       // (first) attempt, or the adapter's own margin guard would refuse before ever reaching the
       // network — this scenario is about the payout callback failing, not the margin guard.
-      await buyerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs - 60_000);
+      await buyerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs - 60_000, { hashLock: hashLock0x, amount, payee: payee.accountId, claimByMs, refundAfterMs });
     } catch (error) {
       caught = error;
     }
@@ -560,7 +563,7 @@ describe("near-htlc (sandbox)", () => {
 
     const balanceBefore = BigInt(await sandbox.usdcBalanceOf(unregisteredPayee));
     const { rail: sellerRail } = await connect(sandbox.seller.signer);
-    const evidence = await sellerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs - 1_000); // already in the past
+    const evidence = await sellerRail.claim(refOf(hashLock0x), preimage0x, refundAfterMs - 1_000, { hashLock: hashLock0x, amount, payee: unregisteredPayee, claimByMs, refundAfterMs }); // already in the past
     expect(evidence.ref).toBe(refOf(hashLock0x));
 
     const balanceAfter = BigInt(await sandbox.usdcBalanceOf(unregisteredPayee));
@@ -654,6 +657,61 @@ describe("near-htlc (sandbox)", () => {
       const result = nearEvidence({ terms, config: sandbox.config, accounts, capture });
       expect(result.rail?.status).toBe("refunded");
     }
+  });
+
+  it("H9 (sandbox): a second lock with the IDENTICAL terms is refused by the contract; its own outcome says \"0\", so commitLock throws NearLockRefusedError instead of mistaking the first lock for its own", async () => {
+    const { hashLock0x } = randomHashLock();
+    const now = await chainNowMs();
+    const terms: NearHtlcTerms = { hashLock: hashLock0x, amount: "10", payee: sandbox.seller.accountId, claimByMs: now + 10 * 60_000, refundAfterMs: now + 20 * 60_000 };
+    const { rail: first } = await connect(sandbox.buyer.signer);
+    await first.prepareLock(terms);
+    await first.commitLock();
+    const { rail: second } = await connect(sandbox.buyer.signer);
+    await second.prepareLock(terms);
+    await expect(second.commitLock()).rejects.toThrow(NearLockRefusedError);
+  });
+
+  it("H10 (sandbox): recoverByTxHash recovers this rail's own lock with FINAL evidence, and refuses another ref, another payer and another signer's rail", async () => {
+    const { hashLock0x } = randomHashLock();
+    const now = await chainNowMs();
+    const terms: NearHtlcTerms = { hashLock: hashLock0x, amount: "10", payee: sandbox.seller.accountId, claimByMs: now + 10 * 60_000, refundAfterMs: now + 20 * 60_000 };
+    const { rail: buyerRail } = await connect(sandbox.buyer.signer);
+    const { ref, txHash } = await buyerRail.prepareLock(terms);
+    const written = await buyerRail.commitLock();
+
+    const { rail: recoveryRail, rpc: recoveryRpc } = await connect(sandbox.buyer.signer);
+    const recovered = await recoveryRail.recoverByTxHash(txHash, sandbox.buyer.accountId, ref);
+    expect(recovered).toMatchObject({ ref, txHash, blockHash: written.blockHash });
+    const statusRequest = recoveryRpc.exchanges().find((e) => e.method === "EXPERIMENTAL_tx_status");
+    expect(JSON.parse(statusRequest!.requestBody).params).toMatchObject({ tx_hash: txHash, sender_account_id: sandbox.buyer.accountId, wait_until: "FINAL" });
+
+    // Another hash lock's ref: the transaction is not the write for it.
+    const other = randomHashLock();
+    await expect(recoveryRail.recoverByTxHash(txHash, sandbox.buyer.accountId, refOf(other.hashLock0x))).rejects.toThrow(NearUnexpectedTransactionError);
+    // Another payer named by the ref.
+    await expect(recoveryRail.recoverByTxHash(txHash, sandbox.buyer.accountId, refOf(hashLock0x, sandbox.seller.accountId))).rejects.toThrow(NearUnexpectedTransactionError);
+    // Another signer's rail asked to recover the buyer's write.
+    const { rail: sellerRail } = await connect(sandbox.seller.signer);
+    await expect(sellerRail.recoverByTxHash(txHash, sandbox.buyer.accountId, ref)).rejects.toThrow(NearUnexpectedTransactionError);
+  });
+
+  it("H12 (sandbox): a claim by an account the lock does not pay is refused before anything is signed", async () => {
+    const { preimage0x, hashLock0x } = randomHashLock();
+    const now = await chainNowMs();
+    const terms: NearHtlcTerms = { hashLock: hashLock0x, amount: "10", payee: sandbox.seller.accountId, claimByMs: now + 10 * 60_000, refundAfterMs: now + 20 * 60_000 };
+    const { rail: buyerRail, rpc } = await connect(sandbox.buyer.signer);
+    await buyerRail.prepareLock(terms);
+    await buyerRail.commitLock();
+    const before = rpc.exchanges().filter((e) => e.method === "send_tx").length;
+    // The buyer holds the preimage in this test, but the lock pays the seller: the default check (payee == signer) refuses.
+    await expect(buyerRail.claim(refOf(hashLock0x), preimage0x, terms.refundAfterMs - 60_000)).rejects.toThrow(/pays "seller.*not the expected payee/);
+    expect(rpc.exchanges().filter((e) => e.method === "send_tx").length).toBe(before);
+    // With the seller as expected payee and the true terms, the buyer's rail would sign -- but wrong terms are refused.
+    await expect(buyerRail.claim(refOf(hashLock0x), preimage0x, terms.refundAfterMs - 60_000, { ...terms, amount: "11" })).rejects.toThrow(/not the expected 11/);
+    // The rightful claim still works.
+    const { rail: sellerRail } = await connect(sandbox.seller.signer);
+    const evidence = await sellerRail.claim(refOf(hashLock0x), preimage0x, terms.refundAfterMs - 60_000, terms);
+    expect(evidence.ref).toBe(refOf(hashLock0x));
   });
 
   it("H8 (sandbox): the evidence reader binds the contract's real code hash and zero-key state; a config pinning any other hash reports null with the reason", async () => {

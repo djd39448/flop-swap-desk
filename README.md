@@ -513,6 +513,30 @@ very last read before broadcast. A claim that would fail any of these (the wrong
 lock that's expired or already resolved, a payee who was never storage-registered) is refused
 client-side and never sent at all.
 
+**Who a claim pays, and what a lock write proves (H9, H10, H12, H13).**
+- *H12.* Before signing, `claim()` requires the lock's payee to be the expected payee (the signer
+  itself, or the payee of the terms the caller passes; the client rail passes the leg's own terms)
+  and the lock's token, amount and both times to equal them. Without expected terms only payee
+  (the signer) and token are checked.
+- *H9.* `commitLock` accepts a lock only when this transaction's own outcome says the whole amount
+  was used (`ft_transfer_call` resolves to the used amount as a JSON string: `"10"` for a made
+  lock, `"0"` for a refusal, both observed on a real sandbox) and the lock is `Locked` with the
+  exact terms. A refusal (`NearLockRefusedError`, "tokens returned") is claimed only when the outcome
+  says `"0"`; anything the outcome and the chain do not settle, including a lock not visible after
+  one re-read at a later final block, throws `NearLockUnknownError` ("call reconcileLockA"), which
+  does not say the tokens came back. A second identical lock attempt is therefore refused rather
+  than mistaken for the first one.
+- *H10.* `recoverByTxHash(txHash, sender, expectedRef)` waits for `FINAL`, decodes the transaction
+  (signer and key, receiver, method, arguments) and recovers only this rail's own lock, claim or
+  refund for that ref (`NearUnexpectedTransactionError` otherwise), then applies the same
+  kind-specific post-checks and typed errors as a send.
+- *H13.* Every read the rail makes has an explicit short timeout (`NEAR_PRESEND_READ_TIMEOUT_MS`,
+  5 s; `send_tx` and the transaction lookup wait for finality and are not bounded by it). The claim's
+  pinned-chain check now runs before its deadline guard, so the guard is the last read before
+  broadcast, and `NEAR_CLAIM_LANDING_MARGIN_MS` (30 s) exceeds the timeout plus a few blocks.
+  The read timeout abandons the call rather than cancelling it: an abandoned request may still
+  complete and appear in the capture log.
+
 **What this proves, and what it does not.** The three committed fixtures
 (`fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b}/`, replayed hermetically by
 `tests/near-sandbox-fixtures.test.ts`) show a real `htlc` contract funded, claimed or refunded on

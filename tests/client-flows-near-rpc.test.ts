@@ -287,12 +287,16 @@ class StatefulNearRpc {
     const decoded = decodeSignedTxFunctionCall(params.signed_tx_base64 as string);
     this.nonces.set(decoded.signerId, (this.nonces.get(decoded.signerId) ?? 0) + 1);
     let failure: unknown = null;
+    // H9: `ft_transfer_call` resolves to the amount used (JSON string): the whole amount when the
+    // lock was made, "0" when `ft_on_transfer` refused it (as observed on a real near-sandbox).
+    let successValue = "";
 
     if (decoded.methodName === "ft_transfer_call") {
       const amount = decoded.argsJson.amount as string;
       const msg = JSON.parse(decoded.argsJson.msg as string) as { hash_lock: string; payee: string; claim_by_ms: string; refund_after_ms: string };
       const alreadyExists = this.locks.has(this.key(decoded.signerId, msg.hash_lock));
       const refused = alreadyExists || msg.payee === this.contract || msg.payee === this.token || BigInt(amount) <= 0n;
+      successValue = Buffer.from(JSON.stringify(refused ? "0" : amount)).toString("base64");
       if (!refused) {
         this.locks.set(this.key(decoded.signerId, msg.hash_lock), {
           status: "Locked",
@@ -344,7 +348,7 @@ class StatefulNearRpc {
 
     this.blockHeight += 1;
     const block = this.currentBlock();
-    return { status: failure === null ? { SuccessValue: "" } : { Failure: failure }, transaction_outcome: { id: `outcome-${this.blockHeight}`, block_hash: block.hash } };
+    return { status: failure === null ? { SuccessValue: successValue } : { Failure: failure }, transaction_outcome: { id: `outcome-${this.blockHeight}`, block_hash: block.hash } };
   }
 
   /** The one dispatch point every fake `fetch` call routes through. */

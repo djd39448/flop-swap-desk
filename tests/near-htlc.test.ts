@@ -15,19 +15,23 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { base58 } from "@scure/base";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   CLAIM_REFUND_GAS,
   FT_TRANSFER_CALL_GAS,
   NEAR_CLAIM_LANDING_MARGIN_MS,
+  NEAR_LOCK_REREAD_DELAY_MS,
   NEAR_SANDBOX_PIN,
   NearHtlcRail,
+  NEAR_PRESEND_READ_TIMEOUT_MS,
   NearLockRefusedError,
+  NearLockUnknownError,
   NearPayoutFailedError,
   NearPendingError,
   NearRefundFailedError,
   NearTxFailedError,
+  NearUnexpectedTransactionError,
   checkNearRailConfig,
   validateNearRailConfig,
   type NearHtlcTerms,
@@ -116,6 +120,13 @@ function sendTxBody(id: string, blockHash: string): string {
   return ok({ status: { SuccessValue: "" }, transaction_outcome: { id, block_hash: blockHash } });
 }
 
+/** H9: `ft_transfer_call` resolves to the amount the receiver used, as a JSON string -- the whole
+ *  amount when the lock was made, "0" when `ft_on_transfer` refused it (both observed on a real
+ *  near-sandbox: SuccessValue "IjEwIg==" for a 10-unit lock, "IjAi" for a refused one). */
+function lockSendTxBody(id: string, blockHash: string, used: string = TERMS.amount): string {
+  return ok({ status: { SuccessValue: Buffer.from(JSON.stringify(used)).toString("base64") }, transaction_outcome: { id, block_hash: blockHash } });
+}
+
 function failedSendTxBody(id: string, blockHash: string, failure: unknown = { ActionError: { kind: "FunctionCallError" } }): string {
   return ok({ status: { Failure: failure }, transaction_outcome: { id, block_hash: blockHash } });
 }
@@ -149,6 +160,7 @@ function railWith(
   bodies: string[],
   connect: string[] = connectBodies(),
   railClock: () => number = () => 5000,
+  sleeps: number[] = [],
 ): { rail: () => Promise<NearHtlcRail>; requests: Array<{ method: string; params: unknown }>; rpc: CapturingRpc } {
   const { fetch: fetchImpl, requests } = fakeFetch([...connect, ...bodies]);
   const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => 5000 });
@@ -158,7 +170,11 @@ function railWith(
   // range), so the guard's `max(...)` resolves to the block time exactly as every existing test
   // already assumes, never the real wall clock `Date.now()` would otherwise fall back to here. A
   // caller exercising the `max(...)` itself (H3's own test below) passes its own `railClock`.
-  return { rail: () => NearHtlcRail.connect({ config: CONFIG, rpc, signer, clock: railClock }), requests, rpc };
+  // H9: the re-read delay is injected (recorded, never actually waited).
+  const sleep = async (ms: number): Promise<void> => {
+    sleeps.push(ms);
+  };
+  return { rail: () => NearHtlcRail.connect({ config: CONFIG, rpc, signer, clock: railClock, sleep }), requests, rpc };
 }
 
 // ── checkNearRailConfig / validateNearRailConfig ────────────────────────────────────────────
@@ -274,7 +290,7 @@ describe("prepareLock / commitLock", () => {
       viewAccessKeyBody(4), // nextNonce
       blockBody(10, BLOCK_HASH_BASE58, "1690000000000000000"), // recentBlockHashBytes
       statusBody(), // commitLock -> sendPrepared's assertPinnedChain
-      sendTxBody("txid-lock-1", "final-block-hash"), // send_tx
+      lockSendTxBody("txid-lock-1", "final-block-hash"), // send_tx
       blockBody(11, "final-block-hash", "1690000001000000000"), // block(blockId) for height
       callFunctionBody(lockView()), // H1: post-send get_lock re-read, matches this signer's own terms
     ];
@@ -330,7 +346,7 @@ describe("prepareLock / commitLock", () => {
       viewAccessKeyBody(1),
       blockBody(10, BLOCK_HASH_BASE58, "1690000000000000000"),
       statusBody(),
-      sendTxBody("txid-1", "bh1"),
+      lockSendTxBody("txid-1", "bh1"),
       blockBody(11, "bh1", "1690000001000000000"),
       callFunctionBody(lockView()),
     ];
@@ -362,17 +378,33 @@ describe("prepareLock / commitLock", () => {
     await expect(r.prepareLock({ ...TERMS, payee: USDC })).rejects.toThrow(/USDC token account itself/);
   });
 
-  // H1 (S3): the transaction itself succeeds, but ft_on_transfer refused it — no lock exists
-  // afterward (or one exists but it isn't this signer's own, with these exact terms).
-  it("commitLock throws NearLockRefusedError when the tx succeeds but no matching lock exists afterward (S3)", async () => {
+  // H1 (S3) / H9: the transaction itself succeeds, but ft_on_transfer refused it. The refusal is
+  // claimed only because the transaction's OWN outcome says "0" used -- never from what get_lock
+  // happens to show (which could be somebody else's, or an earlier attempt's, lock).
+  it("commitLock throws NearLockRefusedError when the transaction's own outcome says 0 was used (S3), without trusting get_lock", async () => {
     const bodies = [
       statusBody(),
       viewAccessKeyBody(4),
       blockBody(10, BLOCK_HASH_BASE58, "1690000000000000000"),
       statusBody(),
-      sendTxBody("txid-lock-2", "final-block-hash"),
+      lockSendTxBody("txid-lock-2", "final-block-hash", "0"),
+    ];
+    const { rail, requests } = railWith(bodies);
+    const r = await rail();
+    await r.prepareLock(TERMS);
+    await expect(r.commitLock()).rejects.toThrow(NearLockRefusedError);
+    expect(requests.filter((request) => (request.params as Record<string, unknown>).method_name === "get_lock")).toHaveLength(0);
+  });
+
+  it("H9: an outcome that says 0 is a refusal even when get_lock shows a matching lock (an earlier attempt's) -- it is not mistaken for this transaction's", async () => {
+    const bodies = [
+      statusBody(),
+      viewAccessKeyBody(4),
+      blockBody(10, BLOCK_HASH_BASE58, "1690000000000000000"),
+      statusBody(),
+      lockSendTxBody("txid-lock-dup", "final-block-hash", "0"),
       blockBody(11, "final-block-hash", "1690000001000000000"),
-      callFunctionBody(null), // get_lock: no lock at all — ft_on_transfer refused it
+      callFunctionBody(lockView()), // identical terms, from the first attempt
     ];
     const { rail } = railWith(bodies);
     const r = await rail();
@@ -380,20 +412,96 @@ describe("prepareLock / commitLock", () => {
     await expect(r.commitLock()).rejects.toThrow(NearLockRefusedError);
   });
 
-  it("commitLock throws NearLockRefusedError when a lock exists but with different terms (e.g. a squatter got there first)", async () => {
+  it("H9: an outcome with no readable used amount (empty SuccessValue) is NearLockUnknownError, never a claimed success or refusal", async () => {
     const bodies = [
       statusBody(),
       viewAccessKeyBody(4),
       blockBody(10, BLOCK_HASH_BASE58, "1690000000000000000"),
       statusBody(),
-      sendTxBody("txid-lock-3", "final-block-hash"),
-      blockBody(11, "final-block-hash", "1690000001000000000"),
-      callFunctionBody(lockView({ payer: "someone-else.near-sandbox-flop" })),
+      sendTxBody("txid-lock-empty", "final-block-hash"), // SuccessValue ""
     ];
     const { rail } = railWith(bodies);
     const r = await rail();
     await r.prepareLock(TERMS);
-    await expect(r.commitLock()).rejects.toThrow(NearLockRefusedError);
+    const error: unknown = await r.commitLock().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(NearLockUnknownError);
+    expect(error).not.toBeInstanceOf(NearLockRefusedError);
+    expect((error as Error).message).toMatch(/reconcileLockA/);
+  });
+
+  it("H9: an outcome that used a different amount than was sent is NearLockUnknownError", async () => {
+    const bodies = [
+      statusBody(),
+      viewAccessKeyBody(4),
+      blockBody(10, BLOCK_HASH_BASE58, "1690000000000000000"),
+      statusBody(),
+      lockSendTxBody("txid-lock-partial", "final-block-hash", "400000"),
+    ];
+    const { rail } = railWith(bodies);
+    const r = await rail();
+    await r.prepareLock(TERMS);
+    await expect(r.commitLock()).rejects.toThrow(NearLockUnknownError);
+  });
+
+  it("H9: a lock not yet visible is re-read ONCE after a delay; found then, it succeeds", async () => {
+    const sleeps: number[] = [];
+    const bodies = [
+      statusBody(),
+      viewAccessKeyBody(4),
+      blockBody(10, BLOCK_HASH_BASE58, "1690000000000000000"),
+      statusBody(),
+      lockSendTxBody("txid-lock-late", "final-block-hash"),
+      blockBody(11, "final-block-hash", "1690000001000000000"),
+      callFunctionBody(null), // not visible yet
+      callFunctionBody(lockView()), // visible at the later block
+    ];
+    const { rail } = railWith(bodies, connectBodies(), () => 5000, sleeps);
+    const r = await rail();
+    await r.prepareLock(TERMS);
+    const evidence = await r.commitLock();
+    expect(evidence.ref).toBe(REF);
+    expect(sleeps).toEqual([NEAR_LOCK_REREAD_DELAY_MS]);
+  });
+
+  it("H9: a lock still not visible after the one re-read is NearLockUnknownError (non-committal), not a refusal", async () => {
+    const sleeps: number[] = [];
+    const bodies = [
+      statusBody(),
+      viewAccessKeyBody(4),
+      blockBody(10, BLOCK_HASH_BASE58, "1690000000000000000"),
+      statusBody(),
+      lockSendTxBody("txid-lock-gone", "final-block-hash"),
+      blockBody(11, "final-block-hash", "1690000001000000000"),
+      callFunctionBody(null),
+      callFunctionBody(null),
+    ];
+    const { rail, requests } = railWith(bodies, connectBodies(), () => 5000, sleeps);
+    const r = await rail();
+    await r.prepareLock(TERMS);
+    const error: unknown = await r.commitLock().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(NearLockUnknownError);
+    expect(error).not.toBeInstanceOf(NearLockRefusedError);
+    expect(requests.filter((request) => (request.params as Record<string, unknown>).method_name === "get_lock")).toHaveLength(2); // exactly one re-read
+  });
+
+  it.each([
+    ["a lock with different terms (a squatter's payer)", lockView({ payer: "someone-else.near-sandbox-flop" })],
+    ["a lock that is not Locked (Claiming)", lockView({ status: "Claiming" })],
+    ["a lock with another amount", lockView({ amount: "999" })],
+  ])("H9: the amount was used but get_lock shows %s -> NearLockUnknownError", async (_label, view) => {
+    const bodies = [
+      statusBody(),
+      viewAccessKeyBody(4),
+      blockBody(10, BLOCK_HASH_BASE58, "1690000000000000000"),
+      statusBody(),
+      lockSendTxBody("txid-lock-3", "final-block-hash"),
+      blockBody(11, "final-block-hash", "1690000001000000000"),
+      callFunctionBody(view),
+    ];
+    const { rail } = railWith(bodies);
+    const r = await rail();
+    await r.prepareLock(TERMS);
+    await expect(r.commitLock()).rejects.toThrow(NearLockUnknownError);
   });
 
   // H1: a top-level Failure throws NearTxFailedError, never returned as if it were evidence.
@@ -427,7 +535,7 @@ describe("claim", () => {
     const bodies = [statusBody(), callFunctionBody(lockView({ status: "Claiming" }))];
     const { rail } = railWith(bodies);
     const r = await rail();
-    await expect(r.claim(REF, PREIMAGE, 9_999_999_999_999)).rejects.toThrow(/claimable "Locked"/);
+    await expect(r.claim(REF, PREIMAGE, 9_999_999_999_999, TERMS)).rejects.toThrow(/claimable "Locked"/);
   });
 
   it("refuses when the payee is not storage-registered on the token", async () => {
@@ -439,7 +547,7 @@ describe("claim", () => {
     ];
     const { rail } = railWith(bodies);
     const r = await rail();
-    await expect(r.claim(REF, PREIMAGE, 9_999_999_999_999)).rejects.toThrow(/storage-registered/);
+    await expect(r.claim(REF, PREIMAGE, 9_999_999_999_999, TERMS)).rejects.toThrow(/storage-registered/);
   });
 
   // H3: refused up front (before ever signing) when notAfterMs leaves less than the landing
@@ -454,7 +562,7 @@ describe("claim", () => {
     const { rail, requests } = railWith(bodies);
     const r = await rail();
     const tooLate = 1_800_000_000_000 - NEAR_CLAIM_LANDING_MARGIN_MS + 1; // 1ms inside the margin
-    await expect(r.claim(REF, PREIMAGE, tooLate)).rejects.toThrow(/landing margin/);
+    await expect(r.claim(REF, PREIMAGE, tooLate, TERMS)).rejects.toThrow(/landing margin/);
     // refused before ever signing (no nonce lookup) or sending
     expect(requests.some((req) => req.method === "send_tx")).toBe(false);
     expect(requests.filter((req) => req.method === "query" && (req.params as Record<string, unknown>).request_type === "view_access_key")).toHaveLength(0);
@@ -468,11 +576,12 @@ describe("claim", () => {
       callFunctionBody({ total: "125000", available: "0" }), // storage_balance_of
       viewAccessKeyBody(2), // nonce for buildAndSign
       blockBody(2, BLOCK_HASH_BASE58, "1700000000200000000"), // recentBlockHashBytes
+      statusBody(), // H13: the pin check precedes the deadline guard
       blockBody(3, BLOCK_HASH_BASE58, "1700000000500000000"), // finalNowMs = 1_700_000_000_500
     ];
     const { rail, requests } = railWith(bodies);
     const r = await rail();
-    await expect(r.claim(REF, PREIMAGE, 1_700_000_000_000)).rejects.toThrow(/at\/after the given deadline/);
+    await expect(r.claim(REF, PREIMAGE, 1_700_000_000_000, TERMS)).rejects.toThrow(/at\/after the given deadline/);
     // nothing was ever sent — the last body in the queue was the deadline read, never send_tx.
     expect(requests.every((req) => req.method !== "send_tx")).toBe(true);
   });
@@ -489,13 +598,14 @@ describe("claim", () => {
       callFunctionBody({ total: "125000", available: "0" }),
       viewAccessKeyBody(3),
       blockBody(2, BLOCK_HASH_BASE58, "1700000000200000000"),
+      statusBody(), // H13: the pin check precedes the deadline guard
       blockBody(3, BLOCK_HASH_BASE58, "1700000000500000000"), // finalNowMs = ...500, BEFORE notAfterMs
     ];
     const notAfterMs = 1_700_000_001_000; // > finalNowMs(...500): block time ALONE would pass
     const clockAheadOfDeadline = () => 1_700_000_002_000; // but the injected clock is already past it
     const { rail, requests } = railWith(bodies, connectBodies(), clockAheadOfDeadline);
     const r = await rail();
-    await expect(r.claim(REF, PREIMAGE, notAfterMs)).rejects.toThrow(/at\/after the given deadline/);
+    await expect(r.claim(REF, PREIMAGE, notAfterMs, TERMS)).rejects.toThrow(/at\/after the given deadline/);
     expect(requests.every((req) => req.method !== "send_tx")).toBe(true);
   });
 
@@ -507,17 +617,24 @@ describe("claim", () => {
       callFunctionBody({ total: "125000", available: "0" }),
       viewAccessKeyBody(3),
       blockBody(2, BLOCK_HASH_BASE58, "1700000000200000000"),
+      statusBody(), // H13: the pin check now precedes the guard
       blockBody(3, BLOCK_HASH_BASE58, "1700000000500000000"), // finalNowMs = ...500
-      statusBody(), // sendPrepared's assertPinnedChain
       sendTxBody("claim-tx-1", "claim-block-hash"),
       blockBody(4, "claim-block-hash", "1700000000600000000"),
       callFunctionBody(lockView({ status: "Claimed", preimage: PREIMAGE_HEX })), // H1 post-send re-read
     ];
     const { rail, requests } = railWith(bodies);
     const r = await rail();
-    const evidence = await r.claim(REF, PREIMAGE, 1_700_000_001_000); // > finalNowMs(...500)
+    const evidence = await r.claim(REF, PREIMAGE, 1_700_000_001_000, TERMS); // > finalNowMs(...500)
     expect(evidence.ref).toBe(REF);
     expect(evidence.blockHeight).toBe(4);
+
+    // H13: the pinned-chain check comes BEFORE the deadline guard, so the guard (a final-block
+    // read) is the very last read before send_tx: [..., status, block, send_tx].
+    const methods = requests.map((request) => request.method);
+    const sendIndex = methods.indexOf("send_tx");
+    expect(methods.slice(sendIndex - 2, sendIndex + 1)).toEqual(["status", "block", "send_tx"]);
+    expect(methods.slice(sendIndex + 1)).toEqual(["block", "query"]); // only the post-send reads follow
 
     const sendReq = requests[requests.length - 3]?.params as Record<string, unknown>;
     const raw = Buffer.from(String(sendReq.signed_tx_base64), "base64").toString("latin1");
@@ -555,8 +672,8 @@ describe("claim", () => {
       callFunctionBody({ total: "125000", available: "0" }),
       viewAccessKeyBody(3),
       blockBody(2, BLOCK_HASH_BASE58, "1700000000200000000"),
-      blockBody(3, BLOCK_HASH_BASE58, "1700000000500000000"),
       statusBody(),
+      blockBody(3, BLOCK_HASH_BASE58, "1700000000500000000"),
       sendTxBody("claim-tx-2", "claim-block-hash"),
       blockBody(4, "claim-block-hash", "1700000000600000000"),
       callFunctionBody(lockView({ status: "Locked", preimage: PREIMAGE_HEX })), // reverted, preimage kept
@@ -565,7 +682,7 @@ describe("claim", () => {
     const r = await rail();
     let caught: unknown;
     try {
-      await r.claim(REF, PREIMAGE, 1_700_000_001_000);
+      await r.claim(REF, PREIMAGE, 1_700_000_001_000, TERMS);
     } catch (error) {
       caught = error;
     }
@@ -581,15 +698,15 @@ describe("claim", () => {
       callFunctionBody({ total: "125000", available: "0" }),
       viewAccessKeyBody(3),
       blockBody(2, BLOCK_HASH_BASE58, "1700000000200000000"),
-      blockBody(3, BLOCK_HASH_BASE58, "1700000000500000000"),
       statusBody(),
+      blockBody(3, BLOCK_HASH_BASE58, "1700000000500000000"),
       sendTxBody("claim-tx-3", "claim-block-hash"),
       blockBody(4, "claim-block-hash", "1700000000600000000"),
       callFunctionBody(lockView({ status: "Claiming", preimage: PREIMAGE_HEX })),
     ];
     const { rail } = railWith(bodies);
     const r = await rail();
-    await expect(r.claim(REF, PREIMAGE, 1_700_000_001_000)).rejects.toThrow(NearPendingError);
+    await expect(r.claim(REF, PREIMAGE, 1_700_000_001_000, TERMS)).rejects.toThrow(NearPendingError);
   });
 
   // H1: a top-level Failure (e.g. claim attempted at/after refundAfterMs, unrevealed) throws
@@ -602,13 +719,13 @@ describe("claim", () => {
       callFunctionBody({ total: "125000", available: "0" }),
       viewAccessKeyBody(3),
       blockBody(2, BLOCK_HASH_BASE58, "1700000000200000000"),
-      blockBody(3, BLOCK_HASH_BASE58, "1700000000500000000"),
       statusBody(),
+      blockBody(3, BLOCK_HASH_BASE58, "1700000000500000000"),
       failedSendTxBody("claim-tx-4", "claim-block-hash"),
     ];
     const { rail } = railWith(bodies);
     const r = await rail();
-    await expect(r.claim(REF, PREIMAGE, 1_700_000_001_000)).rejects.toThrow(NearTxFailedError);
+    await expect(r.claim(REF, PREIMAGE, 1_700_000_001_000, TERMS)).rejects.toThrow(NearTxFailedError);
   });
 
   // H2: a revealed-but-Locked lock (a prior claim's payout callback failed) may be retried past
@@ -635,7 +752,7 @@ describe("claim", () => {
       const r = await rail();
       // notAfterMs is already past refundAfterMs — would be refused up front on an unrevealed
       // lock (H3), but must succeed here since the lock is revealed.
-      const evidence = await r.claim(REF, PREIMAGE, 1_800_000_500_000);
+      const evidence = await r.claim(REF, PREIMAGE, 1_800_000_500_000, TERMS);
       expect(evidence.ref).toBe(REF);
       const sendReq = requests[requests.length - 3]?.params as Record<string, unknown>;
       expect(sendReq.wait_until).toBe("FINAL");
@@ -649,7 +766,7 @@ describe("claim", () => {
       ];
       const { rail } = railWith(bodies);
       const r = await rail();
-      await expect(r.claim(REF, PREIMAGE, 1_800_000_500_000)).rejects.toThrow(/refundAfterMs/);
+      await expect(r.claim(REF, PREIMAGE, 1_800_000_500_000, TERMS)).rejects.toThrow(/refundAfterMs/);
     });
 
     it("still refuses a revealed retry when the payee is not storage-registered", async () => {
@@ -662,7 +779,92 @@ describe("claim", () => {
       ];
       const { rail } = railWith(bodies);
       const r = await rail();
-      await expect(r.claim(REF, PREIMAGE, 1_800_000_500_000)).rejects.toThrow(/storage-registered/);
+      await expect(r.claim(REF, PREIMAGE, 1_800_000_500_000, TERMS)).rejects.toThrow(/storage-registered/);
+    });
+  });
+
+  // H12: the claim pays the lock's own payee, so who it pays is checked before anything is signed.
+  describe("H12: the claim checks who it pays and the terms it expects", () => {
+    function claimBodies(view: Record<string, unknown>): string[] {
+      return [statusBody(), callFunctionBody(view)];
+    }
+    async function refused(view: Record<string, unknown>, expected: NearHtlcTerms | undefined, message: RegExp): Promise<void> {
+      const { rail, requests } = railWith(claimBodies(view));
+      const r = await rail();
+      await expect(r.claim(REF, PREIMAGE, 1_700_000_001_000, expected)).rejects.toThrow(message);
+      expect(requests.every((request) => request.method !== "send_tx")).toBe(true);
+      expect(requests.filter((request) => (request.params as Record<string, unknown>).request_type === "view_access_key")).toHaveLength(0); // never signed
+    }
+
+    it("without expected terms, a lock that pays another account than this signer is refused", async () => {
+      await refused(lockView(), undefined, /pays "seller\.near-sandbox-flop", not the expected payee "buyer\.near-sandbox-flop"/);
+    });
+
+    it("with expected terms, a lock paying another account than the expected payee is refused", async () => {
+      await refused(lockView({ payee: "thief.near-sandbox-flop" }), TERMS, /not the expected payee "seller\.near-sandbox-flop"/);
+    });
+
+    it("a lock of another token is refused (with or without expected terms)", async () => {
+      await refused(lockView({ token: "other-token.near-sandbox-flop" }), TERMS, /token "other-token\.near-sandbox-flop" is not the configured USDC/);
+      await refused(lockView({ payee: BUYER_ACCOUNT, token: "other-token.near-sandbox-flop" }), undefined, /is not the configured USDC/);
+    });
+
+    it("a lock of another amount, another claimByMs or another refundAfterMs than expected is refused", async () => {
+      await refused(lockView({ amount: "1" }), TERMS, /holds 1, not the expected 1000000/);
+      await refused(lockView({ claim_by_ms: "1700000000001" }), TERMS, /claim\/refund times differ/);
+      await refused(lockView({ refund_after_ms: "1800000000001" }), TERMS, /claim\/refund times differ/);
+    });
+
+    it("expected terms naming another hash lock than the ref are refused before any RPC call", async () => {
+      const { rail, requests } = railWith([]);
+      const r = await rail();
+      const before = requests.length;
+      await expect(r.claim(REF, PREIMAGE, 1_700_000_001_000, { ...TERMS, hashLock: `0x${"99".repeat(32)}` })).rejects.toThrow(/another hash lock/);
+      expect(requests.length).toBe(before);
+    });
+
+    it("the default (payee == signer) check passes for a lock that does pay this signer: the claim goes on to its chain-time read", async () => {
+      const { rail, requests } = railWith(claimBodies(lockView({ payee: BUYER_ACCOUNT })));
+      const r = await rail();
+      await expect(r.claim(REF, PREIMAGE, 1_700_000_001_000)).rejects.toThrow(/ran out of canned responses/); // no chain-time body: got PAST the payee check
+      expect(requests.at(-1)?.method).toBe("block");
+    });
+  });
+
+  // H13: the pre-send reads carry an explicit short timeout; the landing margin exceeds it.
+  describe("H13: bounded pre-send reads", () => {
+    it("NEAR_CLAIM_LANDING_MARGIN_MS exceeds the read timeout plus a few blocks (10 s of blocks at a 1 s cadence)", () => {
+      expect(NEAR_PRESEND_READ_TIMEOUT_MS).toBeGreaterThan(0);
+      expect(NEAR_CLAIM_LANDING_MARGIN_MS).toBeGreaterThan(NEAR_PRESEND_READ_TIMEOUT_MS + 10_000);
+    });
+
+    it("a pre-send read that never answers fails the claim after NEAR_PRESEND_READ_TIMEOUT_MS, before anything is sent", async () => {
+      vi.useFakeTimers();
+      try {
+        const answered = [...connectBodies(), statusBody()]; // connect(), then claim's own pin check
+        let i = 0;
+        const requests: Array<{ method: string }> = [];
+        const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+          const parsed = JSON.parse(String(init?.body)) as { method: string };
+          requests.push({ method: parsed.method });
+          const body = answered[i];
+          i += 1;
+          if (body === undefined) return new Promise<Response>(() => undefined); // the get_lock read never answers
+          const bytes = new TextEncoder().encode(body);
+          return { text: async () => body, arrayBuffer: async () => bytes.buffer } as Response;
+        }) as typeof fetch;
+        const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => 5000 });
+        const signer = InMemoryNearSigner.generate(BUYER_ACCOUNT, SEED_BUYER);
+        const r = await NearHtlcRail.connect({ config: CONFIG, rpc, signer, clock: () => 5000 });
+        const outcome = r.claim(REF, PREIMAGE, 1_700_000_001_000, TERMS).catch((e: unknown) => e);
+        await vi.advanceTimersByTimeAsync(NEAR_PRESEND_READ_TIMEOUT_MS + 1);
+        const error = await outcome;
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toMatch(new RegExp(`did not answer within ${String(NEAR_PRESEND_READ_TIMEOUT_MS)}ms`));
+        expect(requests.every((request) => request.method !== "send_tx")).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });
@@ -757,13 +959,47 @@ describe("refund", () => {
 
 // ── recoverByTxHash ──────────────────────────────────────────────────────────────────────────
 
+// H10: `EXPERIMENTAL_tx_status` answers with the transaction body too (shape observed on a real
+// near-sandbox: signer_id, public_key, receiver_id, hash, actions[{FunctionCall:{method_name,
+// args (base64 of JSON), gas, deposit (a decimal string)}}]); recovery decodes it.
+const BUYER_PUBLIC_KEY = InMemoryNearSigner.generate(BUYER_ACCOUNT, SEED_BUYER).publicKey;
+const SELLER_PUBLIC_KEY = InMemoryNearSigner.generate(SELLER_ACCOUNT, SEED_SELLER).publicKey;
+
+function functionCall(methodName: string, args: unknown, deposit: string): Record<string, unknown> {
+  return { FunctionCall: { method_name: methodName, args: Buffer.from(JSON.stringify(args)).toString("base64"), gas: 20_000_000_000_000, deposit } };
+}
+
+function lockCall(overrides: { msg?: Record<string, unknown>; args?: Record<string, unknown> } = {}): Record<string, unknown> {
+  const msg = { hash_lock: HASH_LOCK.slice(2), payee: SELLER_ACCOUNT, claim_by_ms: "1700000000000", refund_after_ms: "1800000000000", ...overrides.msg };
+  return functionCall("ft_transfer_call", { receiver_id: CONTRACT, amount: "1000000", msg: JSON.stringify(msg), ...overrides.args }, "1");
+}
+
+function claimCall(args: Record<string, unknown> = {}): Record<string, unknown> {
+  return functionCall("claim", { hash_lock: HASH_LOCK.slice(2), payer: BUYER_ACCOUNT, preimage: PREIMAGE_HEX, ...args }, "0");
+}
+
+function refundCall(args: Record<string, unknown> = {}): Record<string, unknown> {
+  return functionCall("refund", { hash_lock: HASH_LOCK.slice(2), ...args }, "0");
+}
+
+function txBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { signer_id: BUYER_ACCOUNT, public_key: BUYER_PUBLIC_KEY, receiver_id: USDC, nonce: 5, hash: "known-tx", actions: [lockCall()], ...overrides };
+}
+
+function txStatusBody(transaction: Record<string, unknown> | undefined, status: unknown = { SuccessValue: Buffer.from(JSON.stringify(TERMS.amount)).toString("base64") }): string {
+  return ok({ status, ...(transaction === undefined ? {} : { transaction }), transaction_outcome: { id: "known-tx", block_hash: "known-block-hash" } });
+}
+
 describe("recoverByTxHash", () => {
-  it("returns write evidence carrying the CALLER's own expectedRef (H4), not the raw txHash", async () => {
-    const bodies = [statusBody(), sendTxBody("known-tx", "known-block-hash"), blockBody(7, "known-block-hash", "1700000000000000000")];
-    const { rail } = railWith(bodies);
+  const BLOCK = blockBody(7, "known-block-hash", "1700000000000000000");
+
+  it("recovers this rail's own lock: FINAL wait, the CALLER's own expectedRef (H4), the same post-checks as a send", async () => {
+    const { rail, requests } = railWith([statusBody(), txStatusBody(txBody()), BLOCK, callFunctionBody(lockView())]);
     const r = await rail();
     const evidence = await r.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF);
     expect(evidence).toEqual({ ref: REF, txHash: "known-tx", blockHeight: 7, blockHash: "known-block-hash", raw: expect.any(Array) });
+    const statusRequest = requests.find((request) => request.method === "EXPERIMENTAL_tx_status");
+    expect(statusRequest?.params).toEqual({ tx_hash: "known-tx", sender_account_id: BUYER_ACCOUNT, wait_until: "FINAL" });
   });
 
   it("returns null (never throws) when the node has never seen the transaction", async () => {
@@ -782,11 +1018,92 @@ describe("recoverByTxHash", () => {
 
   // H4: a transaction the node still knows about but that itself executed as Failure is reported
   // as failed, never handed back as evidence.
-  it("throws NearTxFailedError (never returns evidence) for a transaction the node knows failed", async () => {
-    const bodies = [statusBody(), failedSendTxBody("known-failed-tx", "known-block-hash")];
+  it("throws NearTxFailedError (never returns evidence) for this rail's own transaction that failed", async () => {
+    const bodies = [statusBody(), txStatusBody(txBody(), { Failure: { ActionError: { kind: "FunctionCallError" } } })];
     const { rail } = railWith(bodies);
     const r = await rail();
-    await expect(r.recoverByTxHash("known-failed-tx", BUYER_ACCOUNT, REF)).rejects.toThrow(NearTxFailedError);
+    await expect(r.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF)).rejects.toThrow(NearTxFailedError);
+  });
+
+  describe("H10: the same kind-specific post-checks and typed errors as a send", () => {
+    it("a lock whose own outcome says 0 -> NearLockRefusedError, even with an identical lock on chain", async () => {
+      const zero = { SuccessValue: Buffer.from(JSON.stringify("0")).toString("base64") };
+      const { rail } = railWith([statusBody(), txStatusBody(txBody(), zero), BLOCK, callFunctionBody(lockView())]);
+      const r = await rail();
+      await expect(r.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF)).rejects.toThrow(NearLockRefusedError);
+    });
+
+    it("a lock that is not visible -> NearLockUnknownError after one re-read", async () => {
+      const { rail } = railWith([statusBody(), txStatusBody(txBody()), BLOCK, callFunctionBody(null), callFunctionBody(null)]);
+      const r = await rail();
+      await expect(r.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF)).rejects.toThrow(NearLockUnknownError);
+    });
+
+    it("a lock whose recovered terms differ from what is on chain -> NearLockUnknownError", async () => {
+      const { rail } = railWith([statusBody(), txStatusBody(txBody({ actions: [lockCall({ args: { amount: "999" } })] }), { SuccessValue: Buffer.from('"999"').toString("base64") }), BLOCK, callFunctionBody(lockView())]);
+      const r = await rail();
+      await expect(r.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF)).rejects.toThrow(NearLockUnknownError);
+    });
+
+    it("a claim: Claimed -> evidence; still Locked with the preimage -> NearPayoutFailedError; Claiming -> NearPendingError", async () => {
+      const claimTx = txBody({ receiver_id: CONTRACT, actions: [claimCall()] });
+      const ok1 = await railWith([statusBody(), txStatusBody(claimTx, { SuccessValue: "" }), BLOCK, callFunctionBody(lockView({ status: "Claimed", preimage: PREIMAGE_HEX }))]).rail();
+      await expect(ok1.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF)).resolves.toMatchObject({ ref: REF });
+      const failed = await railWith([statusBody(), txStatusBody(claimTx, { SuccessValue: "" }), BLOCK, callFunctionBody(lockView({ preimage: PREIMAGE_HEX }))]).rail();
+      await expect(failed.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF)).rejects.toThrow(NearPayoutFailedError);
+      const pending = await railWith([statusBody(), txStatusBody(claimTx, { SuccessValue: "" }), BLOCK, callFunctionBody(lockView({ status: "Claiming", preimage: PREIMAGE_HEX }))]).rail();
+      await expect(pending.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF)).rejects.toThrow(NearPendingError);
+    });
+
+    it("a refund: Refunded -> evidence; still Locked -> NearRefundFailedError", async () => {
+      const refundTx = txBody({ receiver_id: CONTRACT, actions: [refundCall()] });
+      const ok1 = await railWith([statusBody(), txStatusBody(refundTx, { SuccessValue: "" }), BLOCK, callFunctionBody(lockView({ status: "Refunded" }))]).rail();
+      await expect(ok1.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF)).resolves.toMatchObject({ ref: REF });
+      const failed = await railWith([statusBody(), txStatusBody(refundTx, { SuccessValue: "" }), BLOCK, callFunctionBody(lockView())]).rail();
+      await expect(failed.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF)).rejects.toThrow(NearRefundFailedError);
+    });
+  });
+
+  describe("H10: only this rail's own write for expectedRef is recovered", () => {
+    const OTHER_HASH_LOCK = `0x${"99".repeat(32)}`;
+    const cases: Array<[string, () => string]> = [
+      ["the reply carries no transaction body", () => txStatusBody(undefined)],
+      ["a different transaction hash in the body", () => txStatusBody(txBody({ hash: "some-other-tx" }))],
+      ["another signer account", () => txStatusBody(txBody({ signer_id: SELLER_ACCOUNT }))],
+      ["another key of the same account", () => txStatusBody(txBody({ public_key: SELLER_PUBLIC_KEY }))],
+      ["a lock for another hash lock", () => txStatusBody(txBody({ actions: [lockCall({ msg: { hash_lock: OTHER_HASH_LOCK.slice(2) } })] }))],
+      ["a lock to another contract", () => txStatusBody(txBody({ actions: [lockCall({ args: { receiver_id: "evil.near-sandbox-flop" } })] }))],
+      ["a lock with an extra msg field", () => txStatusBody(txBody({ actions: [lockCall({ msg: { extra: "1" } })] }))],
+      ["a lock with the wrong deposit", () => txStatusBody(txBody({ actions: [functionCall("ft_transfer_call", { receiver_id: CONTRACT, amount: "1000000", msg: "{}" }, "2")] }))],
+      ["a claim for another hash lock", () => txStatusBody(txBody({ receiver_id: CONTRACT, actions: [claimCall({ hash_lock: OTHER_HASH_LOCK.slice(2) })] }))],
+      ["a claim naming another payer", () => txStatusBody(txBody({ receiver_id: CONTRACT, actions: [claimCall({ payer: SELLER_ACCOUNT })] }))],
+      ["a refund for another hash lock", () => txStatusBody(txBody({ receiver_id: CONTRACT, actions: [refundCall({ hash_lock: OTHER_HASH_LOCK.slice(2) })] }))],
+      ["another method on the contract", () => txStatusBody(txBody({ receiver_id: CONTRACT, actions: [functionCall("set_owner", {}, "0")] }))],
+      ["another receiver entirely", () => txStatusBody(txBody({ receiver_id: "somewhere.near-sandbox-flop" }))],
+      ["two actions", () => txStatusBody(txBody({ actions: [lockCall(), refundCall()] }))],
+      ["a non-function-call action", () => txStatusBody(txBody({ actions: [{ Transfer: { deposit: "1" } }] }))],
+    ];
+    it.each(cases)("refuses %s with NearUnexpectedTransactionError, before any post-check read", async (_label, body) => {
+      const { rail, requests } = railWith([statusBody(), body(), BLOCK, callFunctionBody(lockView())]);
+      const r = await rail();
+      const before = requests.length;
+      await expect(r.recoverByTxHash("known-tx", BUYER_ACCOUNT, REF)).rejects.toThrow(NearUnexpectedTransactionError);
+      expect(requests.length).toBe(before + 2); // pin check + the transaction lookup, nothing after
+    });
+
+    it("refuses when the caller names a sender other than this rail's own account", async () => {
+      const { rail } = railWith([statusBody(), txStatusBody(txBody())]);
+      const r = await rail();
+      await expect(r.recoverByTxHash("known-tx", SELLER_ACCOUNT, REF)).rejects.toThrow(NearUnexpectedTransactionError);
+    });
+
+    it("refuses a lock or refund whose ref names another payer than this signer", async () => {
+      const foreignRef = `${HASH_LOCK}:${SELLER_ACCOUNT}`;
+      const lock = await railWith([statusBody(), txStatusBody(txBody())]).rail();
+      await expect(lock.recoverByTxHash("known-tx", BUYER_ACCOUNT, foreignRef)).rejects.toThrow(NearUnexpectedTransactionError);
+      const refund = await railWith([statusBody(), txStatusBody(txBody({ receiver_id: CONTRACT, actions: [refundCall()] }))]).rail();
+      await expect(refund.recoverByTxHash("known-tx", BUYER_ACCOUNT, foreignRef)).rejects.toThrow(NearUnexpectedTransactionError);
+    });
   });
 });
 
