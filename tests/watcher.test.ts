@@ -830,12 +830,13 @@ describe("runSweep", () => {
       const lockA: LockFrame = { type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "evm-htlc", ref: lock.hash };
 
       function dealRowsA(baseDealMs: number) {
+        // P7 fix pass (F4): account lines count only before the accepted lock, so they sit at seq 0.
         const sellerLine = SELLER_EVM.line({ did: seller.did, contract: legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2 });
         const buyerLine = BUYER_EVM.line({ did: buyer.did, contract: legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2 });
         return [
           rowFromRecord(record(dealRoomA, 1, baseDealMs, buyer, encodeFrame(lockA))),
-          rowFromRecord(record(dealRoomA, 2, baseDealMs + 1, seller, sellerLine)),
-          rowFromRecord(record(dealRoomA, 3, baseDealMs + 2, buyer, buyerLine)),
+          rowFromRecord(record(dealRoomA, 0, baseDealMs + 1, seller, sellerLine)),
+          rowFromRecord(record(dealRoomA, 0, baseDealMs + 2, buyer, buyerLine)),
         ];
       }
 
@@ -1170,8 +1171,8 @@ describe("runSweep", () => {
       const dealARows = [
         rowFromRecord(record(swap.dealRoomA, 1, NOW - 50_000, buyer, encodeFrame(rejectedPaperLockA))),
         rowFromRecord(record(swap.dealRoomA, 2, NOW - 49_000, buyer, encodeFrame(acceptedEvmLockA))),
-        rowFromRecord(record(swap.dealRoomA, 3, NOW - 48_000, seller, sellerLine)),
-        rowFromRecord(record(swap.dealRoomA, 4, NOW - 47_000, buyer, buyerLine)),
+        rowFromRecord(record(swap.dealRoomA, 0, NOW - 48_000, seller, sellerLine)),
+        rowFromRecord(record(swap.dealRoomA, 0, NOW - 47_000, buyer, buyerLine)),
       ];
       const callResult = encodeLockedResult(swap.legATerms);
 

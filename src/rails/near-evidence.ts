@@ -141,6 +141,15 @@ export interface NearEvidenceInput {
   config: NearRailConfig;
   accounts: NearAccounts;
   capture: NearCapture;
+  /** P7 fix pass (F2). `"required"` (the default, for the board: replay, watcher, bundle,
+   *  audit-export) needs a FullAccess `view_access_key` read for every proven party key, at the
+   *  capture's finalized block: that read is what stops a mirror pair that only holds a signing key
+   *  from borrowing the lock. `"flow"` (a participant's own live flow: the Seller deciding to claim,
+   *  the Buyer confirming its refund) does not read or require any key: an account's key rotating or
+   *  being deleted after the lock must never gate a claim or a refund (a free option for the
+   *  counterparty), and the chain status itself does not depend on it. The lines are still required
+   *  and still proven by signature; only the key-on-account read is skipped. */
+  keyControl?: "required" | "flow";
 }
 
 export interface NearEvidenceResult {
@@ -494,10 +503,13 @@ function accountKeyReason(
   accounts: NearAccounts,
   block: { hash: string },
 ): string | null {
-  const wanted: Array<{ role: string; account: string | undefined; key: string }> = [];
-  if (accounts.payeeKey !== undefined) wanted.push({ role: "payee", account: accounts.payee, key: accounts.payeeKey });
-  if (accounts.payerKey !== undefined) wanted.push({ role: "payer", account: accounts.payer, key: accounts.payerKey });
+  const wanted: Array<{ role: string; account: string | undefined; key: string | undefined }> = [];
+  // P7 fix pass (F6-3): a resolved account always needs its key, so caller-supplied accounts that
+  // omit a key (a bundle's, say) fail closed instead of silently skipping the check.
+  if (accounts.payee !== undefined || accounts.payeeKey !== undefined) wanted.push({ role: "payee", account: accounts.payee, key: accounts.payeeKey });
+  if (accounts.payer !== undefined || accounts.payerKey !== undefined) wanted.push({ role: "payer", account: accounts.payer, key: accounts.payerKey });
   for (const { role, account, key } of wanted) {
+    if (key === undefined) return `near-htlc: the ${role}'s account line carries no key to check (P7)`;
     if (account === undefined) return `near-htlc: the ${role}'s account line carries a key but no account (P7)`;
     let found = false;
     for (let i = 0; i < exchanges.length; i += 1) {
@@ -689,7 +701,7 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
   if (pinReason !== null) return { lock: { ...baseAtFinalizedView, railVerified: null, reason: pinReason } };
 
   // P7: a proven account line's key must be a FullAccess key of that account at this same block.
-  const keyReason = accountKeyReason(capture, exchanges, accounts, block);
+  const keyReason = input.keyControl === "flow" ? null : accountKeyReason(capture, exchanges, accounts, block);
   if (keyReason !== null) return { lock: { ...baseAtFinalizedView, railVerified: null, reason: keyReason } };
 
   // D-N10: Claiming/Refunding are transitional contract states — never a final RailObservation.
@@ -705,6 +717,12 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
 
   if (accounts.payee === undefined) {
     return { lock: { ...baseAtFinalizedView, railVerified: null, reason: "near-htlc: payee has no account line" } };
+  }
+  // P7 fix pass (F1): the payer's proven line is mandatory too. Without it the lock's payer is tied
+  // to no DID, and the victim Buyer's own counterparty could borrow the victim's lock for a
+  // sock-puppet pair (the payee proof alone is not enough when the payee is the attacker).
+  if (accounts.payer === undefined) {
+    return { lock: { ...baseAtFinalizedView, railVerified: null, reason: "near-htlc: payer has no proven account line (P7)" } };
   }
   const token = config.assets.USDC;
   const mismatch = firstFieldMismatch({

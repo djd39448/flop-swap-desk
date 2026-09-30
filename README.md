@@ -246,8 +246,29 @@ lines lack proofs replays the same way, with the payee unresolved. Schemes by ra
   by this and is not claimed to be: that is a swap, not a mirror of someone else's.
 - EVM proofs are EOA signatures. A contract account (EIP-1271) has no `eip191` proof and is
   refused. The Bitcoin proof is for the P2WPKH address of the key, not for the funded P2WSH.
-- NEAR's key-on-account check is a read at the capture's finalized block. A later key deletion is
-  not seen, and a capture taken before this change has no key read and replays unverified.
+- **Both parties' lines are required (fix pass, 2026-09-30).** On every chain leg a lock verifies only
+  when the payee's AND the payer's proven lines resolve and match the chain lock (Bitcoin already
+  needed both pubkeys). Before, the payer's line was optional corroboration, so the Buyer's own
+  counterparty (who knows the hash lock and controls the payee account) could build a sock-puppet
+  pair that borrowed the Buyer's real lock. `BuyerFlow.lockLegA` now refuses to lock until its own
+  proven payer line resolves, and the Seller's claim check needs it.
+- **Only lines posted before the accepted lock count on all three chains** (EVM replay and watcher
+  previously also counted later lines; a late line could change a settled swap's verdict).
+- NEAR's key-on-account check is a read at the capture's finalized block, so **the board** (replay,
+  watcher, bundle, `audit-export`) reads it again on every capture: a key that is later deleted or
+  rotated withdraws that capture's verification and its claimed/refunded observation, so a settled
+  swap can regress on the board until the key is back. Nothing about funds changes. **A participant's
+  own flow never reads the keys** (`keyControl: "flow"`): the Buyer cannot stall the Seller's claim
+  by deleting its key (no free option), and a rotated key never blocks a refund confirmation. The
+  lines are still required and signature-proven in the flows; only the key-on-account read is
+  skipped there. A capture taken before this change has no key read and replays unverified.
+- **Known limit (NEAR account recycling).** The key read is at the capture's block, not the lock's.
+  If the victim's payee account is deleted and its name re-registered by an attacker (anyone can
+  create a sub-account under a public registrar) who adds its own key, a mirror pair could then
+  borrow the victim's historical claimed lock and verify. This needs the victim's account to be
+  deleted and re-created; archival reads at the lock's block would close it and are not done. EVM
+  and Bitcoin are not affected (the address or pubkey is the key).
+- EVM proofs are canonical: the high-s twin of a signature is refused.
 - The `rails.json` and capture formats gained the key reads for NEAR only; every chain fixture was
   recaptured once for this change (the deal-room lines changed). The 2026-09-18 paper rehearsal is
   unaffected. Solana adopts the same rule (`ed25519`) when its branch is rebased onto this one.

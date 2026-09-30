@@ -608,7 +608,7 @@ describe("near-htlc (sandbox)", () => {
       const evidenceRpc = sandbox.createCapturingRpc();
       const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, refOf(hashLock0x), Date.now());
       const capture: NearCapture = { index, bytes: verifiedExchangeBytes(exchanges as Exchange[]) };
-      const result = nearEvidence({ terms, config: sandbox.config, accounts, capture });
+      const result = nearEvidence({ keyControl: "flow", terms, config: sandbox.config, accounts, capture });
       expect(result.lock.railVerified).toBe(true);
       expect(result.rail?.status).toBe("locked");
       expect(result.rail?.final).toBe(true);
@@ -632,7 +632,7 @@ describe("near-htlc (sandbox)", () => {
       const evidenceRpc = sandbox.createCapturingRpc();
       const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, refOf(hashLock0x), Date.now());
       const capture: NearCapture = { index, bytes: verifiedExchangeBytes(exchanges as Exchange[]) };
-      const result = nearEvidence({ terms, config: sandbox.config, accounts, capture });
+      const result = nearEvidence({ keyControl: "flow", terms, config: sandbox.config, accounts, capture });
       expect(result.rail?.status).toBe("claimed");
     }
 
@@ -654,7 +654,7 @@ describe("near-htlc (sandbox)", () => {
       const evidenceRpc = sandbox.createCapturingRpc();
       const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, refOf(hashLock0x), Date.now());
       const capture: NearCapture = { index, bytes: verifiedExchangeBytes(exchanges as Exchange[]) };
-      const result = nearEvidence({ terms, config: sandbox.config, accounts, capture });
+      const result = nearEvidence({ keyControl: "flow", terms, config: sandbox.config, accounts, capture });
       expect(result.rail?.status).toBe("refunded");
     }
   });
@@ -730,7 +730,7 @@ describe("near-htlc (sandbox)", () => {
     // The real reads: positions 3 and 4 are view_account / view_access_key_list of the contract at the finalized block.
     const good = await captureNearLeg(sandbox.createCapturingRpc(), sandbox.config, terms, accounts, refOf(hashLock0x), Date.now());
     expect(good.exchanges.map((e) => (e.params as { request_type?: string }).request_type)).toEqual([undefined, undefined, "call_function", "view_account", "view_access_key_list", "call_function"]);
-    const goodResult = nearEvidence({ terms, config: sandbox.config, accounts, capture: { index: good.index, bytes: verifiedExchangeBytes(good.exchanges as Exchange[]) } });
+    const goodResult = nearEvidence({ keyControl: "flow", terms, config: sandbox.config, accounts, capture: { index: good.index, bytes: verifiedExchangeBytes(good.exchanges as Exchange[]) } });
     expect(goodResult.lock.railVerified).toBe(true);
 
     // The same real reads under a config that pins some other code hash: the auditor (config) and the capture agree on the wrong pin,
@@ -738,7 +738,7 @@ describe("near-htlc (sandbox)", () => {
     const wrongHash = base58.encode(sha256(new TextEncoder().encode("definitely not the reviewed wasm")));
     const badConfig = { ...sandbox.config, htlcCodeHash: wrongHash };
     const bad = await captureNearLeg(sandbox.createCapturingRpc(), badConfig, terms, accounts, refOf(hashLock0x), Date.now());
-    const badResult = nearEvidence({ terms, config: badConfig, accounts, capture: { index: bad.index, bytes: verifiedExchangeBytes(bad.exchanges as Exchange[]) } });
+    const badResult = nearEvidence({ keyControl: "flow", terms, config: badConfig, accounts, capture: { index: bad.index, bytes: verifiedExchangeBytes(bad.exchanges as Exchange[]) } });
     expect(badResult.lock.railVerified).toBeNull();
     expect(badResult.lock.reason).toMatch(/is not the pinned htlcCodeHash/);
     expect(badResult.rail).toBeUndefined();
@@ -782,15 +782,16 @@ describe("near-htlc (sandbox)", () => {
     const evidenceRpc = sandbox.createCapturingRpc();
     const { index, exchanges } = await captureNearLeg(evidenceRpc, sandbox.config, terms, accounts, ref, Date.now());
     const capture: NearCapture = { index, bytes: verifiedExchangeBytes(exchanges as Exchange[]) };
-    const evidence = nearEvidence({ terms, config: sandbox.config, accounts, capture });
+    const evidence = nearEvidence({ keyControl: "flow", terms, config: sandbox.config, accounts, capture });
     expect(evidence.lock.railVerified).toBe(true);
     expect(evidence.rail?.status).toBe("locked");
     // ...and the same hash lock under the squatter's ref does not verify the buyer's terms (amount 1, other times).
     const squatCapture = await captureNearLeg(sandbox.createCapturingRpc(), sandbox.config, terms, { payee: sandbox.seller.accountId }, refOf(hashLock0x, squatter.accountId), Date.now());
     const squatEvidence = nearEvidence({
+      keyControl: "flow",
       terms,
       config: sandbox.config,
-      accounts: { payee: sandbox.seller.accountId },
+      accounts: { payee: sandbox.seller.accountId, payer: sandbox.buyer.accountId },
       capture: { index: squatCapture.index, bytes: verifiedExchangeBytes(squatCapture.exchanges as Exchange[]) },
     });
     expect(squatEvidence.lock.railVerified).toBe(false);

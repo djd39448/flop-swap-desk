@@ -191,13 +191,15 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
     const nearAccounts: NearAccounts = {
       ...(accounts.payee === undefined ? {} : { payee: accounts.payee }),
       ...(accounts.payer === undefined ? {} : { payer: accounts.payer }),
-      ...(accounts.payeeKey === undefined ? {} : { payeeKey: accounts.payeeKey }),
-      ...(accounts.payerKey === undefined ? {} : { payerKey: accounts.payerKey }),
     };
+    // P7 fix pass (F2): a participant's own flow never reads or requires the parties' keys (no
+    // `payeeKey`/`payerKey` here, `keyControl: "flow"`): a key rotated or deleted after the lock
+    // must not gate the Seller's claim or the Buyer's refund confirmation. The proven lines are still
+    // required; the board (replay, watcher, bundle) still requires the key reads.
     const { index, exchanges } = await captureNearLeg(this.options.rpc, this.options.config, terms, nearAccounts, ref, nowMs);
     const bytes = verifiedExchangeBytes(exchanges);
     const capture: NearCapture = { index, bytes };
-    return nearEvidence({ terms, config: this.options.config, accounts: nearAccounts, capture });
+    return nearEvidence({ terms, config: this.options.config, accounts: nearAccounts, capture, keyControl: "flow" });
   }
 
   /** How the Buyer learns `s` when the Seller claims on chain without ever posting a reveal

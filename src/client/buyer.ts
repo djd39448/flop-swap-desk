@@ -353,8 +353,9 @@ export class BuyerFlow {
     this.legBVerified = true;
   }
 
-  /** Post this Buyer's own leg-A account/key line (D-08) into leg A's deal room, as (optional)
-   *  corroborating payer information. */
+  /** Post this Buyer's own proven leg-A account/key line (D-08) into leg A's deal room. Required
+   *  (P7 fix pass F1): `lockLegA` refuses without it, and the Seller and every evidence reader need
+   *  it to bind the lock's payer to this DID. */
   async postAccountLineA(address: string): Promise<TranscriptRecord> {
     const { offerA, acceptA } = this.requirePaired();
     // P7: a proven line — the chain key signs a message binding this DID and this leg's contract.
@@ -369,8 +370,8 @@ export class BuyerFlow {
 
   /**
    * Lock leg A on this flow's counter-asset rail — refused until leg B has verified
-   * (`verifyLegBLocked`) and the Seller's own account line resolves in leg A's deal room (D-08:
-   * only the payee's line is required). The rail's own connected handle resolves the payee's
+   * (`verifyLegBLocked`) and both proven account lines resolve in leg A's deal room (the Seller's and,
+   * since the P7 fix pass, this Buyer's own). The rail's own connected handle resolves the payee's
    * address/pubkey right before the one write (`lock`) that ever needs it.
    *
    * P22-P24-EVM-FIXES.md B3: re-runs `checkSwapDeadlines` (the pinned `EVM_LOCAL_POLICY`) with
@@ -463,6 +464,13 @@ export class BuyerFlow {
     });
     if (accounts.payee === undefined) {
       throw new Error("buyer: refusing to lock leg A — the Seller's account line has not resolved (D-08)");
+    }
+
+    // P7 fix pass (F1): our own proven payer line must also resolve before we lock. The Seller
+    // and every evidence reader now require it; locking without it would only produce a lock that
+    // reads unverified everywhere.
+    if (accounts.payer === undefined) {
+      throw new Error("buyer: refusing to lock leg A, our own proven payer account line has not resolved (P7)");
     }
 
     const connected = await this.rail.connect(termsA, accounts);

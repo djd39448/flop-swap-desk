@@ -245,7 +245,7 @@ describe("evmEvidence — happy path", () => {
     expect(result.lock.raw).toEqual(capture.index.exchanges.map((e) => e.responseSha256));
   });
 
-  it("locked, payer unbound (no payer account line) -> still true, reason notes it", async () => {
+  it("locked, payer unbound (no payer account line) -> railVerified null (P7 fix pass F1), rail still reported", async () => {
     const capture = buildCapture({
       exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }),
     });
@@ -255,8 +255,17 @@ describe("evmEvidence — happy path", () => {
       accounts: { payee: PAYEE },
       capture,
     });
-    expect(result.lock.railVerified).toBe(true);
-    expect(result.lock.reason).toMatch(/payer unbound/);
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/payer has no proven account line/);
+    expect(result.rail?.status).toBe("locked");
+  });
+
+  it.each([Status.Claimed, Status.Refunded])("a claimed/refunded read with no payer line withholds the rail too (F1, status %s)", async (status) => {
+    const capture = buildCapture({ exchanges: standardExchanges({ callResult: encodeLocksResult({ status }) }) });
+    const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: { payee: PAYEE }, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/payer has no proven account line/);
+    expect(result.rail).toBeUndefined();
   });
 });
 
@@ -606,13 +615,13 @@ describe("evmEvidence — Locked branch field-by-field compare", () => {
     expect(result.rail?.status).toBe("locked");
   });
 
-  it("payer mismatch is NOT checked when the payer account line is unbound", async () => {
+  it("an unbound payer line never verifies, whatever the on-chain payer is (F1)", async () => {
     const capture = buildCapture({
       exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked, payer: OTHER }) }),
     });
     const result = await evmEvidence({ terms: TERMS, config: CONFIG, accounts: { payee: PAYEE }, capture });
-    expect(result.lock.railVerified).toBe(true);
-    expect(result.lock.reason).toMatch(/payer unbound/);
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/payer has no proven account line/);
   });
 
   it("addresses compare case-insensitively (isAddressEqual)", async () => {

@@ -160,6 +160,7 @@ class StatefulNearRpc {
   private readonly locks = new Map<string, LockRow>();
   private readonly nonces = new Map<string, number>();
   private readonly registered = new Set<string>();
+  private readonly accountsWithoutKeys = new Set<string>();
   private readonly readsRemainingBeforeUnregister = new Map<string, number>();
   private blockHeight = 100;
   nowMs: number;
@@ -184,6 +185,11 @@ class StatefulNearRpc {
 
   registerStorage(accountId: string): void {
     this.registered.add(accountId);
+  }
+  /** P7 fix pass (F2): the account's access keys are gone (deleted or rotated): every
+   *  `view_access_key` for it answers "does not exist". */
+  deleteAccessKeys(accountId: string): void {
+    this.accountsWithoutKeys.add(accountId);
   }
   unregisterStorage(accountId: string): void {
     this.registered.delete(accountId);
@@ -255,6 +261,9 @@ class StatefulNearRpc {
     if (requestType === "view_access_key") {
       const accountId = params.account_id as string;
       const block = this.currentBlock();
+      if (this.accountsWithoutKeys.has(accountId)) {
+        return { error: `access key ${String(params.public_key)} does not exist while viewing`, block_height: block.height, block_hash: block.hash };
+      }
       return { nonce: this.nonces.get(accountId) ?? 0, permission: "FullAccess", block_height: block.height, block_hash: block.hash };
     }
     if (requestType === "call_function") {
@@ -815,5 +824,29 @@ describe("G4 — reconcileLockA falls back to a permissive existence check when 
     expect(reconciled.locked).toBe(true);
     expect(reconciled.verified).toBe(false);
     expect(reconciled.reason).toBeTruthy();
+  });
+});
+
+// P7 fix pass (F2): a key rotated or deleted after the lock never gates a claim or a refund.
+
+describe("F2 - the parties' access keys are not read by a participant's own flow", () => {
+  it("the Buyer deletes its payer key after locking: the Seller's claimLegA still claims (no free option for the Buyer)", async () => {
+    const h = harness();
+    const { statement } = await lockedFlow(h);
+    h.node.deleteAccessKeys(BUYER_ACCOUNT);
+    const claimed = await h.sellerFlow.claimLegA(statement);
+    expect(claimed.receipt).toBeDefined();
+    expect(h.node.claimSendTxCalls).toBe(1);
+  });
+
+  it("both parties delete their keys after the claim: a retry still recognises the claim from the chain", async () => {
+    const h = harness();
+    const { statement } = await lockedFlow(h);
+    await h.sellerFlow.claimLegA(statement);
+    h.node.deleteAccessKeys(SELLER_ACCOUNT);
+    h.node.deleteAccessKeys(BUYER_ACCOUNT);
+    const again = await h.sellerFlow.claimLegA(statement);
+    expect(again.receipt).toBeDefined();
+    expect(h.node.claimSendTxCalls).toBe(1);
   });
 });

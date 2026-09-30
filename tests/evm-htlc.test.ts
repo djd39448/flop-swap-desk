@@ -768,7 +768,7 @@ describe("EvmHtlcRail.verifyLockFinal — representative finalized-view branches
       eth_call: () => ({ result: locksResult(2) }),
     });
     const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
-    const evidence = await rail.verifyLockFinal(TERMS, TERMS.statement, { payee: PAYEE });
+    const evidence = await rail.verifyLockFinal(TERMS, TERMS.statement, { payee: PAYEE, payer: PAYER });
     expect(evidence.lock.railVerified).toBe(false);
     expect(evidence.rail?.status).toBe("claimed");
   });
@@ -781,7 +781,7 @@ describe("EvmHtlcRail.verifyLockFinal — representative finalized-view branches
       eth_call: () => ({ result: locksResult(3) }),
     });
     const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
-    const evidence = await rail.verifyLockFinal(TERMS, TERMS.statement, { payee: PAYEE });
+    const evidence = await rail.verifyLockFinal(TERMS, TERMS.statement, { payee: PAYEE, payer: PAYER });
     expect(evidence.lock.railVerified).toBe(false);
     expect(evidence.rail?.status).toBe("refunded");
   });
@@ -799,7 +799,7 @@ describe("EvmHtlcRail.verifyLockFinal — representative finalized-view branches
     expect(evidence.lock.reason).toMatch(/amount differs/);
   });
 
-  it("payer unbound -> still true, reason notes it", async () => {
+  it("payer unbound -> railVerified null (P7 fix pass F1: the payer's proven line is mandatory)", async () => {
     const config = configFor(ANVIL_LOCAL_PIN);
     const { rpc } = mockCapturingRpc({
       eth_chainId: () => ({ result: "0x7a69" }),
@@ -808,8 +808,8 @@ describe("EvmHtlcRail.verifyLockFinal — representative finalized-view branches
     });
     const rail = await EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW });
     const evidence = await rail.verifyLockFinal(TERMS, TERMS.statement, { payee: PAYEE });
-    expect(evidence.lock.railVerified).toBe(true);
-    expect(evidence.lock.reason).toMatch(/payer unbound/);
+    expect(evidence.lock.railVerified).toBeNull();
+    expect(evidence.lock.reason).toMatch(/payer has no proven account line/);
   });
 
   it("casing-insensitive address compare: on-chain payee in lowercase still matches a checksummed account line", async () => {

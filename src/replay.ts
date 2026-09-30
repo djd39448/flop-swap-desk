@@ -390,6 +390,7 @@ export function foldCaptured(input: FoldCapturedInput): Board {
           rail: EVM_RAIL_ID,
           caip2: evmConfigCheck.config.pin.caip2,
           proof: { mode: "required" }, // P7: only proven lines resolve
+          beforeSeq: accepted.seq, // P7 fix pass (F4): only lines before the accepted lock, as btc/near
         });
         // D4 (P22-P24-EVM-FIXES-R2.md): a backstop, not the primary defense — `evmEvidence`
         // validates every address-shaped field it reads off captured data before it can ever

@@ -706,6 +706,10 @@ export function evmEvidence(input: EvmEvidenceInput): EvmEvidenceResult {
     if (accounts.payee === undefined) {
       return { lock: { ...baseAtFinalizedView, railVerified: null, reason: `${baseReason} (payee has no account line to confirm it)` } };
     }
+    // P7 fix pass (F1): the payer's proven line is mandatory too (see the Locked branch below).
+    if (accounts.payer === undefined) {
+      return { lock: { ...baseAtFinalizedView, railVerified: null, reason: `${baseReason} (payer has no proven account line, P7)` } };
+    }
     const claimOrRefundToken = config.assets[terms.asset];
     if (claimOrRefundToken === undefined) {
       return {
@@ -747,6 +751,12 @@ export function evmEvidence(input: EvmEvidenceInput): EvmEvidenceResult {
   if (accounts.payee === undefined) {
     return { lock: { ...baseAtFinalizedView, railVerified: null, reason: "payee has no account line" }, rail };
   }
+  // P7 fix pass (F1): the payer's proven line is mandatory. Otherwise the lock's payer is tied to
+  // no DID, and the victim Buyer's own counterparty (who knows the hash lock and controls the
+  // payee account) could borrow the victim's lock for a sock-puppet pair.
+  if (accounts.payer === undefined) {
+    return { lock: { ...baseAtFinalizedView, railVerified: null, reason: "evm-htlc: payer has no proven account line (P7)" }, rail };
+  }
   const token = config.assets[terms.asset];
   if (token === undefined) {
     return {
@@ -771,10 +781,7 @@ export function evmEvidence(input: EvmEvidenceInput): EvmEvidenceResult {
     return { lock: { ...baseAtFinalizedView, railVerified: false, reason: mismatch }, rail };
   }
 
-  const reason =
-    accounts.payer === undefined
-      ? "evm-htlc: payer unbound (no payer account line)"
-      : "evm-htlc: locked and on-chain state matches terms";
+  const reason = "evm-htlc: locked and on-chain state matches terms";
   return { lock: { ...baseAtFinalizedView, railVerified: true, reason }, rail };
 }
 

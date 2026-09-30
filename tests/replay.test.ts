@@ -335,9 +335,14 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
   function accountLineRecords(dealRoomA: string, contract: string, seq: number, ts: number) {
     const sellerLine = SELLER_EVM.line({ did: seller.did, contract, caip2: ANVIL_LOCAL_PIN.caip2 });
     const buyerLine = BUYER_EVM.line({ did: buyer.did, contract, caip2: ANVIL_LOCAL_PIN.caip2 });
+    // P7 fix pass (F4 + F1): both proven lines must precede the accepted lock, so they sit at
+    // seq 0 of the deal room (both, from different senders) whatever `seq` the caller passes (the lock frames use 1.. and
+    // the tests' own `seq` argument is only kept so the call sites read as before); timestamps
+    // likewise come before the lock.
+    void seq;
     return [
-      record(dealRoomA, seq, ts, seller, sellerLine),
-      record(dealRoomA, seq + 1, ts + 1, buyer, buyerLine),
+      record(dealRoomA, 0, ts - 3 * 60_000, seller, sellerLine),
+      record(dealRoomA, 0, ts - 3 * 60_000 + 1, buyer, buyerLine),
     ];
   }
 
@@ -439,6 +444,50 @@ ${noteBValue}
     expect(view!.evidence.a?.railVerified).toBeNull();
     expect(view!.evidence.a?.reason).toMatch(/payee has no account line/);
     expect(view!.status).not.toBe("a-locked");
+  });
+
+  /** The a-locked fold with caller-chosen leg A deal-room records (lock frame at seq 1). */
+  function foldLockedA(nonce: string, extraRows: (s: ReturnType<typeof buildMixedSwapBase>) => TranscriptRecord[]) {
+    const s = buildMixedSwapBase(nonce);
+    const lockA: LockFrame = { type: "lock", from: buyer.did, contract: s.legAAccept.contract, rail: "evm-htlc", ref: s.lock.hash };
+    const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
+    const dealRoomsA = [record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)), ...extraRows(s)];
+    const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
+    const noteBValue = encodePaperRecord({ status: "locked", lock: "hash", statement: s.lock.hash, refundAfterMs: s.legBOffer.refundAfterMs });
+    const capture = buildCapture(s.lock.hash, standardExchanges(s.lock.hash as Hex, encodeLocksResult({ status: Status.Locked })));
+    const board = foldCaptured({
+      offers: s.offers,
+      dealRooms: new Map([[s.dealRoomA, dealRoomsA], [s.dealRoomB, dealRoomsB]]),
+      notes: new Map([[s.legBAccept.contract, { body: `!! rehearsal
+
+${noteBValue}
+`, endpoint: "kv:test" }]]),
+      chain: new Map([[s.lock.hash, capture]]),
+      rails: { evm: EVM_CONFIG },
+      nowMs: T0 + 6 * MIN,
+    });
+    return board.swaps.find((sw) => sw.swapId === s.swapId)!;
+  }
+
+  it("P7 fix pass F1: a leg with only the payee's proven line (a payee-side mirror borrowing the Buyer's lock) does not verify", () => {
+    const view = foldLockedA("f0a1f0a1f0a1f0a1", (s) => [
+      record(s.dealRoomA, 0, T0 + 1.5 * MIN, seller, SELLER_EVM.line({ did: seller.did, contract: s.legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2 })),
+    ]);
+    expect(view.evidence.a?.railVerified).toBeNull();
+    expect(view.evidence.a?.reason).toMatch(/payer has no proven account line/);
+    expect(view.status).not.toBe("settled");
+  });
+
+  it("P7 fix pass F4: an account line posted after the accepted lock neither resolves nor unresolves a party", () => {
+    const late = foldLockedA("f0a2f0a2f0a2f0a2", (s) => [
+      ...accountLineRecords(s.dealRoomA, s.legAAccept.contract, 2, T0 + 4.5 * MIN),
+      // The Seller posts a second, proven line for another address AFTER the lock: it must not make
+      // the payee ambiguous (conflicting) and withdraw the verification.
+      record(s.dealRoomA, 7, T0 + 5 * MIN, seller, evmSigner(0x1ff).line({ did: seller.did, contract: s.legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2 })),
+      // The Buyer's late proven line for another address must not change the payer either.
+      record(s.dealRoomA, 8, T0 + 5 * MIN, buyer, evmSigner(0x1fe).line({ did: buyer.did, contract: s.legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2 })),
+    ]);
+    expect(late.evidence.a?.railVerified).toBe(true);
   });
 
   it("settled: both legs reveal, and both rails report a final claim", async () => {

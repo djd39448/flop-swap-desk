@@ -21,13 +21,22 @@ import { CapturingRpc, writeCapture } from "../src/rails/rpc-capture.js";
 import {
   captureNearLeg,
   loadNearCapture,
-  nearEvidence,
+  nearEvidence as nearEvidenceCore,
   nearLockRefInvalid,
+  type NearEvidenceInput,
   type NearAccounts,
   type NearCapture,
   type NearCaptureIndex,
   type NearCaptureIndexExchange,
 } from "../src/rails/near-evidence.js";
+
+/** Most tests below are about the chain read, not key control: they run with `keyControl: "flow"`
+ *  unless the accounts carry keys (then the board's "required" rule applies). The key-control
+ *  tests at the end pass `keyControl` explicitly. */
+function nearEvidence(input: NearEvidenceInput): ReturnType<typeof nearEvidenceCore> {
+  const keyed = input.accounts.payeeKey !== undefined || input.accounts.payerKey !== undefined;
+  return nearEvidenceCore({ keyControl: keyed ? "required" : "flow", ...input });
+}
 
 function sha256Hex(text: string): string {
   return bytesToHex(sha256(new TextEncoder().encode(text)));
@@ -320,11 +329,12 @@ describe("nearEvidence — happy path", () => {
     expect(result.lock.raw).toEqual(capture.index.exchanges.map((e) => e.responseSha256));
   });
 
-  it("locked, payer omitted from accounts -> still true (payer is only optional corroboration)", () => {
+  it("locked, payer omitted from accounts -> railVerified null, no rail (P7 fix pass F1: the payer's proven line is mandatory)", () => {
     const capture = buildCapture({ exchanges: standardExchanges() });
     const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: { payee: SELLER_ACCOUNT }, capture });
-    expect(result.lock.railVerified).toBe(true);
-    expect(result.rail?.status).toBe("locked");
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/payer has no proven account line/);
+    expect(result.rail).toBeUndefined();
   });
 
   it("claimed, fields match -> railVerified false, rail claimed+final", () => {
@@ -657,7 +667,7 @@ describe("nearEvidence — squatting fix: the ref is 0x<hash lock>:<payer>", () 
 
   it("evidence requires the on-chain payer to equal the ref payer (railVerified false, no rail)", () => {
     const capture = buildCapture({ exchanges: standardExchanges({ lock: { view: lockViewPayload({ payer: OTHER_ACCOUNT }) }, storage: false }) });
-    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: { payee: SELLER_ACCOUNT }, capture });
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: { payee: SELLER_ACCOUNT, payer: BUYER_ACCOUNT }, capture });
     expect(result.lock.railVerified).toBe(false);
     expect(result.lock.reason).toMatch(/payer named by the ref/);
     expect(result.rail).toBeUndefined();
@@ -1347,9 +1357,18 @@ describe("nearEvidence -- P7: the proven line's key must be a FullAccess key of 
     expect(result.rail?.status).toBe("locked");
   });
 
-  it("without any key in accounts nothing is checked (the pre-proof fold is unchanged)", () => {
-    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: buildCapture({ exchanges: standardExchanges() }) });
+  it("keyControl flow (a participant's own flow) reads no key: accounts without keys verify", () => {
+    const result = nearEvidenceCore({ keyControl: "flow", terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: buildCapture({ exchanges: standardExchanges() }) });
     expect(result.lock.railVerified).toBe(true);
+  });
+
+  it("F6-3: under the default (required) a resolved account with no key fails closed", () => {
+    for (const accounts of [{ payee: SELLER_ACCOUNT, payer: BUYER_ACCOUNT }, { payee: SELLER_ACCOUNT, payer: BUYER_ACCOUNT, payerKey: BUYER_KEY }]) {
+      const result = nearEvidenceCore({ terms: TERMS, config: CONFIG, accounts, capture: buildCapture({ exchanges: standardExchanges() }) });
+      expect(result.lock.railVerified).toBeNull();
+      expect(result.lock.reason).toMatch(/carries no key to check/);
+      expect(result.rail).toBeUndefined();
+    }
   });
 
   it("a function-call key is refused", () => {
@@ -1389,7 +1408,7 @@ describe("nearEvidence -- P7: the proven line's key must be a FullAccess key of 
   });
 
   it("a key with no account is refused", () => {
-    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: { payee: SELLER_ACCOUNT, payerKey: BUYER_KEY }, capture: buildCapture({ exchanges: keyed({ n: 7 }) }) });
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: { payee: SELLER_ACCOUNT, payeeKey: SELLER_KEY, payerKey: BUYER_KEY }, capture: buildCapture({ exchanges: keyed({ n: 7 }) }) });
     expect(result.lock.railVerified).toBeNull();
     expect(result.lock.reason).toContain("carries a key but no account");
   });

@@ -493,6 +493,17 @@ describe("BuyerFlow.lockLegA — refusals never touch the network", () => {
     await expect(h.buyerFlow.lockLegA()).rejects.toThrow(/Seller's account line has not resolved/);
   });
 
+  it("refuses to lock before the Buyer's own proven payer line is posted (P7 fix pass F1)", async () => {
+    const h = harness(44, 45);
+    const { offerBRecord, acceptARecord } = await bidAndAcceptA(h, "00000001");
+    const { acceptBRecord } = await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0);
+    await h.sellerFlow.lockLegB(acceptBRecord);
+    await h.buyerFlow.verifyLegBLocked();
+    await h.sellerFlow.postAccountLineA(SELLER_ACCOUNT);
+    // Deliberately never call buyerFlow.postAccountLineA.
+    await expect(h.buyerFlow.lockLegA()).rejects.toThrow(/own proven payer account line has not resolved/);
+  });
+
   // P7: a line with no proof, or a proof for another DID, contract or account, is never resolved.
   it.each([
     ["an unproven line", (_contract: string, _did: string) => formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: SELLER_ACCOUNT })],
@@ -964,12 +975,12 @@ describe("SellerFlow.claimLegA — E4 (re-checks chain time again after verifyLo
       refundAfterMs,
       expiresMs: T0 + 10 * 60_000,
     });
-    await h.sellerFlow.acceptLegA(offerA, legBDeadlines(T0), T0);
-    // Only the payee's account line is required (D-08) for `verifyLockFinal` to resolve; the
-    // Buyer's own line is optional corroboration this test does not need (posting it would
-    // require the full `acceptLegB` pairing dance, which this test's own custom leg-A deadlines
-    // have no need for either).
+    const { acceptARecord, offerBRecord } = await h.sellerFlow.acceptLegA(offerA, legBDeadlines(T0), T0);
+    // Both proven lines are required for `verifyLockFinal` to resolve (P7 fix pass F1), so the
+    // Buyer pairs leg B and posts its own payer line too.
+    await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0);
     await h.sellerFlow.postAccountLineA(SELLER_ACCOUNT);
+    await h.buyerFlow.postAccountLineA(BUYER_ACCOUNT);
 
     await expect(h.sellerFlow.claimLegA(h.sellerFlow.statement!)).rejects.toThrow(
       /at\/after its claimByMs \(chain time, re-checked after verifyLockFinal\) \(E4\)/,
