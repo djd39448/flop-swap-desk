@@ -461,6 +461,86 @@ fn lock_payee_may_not_be_the_escrow_or_the_vault() {
     }
 }
 
+// S2 (NEAR H5 twin): a payee nobody can ever sign for is refused at Lock.
+#[test]
+fn lock_payee_that_can_never_receive_is_refused() {
+    let mut e = Env::new();
+    let p = Keypair::try_from(e.payer.to_bytes().as_slice()).unwrap();
+    let m = lock_metas(&p.pubkey(), &e.escrow(), &e.vault(), &e.mint, &e.payer_ta);
+    for bad in [system_program(), program_id(), token_program(), e.mint] {
+        let r = e.send(&[ix(m.clone(), lock_data(&e.hash, &bad, e.claim_by(), e.refund_after(), 5))], &[&p]);
+        assert_code(&r, E_PAYEE_IS_PROGRAM_ACCOUNT);
+    }
+    assert!(e.svm.get_account(&e.escrow()).is_none());
+}
+
+// S1: a failed claim reverts completely but leaves the escrow Locked with no revealed flag, so the
+// payer can still refund after refund_after (Solana keeps no revealed state; the client must protect
+// the secret, see README Guarantees).
+#[test]
+fn failed_claim_leaves_the_escrow_locked_and_refundable() {
+    let mut e = Env::new().locked();
+    let ghost = Address::new_unique(); // payee token account that does not exist
+    let c = Keypair::try_from(e.cranker.to_bytes().as_slice()).unwrap();
+    let i = ix(claim_metas(&e.escrow(), &e.vault(), &e.mint, &ghost), claim_data(&e.preimage));
+    assert!(e.send(&[i], &[&c]).is_err());
+    assert_eq!(e.escrow_bytes()[2], 0, "no revealed flag survives a failed claim");
+    set_time(&mut e.svm, T0 + 2 * HOUR);
+    assert_ok(&e.refund());
+    assert_eq!(ta_amount(&e.svm, &e.payer_ta), BALANCE);
+}
+
+#[test]
+fn late_claim_fails_with_the_secret_public_and_refund_still_works() {
+    let mut e = Env::new().locked();
+    set_time(&mut e.svm, T0 + 2 * HOUR);
+    assert_code(&e.claim(), E_CLAIM_WINDOW_CLOSED);
+    assert_eq!(e.escrow_bytes()[2], 0);
+    assert_ok(&e.refund());
+}
+
+#[test]
+fn token_2022_accounts_and_mint_are_refused() {
+    let t22: Address = TOKEN_2022.parse().unwrap();
+    let mut e = Env::new();
+    let p = Keypair::try_from(e.payer.to_bytes().as_slice()).unwrap();
+    let m = lock_metas(&p.pubkey(), &e.escrow(), &e.vault(), &e.mint, &e.payer_ta);
+    let data = lock_data(&e.hash, &e.payee, e.claim_by(), e.refund_after(), 5);
+    let mut ta = e.svm.get_account(&e.payer_ta).unwrap();
+    ta.owner = t22;
+    e.svm.set_account(e.payer_ta, ta).unwrap();
+    assert_code(&e.send(&[ix(m.clone(), data.clone())], &[&p]), E_BAD_TOKEN_ACCOUNT);
+    let mut ta = e.svm.get_account(&e.payer_ta).unwrap();
+    ta.owner = token_program();
+    e.svm.set_account(e.payer_ta, ta).unwrap();
+    let mut mi = e.svm.get_account(&e.mint).unwrap();
+    mi.owner = t22;
+    e.svm.set_account(e.mint, mi).unwrap();
+    assert_code(&e.send(&[ix(m, data)], &[&p]), E_BAD_MINT);
+}
+
+#[test]
+fn double_claim_in_one_transaction_reverts_both() {
+    let mut e = Env::new().locked();
+    let c = Keypair::try_from(e.cranker.to_bytes().as_slice()).unwrap();
+    let i = e.claim_ix(&e.preimage.clone());
+    let r = e.send(&[i.clone(), i], &[&c]);
+    assert!(r.is_err());
+    assert_eq!(e.status(), 1);
+    assert_eq!(ta_amount(&e.svm, &e.vault()), 500_000);
+}
+
+#[test]
+fn the_vault_passed_as_the_escrow_is_refused() {
+    let mut e = Env::new().locked();
+    let c = Keypair::try_from(e.cranker.to_bytes().as_slice()).unwrap();
+    let mut m = claim_metas(&e.escrow(), &e.vault(), &e.mint, &e.payee_ta);
+    m[0].pubkey = e.vault();
+    m[1].pubkey = e.escrow();
+    assert!(e.send(&[ix(m, claim_data(&e.preimage))], &[&c]).is_err());
+    assert_eq!(e.status(), 1);
+}
+
 #[test]
 fn lock_account_validation() {
     let mut e = Env::new();
