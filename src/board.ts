@@ -168,14 +168,58 @@ export function buildBoard(input: BoardInput): Board {
     }
   }
 
-  // V6: leg B belongs to the DID that accepted leg A. Among the leg-B offers naming a leg A, the
-  // earliest-seq one signed by an accepter of that leg A pairs with it; when leg A has no accept
-  // at all, the earliest-seq leg B stands in (coordination-only, on export row order).
+  // V6 + R3-2: leg B belongs to the DID that accepted leg A, and the real pair is a crossing one:
+  // leg B signed by an accepter of leg A AND carrying its own genuine accept from leg A's offerer
+  // (the Buyer). A stranger who accepts leg A and posts their own leg B first has no such Buyer
+  // accept, so they cannot hide the real swap. Among crossing candidates the one whose leg-A
+  // accept is earliest wins. Only when no crossing pair exists does the earliest-seq leg B signed
+  // by an accepter of leg A stand in (coordination-only, on export row order); when leg A has no
+  // accept at all, the earliest-seq leg B stands in (also coordination-only).
   const legBByLegAOfferId = new Map<string, LegBCandidate>();
   const legBPairedByRowOrder = new Set<string>();
+  const legBPairedNoCrossing = new Set<string>();
   const unpaired: Array<{ offerId: string; reason: string }> = [];
 
   const orderedLegB = [...legBCandidates].sort((left, right) => left.record.seq - right.record.seq);
+  const candidatesByLegA = new Map<string, LegBCandidate[]>();
+  for (const candidate of orderedLegB) {
+    const list = candidatesByLegA.get(candidate.context.legAOfferId);
+    if (list === undefined) candidatesByLegA.set(candidate.context.legAOfferId, [candidate]);
+    else list.push(candidate);
+  }
+  for (const [legAOfferId, candidates] of candidatesByLegA) {
+    const legA = legAByOfferId.get(legAOfferId);
+    if (legA === undefined) continue;
+    const accepts = acceptsByRef.get(legAOfferId) ?? [];
+    if (accepts.length === 0) {
+      legBByLegAOfferId.set(legAOfferId, candidates[0]!);
+      legBPairedByRowOrder.add(legAOfferId);
+      continue;
+    }
+    const acceptSeqOf = (did: string): number | undefined => {
+      const seqs = accepts.filter((accept) => accept.frame.from === did).map((accept) => accept.record.seq);
+      return seqs.length === 0 ? undefined : Math.min(...seqs);
+    };
+    let crossing: LegBCandidate | undefined;
+    let crossingSeq = Infinity;
+    let fallback: LegBCandidate | undefined;
+    for (const candidate of candidates) {
+      const aSeq = acceptSeqOf(candidate.offer.from);
+      if (aSeq === undefined) continue;
+      if (fallback === undefined) fallback = candidate;
+      const buyerAccepted = (acceptsByRef.get(candidate.offer.id) ?? []).some(
+        (accept) => accept.frame.from === legA.offer.from,
+      );
+      if (buyerAccepted && aSeq < crossingSeq) {
+        crossing = candidate;
+        crossingSeq = aSeq;
+      }
+    }
+    const chosen = crossing ?? fallback;
+    if (chosen === undefined) continue;
+    legBByLegAOfferId.set(legAOfferId, chosen);
+    if (crossing === undefined) legBPairedNoCrossing.add(legAOfferId);
+  }
   for (const candidate of orderedLegB) {
     const legAOfferId = candidate.context.legAOfferId;
     if (!legAByOfferId.has(legAOfferId)) {
@@ -185,21 +229,18 @@ export function buildBoard(input: BoardInput): Board {
       });
       continue;
     }
-    if (legBByLegAOfferId.has(legAOfferId)) {
+    const winner = legBByLegAOfferId.get(legAOfferId);
+    if (winner === candidate) continue;
+    if (winner !== undefined && winner.record.seq < candidate.record.seq) {
       unpaired.push({ offerId: candidate.offer.id, reason: "leg A already paired" });
       continue;
     }
-    const accepts = acceptsByRef.get(legAOfferId);
-    if (accepts === undefined || accepts.length === 0) {
-      legBByLegAOfferId.set(legAOfferId, candidate);
-      legBPairedByRowOrder.add(legAOfferId);
-      continue;
-    }
-    if (!accepts.some((accept) => accept.frame.from === candidate.offer.from)) {
+    const accepts = acceptsByRef.get(legAOfferId) ?? [];
+    if (accepts.length > 0 && !accepts.some((accept) => accept.frame.from === candidate.offer.from)) {
       unpaired.push({ offerId: candidate.offer.id, reason: "leg B is not signed by the DID that accepted leg A" });
-      continue;
+    } else {
+      unpaired.push({ offerId: candidate.offer.id, reason: "leg A already paired" });
     }
-    legBByLegAOfferId.set(legAOfferId, candidate);
   }
 
   const swaps: SwapView[] = [];
@@ -240,6 +281,13 @@ export function buildBoard(input: BoardInput): Board {
       view.coordinationOnly.push({
         basis: "coordination-only",
         reason: "leg B paired to a leg A with no accept by export row order (earliest seq), not by its accepter",
+      });
+    }
+    if (legB !== undefined && legBPairedNoCrossing.has(legAOfferId)) {
+      view.coordinationOnly.push({
+        basis: "coordination-only",
+        reason:
+          "leg B paired by export row order among accepters of leg A: no leg B carries the Buyer's own accept (no crossing pair)",
       });
     }
     // H4: foldSwap has no visibility into how an accept was chosen among several candidates

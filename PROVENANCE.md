@@ -237,7 +237,7 @@ independently of tclk's own choreography status (H3, tclk#180/#181). Vendored tc
 observation folded a swap to `settled`, and two pairs with the same buyer and nonce shared one
 evidence entry. Both are first-party changes; nothing is vendored or copied from that review beyond
 the two reproductions, which are regression tests in `tests/binding.test.ts`. No capture or
-evidence file format changed, so no fixture was recaptured. Round 2 of the review (V3-V8, P5-NEAR-FIXES-R2.md) removed the shared-swapId evidence blanking, kept only genuine accepts for candidates and evidence keys, paired leg B with leg A's accepter, made a refund frame insufficient for chain legs, and keyed the watcher, bundle and audit-export by pair; all first-party.
+evidence file format changed, so no fixture was recaptured. Round 2 of the review (V3-V8, P5-NEAR-FIXES-R2.md) removed the shared-swapId evidence blanking, kept only genuine accepts for candidates and evidence keys, paired leg B with leg A's accepter, made a refund frame insufficient for chain legs, and keyed the watcher, bundle and audit-export by pair; all first-party. Round 3 (R3-2, R3-3) made the board prefer the crossing pair and kept a stranger's copy of a swapId out of the bundle and `--expect`; the evidence section of the README records (R3-1) that chain evidence does not bind a lock to a tclk contract, so a mirror pair can borrow it - nothing here claims otherwise, and no contract or lock format changed.
 
 ## Reveal latches and signer error text (P5-NEAR-FIXES-R2.md G6, D4)
 

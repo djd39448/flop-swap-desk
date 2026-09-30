@@ -202,6 +202,19 @@ real block on the chain it was read from, so anyone with their own RPC access to
 re-query `locks(hashLock)` at that exact block hash and compare against what this build
 reported, independent of this repository entirely.
 
+### Known limits of chain evidence (all three chain legs; recorded 2026-09-30, R3-1)
+
+- **Chain evidence proves that a lock with these terms exists and was claimed or refunded on
+  chain, not which tclk contract it belongs to.** The on-chain HTLC does not commit to the tclk
+  contract id, and the account/pubkey lines in the evidence are claims, not proof of control. A
+  stranger can therefore build a mirror pair (their own offers and accepts) that borrows a real
+  swap's on-chain evidence and folds to `settled`. The victim's own status is unaffected and no
+  funds move: the parties' own clients verify against their own freshly minted hash lock and their
+  counterparty's signed lines, never against a board status. Two fixes are under consideration:
+  the lock committing to the contract id (a contract/script change; the EVM contract is vendored),
+  or proof-of-control account lines signed by the chain key. Neither is done in this build; the
+  lock format and the contracts are unchanged.
+
 ### Known limits of the EVM leg (recorded 2026-09-28 after three review rounds)
 
 None of these can move value to the wrong party or reveal the secret without payment; each is

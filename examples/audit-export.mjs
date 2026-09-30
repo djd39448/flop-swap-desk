@@ -586,7 +586,13 @@ function printReport(swaps, unpaired) {
 export function statusForExpectation(swaps, key) {
   const byPair = swaps.filter((s) => s.pairKey !== null && s.pairKey === key);
   if (byPair.length === 1) return byPair[0].status;
-  const matches = swaps.filter((s) => s.swapId === key);
+  // R3-3: the swapId is defined per buyer, so it can repeat only among leg-A offers signed by the
+  // same DID (the rule the board uses). A stranger copying a public job.id must not make the
+  // victim's expectation ambiguous: the swaps come in venue order, so the signer of the first
+  // swap carrying this swapId is the one named, and other signers' copies are not counted.
+  const sameId = swaps.filter((s) => s.swapId === key);
+  const signer = sameId.length > 0 ? sameId[0].buyerDid : null;
+  const matches = signer === null ? sameId : sameId.filter((s) => s.buyerDid === signer);
   if (matches.length > 1) {
     return `(ambiguous: swapId shared by ${matches.length} swaps, name one by pairKey: ${matches.map((s) => s.status).join(", ")})`;
   }

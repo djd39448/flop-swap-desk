@@ -197,7 +197,16 @@ export function selectBundleSwap(
     (swap) => swap.legA?.state?.contract === evidence.legA.contract && swap.legB?.state?.contract === evidence.legB.contract,
   );
   if (byContract !== undefined) return byContract;
-  const sameSwapId = swaps.filter((swap) => swap.swapId === evidence.swapId);
+  // R3-2: a swap that shares the swapId but whose folded leg contracts are set and differ from
+  // the bundle's own is another pair (a stranger's copy of the public job id), never ours.
+  const sameSwapId = swaps.filter((swap) => {
+    if (swap.swapId !== evidence.swapId) return false;
+    const a = swap.legA?.state?.contract;
+    const b = swap.legB?.state?.contract;
+    if (a !== undefined && a !== evidence.legA.contract) return false;
+    if (b !== undefined && b !== evidence.legB.contract) return false;
+    return true;
+  });
   return sameSwapId.length === 1 ? sameSwapId[0] : undefined;
 }
 
