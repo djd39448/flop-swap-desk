@@ -147,15 +147,17 @@ comment).
   (confirmed live against the sandbox, NB-int).
 - `src/rails/near-htlc.ts` — the desk-facing `near-htlc` adapter: chain pin (allow list
   `near-sandbox-flop`/`testnet`), keyless writes via an in-memory `NearSigner` (§1/§4), the
-  sign-and-record-then-broadcast split (D-N4), `FT_TRANSFER_CALL_GAS`/`CLAIM_REFUND_GAS`
+  sign-and-record-then-broadcast split (D-N4; the lock is the only two-step write, `claim` and
+  `refund` are single calls), `FT_TRANSFER_CALL_GAS`/`CLAIM_REFUND_GAS`
   corrected from their provisional 100/60 Tgas to 20/40 Tgas against real measured gas burn on
   the sandbox (D-N9, NB-int).
 - `src/rails/near-evidence.ts` — the pure, fail-closed finalized-view evidence decoder shared by
   the live rail and the offline replay, the NEAR twin of `src/rails/evm-evidence.ts`/
   `src/rails/btc-evidence.ts` (D-N10).
 - `src/rails/near-signer-memory.ts` — `InMemoryNearSigner`, the ONLY concrete `NearSigner`
-  implementation in this build (test/harness code only — §1/D-N2/D-10): `generate()` for a fresh
-  in-memory keypair, `fromNearSecretKey()` for `tests-near/helpers/sandbox.ts`'s own one-time
+  implementation in this build (test/harness code only — §1/D-N2/D-10): the secret key is an ES
+  `#secretKey` private field, and `toJSON`/`util.inspect` expose only the account id and public
+  key (D1); `generate()` for a fresh in-memory keypair, `fromNearSecretKey()` for `tests-near/helpers/sandbox.ts`'s own one-time
   read of the sandbox's own `test.near` key.
 - `src/client/near-rail.ts` — the `near-htlc` implementation of `src/client/counter-rail.ts`'s
   `CounterAssetRail` interface, the rail-agnostic wiring `src/client/seller.ts`/`buyer.ts` drive
@@ -197,10 +199,12 @@ private key material (this build never holds a real NEAR secret key to begin wit
 one sandbox-generated `test.near` key, read once into memory and never serialized — D-N2; every
 account and key these captures ever name past that point is this process's own freshly generated,
 zero-value, in-memory keypair). `tests/near-sandbox-fixtures.test.ts`'s own extended key-material
-scan (the Bitcoin fixture scan's patterns plus NEAR's own literal `"secret_key"` field name —
-see that file's own comment for why a length-based `ed25519:` heuristic alone cannot reliably
-distinguish a secret key from an ordinary, entirely public chain signature of the same byte
-length) additionally pins this for the three committed directories on every `npm test` run.
+scan (the Bitcoin fixture scan's patterns, the literal `"secret_key"` and `"private_key"` field
+names, any base58 token decoding to 64 bytes whose first 32 bytes derive its last 32, and any
+32-byte hex or base58 token whose derived public key is one of the fixture's own public keys —
+each shape has a planted-leak test) additionally pins this for the three committed directories
+on every `npm test` run. `refunded-b` contains no NEAR bytes at all (the Buyer never locked leg
+A), so it carries no chain evidence of its own.
 
 ## Settlement-view vocabulary — pinned to tclk PR #173
 
