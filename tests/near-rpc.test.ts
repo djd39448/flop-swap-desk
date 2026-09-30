@@ -6,7 +6,7 @@
 // decoding, plus the two distinct error paths (`RpcCaptureError` → a typed `NearRpcError`
 // subclass; a successful `query` response carrying `result.error` → `NearFunctionCallPanicError`).
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import {
@@ -172,12 +172,79 @@ describe("NearRpc.sendTx / txStatus — outcome decoding", () => {
     expect(outcome.transactionOutcome).toEqual({ id: "txid1", blockHash: "blockhash1" });
   });
 
-  it("txStatus uses EXPERIMENTAL_tx_status with array params [hash, sender]", async () => {
+  it("txStatus uses EXPERIMENTAL_tx_status with object params and wait_until FINAL by default (H10)", async () => {
     const { near, requests } = rpcNear([
       ok(1, { status: {}, transaction_outcome: { id: "txid1", block_hash: "blockhash1" } }),
     ]);
     await near.txStatus("txid1", "buyer.near-sandbox-flop");
-    expect(requests[0]).toEqual({ method: "EXPERIMENTAL_tx_status", params: ["txid1", "buyer.near-sandbox-flop"] });
+    expect(requests[0]).toEqual({
+      method: "EXPERIMENTAL_tx_status",
+      params: { tx_hash: "txid1", sender_account_id: "buyer.near-sandbox-flop", wait_until: "FINAL" },
+    });
+  });
+
+  it("txStatus carries the transaction body the node reports, and undefined when absent (H10)", async () => {
+    const withTx = rpcNear([ok(1, { status: {}, transaction: { signer_id: "buyer.near-sandbox-flop" }, transaction_outcome: { id: "t", block_hash: "b" } })]);
+    expect((await withTx.near.txStatus("t", "buyer.near-sandbox-flop")).transaction).toEqual({ signer_id: "buyer.near-sandbox-flop" });
+    const without = rpcNear([ok(1, { status: {}, transaction_outcome: { id: "t", block_hash: "b" } })]);
+    expect((await without.near.txStatus("t", "buyer.near-sandbox-flop")).transaction).toBeUndefined();
+  });
+});
+
+// H13: reads made through `withReadTimeout` give up; `send_tx` and `txStatus` (which wait for
+// finality) are never bounded by it.
+describe("NearRpc.withReadTimeout (H13)", () => {
+  function hangingNear(): { near: NearRpc } {
+    const fetchImpl = (async () => new Promise<Response>(() => undefined)) as unknown as typeof fetch;
+    const rpc = new CapturingRpc({ endpoint: "http://127.0.0.1:9999", fetch: fetchImpl, clock: () => 1000 });
+    return { near: new NearRpc(rpc) };
+  }
+
+  it("a read that never answers is abandoned with a plain Error after the bound", async () => {
+    vi.useFakeTimers();
+    try {
+      const { near } = hangingNear();
+      const bounded = near.withReadTimeout(5_000);
+      const outcome = bounded.block({ finality: "final" }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(5_001);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(NearRpcError);
+      expect((error as Error).message).toMatch(/block read did not answer within 5000ms/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("send_tx and txStatus are NOT bounded (they wait for finality)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { near } = hangingNear();
+      const bounded = near.withReadTimeout(5_000);
+      let settled = false;
+      const send = bounded.sendTx("x").then(() => (settled = true), () => (settled = true));
+      const status = bounded.txStatus("h", "a").then(() => (settled = true), () => (settled = true));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(settled).toBe(false);
+      void send;
+      void status;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an unbounded client (the default) never times a read out by itself", async () => {
+    vi.useFakeTimers();
+    try {
+      const { near } = hangingNear();
+      let settled = false;
+      const read = near.block({ finality: "final" }).then(() => (settled = true), () => (settled = true));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(settled).toBe(false);
+      void read;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -188,12 +255,11 @@ describe("NearRpc.sendTx / txStatus — outcome decoding", () => {
 // `data`/`message` as SIBLINGS, e.g.:
 //   { "name": "HANDLER_ERROR", "cause": { "name": "UNKNOWN_TRANSACTION", "info": {...} },
 //     "code": -32000, "data": "Transaction ... doesn't exist", "message": "Server error" }
-// This build's own live sandbox run (this stage) had no way to force a genuine
-// EXPIRED_TRANSACTION/INVALID_TRANSACTION response without a much longer scripted scenario than
-// this hermetic file affords; those two shapes below are built from NEAR's own documented
-// taxonomy rather than a captured live response — flagged here rather than silently presented as
-// observed. UNKNOWN_TRANSACTION and the plain code/message fallback ARE exercised live by
-// `tests-near/near-htlc.near.test.ts`'s own recoverByTxHash sandbox test.
+// H11: the INVALID_TRANSACTION bodies below (nonce, expired) are REAL replies captured from a
+// near-sandbox run, not built from documentation; `tests-near/near-rpc-errors.near.test.ts`
+// forces the same two errors against a live node. UNKNOWN_TRANSACTION and the plain
+// code/message fallback are exercised live by `tests-near/near-htlc.near.test.ts`'s own
+// recoverByTxHash sandbox test.
 describe("NEAR error mapping", () => {
   function errBody(id: number, code: number, message: string): string {
     return JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } });

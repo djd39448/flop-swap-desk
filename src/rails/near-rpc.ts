@@ -210,6 +210,11 @@ export interface NearCallFunctionResult {
 export interface NearTxOutcome {
   status: unknown;
   transactionOutcome: { blockHash: string; id: string };
+  /** H10: the transaction body the node reports (`signer_id`, `public_key`, `receiver_id`,
+   *  `actions`, `hash`), when the response carries one -- `EXPERIMENTAL_tx_status` does, and
+   *  `near-htlc.ts`'s `recoverByTxHash` decodes it to prove the transaction is this rail's own
+   *  write. `undefined` when absent (never fabricated). */
+  transaction: Record<string, unknown> | undefined;
   raw: Record<string, unknown>;
 }
 
@@ -220,7 +225,9 @@ function decodeOutcome(raw: Record<string, unknown>): NearTxOutcome {
   if (outcome === undefined || typeof outcome.block_hash !== "string" || typeof outcome.id !== "string") {
     throw new Error("near-rpc: outcome is missing transaction_outcome.block_hash/id");
   }
-  return { status: raw.status, transactionOutcome: { blockHash: outcome.block_hash, id: outcome.id }, raw };
+  const transaction =
+    raw.transaction !== null && typeof raw.transaction === "object" && !Array.isArray(raw.transaction) ? (raw.transaction as Record<string, unknown>) : undefined;
+  return { status: raw.status, transactionOutcome: { blockHash: outcome.block_hash, id: outcome.id }, transaction, raw };
 }
 
 /**
@@ -232,16 +239,37 @@ function decodeOutcome(raw: Record<string, unknown>): NearTxOutcome {
  */
 export class NearRpc {
   private readonly rpc: CapturingRpc;
+  private readonly readTimeoutMs: number | undefined;
 
-  constructor(rpc: CapturingRpc) {
+  constructor(rpc: CapturingRpc, options: { readTimeoutMs?: number } = {}) {
     this.rpc = rpc;
+    this.readTimeoutMs = options.readTimeoutMs;
   }
 
-  private async call<T>(method: string, params: unknown): Promise<T> {
+  /** H13: a client over the SAME `CapturingRpc` whose reads (everything except `send_tx` and
+   *  `txStatus`, which legitimately wait for finality) give up after `ms`. A read that outlives
+   *  the bound throws a plain `Error` (never a NEAR-typed one: it says nothing about the chain);
+   *  the abandoned HTTP request may still complete and be recorded in the capture log. */
+  withReadTimeout(ms: number): NearRpc {
+    return new NearRpc(this.rpc, { readTimeoutMs: ms });
+  }
+
+  private async call<T>(method: string, params: unknown, options: { bounded?: boolean } = {}): Promise<T> {
+    const bounded = options.bounded !== false && this.readTimeoutMs !== undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return (await this.rpc.request({ method, params })) as T;
+      const request = this.rpc.request({ method, params });
+      if (!bounded) return (await request) as T;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`near-rpc: ${method} read did not answer within ${String(this.readTimeoutMs)}ms`)), this.readTimeoutMs);
+      });
+      // The abandoned request must never surface as an unhandled rejection.
+      request.catch(() => undefined);
+      return (await Promise.race([request, timeout])) as T;
     } catch (error) {
-      mapNearRpcError(error);
+      return mapNearRpcError(error);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 
@@ -352,15 +380,20 @@ export class NearRpc {
    *  (D-N4/D-N9: this build always sends `"FINAL"`, so `commitLock`/`claim`/`refund` return
    *  evidence straight from this one call's own outcome). */
   async sendTx(signedTxBase64: string, waitUntil: NearWaitUntil = "FINAL"): Promise<NearTxOutcome> {
-    const raw = await this.call<Record<string, unknown>>("send_tx", { signed_tx_base64: signedTxBase64, wait_until: waitUntil });
+    const raw = await this.call<Record<string, unknown>>("send_tx", { signed_tx_base64: signedTxBase64, wait_until: waitUntil }, { bounded: false });
     return decodeOutcome(raw);
   }
 
-  /** D-N4's lost-reply recovery path: `EXPERIMENTAL_tx_status`, classic array params
-   *  (`[txHashBase58, senderAccountId]` — the same shape the plain `tx` method has always taken,
-   *  still accepted alongside the newer object form). */
-  async txStatus(txHashBase58: string, senderAccountId: string): Promise<NearTxOutcome> {
-    const raw = await this.call<Record<string, unknown>>("EXPERIMENTAL_tx_status", [txHashBase58, senderAccountId]);
+  /** D-N4's lost-reply recovery path: `EXPERIMENTAL_tx_status` by the write's own recorded hash
+   *  and sender, object params with `wait_until` (H10: default `"FINAL"`, so what comes back is
+   *  final -- an outcome that has not reached that level answers `TIMEOUT_ERROR`, never a
+   *  half-known status). Not read-bounded: it legitimately waits for finality. */
+  async txStatus(txHashBase58: string, senderAccountId: string, waitUntil: NearWaitUntil = "FINAL"): Promise<NearTxOutcome> {
+    const raw = await this.call<Record<string, unknown>>(
+      "EXPERIMENTAL_tx_status",
+      { tx_hash: txHashBase58, sender_account_id: senderAccountId, wait_until: waitUntil },
+      { bounded: false },
+    );
     return decodeOutcome(raw);
   }
 }
