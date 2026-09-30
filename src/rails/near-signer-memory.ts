@@ -71,11 +71,18 @@ export class InMemoryNearSigner implements NearSigner {
    *  first 32 bytes (the seed) are ever used; the trailing 32 (the public key) are re-derived by
    *  `keygen` itself, never trusted blindly from the file. */
   static fromNearSecretKey(accountId: string, secretKey: string): InMemoryNearSigner {
+    // D4: no error message here ever includes a character of the input (not a prefix, not a
+    // base58 decoder's "unknown letter"): the input is a secret key.
     const prefix = "ed25519:";
     if (!secretKey.startsWith(prefix)) {
-      throw new Error(`near-signer-memory: unsupported secret key format "${secretKey.slice(0, 8)}..." (only ed25519: is supported)`);
+      throw new Error("near-signer-memory: unsupported secret key format (only ed25519: is supported)");
     }
-    const decoded = base58.decode(secretKey.slice(prefix.length));
+    let decoded: Uint8Array;
+    try {
+      decoded = base58.decode(secretKey.slice(prefix.length));
+    } catch {
+      throw new Error("near-signer-memory: secret key is not valid base58");
+    }
     if (decoded.length !== 64) {
       throw new Error("near-signer-memory: ed25519 secret key must decode to exactly 64 bytes (seed || publicKey)");
     }

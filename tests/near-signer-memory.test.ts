@@ -77,6 +77,28 @@ describe("InMemoryNearSigner — D1: the secret key is a real private field", ()
     assertNoKeyBytes(signer, new Uint8Array(32).fill(9));
   });
 
+  it("fromNearSecretKey's errors never echo a character of the input (D4)", () => {
+    const inputs = [
+      "secp256k1:QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo",
+      "Q3zHkRvmXaPtWnE9sYdLuBc7",
+      "ed25519:0OIl*#!?0OIl",
+      `ed25519:${"1".repeat(20)}`,
+    ];
+    for (const input of inputs) {
+      let message = "";
+      try {
+        InMemoryNearSigner.fromNearSecretKey("alice.near-sandbox-flop", input);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).not.toBe("");
+      const payload = input.slice(input.indexOf(":") + 1);
+      for (let i = 0; i + 4 <= payload.length; i++) {
+        expect(message).not.toContain(payload.slice(i, i + 4));
+      }
+    }
+  });
+
   it("the #secretKey field is invisible to every reflection API, not merely omitted from toJSON/inspect", () => {
     const signer = InMemoryNearSigner.generate("bob.near-sandbox-flop");
     expect(Object.keys(signer)).not.toContain("secretKey");

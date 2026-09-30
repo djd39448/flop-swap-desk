@@ -393,8 +393,9 @@ export function foldSwap(input: SwapFoldInput): SwapView {
       return view;
     }
     if (legAState.status === "refunded") {
-      // E3: same rule as the paired-legs branch below — a refund frame conflicting with leg
-      // A's own chain evidence never folds to refunded-a.
+      // E3 + V4: same rule as the paired-legs branch below — on a chain rail a refund frame
+      // folds to refunded-a only with a bound, final "refunded" observation of leg A; without
+      // one (or against a conflicting one) it does not fold. Paper still folds from the frame.
       if (refundedFold("A", legAState, evidence.aRail, reasons)) {
         reasons.push("leg A refunded with no leg B");
         view.status = "refunded-a";
@@ -493,7 +494,8 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     return view;
   }
 
-  // E3: keyed off each leg's own chain rail observation when one exists, never the frame alone.
+  // E3 + V4: a chain-rail leg needs its own bound, final "refunded" observation to fold as
+  // refunded (a refund frame alone never does); only the paper rail folds from the frame alone.
   const refundedA = refundedFold("A", legAState, evidence.aRail, reasons);
   const refundedB = refundedFold("B", legBState, evidence.bRail, reasons);
   if (refundedA && refundedB) {
