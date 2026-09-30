@@ -116,6 +116,10 @@ interface FakeRailScript {
 
 class FakeConnectedRail implements ConnectedCounterAssetRail {
   readonly exchanges: readonly Exchange[] = [];
+  // P7: these fakes post unproven lines (the flows do not post proofs yet), so signing is never reached.
+  async signAccountProof(): Promise<never> {
+    throw new Error("FakeConnectedRail: signAccountProof is not scripted");
+  }
   readonly resendRefundIfDropped?: (ref: string, priorEvidence: RailWriteEvidence) => Promise<RailWriteEvidence>;
   readonly checkPendingClaim?: (ref: string, fromMarker?: RailBlockMarker) => Promise<string | null>;
   constructor(private readonly script: FakeRailScript) {

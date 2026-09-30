@@ -24,6 +24,8 @@
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
 import { formatPubkeyLine, resolvePubkeys } from "../rails/account-line.js";
+import type { AccountProof } from "../rails/account-proof.js";
+import { bip322ProofPsbt, bip322Verifier, bip322WitnessFromSignedTx } from "../rails/btc-proof.js";
 import { btcEvidence, captureBtcLeg, BTC_RAIL_ID, type BtcAccounts, type BtcCapture } from "../rails/btc-evidence.js";
 import {
   assetIdFor,
@@ -122,6 +124,39 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
 
   private ownWallet(): BtcWalletHandle {
     return { wallet: this.options.wallet, key: this.options.key };
+  }
+
+  /** P7: a BIP-322 simple signature by this party's own wallet key for the P2WPKH address of its
+   *  pubkey, over `message` (`pubkeyProofMessage`). Keyless: the PSBT of BIP-322's `to_sign` goes
+   *  to the node wallet's own `walletprocesspsbt`, exactly like the leg's own writes, and only the
+   *  public witness comes back. The result is re-verified locally before it is returned. */
+  async signAccountProof(message: string): Promise<AccountProof> {
+    const { pubkey } = this.options.key;
+    if (!message.endsWith(`|${this.options.config.pin.caip2}:${pubkey.toLowerCase()}`)) {
+      throw new Error("btc-rail: refusing to sign an account proof for a message that does not name this handle's own pubkey");
+    }
+    const psbt = bip322ProofPsbt(message, pubkey.toLowerCase(), {
+      fingerprint: this.options.key.fingerprint,
+      path: this.options.key.path,
+    });
+    const processed = (await this.options.rpc.request({
+      method: "walletprocesspsbt",
+      params: [psbt],
+      path: `/wallet/${this.options.wallet}`,
+    })) as { complete?: boolean; hex?: string };
+    if (processed.complete !== true || typeof processed.hex !== "string") {
+      throw new Error("btc-rail: walletprocesspsbt did not produce a complete BIP-322 proof transaction");
+    }
+    const proof: AccountProof = { scheme: "bip322", signature: bip322WitnessFromSignedTx(processed.hex) };
+    const ok = bip322Verifier.verify({
+      message,
+      railId: BTC_RAIL_ID,
+      caip2: this.options.config.pin.caip2,
+      subject: pubkey.toLowerCase(),
+      proof,
+    });
+    if (!ok) throw new Error("btc-rail: the wallet's BIP-322 signature does not verify for this pubkey");
+    return proof;
   }
 
   /** G3: builds and signs the funding PSBT (via `BtcHtlcRail.prepareFunding`) WITHOUT

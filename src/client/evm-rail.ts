@@ -13,6 +13,7 @@ import type { Address, Hex } from "viem";
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
 import { formatAccountLine, resolveAccounts } from "../rails/account-line.js";
+import { eip191Verifier, type AccountProof } from "../rails/account-proof.js";
 import { EVM_RAIL_ID, type EvmAccounts } from "../rails/evm-evidence.js";
 import { EvmHtlcRail, type EvmRailConfig } from "../rails/evm-htlc.js";
 import type { CapturingRpc, Exchange } from "../rails/rpc-capture.js";
@@ -59,14 +60,47 @@ function addressBookFor(terms: LockTerms, accounts: RailAccounts, ownAccount: Ad
 class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
   private readonly rail: EvmHtlcRail;
   private readonly rpc: CapturingRpc;
+  private readonly account: Address;
+  private readonly caip2: string;
   /** G3: `prepareLock`'s own recorded intent — EVM's write ref (the hashLock) is already known
    *  before any write happens at all (P22-P24-EVM-FIXES-R3.md E3), so preparing needs no network
    *  call of its own; `commitLock` consumes this and does the real approve+lock. */
   private prepared: { terms: LockTerms; feeBps: number } | undefined;
 
-  constructor(rail: EvmHtlcRail, rpc: CapturingRpc) {
+  constructor(rail: EvmHtlcRail, rpc: CapturingRpc, account: Address, caip2: string) {
     this.rail = rail;
     this.rpc = rpc;
+    this.account = account;
+    this.caip2 = caip2;
+  }
+
+  /** P7: EIP-191 `personal_sign` by this party's own JSON-RPC account: the node holds the key and
+   *  signs over RPC, this code never sees one (D-10). The signature is re-verified locally (the
+   *  same `eip191` verifier a resolver uses) before it is returned, so a node that signs with the
+   *  wrong account or returns garbage is refused here, not discovered at resolution. */
+  async signAccountProof(message: string): Promise<AccountProof> {
+    const own = `${this.caip2}:${this.account.toLowerCase()}`;
+    if (!message.endsWith(`|${own}`)) {
+      throw new Error("evm-rail: refusing to sign an account proof for a message that does not name this handle's own account");
+    }
+    const hex = `0x${Buffer.from(message, "utf8").toString("hex")}`;
+    const signed = await this.rpc.request({ method: "personal_sign", params: [hex, this.account] });
+    if (typeof signed !== "string" || !/^0x[0-9a-fA-F]{130}$/.test(signed)) {
+      throw new Error("evm-rail: personal_sign did not return a 65-byte signature");
+    }
+    const bytes = Buffer.from(signed.slice(2), "hex");
+    // Some nodes return v as 0/1; EIP-191 tooling (and the verifier) use 27/28.
+    if (bytes[64]! < 27) bytes[64] = bytes[64]! + 27;
+    const proof: AccountProof = { scheme: "eip191", signature: bytes.toString("hex") };
+    const ok = eip191Verifier.verify({
+      message,
+      railId: "evm-htlc",
+      caip2: this.caip2,
+      subject: this.account.toLowerCase(),
+      proof,
+    });
+    if (!ok) throw new Error("evm-rail: the node's personal_sign signature does not verify for this account");
+    return proof;
   }
 
   get exchanges(): readonly Exchange[] {
@@ -165,7 +199,7 @@ class EvmCounterRail implements CounterAssetRail {
       addressBook,
       clock: this.options.clock,
     });
-    return new ConnectedEvmCounterRail(rail, this.options.rpc);
+    return new ConnectedEvmCounterRail(rail, this.options.rpc, this.options.account, this.caip2);
   }
 }
 

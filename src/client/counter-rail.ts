@@ -25,6 +25,7 @@
 
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
+import type { AccountProof } from "../rails/account-proof.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import type { LockEvidence, RailObservation } from "../types.js";
 import type { RailLocalPolicy } from "./policy.js";
@@ -36,6 +37,11 @@ import type { RailLocalPolicy } from "./policy.js";
 export interface RailAccounts {
   payer?: string;
   payee?: string;
+  /** P7, `near-htlc` only: the public key each party's proven account line carries. The rail's
+   *  evidence read must show it is a FullAccess key of that account (the proof alone shows only
+   *  that the key signed). Absent for every other rail and for the pre-proof fold. */
+  payerKey?: string;
+  payeeKey?: string;
 }
 
 /**
@@ -126,6 +132,14 @@ export interface ConnectedCounterAssetRail {
    * amount; a deployment with no fee concept refuses anything but `0`.
    */
   prepareLock(terms: LockTerms, feeBps: number): Promise<PreparedLock>;
+  /**
+   * P7 (handoff/P7-ACCOUNT-PROOF-SPEC.md): sign `message` (the exact string `accountProofMessage` /
+   * `pubkeyProofMessage` builds for this party's own account line) with this party's chain key and
+   * return the proof the line carries. Keyless where the chain allows (EVM: the node signs over
+   * RPC; Bitcoin: the node wallet signs a BIP-322 PSBT; NEAR: the in-memory signer, D-N2). Refuses
+   * a message that does not name this handle's own account or key.
+   */
+  signAccountProof(message: string): Promise<AccountProof>;
   /** Broadcasts whatever `prepareLock` most recently prepared on this same connected handle;
    *  throws if `prepareLock` was never called first. */
   commitLock(): Promise<RailWriteEvidence>;

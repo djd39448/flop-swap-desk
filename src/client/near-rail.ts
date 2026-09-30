@@ -28,6 +28,7 @@
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
 import { formatAccountLine, resolveAccounts } from "../rails/account-line.js";
+import type { AccountProof } from "../rails/account-proof.js";
 import { nearEvidence, captureNearLeg, NEAR_RAIL_ID, type NearAccounts, type NearCapture } from "../rails/near-evidence.js";
 import {
   NEAR_AMOUNT_FLOOR,
@@ -38,6 +39,7 @@ import {
   type NearSigner,
   type NearWriteEvidence,
 } from "../rails/near-htlc.js";
+import { nep413Verifier, signNep413 } from "../rails/near-proof.js";
 import { parseNearRef } from "../rails/near-ref.js";
 import { NearRpc } from "../rails/near-rpc.js";
 import { verifiedExchangeBytes, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
@@ -106,6 +108,27 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
     return this.options.rpc.exchanges();
   }
 
+  /** P7: a NEP-413 signature over `message` (`accountProofMessage`) by this party's own in-memory
+   *  full-access key (D-N2: the key never leaves the signer). The line carries the public key;
+   *  that it is a FullAccess key of the account is the evidence reader's check. Re-verified
+   *  locally before it is returned. */
+  async signAccountProof(message: string): Promise<AccountProof> {
+    const signer = this.options.signer;
+    if (!message.endsWith(`|${this.options.config.pin.caip2}:${signer.accountId}`)) {
+      throw new Error("near-rail: refusing to sign an account proof for a message that does not name this handle's own account");
+    }
+    const proof = await signNep413(signer, message);
+    const ok = nep413Verifier.verify({
+      message,
+      railId: NEAR_RAIL_ID,
+      caip2: this.options.config.pin.caip2,
+      subject: signer.accountId,
+      proof,
+    });
+    if (!ok) throw new Error("near-rail: the signer's NEP-413 signature does not verify against its own public key");
+    return proof;
+  }
+
   /** G3/D-N4: builds and signs the Buyer's `ft_transfer_call` lock (via `NearHtlcRail
    *  .prepareLock`) WITHOUT broadcasting it — `ref` (`0x<hash lock>:<payer>`, near-ref.ts) is already fully known
    *  before this ever touches the network, exactly like `evm-rail.ts`'s own `prepareLock`, never
@@ -168,6 +191,8 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
     const nearAccounts: NearAccounts = {
       ...(accounts.payee === undefined ? {} : { payee: accounts.payee }),
       ...(accounts.payer === undefined ? {} : { payer: accounts.payer }),
+      ...(accounts.payeeKey === undefined ? {} : { payeeKey: accounts.payeeKey }),
+      ...(accounts.payerKey === undefined ? {} : { payerKey: accounts.payerKey }),
     };
     const { index, exchanges } = await captureNearLeg(this.options.rpc, this.options.config, terms, nearAccounts, ref, nowMs);
     const bytes = verifiedExchangeBytes(exchanges);
@@ -292,6 +317,8 @@ class NearCounterRail implements CounterAssetRail {
     return {
       ...(resolved.payer === undefined ? {} : { payer: resolved.payer }),
       ...(resolved.payee === undefined ? {} : { payee: resolved.payee }),
+      ...(resolved.payerKey === undefined ? {} : { payerKey: resolved.payerKey }),
+      ...(resolved.payeeKey === undefined ? {} : { payeeKey: resolved.payeeKey }),
     };
   }
 
