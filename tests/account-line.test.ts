@@ -24,6 +24,10 @@ import { identity, record, recordSignedBy, unsignedRecord } from "./helpers/iden
 
 const T0 = 1_758_000_000_000;
 
+// P7: these tests cover the unchanged fold rules (sender binding, room, conflicts); proof
+// behaviour is in tests/account-proof.test.ts.
+const LEGACY = { mode: "legacy-unproven" } as const;
+
 const buyer = identity("d4".repeat(32)); // the payer in every fixture below
 const seller = identity("e5".repeat(32)); // the payee in every fixture below
 
@@ -190,7 +194,7 @@ describe("account-line grammar", () => {
 });
 
 describe("resolveAccounts", () => {
-  const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, rail: RAIL, caip2: CAIP2 };
+  const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, rail: RAIL, caip2: CAIP2, proof: LEGACY };
 
   function accountLineRecord(seq: number, signer: typeof buyer, address: string, room: string = ROOM): ReturnType<typeof record> {
     return record(room, seq, T0 + seq * 60_000, signer, formatAccountLine({ railId: RAIL, caip2: CAIP2, address }));
@@ -426,7 +430,7 @@ describe("near-htlc account line grammar (D-N5)", () => {
 });
 
 describe("resolveAccounts — near-htlc", () => {
-  const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, rail: NEAR_RAIL, caip2: NEAR_CAIP2 };
+  const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, rail: NEAR_RAIL, caip2: NEAR_CAIP2, proof: LEGACY };
 
   it("resolves the payee's line to `payee`, sender-bound", () => {
     const records = [nearAccountLine(1, seller, "seller.near-sandbox-flop")];
@@ -614,7 +618,7 @@ describe("pubkey-line grammar", () => {
 });
 
 describe("resolvePubkeys", () => {
-  const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, rail: BTC_RAIL, caip2: BTC_CAIP2 };
+  const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, rail: BTC_RAIL, caip2: BTC_CAIP2, proof: LEGACY };
 
   function pubkeyLineRecord(seq: number, signer: typeof buyer, pubkey: string, room: string = ROOM): ReturnType<typeof record> {
     return record(room, seq, T0 + seq * 60_000, signer, formatPubkeyLine({ railId: BTC_RAIL, caip2: BTC_CAIP2, pubkey }));

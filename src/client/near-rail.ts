@@ -283,7 +283,12 @@ class NearCounterRail implements CounterAssetRail {
     records: readonly TranscriptRecord[],
     input: { contract: string; payerDid: string; payeeDid: string; beforeSeq?: number },
   ): RailAccounts {
-    const resolved = resolveAccounts(records, { ...input, rail: this.railId, caip2: this.caip2 });
+    const resolved = resolveAccounts(records, {
+      ...input,
+      rail: this.railId,
+      caip2: this.caip2,
+      proof: { mode: "legacy-unproven" }, // P7: migrate to { mode: "required" } in the Rails stage
+    });
     return {
       ...(resolved.payer === undefined ? {} : { payer: resolved.payer }),
       ...(resolved.payee === undefined ? {} : { payee: resolved.payee }),

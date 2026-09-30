@@ -389,6 +389,7 @@ export function foldCaptured(input: FoldCapturedInput): Board {
           payeeDid: terms.payee,
           rail: EVM_RAIL_ID,
           caip2: evmConfigCheck.config.pin.caip2,
+          proof: { mode: "legacy-unproven" }, // P7: migrate to { mode: "required" } in the Rails stage
         });
         // D4 (P22-P24-EVM-FIXES-R2.md): a backstop, not the primary defense — `evmEvidence`
         // validates every address-shaped field it reads off captured data before it can ever
@@ -447,6 +448,7 @@ export function foldCaptured(input: FoldCapturedInput): Board {
           payeeDid: terms.payee,
           rail: BTC_RAIL_ID,
           caip2: btcConfigCheck.config.pin.caip2,
+          proof: { mode: "legacy-unproven" }, // P7: migrate to { mode: "required" } in the Rails stage
           beforeSeq: accepted.seq,
         });
         // D4-style defense in depth (mirrors the evm-htlc branch above): this call sits inside
@@ -507,6 +509,7 @@ export function foldCaptured(input: FoldCapturedInput): Board {
           payeeDid: terms.payee,
           rail: NEAR_RAIL_ID,
           caip2: nearConfigCheck.config.pin.caip2,
+          proof: { mode: "legacy-unproven" }, // P7: migrate to { mode: "required" } in the Rails stage
           beforeSeq: accepted.seq,
         });
         // D4-style defense in depth (mirrors the evm-htlc/btc-htlc branches above): this call

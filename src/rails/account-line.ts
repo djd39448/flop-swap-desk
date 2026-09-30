@@ -18,10 +18,12 @@
 // below) — the wire shape CAIP-10 itself defines, not that chain's own semantic rules, which is
 // deferred to that rail's own build stage.
 //
-// The line carries no signature of its own beyond the transcript record it rides in: the
-// binding DID is `record.sender` (whoever signed the record), never a field inside the line —
-// there is nothing in the grammar a forger could point at another party, so the fold need only
-// trust `verifyTranscriptRecord`. `resolveAccounts` folds every account line in one leg's deal
+// The binding DID is `record.sender` (whoever signed the record), never a field inside the line.
+// P7 (handoff/P7-ACCOUNT-PROOF-SPEC.md, closing R3-1): a line may end with `proof <scheme>:<sig>
+// [<key>]`, a signature by the chain key over a message binding that DID, the leg's contract id,
+// the rail and the account (`src/rails/account-proof.ts`); under a `required` proof policy a
+// line counts only if the proof verifies. The transcript record alone proves who posted a line,
+// never that the poster controls the named chain account. `resolveAccounts` folds every account line in one leg's deal
 // room into at most one address per party, refusing (not "first wins") when a party's own lines
 // disagree — ordering inside a room is venue-controlled (H4, tclk#175), so it is never used to
 // break a tie about which of a party's own claims is the real one.
@@ -32,10 +34,20 @@
 import { isAddress, type Address } from "viem";
 import {
   dealRoom,
+  MAX_FRAME_CHARS,
   normalizeRailId,
   verifyTranscriptRecord,
   type TranscriptRecord,
 } from "@flop-labs/tclk";
+
+import {
+  buildAccountProofMessage,
+  checkLineProof,
+  formatProofField,
+  parseProofTokens,
+  type AccountProof,
+  type ProofPolicy,
+} from "./account-proof.js";
 
 /** Rail → CAIP-2 namespace (SPEC §3): `evm-htlc` ↔ `eip155` is the only pair with a
  *  chain-specific address grammar in this build (see `validateEip155Address`); `btc-htlc`/
@@ -56,7 +68,7 @@ const EIP155_REFERENCE = /^(0|[1-9][0-9]*)$/;
 
 /** `swap1 account <rail-id> <caip-10 account>` — single ASCII spaces, no trailing space. Two
  *  captured tokens; each is further decomposed (rail id; namespace:reference:address) below. */
-const LINE_PATTERN = /^swap1 account (\S+) (\S+)$/;
+const LINE_PATTERN = /^swap1 account (\S+) (\S+)(?: proof (\S+)(?: (\S+))?)?$/;
 
 export interface ParsedAccountLine {
   /** Canonical per tclk's registry (e.g. `"evm-htlc"`) — never an alias, never a non-canonical
@@ -68,6 +80,9 @@ export interface ParsedAccountLine {
   /** The chain address, normalized (eip155: lowercased after checksum validation — see
    *  `isAddress`'s comparison rule below). */
   address: string;
+  /** The trailing `proof <scheme>:<signature>[ <key>]` field (P7), when the line has one. Its
+   *  presence says nothing about validity: `resolveAccounts` checks it. */
+  proof?: AccountProof;
 }
 
 /**
@@ -132,7 +147,14 @@ function validateChainAddress(namespace: string, reference: string, address: str
  * grammar — this produces a line that is about to be signed and posted, so the same
  * fail-loud-on-write rule `src/profile.ts`'s `legAContext`/`legBContext` use applies here too.
  */
-export function formatAccountLine(input: { railId: string; caip2: string; address: string }): string {
+export function formatAccountLine(input: {
+  railId: string;
+  caip2: string;
+  address: string;
+  /** P7: the chain key's proof over `accountProofMessage(...)`; omitted only for a line that is
+   *  deliberately unproven (it will not resolve under a `required` proof policy). */
+  proof?: AccountProof;
+}): string {
   const railId = normalizeRailId(input.railId);
   if (railId !== input.railId) {
     throw new Error(`account-line: non-canonical rail id: ${input.railId}; use ${railId}`);
@@ -154,7 +176,37 @@ export function formatAccountLine(input: { railId: string; caip2: string; addres
   if (normalizedAddress === null) {
     throw new Error(`account-line: "${input.address}" is not a valid ${namespace} address for reference "${reference}"`);
   }
-  return `swap1 account ${railId} ${ns}:${reference}:${normalizedAddress}`;
+  const line = `swap1 account ${railId} ${ns}:${reference}:${normalizedAddress}${
+    input.proof === undefined ? "" : ` proof ${formatProofField(input.proof)}`
+  }`;
+  if (line.length > MAX_FRAME_CHARS) {
+    throw new Error(`account-line: line is ${line.length} chars, over the room-message cap of ${MAX_FRAME_CHARS}`);
+  }
+  return line;
+}
+
+/**
+ * The exact message the chain key must sign for an account line (P7): binds the signer's DID
+ * (`did`: the sender of the record that will carry the line), the leg's tclk contract id, the
+ * rail and the account as the line will spell it (normalized). Throws on a non-canonical input,
+ * like `formatAccountLine`.
+ */
+export function accountProofMessage(input: {
+  did: string;
+  contract: string;
+  railId: string;
+  caip2: string;
+  address: string;
+}): string {
+  const line = formatAccountLine({ railId: input.railId, caip2: input.caip2, address: input.address });
+  const parsed = parseAccountLine(line);
+  if (parsed === null) throw new Error("account-line: cannot build a proof message for this account");
+  return buildAccountProofMessage({
+    did: input.did,
+    contract: input.contract,
+    railId: parsed.railId,
+    account: `${parsed.caip2}:${parsed.address}`,
+  });
 }
 
 /**
@@ -170,9 +222,18 @@ export function parseAccountLine(line: string): ParsedAccountLine | null {
   if (typeof line !== "string") return null;
   const match = LINE_PATTERN.exec(line);
   if (match === null) return null;
+  if (line.length > MAX_FRAME_CHARS) return null;
   const railToken = match[1];
   const caipToken = match[2];
   if (railToken === undefined || caipToken === undefined) return null;
+  // A trailing proof must be well formed: `proof` with a malformed body is a malformed line
+  // (null), never a line that quietly counts as if it had no proof.
+  let proof: AccountProof | undefined;
+  if (match[3] !== undefined) {
+    const parsedProof = parseProofTokens(match[3], match[4]);
+    if (parsedProof === null) return null;
+    proof = parsedProof;
+  }
 
   let railId: string;
   try {
@@ -196,7 +257,7 @@ export function parseAccountLine(line: string): ParsedAccountLine | null {
   const normalizedAddress = validateChainAddress(namespace, reference, address);
   if (normalizedAddress === null) return null;
 
-  return { railId, caip2: `${ns}:${reference}`, address: normalizedAddress };
+  return { railId, caip2: `${ns}:${reference}`, address: normalizedAddress, ...(proof === undefined ? {} : { proof }) };
 }
 
 // ── the pubkey line (P4-BTC-SPEC.md §6) ─────────────────────────────────────────────────────
@@ -262,7 +323,7 @@ function validatePubkeyForNamespace(namespace: string, reference: string, pubkey
 /** `swap1 pubkey <rail-id> <caip-2> <pubkey>` — four tokens (unlike the account line's three):
  *  the CAIP-2 chain id and the pubkey are separate tokens here, since a CAIP-2 id
  *  (`namespace:reference`) has no address segment to share a token with in the first place. */
-const PUBKEY_LINE_PATTERN = /^swap1 pubkey (\S+) (\S+) (\S+)$/;
+const PUBKEY_LINE_PATTERN = /^swap1 pubkey (\S+) (\S+) (\S+)(?: proof (\S+)(?: (\S+))?)?$/;
 
 export interface ParsedPubkeyLine {
   /** Canonical per tclk's registry, exactly like `ParsedAccountLine.railId`. */
@@ -271,6 +332,8 @@ export interface ParsedPubkeyLine {
   caip2: string;
   /** The 33-byte compressed pubkey, lowercase hex (already normalized by `PUBKEY_SHAPE`). */
   pubkey: string;
+  /** The trailing proof field (P7), when present; `resolvePubkeys` checks it. */
+  proof?: AccountProof;
 }
 
 /**
@@ -278,7 +341,13 @@ export interface ParsedPubkeyLine {
  * rail id, a `caip2` whose namespace does not match that rail, or a pubkey that fails the
  * namespace's grammar — same fail-loud-on-write rule `formatAccountLine` follows.
  */
-export function formatPubkeyLine(input: { railId: string; caip2: string; pubkey: string }): string {
+export function formatPubkeyLine(input: {
+  railId: string;
+  caip2: string;
+  pubkey: string;
+  /** P7: the chain key's proof over `pubkeyProofMessage(...)`. */
+  proof?: AccountProof;
+}): string {
   const railId = normalizeRailId(input.railId);
   if (railId !== input.railId) {
     throw new Error(`pubkey-line: non-canonical rail id: ${input.railId}; use ${railId}`);
@@ -300,7 +369,36 @@ export function formatPubkeyLine(input: { railId: string; caip2: string; pubkey:
   if (normalizedPubkey === null) {
     throw new Error(`pubkey-line: "${input.pubkey}" is not a valid ${namespace} pubkey for reference "${reference}"`);
   }
-  return `swap1 pubkey ${railId} ${ns}:${reference} ${normalizedPubkey}`;
+  const line = `swap1 pubkey ${railId} ${ns}:${reference} ${normalizedPubkey}${
+    input.proof === undefined ? "" : ` proof ${formatProofField(input.proof)}`
+  }`;
+  if (line.length > MAX_FRAME_CHARS) {
+    throw new Error(`pubkey-line: line is ${line.length} chars, over the room-message cap of ${MAX_FRAME_CHARS}`);
+  }
+  return line;
+}
+
+/**
+ * The exact message the chain key must sign for a pubkey line (P7). The "account" the message
+ * names is `<caip2>:<pubkey hex>`: the pubkey line names a key, not an address. (The Rails stage
+ * verifier for `bip322` derives the P2WPKH address from that key itself.)
+ */
+export function pubkeyProofMessage(input: {
+  did: string;
+  contract: string;
+  railId: string;
+  caip2: string;
+  pubkey: string;
+}): string {
+  const line = formatPubkeyLine({ railId: input.railId, caip2: input.caip2, pubkey: input.pubkey });
+  const parsed = parsePubkeyLine(line);
+  if (parsed === null) throw new Error("pubkey-line: cannot build a proof message for this pubkey");
+  return buildAccountProofMessage({
+    did: input.did,
+    contract: input.contract,
+    railId: parsed.railId,
+    account: `${parsed.caip2}:${parsed.pubkey}`,
+  });
 }
 
 /**
@@ -318,10 +416,17 @@ export function parsePubkeyLine(line: string): ParsedPubkeyLine | null {
   if (typeof line !== "string") return null;
   const match = PUBKEY_LINE_PATTERN.exec(line);
   if (match === null) return null;
+  if (line.length > MAX_FRAME_CHARS) return null;
   const railToken = match[1];
   const caipToken = match[2];
   const pubkeyToken = match[3];
   if (railToken === undefined || caipToken === undefined || pubkeyToken === undefined) return null;
+  let proof: AccountProof | undefined;
+  if (match[4] !== undefined) {
+    const parsedProof = parseProofTokens(match[4], match[5]);
+    if (parsedProof === null) return null;
+    proof = parsedProof;
+  }
 
   let railId: string;
   try {
@@ -344,7 +449,7 @@ export function parsePubkeyLine(line: string): ParsedPubkeyLine | null {
   const normalizedPubkey = validatePubkeyForNamespace(namespace, reference, pubkeyToken);
   if (normalizedPubkey === null) return null;
 
-  return { railId, caip2: `${ns}:${reference}`, pubkey: normalizedPubkey };
+  return { railId, caip2: `${ns}:${reference}`, pubkey: normalizedPubkey, ...(proof === undefined ? {} : { proof }) };
 }
 
 export interface ResolvePubkeysInput {
@@ -365,6 +470,11 @@ export interface ResolvePubkeysInput {
    *  from this function's behaviour before G1 (every non-flow caller — `src/replay.ts`'s
    *  `foldCaptured`, the live watcher, `examples/audit-export.mjs` — never passes this). */
   beforeSeq?: number;
+  /** P7: how proofs are treated. Required (no default) so every call site states its choice:
+   *  `{ mode: "required" }` counts only lines whose proof verifies for this sender, contract,
+   *  rail and account; `{ mode: "legacy-unproven" }` is the pre-P7 fold, left in only at the
+   *  call sites the Rails stage has not migrated yet. */
+  proof: ProofPolicy;
 }
 
 export interface ResolvedPubkeys {
@@ -430,6 +540,23 @@ export function resolvePubkeys(records: readonly TranscriptRecord[], input: Reso
 
     if (candidate.sender !== input.payerDid && candidate.sender !== input.payeeDid) continue; // not a party to this swap
 
+    if (input.proof.mode === "required") {
+      const why = checkLineProof({
+        policy: input.proof,
+        did: candidate.sender,
+        contract: input.contract,
+        railId: rail,
+        caip2: input.caip2,
+        account: `${parsed.caip2}:${parsed.pubkey}`,
+        subject: parsed.pubkey,
+        proof: parsed.proof,
+      });
+      if (why !== null) {
+        reasons.push(`pubkey-line: ${candidate.sender} posted a pubkey line that is not proven (${why}); ignored`);
+        continue;
+      }
+    }
+
     const seen = pubkeysByDid.get(candidate.sender) ?? new Set<string>();
     seen.add(parsed.pubkey);
     pubkeysByDid.set(candidate.sender, seen);
@@ -472,6 +599,8 @@ export interface ResolveAccountsInput {
   /** P4-BTC-FIXES.md G1 (see `ResolvePubkeysInput.beforeSeq`'s identical doc) — omitted by every
    *  non-flow caller. */
   beforeSeq?: number;
+  /** P7: see `ResolvePubkeysInput.proof`. */
+  proof: ProofPolicy;
 }
 
 export interface ResolvedAccounts {
@@ -539,6 +668,23 @@ export function resolveAccounts(
     }
 
     if (candidate.sender !== input.payerDid && candidate.sender !== input.payeeDid) continue; // not a party to this swap
+
+    if (input.proof.mode === "required") {
+      const why = checkLineProof({
+        policy: input.proof,
+        did: candidate.sender,
+        contract: input.contract,
+        railId: rail,
+        caip2: input.caip2,
+        account: `${parsed.caip2}:${parsed.address}`,
+        subject: parsed.address,
+        proof: parsed.proof,
+      });
+      if (why !== null) {
+        reasons.push(`account-line: ${candidate.sender} posted an account line that is not proven (${why}); ignored`);
+        continue;
+      }
+    }
 
     const seen = addressesByDid.get(candidate.sender) ?? new Set<string>();
     seen.add(parsed.address);
