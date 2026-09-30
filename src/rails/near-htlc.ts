@@ -9,7 +9,7 @@
 // D-N4's "sign-and-record, then broadcast" rule, generalised over every write this rail makes:
 // `prepareLock`/`commitLock` split the lock write into "build+sign, record `ref`+`txHash`" and
 // "actually broadcast" (mirroring `btc-htlc.ts`'s `prepareFunding`/`broadcastFunding`), because
-// the ref (the hash lock) is known before ever touching the network. `claim`/`refund` are single
+// the ref (`0x<hash lock>:<payer>`) is known before ever touching the network. `claim`/`refund` are single
 // calls that still internally sign-and-record before ever sending (the tx hash is deterministic
 // from the signed bytes, so a caller recovering from a lost reply uses `recoverByTxHash`, never
 // re-signs blind).
@@ -41,6 +41,7 @@ import {
   NearUnknownTransactionError,
   type NearBlockRef,
 } from "./near-rpc.js";
+import { formatNearRef, NEAR_ACCOUNT_ID, NEAR_HASH_LOCK_SHAPE, requireNearRef } from "./near-ref.js";
 import type { CapturingRpc } from "./rpc-capture.js";
 
 // --- H1: typed write-result errors ---------------------------------------------------------
@@ -221,9 +222,10 @@ export interface NearRailConfig {
  *  practical subset of NEAR's own account-id grammar (a valid NEAR id can also nest a top-level
  *  account through multiple `.` segments — matched here too, since each segment obeys the same
  *  rule). */
-const NEAR_ACCOUNT_ID = /^(?=.{2,64}$)[a-z0-9]+(?:[-_.][a-z0-9]+)*$/;
+// The grammar itself lives in `near-ref.ts` (shared with the ref helper: no `:` is what makes
+// the compound ref unambiguous).
 
-const HASH_LOCK_SHAPE = /^0x[0-9a-f]{64}$/;
+const HASH_LOCK_SHAPE = NEAR_HASH_LOCK_SHAPE;
 const SECRET_SHAPE = /^0x[0-9a-f]{64}$/;
 const NONNEG_DECIMAL = /^(0|[1-9][0-9]*)$/;
 
@@ -664,8 +666,8 @@ export class NearHtlcRail {
    * D-N4: builds and signs the Buyer's `ft_transfer_call` lock — `receiver_id` = the HTLC
    * contract, `msg` = the JSON the contract's own `ft_on_transfer` parses (hash_lock without its
    * `0x` prefix, payee, claim_by_ms/refund_after_ms as strings, matching the contract's own u64
-   * JSON convention) — and records `{ ref, txHash }` WITHOUT sending. `ref` is the hash lock
-   * itself (D-N4: "known before any write"), not the transaction hash. A caller records this
+   * JSON convention) — and records `{ ref, txHash }` WITHOUT sending. `ref` is `0x<hash lock>:<payer>`
+   * (near-ref.ts; squatting fix, replacing D-N4 "ref = hash lock": known before any write), not the tx hash. A caller records this
    * return value before ever calling `commitLock()`.
    */
   async prepareLock(terms: NearHtlcTerms): Promise<{ ref: string; txHash: string }> {
@@ -687,8 +689,10 @@ export class NearHtlcRail {
       deposit: ONE_YOCTO,
     };
     const built = await this.buildAndSign(tokenAccount, [action]);
-    this.prepared = { ref: terms.hashLock, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "lock", lockTerms: terms };
-    return { ref: terms.hashLock, txHash: built.txHash };
+    // The ref names the payer (this signer) too: locks are keyed by (payer, hash lock).
+    const ref = formatNearRef(terms.hashLock, this.signer.accountId);
+    this.prepared = { ref, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "lock", lockTerms: terms };
+    return { ref, txHash: built.txHash };
   }
 
   /** Sends exactly the transaction `prepareLock` most recently built and signed. Throws if
@@ -709,8 +713,9 @@ export class NearHtlcRail {
    *  evidence-style read in this build) and decodes it, or `null` when no lock exists under this
    *  hash. Never throws for "no such lock" — only for a malformed response shape or a genuine
    *  transport failure. */
-  private async getLock(hashLock: string, ref: NearBlockRef = { finality: "final" }): Promise<NearLockView | null> {
-    const result = await this.near.callFunction(this.config.contract, "get_lock", { hash_lock: hashLock.slice(2) }, ref);
+  private async getLock(lockRef: string, ref: NearBlockRef = { finality: "final" }): Promise<NearLockView | null> {
+    const { hashLock, payer } = requireNearRef(lockRef);
+    const result = await this.near.callFunction(this.config.contract, "get_lock", { hash_lock: hashLock.slice(2), payer }, ref);
     return parseLockView(result.resultText);
   }
 
@@ -748,8 +753,8 @@ export class NearHtlcRail {
    * own final-block cadence has stalled must never let a stale "chain time" understate how much
    * real time has actually passed.
    */
-  async claim(hashLock: string, preimage: string, notAfterMs: number): Promise<NearWriteEvidence> {
-    if (!HASH_LOCK_SHAPE.test(hashLock)) throw new Error("near-htlc: hashLock must be 0x + 64 lowercase hex");
+  async claim(ref: string, preimage: string, notAfterMs: number): Promise<NearWriteEvidence> {
+    const { hashLock, payer } = requireNearRef(ref);
     if (!SECRET_SHAPE.test(preimage)) throw new Error("near-htlc: preimage must be 0x + 64 lowercase hex");
     const preimageBytes = hexToBytes(preimage.slice(2));
     const hashLockBytes = hexToBytes(hashLock.slice(2));
@@ -758,7 +763,7 @@ export class NearHtlcRail {
     }
     await this.assertPinnedChain();
 
-    const lockView = await this.getLock(hashLock);
+    const lockView = await this.getLock(ref);
     if (lockView === null || lockView.status !== "Locked") {
       throw new Error(`near-htlc: refusing to claim — lock is not in a claimable "Locked" state (got ${lockView?.status ?? "none"})`);
     }
@@ -782,7 +787,7 @@ export class NearHtlcRail {
     const action: NearAction = {
       type: "FunctionCall",
       methodName: "claim",
-      args: new TextEncoder().encode(JSON.stringify({ hash_lock: hashLock.slice(2), preimage: preimage.slice(2) })),
+      args: new TextEncoder().encode(JSON.stringify({ hash_lock: hashLock.slice(2), payer, preimage: preimage.slice(2) })),
       gas: CLAIM_REFUND_GAS,
       deposit: 0n,
     };
@@ -798,7 +803,7 @@ export class NearHtlcRail {
       }
     }
 
-    return this.sendPrepared({ ref: hashLock, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "claim" });
+    return this.sendPrepared({ ref, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "claim" });
   }
 
   /**
@@ -807,11 +812,16 @@ export class NearHtlcRail {
    * the payer's own wallet"), and chain time has reached `refundAfterMs` — all against a fresh
    * `final` read — before anything is built or signed.
    */
-  async refund(hashLock: string): Promise<NearWriteEvidence> {
-    if (!HASH_LOCK_SHAPE.test(hashLock)) throw new Error("near-htlc: hashLock must be 0x + 64 lowercase hex");
+  async refund(ref: string): Promise<NearWriteEvidence> {
+    const { hashLock, payer } = requireNearRef(ref);
+    // The contract keys a refund by (predecessor, hash lock): only the payer's own signer can
+    // ever reach its own lock, so a ref naming another payer is refused before anything is signed.
+    if (payer !== this.signer.accountId) {
+      throw new Error("near-htlc: refund must be signed by the payer's own account (the ref's payer must equal signer.accountId)");
+    }
     await this.assertPinnedChain();
 
-    const lockView = await this.getLock(hashLock);
+    const lockView = await this.getLock(ref);
     if (lockView === null || lockView.status !== "Locked") {
       throw new Error(`near-htlc: refusing to refund — lock is not in a refundable "Locked" state (got ${lockView?.status ?? "none"})`);
     }
@@ -831,7 +841,7 @@ export class NearHtlcRail {
       deposit: 0n,
     };
     const built = await this.buildAndSign(this.config.contract, [action]);
-    return this.sendPrepared({ ref: hashLock, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "refund" });
+    return this.sendPrepared({ ref, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "refund" });
   }
 
   /**
@@ -881,9 +891,9 @@ export class NearHtlcRail {
    *  the Buyer's leg A is spent and its only remaining move is to take leg B with this secret.
    *  Gating on `Claiming`/`Claimed` here made `BuyerFlow.learnSecret` blind to exactly that
    *  state (main-loop review 2026-09-29): the Buyer would have missed leg B's own window. */
-  async findClaimedPreimage(hashLock: string): Promise<string | null> {
-    if (!HASH_LOCK_SHAPE.test(hashLock)) throw new Error("near-htlc: hashLock must be 0x + 64 lowercase hex");
-    const lock = await this.getLock(hashLock);
+  async findClaimedPreimage(ref: string): Promise<string | null> {
+    const { hashLock } = requireNearRef(ref);
+    const lock = await this.getLock(ref);
     if (lock === null || lock.preimage === null) return null;
     const hashLockBytes = hexToBytes(hashLock.slice(2));
     const preimageBytes = hexToBytes(lock.preimage.slice(2));
@@ -898,8 +908,8 @@ export class NearHtlcRail {
    *  than only ever calling `findClaimedPreimage` directly) so a caller's intent — "is there a
    *  claim in flight I should know about before building a refund" — reads clearly at the call
    *  site, mirroring `ConnectedCounterAssetRail.checkPendingClaim`'s own documented purpose. */
-  async checkPendingClaim(hashLock: string): Promise<string | null> {
-    return this.findClaimedPreimage(hashLock);
+  async checkPendingClaim(ref: string): Promise<string | null> {
+    return this.findClaimedPreimage(ref);
   }
 
   /** D-N7: the FINAL block header's own `timestamp_nanosec`, ns→ms — never the wall clock; the
