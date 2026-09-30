@@ -236,12 +236,15 @@ export function accountProofMessage(
   const line = formatAccountLine({ railId: input.railId, caip2: input.caip2, address: input.address }, registry);
   const parsed = parseAccountLine(line, registry);
   if (parsed === null) throw new Error("account-line: cannot build a proof message for this account");
-  return buildAccountProofMessage({
-    did: input.did,
-    contract: input.contract,
-    railId: parsed.railId,
-    account: `${parsed.caip2}:${parsed.address}`,
-  });
+  return buildAccountProofMessage(
+    {
+      did: input.did,
+      contract: input.contract,
+      railId: parsed.railId,
+      account: `${parsed.caip2}:${parsed.address}`,
+    },
+    registry,
+  );
 }
 
 /**
@@ -722,6 +725,7 @@ export function resolveAccounts(
         account: `${parsed.caip2}:${parsed.address}`,
         subject: parsed.address,
         proof: parsed.proof,
+        ...(input.railRegistry === undefined ? {} : { registry: input.railRegistry }),
       });
       if (why !== null) {
         reasons.push(`account-line: ${candidate.sender} posted an account line that is not proven (${why}); ignored`);

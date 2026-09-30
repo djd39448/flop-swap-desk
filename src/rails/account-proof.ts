@@ -26,7 +26,7 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { base58 } from "@scure/base";
 import { hashMessage } from "viem";
 import { publicKeyToAddress } from "viem/utils";
-import { normalizeRailId } from "@flop-labs/tclk";
+import { normalizeRailIdWith, type CustomRailRegistry } from "./custom-rails.js";
 
 import { bip322Verifier } from "./btc-proof.js";
 import { nep413Verifier } from "./near-proof.js";
@@ -63,12 +63,12 @@ export interface AccountProofMessageInput {
  * The exact message a chain key signs. Throws on any field that is not canonical or could make
  * two different tuples render the same string (a `|`, whitespace or control character).
  */
-export function buildAccountProofMessage(input: AccountProofMessageInput): string {
+export function buildAccountProofMessage(input: AccountProofMessageInput, registry?: CustomRailRegistry): string {
   if (!DID_SHAPE.test(input.did)) throw new Error(`account-proof: malformed did "${input.did}"`);
   if (!CONTRACT_SHAPE.test(input.contract)) throw new Error(`account-proof: malformed contract id "${input.contract}"`);
   let railId: string;
   try {
-    railId = normalizeRailId(input.railId);
+    railId = normalizeRailIdWith(input.railId, registry);
   } catch {
     throw new Error(`account-proof: "${input.railId}" is not a registered rail id`);
   }
@@ -263,6 +263,8 @@ export function checkLineProof(args: {
   subject: string;
   caip2: string;
   proof: AccountProof | undefined;
+  /** A caller-owned custom rail registry (Solana): the rail id is admitted through it, as in the line. */
+  registry?: CustomRailRegistry;
 }): string | null {
   if (args.proof === undefined) return "no proof";
   const allowed = args.policy.allowedSchemes ?? RAIL_PROOF_SCHEMES[args.railId] ?? [];
@@ -273,12 +275,15 @@ export function checkLineProof(args: {
   if (verifier === undefined) return `no verifier for scheme "${args.proof.scheme}"`;
   let message: string;
   try {
-    message = buildAccountProofMessage({
-      did: args.did,
-      contract: args.contract,
-      railId: args.railId,
-      account: args.account,
-    });
+    message = buildAccountProofMessage(
+      {
+        did: args.did,
+        contract: args.contract,
+        railId: args.railId,
+        account: args.account,
+      },
+      args.registry,
+    );
   } catch (error) {
     return error instanceof Error ? error.message : "cannot build the proof message";
   }

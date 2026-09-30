@@ -70,7 +70,7 @@ import {
 } from "./sol-htlc.js";
 import { BPF_LOADER_UPGRADEABLE_ID, TOKEN_PROGRAM_ID, associatedTokenAddress, decodeTokenAccount } from "./sol-spl.js";
 import { bytesEqual, findProgramAddress, isValidPubkeyBase58, pubkeyFromBase58, pubkeyToBase58 } from "./sol-tx.js";
-import type { LockEvidence, RailObservation } from "../types.js";
+import { railBinding, type LockEvidence, type RailObservation } from "../types.js";
 
 export { SOL_RAIL_ID };
 
@@ -482,6 +482,10 @@ function decide(input: SolEvidenceInput): SolEvidenceResult {
     return end("sol-htlc: the escrow's own payer/hash lock differ from the ref (not this lock)", fin);
   }
   if (accounts.payee === undefined) return end("sol-htlc: payee has no account line", fin);
+  // P7 fix pass (F1): the payer's proven line is mandatory too. Without it the lock's payer is tied to no
+  // DID, and the victim Buyer's own counterparty (who knows the hash lock and controls the payee wallet)
+  // could borrow the victim's lock for a sock-puppet pair.
+  if (accounts.payer === undefined) return end("sol-htlc: payer has no proven account line (P7)", fin);
 
   const mismatch = firstFieldMismatch({ view, payee: accounts.payee, ...(accounts.payer === undefined ? {} : { payer: accounts.payer }), mint: trusted.assets.USDC, terms });
   const mintBytes = pubkeyFromBase58(trusted.assets.USDC);
@@ -503,7 +507,7 @@ function decide(input: SolEvidenceInput): SolEvidenceResult {
     if (payeeProblem !== null) {
       return { lock: { ...base, endpoint: endpointFor, ...fin, railVerified: false, reason: `sol-htlc: the payee's token account ${payeeProblem} - the payout could never land` } };
     }
-    const rail: RailObservation = { status: "locked", final: true, checkedAtMs, finalizedRef };
+    const rail: RailObservation = { status: "locked", final: true, checkedAtMs, finalizedRef, ...railBinding(base) };
     return { lock: { ...base, endpoint: endpointFor, ...fin, railVerified: true, reason: "sol-htlc: locked and on-chain state matches terms (vault funded, payee token account usable)" }, rail };
   }
 
@@ -520,7 +524,7 @@ function decide(input: SolEvidenceInput): SolEvidenceResult {
   if (mismatch !== null) {
     return end(`${baseReason} - and its other fields do not match this swap's terms/accounts (${mismatch}) - refusing to trust it as this swap's own lock`, fin);
   }
-  const rail: RailObservation = { status: label, final: true, checkedAtMs, finalizedRef };
+  const rail: RailObservation = { status: label, final: true, checkedAtMs, finalizedRef, ...railBinding(base) };
   return { lock: { ...base, endpoint: endpointFor, ...fin, railVerified: false, reason: baseReason }, rail };
 }
 

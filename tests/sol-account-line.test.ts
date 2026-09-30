@@ -9,9 +9,10 @@
 import { dealRoom } from "@flop-labs/tclk";
 import { describe, expect, it } from "vitest";
 
-import { formatAccountLine, formatSolAccountLine, resolveSolAccounts } from "../src/rails/account-line.js";
+import { accountProofMessage, formatAccountLine, formatSolAccountLine, resolveAccounts, resolveSolAccounts } from "../src/rails/account-line.js";
 import { SOL_RAIL_ID, createCustomRailRegistry, createSolRailRegistry } from "../src/rails/custom-rails.js";
 import { pubkeyToBase58 } from "../src/rails/sol-tx.js";
+import { provenSolLine, solWallet } from "./helpers/sol-proof.js";
 import { identity, record, recordSignedBy, unsignedRecord } from "./helpers/identity.js";
 
 const T0 = 1_758_000_000_000;
@@ -21,20 +22,28 @@ const outsider = identity("f6".repeat(32));
 const CONTRACT = `0x${"ab".repeat(32)}`;
 const ROOM = dealRoom(CONTRACT);
 const CAIP2 = "solana:localnet-flop";
-const BUYER_KEY = pubkeyToBase58(new Uint8Array(32).fill(1));
-const SELLER_KEY = pubkeyToBase58(new Uint8Array(32).fill(2));
-const OTHER_KEY = pubkeyToBase58(new Uint8Array(32).fill(3));
+// Real (throwaway) Ed25519 wallets: the address is the public key, and every line must carry the wallet's
+// own `ed25519` proof (P7) to resolve.
+const BUYER_WALLET = solWallet(1);
+const SELLER_WALLET = solWallet(2);
+const OTHER_WALLET = solWallet(3);
+const BUYER_KEY = BUYER_WALLET.address;
+const SELLER_KEY = SELLER_WALLET.address;
+const OTHER_KEY = OTHER_WALLET.address;
+const WALLETS = new Map([[BUYER_KEY, BUYER_WALLET], [SELLER_KEY, SELLER_WALLET], [OTHER_KEY, OTHER_WALLET]]);
 const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, caip2: CAIP2 };
 
 function line(seq: number, signer: typeof buyer, address: string, room: string = ROOM, caip2: string = CAIP2): ReturnType<typeof record> {
-  return record(room, seq, T0 + seq * 60_000, signer, formatSolAccountLine({ caip2, address }));
+  // proven for the contract CONTRACT (a cross-room or cross-contract replay is tested separately)
+  const wallet = WALLETS.get(address) as ReturnType<typeof solWallet>;
+  return record(room, seq, T0 + seq * 60_000, signer, provenSolLine(wallet, signer.did, CONTRACT, caip2));
 }
 
 describe("formatSolAccountLine", () => {
   it("builds the line with the one Solana rail id and refuses anything that is not a canonical 32-byte base58 address", () => {
     expect(formatSolAccountLine({ caip2: CAIP2, address: SELLER_KEY })).toBe(`swap1 account ${SOL_RAIL_ID} ${CAIP2}:${SELLER_KEY}`);
     expect(() => formatSolAccountLine({ caip2: CAIP2, address: "0x" + "ab".repeat(20) })).toThrow(/not a valid solana address/);
-    expect(() => formatSolAccountLine({ caip2: CAIP2, address: SELLER_KEY.slice(1) })).toThrow();
+    expect(() => formatSolAccountLine({ caip2: CAIP2, address: pubkeyToBase58(new Uint8Array(32).fill(2)).slice(0, 30) })).toThrow();
     expect(() => formatSolAccountLine({ caip2: "eip155:1", address: SELLER_KEY })).toThrow(/does not match rail/);
   });
 
@@ -70,7 +79,7 @@ describe("resolveSolAccounts", () => {
   });
 
   it("ignores an unsigned record, a forged sender, a line in another room, and a sender who is not a party", () => {
-    const text = formatSolAccountLine({ caip2: CAIP2, address: SELLER_KEY });
+    const text = provenSolLine(SELLER_WALLET, seller.did, CONTRACT, CAIP2);
     expect(resolveSolAccounts([unsignedRecord(ROOM, 1, T0, text)], input).payee).toBeUndefined();
     expect(resolveSolAccounts([recordSignedBy(ROOM, 1, T0, outsider, seller.did, text)], input).payee).toBeUndefined();
     expect(resolveSolAccounts([line(1, seller, SELLER_KEY, dealRoom(`0x${"cd".repeat(32)}`))], input).payee).toBeUndefined();
@@ -93,5 +102,47 @@ describe("resolveSolAccounts", () => {
     expect(result.payee).toBeUndefined();
     expect(result.reasons[0]).toMatch(/not a registered rail id/);
     expect(resolveSolAccounts([line(1, seller, SELLER_KEY)], { ...input, railRegistry: createSolRailRegistry() }).payee).toBe(SELLER_KEY);
+  });
+
+  describe("P7 proof of control (ed25519, required)", () => {
+    it("an unproven line resolves nothing, with a reason; the same line with the wallet's proof resolves", () => {
+      const bare = record(ROOM, 1, T0, seller, formatSolAccountLine({ caip2: CAIP2, address: SELLER_KEY }));
+      const r = resolveSolAccounts([bare], input);
+      expect(r.payee).toBeUndefined();
+      expect(r.reasons.some((x) => x.includes("not proven") && x.includes("no proof"))).toBe(true);
+      expect(resolveSolAccounts([line(1, seller, SELLER_KEY)], input).payee).toBe(SELLER_KEY);
+    });
+
+    it("a proof by a different wallet, for another DID, or for another contract does not resolve (no borrowing an address)", () => {
+      // the seller names the BUYER's wallet address but signs with its own wallet
+      const message = accountProofMessage({ did: seller.did, contract: CONTRACT, railId: SOL_RAIL_ID, caip2: CAIP2, address: BUYER_KEY }, createSolRailRegistry());
+      const wrongKey = formatSolAccountLine({ caip2: CAIP2, address: BUYER_KEY, proof: { scheme: "ed25519", signature: SELLER_WALLET.sign(message) } });
+      expect(resolveSolAccounts([record(ROOM, 1, T0, seller, wrongKey)], input).payee).toBeUndefined();
+      // a proof the buyer made for ITS OWN did, replayed by the seller
+      const replayedFromBuyer = provenSolLine(BUYER_WALLET, buyer.did, CONTRACT, CAIP2);
+      expect(resolveSolAccounts([record(ROOM, 1, T0, seller, replayedFromBuyer)], input).payee).toBeUndefined();
+      // a proof made for another contract
+      const otherContract = provenSolLine(SELLER_WALLET, seller.did, `0x${"cd".repeat(32)}`, CAIP2);
+      expect(resolveSolAccounts([record(ROOM, 1, T0, seller, otherContract)], input).payee).toBeUndefined();
+    });
+
+    it("only ed25519 is accepted for the Solana rail: another scheme's proof does not count", () => {
+      const message = accountProofMessage({ did: seller.did, contract: CONTRACT, railId: SOL_RAIL_ID, caip2: CAIP2, address: SELLER_KEY }, createSolRailRegistry());
+      const text = formatSolAccountLine({ caip2: CAIP2, address: SELLER_KEY, proof: { scheme: "eip191", signature: SELLER_WALLET.sign(message) } });
+      const r = resolveSolAccounts([record(ROOM, 1, T0, seller, text)], input);
+      expect(r.payee).toBeUndefined();
+      expect(r.reasons.some((x) => x.includes('scheme "eip191" is not accepted'))).toBe(true);
+    });
+
+    it("the generic resolver has no scheme entry for the Solana id: ed25519 is allowed only through resolveSolAccounts", () => {
+      const r = resolveAccounts([line(1, seller, SELLER_KEY)], {
+        ...input,
+        rail: SOL_RAIL_ID,
+        railRegistry: createSolRailRegistry(),
+        proof: { mode: "required" },
+      });
+      expect(r.payee).toBeUndefined();
+      expect(r.reasons.some((x) => x.includes("is not accepted for rail"))).toBe(true);
+    });
   });
 });

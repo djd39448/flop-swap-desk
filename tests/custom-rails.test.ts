@@ -22,6 +22,7 @@ import {
 } from "../src/rails/custom-rails.js";
 import { pubkeyToBase58 } from "../src/rails/sol-tx.js";
 import { identity, record } from "./helpers/identity.js";
+import { provenSolLine, solWallet } from "./helpers/sol-proof.js";
 
 const PUBKEY = pubkeyToBase58(new Uint8Array(32).fill(7));
 const CAIP2 = "solana:localnet-flop";
@@ -186,11 +187,14 @@ describe("the account line with a custom rail registry", () => {
     const ROOM = dealRoom(CONTRACT);
     const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, rail: SOL_RAIL_ID, caip2: CAIP2 };
     const T0 = 1_758_000_000_000;
+    // the conflict/chain/registry rules below are about the line fold, not proofs (proofs: sol-account-line.test.ts)
+    const LEGACY = { mode: "legacy-unproven" } as const;
 
     it("resolves the Solana payee through the registry with the usual sender binding", () => {
-      const payeeKey = pubkeyToBase58(new Uint8Array(32).fill(9));
-      const records = [record(ROOM, 1, T0, seller, formatAccountLine({ railId: SOL_RAIL_ID, caip2: CAIP2, address: payeeKey }, registry))];
-      const result = resolveAccounts(records, { ...input, railRegistry: registry });
+      const wallet = solWallet(9);
+      const payeeKey = wallet.address;
+      const records = [record(ROOM, 1, T0, seller, provenSolLine(wallet, seller.did, CONTRACT, CAIP2, registry))];
+      const result = resolveAccounts(records, { ...input, railRegistry: registry, proof: { mode: "required", allowedSchemes: ["ed25519"] } });
       expect(result.payee).toBe(payeeKey);
       expect(result.payer).toBeUndefined();
       expect(result.reasons).toEqual([]);
@@ -198,7 +202,7 @@ describe("the account line with a custom rail registry", () => {
 
     it("without the registry the rail is unregistered and nothing resolves", () => {
       const records = [record(ROOM, 1, T0, seller, LINE)];
-      const result = resolveAccounts(records, input);
+      const result = resolveAccounts(records, { ...input, proof: LEGACY });
       expect(result.payee).toBeUndefined();
       expect(result.reasons).toEqual([expect.stringContaining("not a registered rail id")]);
     });
@@ -207,12 +211,12 @@ describe("the account line with a custom rail registry", () => {
       const other = pubkeyToBase58(new Uint8Array(32).fill(3));
       const wrongChain = `swap1 account ${SOL_RAIL_ID} solana:devnet-x:${PUBKEY}`;
       const records = [record(ROOM, 1, T0, seller, wrongChain)];
-      const wrong = resolveAccounts(records, { ...input, railRegistry: registry });
+      const wrong = resolveAccounts(records, { ...input, railRegistry: registry, proof: LEGACY });
       expect(wrong.payee).toBeUndefined();
       expect(wrong.reasons.some((r) => r.includes("solana:devnet-x"))).toBe(true);
       const conflict = resolveAccounts(
         [record(ROOM, 1, T0, seller, LINE), record(ROOM, 2, T0 + 1, seller, `swap1 account ${SOL_RAIL_ID} ${CAIP2}:${other}`)],
-        { ...input, railRegistry: registry },
+        { ...input, railRegistry: registry, proof: LEGACY },
       );
       expect(conflict.payee).toBeUndefined();
       expect(conflict.reasons.some((r) => r.includes("conflicting account lines"))).toBe(true);

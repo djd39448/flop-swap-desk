@@ -147,7 +147,17 @@ describe("solEvidence - happy path", () => {
     const { w, capture } = await lockedWorld();
     const result = verdict(w, capture);
     expect(result.lock.railVerified).toBe(true);
-    expect(result.rail).toEqual({ status: "locked", final: true, checkedAtMs: NOW, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toEqual({
+      status: "locked",
+      final: true,
+      checkedAtMs: NOW,
+      finalizedRef: FINALIZED_REF,
+      // the binding (tclk#194): what this observation is an observation OF
+      rail: SOL_RAIL_ID,
+      ref: w.ref,
+      contract: termsFor(w).contract,
+      terms: termsFor(w),
+    });
     expect(result.lock.finalizedRef).toBe(FINALIZED_REF);
     expect(result.lock.ref).toBe(w.ref);
     expect(result.lock.rail).toBe(SOL_RAIL_ID);
@@ -183,12 +193,21 @@ describe("solEvidence - happy path", () => {
     expect(result.rail).toBeUndefined();
   });
 
-  it("a payer account line is optional corroboration; the ref's payer is used when there is none", async () => {
+  it("the payer's proven line is mandatory (P7 F1): without it the lock's payer is tied to no DID and the verdict is unknown, never verified", async () => {
     const w = makeWorld();
     putLockedEscrow(w);
     const accounts = { payee: w.seller.publicKey };
     const capture = await takeCapture(w, { accounts });
-    expect(verdict(w, capture, { accounts }).lock.railVerified).toBe(true);
+    const result = verdict(w, capture, { accounts });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/payer has no proven account line/);
+    expect(result.rail).toBeUndefined();
+    // the same holds for a claimed escrow: no observation is attached without the payer's line
+    const claimed = makeWorld();
+    withEscrow(claimed, { status: "Claimed", preimage: claimed.preimage, vaultAmount: 0n });
+    const claimedResult = verdict(claimed, await takeCapture(claimed, { accounts }), { accounts });
+    expect(claimedResult.lock.railVerified).toBeNull();
+    expect(claimedResult.rail).toBeUndefined();
   });
 
   it("the ProgramData may carry trailing zero padding, and the authority may be None or all-zero", async () => {
@@ -213,7 +232,17 @@ describe("solEvidence - claimed and refunded", () => {
     withEscrow(w, { status: "Claimed", preimage: w.preimage, vaultAmount: 0n });
     const result = verdict(w, await takeCapture(w));
     expect(result.lock.railVerified).toBe(false);
-    expect(result.rail).toEqual({ status: "claimed", final: true, checkedAtMs: NOW, finalizedRef: FINALIZED_REF });
+    expect(result.rail).toEqual({
+      status: "claimed",
+      final: true,
+      checkedAtMs: NOW,
+      finalizedRef: FINALIZED_REF,
+      // the binding (tclk#194): what this observation is an observation OF
+      rail: SOL_RAIL_ID,
+      ref: w.ref,
+      contract: termsFor(w).contract,
+      terms: termsFor(w),
+    });
     expect(result.lock.reason).toMatch(/claimed on-chain, not locked/);
   });
 
