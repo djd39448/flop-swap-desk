@@ -432,7 +432,8 @@ actually locks — NEAR's own twin of the Bitcoin leg's "before N confirmations"
 for a write that actually happened; the Buyer learning the secret from `get_lock` alone with no
 reveal frame ever posted; a claim to an unregistered payee refused before ever sending a
 transaction; a retry of a refused claim once the payee registers; and `recoverByTxHash` against a
-completed write, called on the rail directly in a client-flow scenario). Recovery in the client
+completed write, called on the rail directly in a client-flow scenario; the hermetic
+`tests/client-flows-near-rpc.test.ts` additionally pins the reveal handling below). Recovery in the client
 flows is by hash-lock state (`get_lock`, the reader the flows re-derive their evidence from), not
 by transaction hash: `recoverByTxHash` is a rail primitive pinned against a write that did
 complete, and neither flow calls it. The lock is the only two-step write
@@ -539,7 +540,10 @@ client-side and never sent at all.
 
 **What this proves, and what it does not.** The three committed fixtures
 (`fixtures/near-sandbox-2026-09-29/{settled,refunded,refunded-b}/`, replayed hermetically by
-`tests/near-sandbox-fixtures.test.ts`) show a real `htlc` contract funded, claimed or refunded on
+`tests/near-sandbox-fixtures.test.ts`) were captured before H8 (the code-hash and access-key
+reads), so until they are recaptured (`CAPTURE_NEAR_FIXTURES=1 npm run test:near`, pending) the six
+replay checks in that test do not pass and nothing in this section claims they do. Once recaptured
+they show a real `htlc` contract funded, claimed or refunded on
 a real near-sandbox 2.13.4 node (`refunded-b` carries no NEAR bytes at all: the Buyer never locked
 leg A, so it shows only the paper-rail fold and the absence of any NEAR write), with every verdict re-derivable from the exact captured RPC
 bytes — but on a throwaway sandbox this repo itself starts and stops, never a real network, and
@@ -587,10 +591,31 @@ Each is written down instead of hidden, per the same discipline the EVM and Bitc
   payee who was never `storage_deposit`'d on the token fails only that inner transfer — the
   preimage is already public (the contract wrote it before ever calling `ft_transfer`) even
   though the lock reverts back to `Locked` and no payout lands. `NearHtlcRail.claim()`'s own
-  no-secret `storage_balance_of` pre-check (P5-NEAR-SPEC.md §4) exists specifically to stop this
-  build's own client from ever reaching that state through the normal claim path; it is only
-  reachable by a caller that builds and sends the raw transaction directly, bypassing the
-  adapter's own guard on purpose (exactly how this stage's own test reproduces it).
+  no-secret `storage_balance_of` pre-check (P5-NEAR-SPEC.md §4) narrows the window but cannot
+  close it: a payee who is registered when the pre-check reads can be unregistered before the
+  payout promise runs, and the hermetic client-flow scenario (`tests/client-flows-near-rpc.test.ts`,
+  the payout armed to fail after the pre-check's reads) reaches this state through the ordinary
+  claim path. The sandbox test reaches it by sending the raw transaction, bypassing the guard.
+  The client then throws `NearPayoutFailedError` (see the next bullet for what is posted).
+- **The reveal must land before `refundAfterMs` (G6).** After a claim whose payout failed, or a
+  claim that landed on chain, the Seller posts the tclk reveal frame (retried up to 3 times) and
+  throws `RevealNotPostedError` if it still fails; the message says the reveal must land before
+  `refundAfterMs` and to call `claimLegA` again before then. A per-flow `revealPosted` /
+  `receiptPosted` latch means that retry (and the chain-already-agrees path) posts only the frame
+  that is missing and never a second copy; a `NearPayoutFailedError` posts a reveal but no receipt.
+  The latches live in the flow instance: a new process re-posts. tclk's machine accepts a reveal
+  only while the contract is `locked`, so a leg that is claimed on chain after `refundAfterMs`
+  through the revealed-lock rule (F4/H2), once the Buyer's refund frame has landed, cannot be
+  recorded in the tclk transcript (no test here exercises what the board then reports for that
+  case).
+- **Contract storage is never freed, and it is cheap to consume.** Claimed and refunded lock rows
+  stay in contract storage forever, and any holder of the configured token can create one for a
+  1-unit lock. The contract's reserve check then refuses new locks until someone tops the contract
+  account up; nothing here bounds or reclaims that. (`contracts-near/README.md`.)
+- **The response byte cap bounds memory only when the server sends `Content-Length`.** An oversized
+  reply that declares its length is refused before its body is read; a chunked reply is buffered in
+  full and checked afterwards (`DEFAULT_MAX_RESPONSE_BYTES`, 4 MiB), so a hostile endpoint can make
+  the process buffer more than the cap before it is refused. A streaming cap is not implemented.
 - **A stuck `Claiming`/`Refunding` lock has no recovery method (F5).** If the payout callback
   itself fails, the lock stays in that state and no method moves it out. Reachable only with a
   non-standard token whose `ft_transfer` result is not empty or JSON unit; the evidence reader

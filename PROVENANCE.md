@@ -238,3 +238,12 @@ observation folded a swap to `settled`, and two pairs with the same buyer and no
 evidence entry. Both are first-party changes; nothing is vendored or copied from that review beyond
 the two reproductions, which are regression tests in `tests/binding.test.ts`. No capture or
 evidence file format changed, so no fixture was recaptured. Round 2 of the review (V3-V8, P5-NEAR-FIXES-R2.md) removed the shared-swapId evidence blanking, kept only genuine accepts for candidates and evidence keys, paired leg B with leg A's accepter, made a refund frame insufficient for chain legs, and keyed the watcher, bundle and audit-export by pair; all first-party.
+
+## Reveal latches and signer error text (P5-NEAR-FIXES-R2.md G6, D4)
+
+`src/client/seller.ts` gained `RevealNotPostedError` and the `revealPosted`/`receiptPosted` latches
+(the reveal is retried up to three times and a failure is a distinct error rather than a silent
+skip, and a retry of `claimLegA` posts only the frame still missing); `fromNearSecretKey` in
+`src/rails/near-signer-memory.ts` no longer puts any character of its input in an error; the
+comments at the two `refundedFold` call sites in `src/swap.ts` now describe the V4 rule. All
+first-party, covered by `tests/client-flows-near-rpc.test.ts` and `tests/near-signer-memory.test.ts`.

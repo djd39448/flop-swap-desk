@@ -122,6 +122,10 @@ known before any write, and every adapter call derives `hash_lock` and `payer` f
   (The F2 reserve check still covers it.) A squatter's 1-unit lock still costs the contract
   storage staking; the F2 reserve check refuses new locks when the contract can no longer afford
   them, exactly as before.
+- **Storage is never freed and is cheap to consume.** `claim` and `refund` only change a lock's
+  status; the row and its storage stay, and a lock costs its creator one token unit plus gas. Enough
+  cheap locks make the F2 reserve check refuse every new lock until the contract account is topped
+  up. Nothing in the contract prunes rows or charges the payer for the storage it occupies.
 - **A revealed lock cannot be refunded (F4).** If the payee named in a lock never registers
   storage on the token, a revealed lock can neither pay out nor be refunded; the payer's funds stay
   in it. The payer keeps the preimage for the other leg.
