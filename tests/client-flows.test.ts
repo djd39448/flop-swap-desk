@@ -53,6 +53,7 @@ import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { swapId as computeSwapId } from "../src/profile.js";
+import { evmSigner } from "./helpers/proven-lines.js";
 import { identity, record, unsignedRecord, type Identity } from "./helpers/identity.js";
 
 function addr(tag: string): Address {
@@ -69,8 +70,27 @@ function ident(tag: number): Identity {
 const T0 = 1_700_000_000_000;
 const RAIL_CONTRACT = addr("client-flows-rail");
 const TOKEN = addr("client-flows-usdc");
-const BUYER_ACCOUNT = addr("client-flows-buyer-account");
-const SELLER_ACCOUNT = addr("client-flows-seller-account");
+// P7: the parties' accounts hold keys here (a stand-in for the node-held accounts anvil signs
+// with over RPC), so `postAccountLineA` can post the proven line every resolver now requires.
+const BUYER_SIGNER = evmSigner(0x401);
+const SELLER_SIGNER = evmSigner(0x402);
+const BUYER_ACCOUNT = BUYER_SIGNER.address;
+const SELLER_ACCOUNT = SELLER_SIGNER.address;
+
+/** The two reads a proven account line costs on the wire: the pin check (`eth_chainId`) and the
+ *  node's `personal_sign` (answered here by the account's own stand-in key). Every other method
+ *  stays whatever the test's transport says it is. */
+function proofRpcResult(method: string, params: readonly unknown[]): { result: unknown } | undefined {
+  if (method === "eth_chainId") return { result: `0x${ANVIL_LOCAL_PIN.chainId.toString(16)}` };
+  if (method === "personal_sign") {
+    const hex = String(params[0]);
+    const account = String(params[1]).toLowerCase();
+    const signer = [BUYER_SIGNER, SELLER_SIGNER].find((candidate) => candidate.address.toLowerCase() === account);
+    if (signer === undefined) return undefined;
+    return { result: `0x${signer.signPersonal(Buffer.from(hex.slice(2), "hex").toString("utf8"))}` };
+  }
+  return undefined;
+}
 const TX_HASH = ("0x" + "aa".repeat(32)) as Hex;
 const BLOCK_HASH = ("0x" + "cd".repeat(32)) as Hex;
 
@@ -125,8 +145,13 @@ function successReceipt(to: Address, blockNumber: string) {
  *  happen before this flow ever touches the network uses this, so a regression that let the
  *  flow reach the RPC layer fails loudly instead of silently mocking its way past the bug. */
 function unreachableRpc(): CapturingRpc {
-  const fetchImpl = (async () => {
-    throw new Error("client-flows.test.ts: unexpected network call in a hermetic test");
+  const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as { id: number; method: string; params: readonly unknown[] };
+    const proven = proofRpcResult(body.method, body.params);
+    if (proven === undefined) throw new Error("client-flows.test.ts: unexpected network call in a hermetic test");
+    const text = JSON.stringify({ jsonrpc: "2.0", id: body.id, result: proven.result });
+    const bytes = new TextEncoder().encode(text);
+    return { text: async () => text, arrayBuffer: async () => bytes.buffer } as Response;
   }) as unknown as typeof fetch;
   return new CapturingRpc({ endpoint: "http://unreachable.invalid", fetch: fetchImpl });
 }
@@ -139,8 +164,9 @@ type Responder = (params: readonly unknown[]) => { result?: unknown; error?: { c
 function mockRpc(handlers: Record<string, Responder>): CapturingRpc {
   const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body)) as { id: number; method: string; params: readonly unknown[] };
-    const handler = handlers[body.method];
-    if (handler === undefined) throw new Error(`mock rpc: unexpected method ${body.method}`);
+    const handler = handlers[body.method] ?? ((params: readonly unknown[]) => proofRpcResult(body.method, params) ?? (() => {
+      throw new Error(`mock rpc: unexpected method ${body.method}`);
+    })());
     const response = handler(body.params);
     const envelope =
       response.error !== undefined

@@ -23,7 +23,6 @@ import { describe, expect, it } from "vitest";
 
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
 import { findSwapLegCandidates, foldCaptured } from "../src/replay.js";
-import { formatAccountLine, formatPubkeyLine } from "../src/rails/account-line.js";
 import type { BtcCapture, BtcCaptureIndex, BtcCaptureIndexExchange } from "../src/rails/btc-evidence.js";
 import { BTC_REGTEST_PIN, type BtcRailConfig } from "../src/rails/btc-htlc.js";
 import { BTC_REGTEST_NETWORK, buildHtlcScript } from "../src/rails/btc-script.js";
@@ -31,6 +30,7 @@ import type { EvmCapture, EvmCaptureIndex } from "../src/rails/evm-evidence.js";
 import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
+import { btcSigner, evmSigner } from "./helpers/proven-lines.js";
 import { identity, record } from "./helpers/identity.js";
 
 const T0 = 1_758_000_000_000;
@@ -178,8 +178,11 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
 
   const RAIL_CONTRACT = addr("evm-rail-contract");
   const TOKEN = addr("usdc-token");
-  const BUYER_ADDR = addr("buyer-evm-addr");
-  const SELLER_ADDR = addr("seller-evm-addr");
+  // P7: the parties' chain accounts hold keys in this test, so their lines can carry proofs.
+  const BUYER_EVM = evmSigner(0x101);
+  const SELLER_EVM = evmSigner(0x102);
+  const BUYER_ADDR = BUYER_EVM.address;
+  const SELLER_ADDR = SELLER_EVM.address;
   const BLOCK_HASH = ("0x" + "cd".repeat(32)) as Hex;
 
   const EVM_CONFIG: EvmRailConfig = {
@@ -328,9 +331,9 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
 
   /** Leg A's account lines (D-08): the payee (seller) posts, required; the payer (buyer)
    *  posts too in most tests, as corroboration. */
-  function accountLineRecords(dealRoomA: string, seq: number, ts: number) {
-    const sellerLine = formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: SELLER_ADDR });
-    const buyerLine = formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: BUYER_ADDR });
+  function accountLineRecords(dealRoomA: string, contract: string, seq: number, ts: number) {
+    const sellerLine = SELLER_EVM.line({ did: seller.did, contract, caip2: ANVIL_LOCAL_PIN.caip2 });
+    const buyerLine = BUYER_EVM.line({ did: buyer.did, contract, caip2: ANVIL_LOCAL_PIN.caip2 });
     return [
       record(dealRoomA, seq, ts, seller, sellerLine),
       record(dealRoomA, seq + 1, ts + 1, buyer, buyerLine),
@@ -343,7 +346,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
       record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 2, T0 + 4.5 * MIN)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -376,7 +379,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
 
     const dealRoomsA = [
       record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 2, T0 + 4.5 * MIN)),
       record(s.dealRoomA, 4, T0 + 5 * MIN, seller, encodeFrame(revealA)),
     ];
     const dealRoomsB = [
@@ -416,7 +419,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
       record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 2, T0 + 4.5 * MIN)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -443,7 +446,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
       record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 2, T0 + 4.5 * MIN)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -474,7 +477,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
       record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 2, T0 + 4.5 * MIN)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -511,7 +514,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
       const dealRoomsA = [
         record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-        ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+        ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 2, T0 + 4.5 * MIN)),
       ];
       const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
       return { dealRoomsA, dealRoomsB };
@@ -569,7 +572,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
       record(s.dealRoomA, 1, T0 + 4 * MIN, seller, encodeFrame(forgedLockA)),
-      ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 2, T0 + 4.5 * MIN)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -596,7 +599,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
       record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 2, T0 + 4.5 * MIN)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -635,7 +638,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       const dealRoomsA = [
         record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(rejectedPaperLockA)),
         record(s.dealRoomA, 2, T0 + 4.2 * MIN, buyer, encodeFrame(acceptedEvmLockA)),
-        ...accountLineRecords(s.dealRoomA, 3, T0 + 4.5 * MIN),
+        ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 3, T0 + 4.5 * MIN)),
       ];
       const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -685,7 +688,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       const dealRoomsA = [
         record(s.dealRoomA, 1, T0 + 65 * MIN /* after legAOffer.refundAfterMs (60 min) */, buyer, encodeFrame(rejectedByDeadlineLockA)),
         record(s.dealRoomA, 2, T0 + 4 * MIN, buyer, encodeFrame(acceptedLockA)),
-        ...accountLineRecords(s.dealRoomA, 3, T0 + 4.5 * MIN),
+        ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 3, T0 + 4.5 * MIN)),
       ];
       const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -725,7 +728,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
       const dealRoomsA = [
         record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(wrongRefLockA)), // on time, wrong ref: tclk accepts it
         record(s.dealRoomA, 2, T0 + 4.2 * MIN, buyer, encodeFrame(laterCorrectLockA)), // on time, right ref: too late, already locked
-        ...accountLineRecords(s.dealRoomA, 3, T0 + 4.5 * MIN),
+        ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 3, T0 + 4.5 * MIN)),
       ];
       const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -757,7 +760,7 @@ describe("foldCaptured — evm-htlc leg (P22-P24-EVM-SPEC.md §5)", () => {
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
       record(s.dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame(lockA)),
-      ...accountLineRecords(s.dealRoomA, 2, T0 + 4.5 * MIN),
+      ...(accountLineRecords(s.dealRoomA, s.legAAccept.contract, 2, T0 + 4.5 * MIN)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
 
@@ -796,8 +799,10 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     return JSON.stringify({ jsonrpc: "2.0", id, result });
   }
 
-  const PAYEE_PUBKEY = "0361c6efa7529b0f113fe6ea467248133aba7f14927a7163d6333048ebbf01318a"; // seller
-  const PAYER_PUBKEY = "0372320de1e3ad1abed6a51d6c435cd1312657a62d6b3545cfca062bc8fd08a627"; // buyer
+  const SELLER_BTC = btcSigner(0x103);
+  const BUYER_BTC = btcSigner(0x104);
+  const PAYEE_PUBKEY = SELLER_BTC.pubkey; // seller
+  const PAYER_PUBKEY = BUYER_BTC.pubkey; // buyer
   const FUND_TXID = "ab08a3ba29a27d8ccbc37fe3efe3f56018e34978328bc421361e688dc8d66694";
   const FUND_VOUT = 1;
   const REF = `${FUND_TXID}:${FUND_VOUT}`;
@@ -943,9 +948,9 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
 
   /** Leg A's pubkey lines (P4-BTC-SPEC.md §6): both parties are required, unlike evm-htlc's
    *  single (payee-only-required) account line. */
-  function pubkeyLineRecords(dealRoomA: string, seq: number, ts: number) {
-    const sellerLine = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYEE_PUBKEY });
-    const buyerLine = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYER_PUBKEY });
+  function pubkeyLineRecords(dealRoomA: string, contract: string, seq: number, ts: number) {
+    const sellerLine = SELLER_BTC.line({ did: seller.did, contract, caip2: BTC_REGTEST_PIN.caip2 });
+    const buyerLine = BUYER_BTC.line({ did: buyer.did, contract, caip2: BTC_REGTEST_PIN.caip2 });
     return [
       record(dealRoomA, seq, ts, seller, sellerLine),
       record(dealRoomA, seq + 1, ts + 1, buyer, buyerLine),
@@ -1013,7 +1018,7 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const dealRoomsA = [
       // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
       // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
-      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      ...pubkeyLineRecords(s.dealRoomA, s.legAAccept.contract, 1, T0 + 4 * MIN),
       record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
@@ -1049,7 +1054,7 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const dealRoomsA = [
       // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
       // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
-      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      ...pubkeyLineRecords(s.dealRoomA, s.legAAccept.contract, 1, T0 + 4 * MIN),
       record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
       record(s.dealRoomA, 4, T0 + 5 * MIN, seller, encodeFrame(revealA)),
     ];
@@ -1095,7 +1100,7 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const dealRoomsA = [
       // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
       // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
-      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      ...pubkeyLineRecords(s.dealRoomA, s.legAAccept.contract, 1, T0 + 4 * MIN),
       record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
@@ -1134,7 +1139,7 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const dealRoomsA = [
       // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
       // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
-      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      ...pubkeyLineRecords(s.dealRoomA, s.legAAccept.contract, 1, T0 + 4 * MIN),
       record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
@@ -1168,7 +1173,7 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const dealRoomsA = [
       // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
       // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
-      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      ...pubkeyLineRecords(s.dealRoomA, s.legAAccept.contract, 1, T0 + 4 * MIN),
       record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
@@ -1211,7 +1216,7 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const forgedLockA: LockFrame = { type: "lock", from: seller.did, contract: s.legAAccept.contract, rail: "btc-htlc", ref: REF };
     const lockB: LockFrame = { type: "lock", from: seller.did, contract: s.legBAccept.contract, rail: "paper", ref: s.legBAccept.contract };
     const dealRoomsA = [
-      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      ...pubkeyLineRecords(s.dealRoomA, s.legAAccept.contract, 1, T0 + 4 * MIN),
       record(s.dealRoomA, 3, T0 + 4.5 * MIN, seller, encodeFrame(forgedLockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];
@@ -1241,7 +1246,7 @@ describe("foldCaptured — btc-htlc leg (P4-BTC-SPEC.md §7)", () => {
     const dealRoomsA = [
       // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
       // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
-      ...pubkeyLineRecords(s.dealRoomA, 1, T0 + 4 * MIN),
+      ...pubkeyLineRecords(s.dealRoomA, s.legAAccept.contract, 1, T0 + 4 * MIN),
       record(s.dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame(lockA)),
     ];
     const dealRoomsB = [record(s.dealRoomB, 1, T0 + 5 * MIN, seller, encodeFrame(lockB))];

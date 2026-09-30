@@ -23,7 +23,7 @@
 
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
-import { formatPubkeyLine, resolvePubkeys } from "../rails/account-line.js";
+import { formatPubkeyLine, pubkeyProofMessage, resolvePubkeys } from "../rails/account-line.js";
 import type { AccountProof } from "../rails/account-proof.js";
 import { bip322ProofPsbt, bip322Verifier, bip322WitnessFromSignedTx } from "../rails/btc-proof.js";
 import { btcEvidence, captureBtcLeg, BTC_RAIL_ID, type BtcAccounts, type BtcCapture } from "../rails/btc-evidence.js";
@@ -290,6 +290,21 @@ class BtcCounterRail implements CounterAssetRail {
     return formatPubkeyLine({ railId: this.railId, caip2: this.caip2, pubkey: address });
   }
 
+  /** P7: the proven pubkey line — a BIP-322 proof by the wallet key for the P2WPKH address of
+   *  `address` (the pubkey), signed keylessly by the node wallet. */
+  async proveAccountLine(input: { address: string; did: string; contract: string; terms: LockTerms }): Promise<string> {
+    const message = pubkeyProofMessage({
+      did: input.did,
+      contract: input.contract,
+      railId: this.railId,
+      caip2: this.caip2,
+      pubkey: input.address,
+    });
+    const connected = await this.connect(input.terms, {});
+    const proof = await connected.signAccountProof(message);
+    return formatPubkeyLine({ railId: this.railId, caip2: this.caip2, pubkey: input.address, proof });
+  }
+
   resolveAccounts(
     records: readonly TranscriptRecord[],
     input: { contract: string; payerDid: string; payeeDid: string; beforeSeq?: number },
@@ -298,7 +313,7 @@ class BtcCounterRail implements CounterAssetRail {
       ...input,
       rail: this.railId,
       caip2: this.caip2,
-      proof: { mode: "legacy-unproven" }, // P7: migrate to { mode: "required" } in the Rails stage
+      proof: { mode: "required" }, // P7: only proven lines resolve
     });
     return {
       ...(resolved.payer === undefined ? {} : { payer: resolved.payer }),

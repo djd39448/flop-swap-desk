@@ -20,10 +20,10 @@ import { dealRoom, encodeFrame, generateHashLock, makeAccept, makeOffer, OFFER_R
 
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
-import { formatAccountLine } from "../src/rails/account-line.js";
 import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { identity, record } from "./helpers/identity.js";
+import { evmSigner } from "./helpers/proven-lines.js";
 // @ts-expect-error plain .mjs, no type declarations
 import { loadEvmCaptures, loadRails } from "../examples/audit-export.mjs";
 
@@ -42,8 +42,11 @@ function addr(tag: string): Address {
 }
 const RAIL_CONTRACT = addr("evm-rail-contract");
 const TOKEN = addr("usdc-token");
-const BUYER_ADDR = addr("buyer-evm-addr");
-const SELLER_ADDR = addr("seller-evm-addr");
+// P7: the parties' accounts hold keys in this test, so their lines carry EIP-191 proofs.
+const BUYER_EVM = evmSigner(0x321);
+const SELLER_EVM = evmSigner(0x322);
+const BUYER_ADDR = BUYER_EVM.address;
+const SELLER_ADDR = SELLER_EVM.address;
 const BLOCK_HASH = `0x${"cd".repeat(32)}`;
 
 const EVM_CONFIG: EvmRailConfig = {
@@ -110,11 +113,11 @@ function buildEvmFixture(contractAddress: Address) {
     record(dealRoomA, 1, T0 + 4 * MIN, buyer, encodeFrame({
       type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "evm-htlc", ref: lock.hash,
     })),
-    record(dealRoomA, 2, T0 + 4.5 * MIN, seller, formatAccountLine({
-      railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: SELLER_ADDR,
+    record(dealRoomA, 2, T0 + 4.5 * MIN, seller, SELLER_EVM.line({
+      did: seller.did, contract: legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2,
     })),
-    record(dealRoomA, 3, T0 + 4.5 * MIN + 1, buyer, formatAccountLine({
-      railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: BUYER_ADDR,
+    record(dealRoomA, 3, T0 + 4.5 * MIN + 1, buyer, BUYER_EVM.line({
+      did: buyer.did, contract: legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2,
     })),
   ];
 

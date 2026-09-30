@@ -754,7 +754,7 @@ async function sweepOnce(options: RunSweepOptions): Promise<SweepReport> {
         payeeDid: terms.payee,
         rail: NEAR_RAIL_ID,
         caip2: nearConfig.pin.caip2,
-        proof: { mode: "legacy-unproven" }, // P7: migrate to { mode: "required" } in the Rails stage
+        proof: { mode: "required" }, // P7: only proven lines resolve
         beforeSeq: accepted.seq,
       });
 

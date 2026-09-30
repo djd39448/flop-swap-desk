@@ -154,6 +154,12 @@ class FakeCounterAssetRail implements CounterAssetRail {
     return `swap1 pubkey btc-htlc ${this.caip2.split(":")[1]} ${pubkey}`;
   }
 
+  /** P7: the scripted rail has no key to sign with; the line it posts is unproven (its own
+   *  scripted `resolveAccounts` never reads the room). */
+  async proveAccountLine(input: { address: string }): Promise<string> {
+    return this.formatAccountLine(input.address);
+  }
+
   resolveAccounts(): RailAccounts {
     // No test below ever needs this fake to actually read the deal room — a refusal under test
     // either happens before any account is ever resolved, or the test only cares about the

@@ -213,8 +213,17 @@ export interface CounterAssetRail {
    *  D-08 line this adapter's `formatAccountLine` builds. */
   readonly caip2: string;
 
-  /** D-08: format this party's own line to post into the leg's deal room. */
+  /** D-08: format this party's own line to post into the leg's deal room, WITHOUT a proof. Such a
+   *  line never resolves (P7: every resolver requires a proof); the flows post
+   *  `proveAccountLine`'s line instead. Kept for tests that need an unproven line. */
   formatAccountLine(address: string): string;
+
+  /** P7 (handoff/P7-ACCOUNT-PROOF-SPEC.md): this party's own PROVEN line for the leg's deal room —
+   *  the message that binds `did` (the record's sender) and `contract` (the leg's tclk contract) to
+   *  `address` is signed by this party's own chain key through a connected handle
+   *  (`signAccountProof`) and the line carries the proof. `terms` only lets the rail connect; it
+   *  never changes what is signed. Refuses an `address` that is not this party's own. */
+  proveAccountLine(input: { address: string; did: string; contract: string; terms: LockTerms }): Promise<string>;
 
   /** D-08: resolve the parties' chain identities from a leg's deal-room records — only a
    *  record that both verifies and matches this rail id/chain counts; per party, every one of

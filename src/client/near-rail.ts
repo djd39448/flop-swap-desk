@@ -27,7 +27,7 @@
 
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
-import { formatAccountLine, resolveAccounts } from "../rails/account-line.js";
+import { accountProofMessage, formatAccountLine, resolveAccounts } from "../rails/account-line.js";
 import type { AccountProof } from "../rails/account-proof.js";
 import { nearEvidence, captureNearLeg, NEAR_RAIL_ID, type NearAccounts, type NearCapture } from "../rails/near-evidence.js";
 import {
@@ -300,6 +300,21 @@ class NearCounterRail implements CounterAssetRail {
     return formatAccountLine({ railId: this.railId, caip2: this.caip2, address });
   }
 
+  /** P7: the proven account line — the NEP-413 proof carries the signer's public key, which the
+   *  evidence read later checks is a FullAccess key of the account. */
+  async proveAccountLine(input: { address: string; did: string; contract: string; terms: LockTerms }): Promise<string> {
+    const message = accountProofMessage({
+      did: input.did,
+      contract: input.contract,
+      railId: this.railId,
+      caip2: this.caip2,
+      address: input.address,
+    });
+    const connected = await this.connect(input.terms, {});
+    const proof = await connected.signAccountProof(message);
+    return formatAccountLine({ railId: this.railId, caip2: this.caip2, address: input.address, proof });
+  }
+
   /** D-N5: resolves each party's account line from the leg's own deal room, bounded (when the
    *  caller supplies `beforeSeq`) to lines posted before the accepted lock frame — the account
    *  line, before the accepted lock only, exactly as the shared G1 rule already applies to the
@@ -312,7 +327,7 @@ class NearCounterRail implements CounterAssetRail {
       ...input,
       rail: this.railId,
       caip2: this.caip2,
-      proof: { mode: "legacy-unproven" }, // P7: migrate to { mode: "required" } in the Rails stage
+      proof: { mode: "required" }, // P7: only proven lines resolve
     });
     return {
       ...(resolved.payer === undefined ? {} : { payer: resolved.payer }),

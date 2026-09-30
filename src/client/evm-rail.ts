@@ -12,7 +12,7 @@
 import type { Address, Hex } from "viem";
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
-import { formatAccountLine, resolveAccounts } from "../rails/account-line.js";
+import { accountProofMessage, formatAccountLine, resolveAccounts } from "../rails/account-line.js";
 import { eip191Verifier, type AccountProof } from "../rails/account-proof.js";
 import { EVM_RAIL_ID, type EvmAccounts } from "../rails/evm-evidence.js";
 import { EvmHtlcRail, type EvmRailConfig } from "../rails/evm-htlc.js";
@@ -174,6 +174,19 @@ class EvmCounterRail implements CounterAssetRail {
     return formatAccountLine({ railId: this.railId, caip2: this.caip2, address });
   }
 
+  async proveAccountLine(input: { address: string; did: string; contract: string; terms: LockTerms }): Promise<string> {
+    const message = accountProofMessage({
+      did: input.did,
+      contract: input.contract,
+      railId: this.railId,
+      caip2: this.caip2,
+      address: input.address,
+    });
+    const connected = await this.connect(input.terms, {});
+    const proof = await connected.signAccountProof(message);
+    return formatAccountLine({ railId: this.railId, caip2: this.caip2, address: input.address, proof });
+  }
+
   resolveAccounts(
     records: readonly TranscriptRecord[],
     input: { contract: string; payerDid: string; payeeDid: string; beforeSeq?: number },
@@ -182,7 +195,7 @@ class EvmCounterRail implements CounterAssetRail {
       ...input,
       rail: this.railId,
       caip2: this.caip2,
-      proof: { mode: "legacy-unproven" }, // P7: migrate to { mode: "required" } in the Rails stage
+      proof: { mode: "required" }, // P7: only proven lines resolve
     });
     return {
       ...(resolved.payer === undefined ? {} : { payer: resolved.payer }),

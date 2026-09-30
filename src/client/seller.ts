@@ -371,8 +371,14 @@ export class SellerFlow {
   /** Post this Seller's own leg-A account/key line (D-08) into leg A's deal room, as the payee
    *  — required before the Buyer may lock (SPEC §3, §6). */
   async postAccountLineA(address: string): Promise<TranscriptRecord> {
-    const { acceptA } = this.requireAcceptedA();
-    const line = this.rail.formatAccountLine(address);
+    const { offerA, acceptA } = this.requireAcceptedA();
+    // P7: a proven line — the chain key signs a message binding this DID and this leg's contract.
+    const line = await this.rail.proveAccountLine({
+      address,
+      did: this.identity.did,
+      contract: acceptA.contract,
+      terms: offerAcceptLockTerms(offerA, acceptA),
+    });
     return this.venue.post(dealRoom(acceptA.contract), line, this.identity);
   }
 

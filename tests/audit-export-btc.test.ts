@@ -21,10 +21,10 @@ import { dealRoom, encodeFrame, generateHashLock, makeAccept, makeOffer, OFFER_R
 
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
-import { formatPubkeyLine } from "../src/rails/account-line.js";
 import { BTC_REGTEST_PIN, type BtcRailConfig } from "../src/rails/btc-htlc.js";
 import { BTC_REGTEST_NETWORK, buildHtlcScript } from "../src/rails/btc-script.js";
 import { identity, record } from "./helpers/identity.js";
+import { btcSigner } from "./helpers/proven-lines.js";
 // @ts-expect-error plain .mjs, no type declarations
 import { loadBtcCaptures, loadRails } from "../examples/audit-export.mjs";
 
@@ -37,8 +37,11 @@ const seller = identity("c4".repeat(32));
 const T0 = 1_758_000_000_000;
 const MIN = 60_000;
 
-const PAYEE_PUBKEY = "0361c6efa7529b0f113fe6ea467248133aba7f14927a7163d6333048ebbf01318a"; // seller
-const PAYER_PUBKEY = "0372320de1e3ad1abed6a51d6c435cd1312657a62d6b3545cfca062bc8fd08a627"; // buyer
+// P7: the parties' keys are held by the test, so their pubkey lines carry BIP-322 proofs.
+const SELLER_BTC = btcSigner(0x311);
+const BUYER_BTC = btcSigner(0x312);
+const PAYEE_PUBKEY = SELLER_BTC.pubkey; // seller
+const PAYER_PUBKEY = BUYER_BTC.pubkey; // buyer
 const FUND_TXID = "ab08a3ba29a27d8ccbc37fe3efe3f56018e34978328bc421361e688dc8d66694";
 const FUND_VOUT = 1;
 const REF = `${FUND_TXID}:${FUND_VOUT}`;
@@ -118,11 +121,11 @@ function buildBtcFixture() {
   // at or after the accepted lock's own seq.
   const dealRoomA = dealRoom(legAAccept.contract);
   const dealRoomARows = [
-    record(dealRoomA, 1, T0 + 4 * MIN, seller, formatPubkeyLine({
-      railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYEE_PUBKEY,
+    record(dealRoomA, 1, T0 + 4 * MIN, seller, SELLER_BTC.line({
+      did: seller.did, contract: legAAccept.contract, caip2: BTC_REGTEST_PIN.caip2,
     })),
-    record(dealRoomA, 2, T0 + 4 * MIN + 1, buyer, formatPubkeyLine({
-      railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYER_PUBKEY,
+    record(dealRoomA, 2, T0 + 4 * MIN + 1, buyer, BUYER_BTC.line({
+      did: buyer.did, contract: legAAccept.contract, caip2: BTC_REGTEST_PIN.caip2,
     })),
     record(dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame({
       type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "btc-htlc", ref: REF,
@@ -348,8 +351,8 @@ describe("examples/audit-export.mjs — btc-htlc leg end to end", () => {
     // tclk machine actually accepted (seq 3) — per G1's own rule (now applied on replay too,
     // R2-3), this must neither add to nor conflict with what already resolved before the lock.
     fixture.dealRoomARows.push(
-      record(fixture.dealRoomA, 4, T0 + 5 * MIN, seller, formatPubkeyLine({
-        railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: `03${"ee".repeat(32)}`,
+      record(fixture.dealRoomA, 4, T0 + 5 * MIN, seller, btcSigner(0x313).line({
+        did: seller.did, contract: fixture.legAAccept.contract, caip2: BTC_REGTEST_PIN.caip2,
       })),
     );
     await writeWatchRoot(root, fixture, { rails: { btc: BTC_CONFIG } });

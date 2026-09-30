@@ -25,7 +25,6 @@ import { Transaction } from "@scure/btc-signer";
 import { encodeFunctionResult, type Address } from "viem";
 import { buildBoard } from "../src/board.js";
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
-import { formatAccountLine, formatPubkeyLine } from "../src/rails/account-line.js";
 import { BTC_REGTEST_PIN, type BtcRailConfig } from "../src/rails/btc-htlc.js";
 import { BTC_REGTEST_NETWORK, buildHtlcScript } from "../src/rails/btc-script.js";
 import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
@@ -33,6 +32,7 @@ import { NEAR_SANDBOX_PIN, type NearRailConfig } from "../src/rails/near-htlc.js
 import { offerAcceptLockTerms } from "../src/swap.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { quoteBigNonces, runSweep, type RunSweepOptions } from "../src/watcher.js";
+import { btcSigner, evmSigner, nearSigner } from "./helpers/proven-lines.js";
 import { identity, record } from "./helpers/identity.js";
 import { fakeBuildBoard } from "./helpers/fakeBoard.js";
 
@@ -769,8 +769,11 @@ describe("runSweep", () => {
 
     const RAIL_CONTRACT = addr("evm-rail-contract");
     const TOKEN = addr("usdc-token");
-    const BUYER_ADDR = addr("buyer-evm-addr");
-    const SELLER_ADDR = addr("seller-evm-addr");
+    // P7: the parties' chain accounts hold keys here, so their lines carry proofs.
+    const BUYER_EVM = evmSigner(0x201);
+    const SELLER_EVM = evmSigner(0x202);
+    const BUYER_ADDR = BUYER_EVM.address;
+    const SELLER_ADDR = SELLER_EVM.address;
     const BLOCK_HASH = `0x${"cd".repeat(32)}`;
 
     const EVM_CONFIG: EvmRailConfig = {
@@ -827,8 +830,8 @@ describe("runSweep", () => {
       const lockA: LockFrame = { type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "evm-htlc", ref: lock.hash };
 
       function dealRowsA(baseDealMs: number) {
-        const sellerLine = formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: SELLER_ADDR });
-        const buyerLine = formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: BUYER_ADDR });
+        const sellerLine = SELLER_EVM.line({ did: seller.did, contract: legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2 });
+        const buyerLine = BUYER_EVM.line({ did: buyer.did, contract: legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2 });
         return [
           rowFromRecord(record(dealRoomA, 1, baseDealMs, buyer, encodeFrame(lockA))),
           rowFromRecord(record(dealRoomA, 2, baseDealMs + 1, seller, sellerLine)),
@@ -1162,8 +1165,8 @@ describe("runSweep", () => {
       // rail, so tclk's own machine rejects it; the payer's later evm-htlc lock is accepted.
       const rejectedPaperLockA: LockFrame = { type: "lock", from: buyer.did, contract: swap.legAAccept.contract, rail: "paper", ref: swap.legAAccept.contract };
       const acceptedEvmLockA: LockFrame = { type: "lock", from: buyer.did, contract: swap.legAAccept.contract, rail: "evm-htlc", ref: swap.lock.hash };
-      const sellerLine = formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: SELLER_ADDR });
-      const buyerLine = formatAccountLine({ railId: "evm-htlc", caip2: ANVIL_LOCAL_PIN.caip2, address: BUYER_ADDR });
+      const sellerLine = SELLER_EVM.line({ did: seller.did, contract: swap.legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2 });
+      const buyerLine = BUYER_EVM.line({ did: buyer.did, contract: swap.legAAccept.contract, caip2: ANVIL_LOCAL_PIN.caip2 });
       const dealARows = [
         rowFromRecord(record(swap.dealRoomA, 1, NOW - 50_000, buyer, encodeFrame(rejectedPaperLockA))),
         rowFromRecord(record(swap.dealRoomA, 2, NOW - 49_000, buyer, encodeFrame(acceptedEvmLockA))),
@@ -1237,8 +1240,10 @@ describe("runSweep", () => {
     const FUND_VOUT = 1;
     const REF = `${FUND_TXID}:${FUND_VOUT}`;
     const AMOUNT_SATS = 100_000_000n;
-    const PAYEE_PUBKEY = "0361c6efa7529b0f113fe6ea467248133aba7f14927a7163d6333048ebbf01318a"; // seller
-    const PAYER_PUBKEY = "0372320de1e3ad1abed6a51d6c435cd1312657a62d6b3545cfca062bc8fd08a627"; // buyer
+    const SELLER_BTC = btcSigner(0x203);
+    const BUYER_BTC = btcSigner(0x204);
+    const PAYEE_PUBKEY = SELLER_BTC.pubkey; // seller
+    const PAYER_PUBKEY = BUYER_BTC.pubkey; // buyer
     const TIP_HEIGHT = 110;
     const FUNDING_BLOCK_HASH = "bb".repeat(32);
 
@@ -1292,8 +1297,8 @@ describe("runSweep", () => {
       const lockA: LockFrame = { type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "btc-htlc", ref: REF };
 
       function dealRowsA(baseDealMs: number) {
-        const sellerLine = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYEE_PUBKEY });
-        const buyerLine = formatPubkeyLine({ railId: "btc-htlc", caip2: BTC_REGTEST_PIN.caip2, pubkey: PAYER_PUBKEY });
+        const sellerLine = SELLER_BTC.line({ did: seller.did, contract: legAAccept.contract, caip2: BTC_REGTEST_PIN.caip2 });
+        const buyerLine = BUYER_BTC.line({ did: buyer.did, contract: legAAccept.contract, caip2: BTC_REGTEST_PIN.caip2 });
         // P4-BTC-FIXES-R2.md R2-3: pubkey lines before the lock frame — `replay.ts` now resolves
         // them with `beforeSeq: accepted.seq`, so a line at/after the lock's own seq is ignored.
         return [
@@ -1567,8 +1572,10 @@ describe("runSweep", () => {
   describe("chain evidence (near-htlc rail, P5-NEAR-SPEC.md §4)", () => {
     const CONTRACT_ACCOUNT = "htlc.near-sandbox-flop";
     const USDC_ACCOUNT = "usdc.near-sandbox-flop";
-    const BUYER_ACCOUNT = "buyer.near-sandbox-flop";
-    const SELLER_ACCOUNT = "seller.near-sandbox-flop";
+    const BUYER_NEAR = nearSigner("buyer.near-sandbox-flop", 0x205);
+    const SELLER_NEAR = nearSigner("seller.near-sandbox-flop", 0x206);
+    const BUYER_ACCOUNT = BUYER_NEAR.accountId;
+    const SELLER_ACCOUNT = SELLER_NEAR.accountId;
     const BLOCK_HEIGHT = 42;
     const BLOCK_HASH = "244ZQ9cgj3CQ6bWBdytfrJMuMQ1jdXLFGnr4HhvtCTnM"; // a real 32-byte base58 value
     const TIMESTAMP_NS = "1735000000000000000";
@@ -1634,8 +1641,8 @@ describe("runSweep", () => {
       const lockA: LockFrame = { type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "near-htlc", ref: lockRef === undefined ? `${lock.hash}:${BUYER_ACCOUNT}` : lockRef(lock.hash) };
 
       function dealRowsA(baseDealMs: number) {
-        const sellerLine = formatAccountLine({ railId: "near-htlc", caip2: NEAR_SANDBOX_PIN.caip2, address: SELLER_ACCOUNT });
-        const buyerLine = formatAccountLine({ railId: "near-htlc", caip2: NEAR_SANDBOX_PIN.caip2, address: BUYER_ACCOUNT });
+        const sellerLine = SELLER_NEAR.line({ did: seller.did, contract: legAAccept.contract, caip2: NEAR_SANDBOX_PIN.caip2 });
+        const buyerLine = BUYER_NEAR.line({ did: buyer.did, contract: legAAccept.contract, caip2: NEAR_SANDBOX_PIN.caip2 });
         // D-N5/R2-3: unlike evm-htlc (whose live capture needs no account resolution at all —
         // `locks(hashLock)` alone), near-htlc's own live capture (`src/watcher.ts`) resolves
         // `accounts.payee` with `beforeSeq: accepted.seq` BEFORE deciding whether to read
@@ -1720,6 +1727,10 @@ describe("runSweep", () => {
             return { result: { amount: "1", locked: "0", code_hash: HTLC_CODE_HASH, storage_usage: 1, storage_paid_at: 0, block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH } };
           }
           if (p.request_type === "view_access_key_list") return { result: { keys: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH } };
+          // P7: the proven lines' keys are FullAccess keys of their accounts at the finalized block.
+          if (p.request_type === "view_access_key") {
+            return { result: { nonce: 0, permission: "FullAccess", block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH } };
+          }
           if (p.method_name === "get_lock") return { result: { result: resultBytesOf(lockViewPayload) } };
           if (p.method_name === "storage_balance_of") return { result: { result: resultBytesOf(STORAGE_BALANCE) } };
         }
@@ -1791,7 +1802,8 @@ describe("runSweep", () => {
       // Squatting fix: the index records the full ref (0x<hash lock>:<payer>) from the accepted
       // lock frame, and the live get_lock read names that payer next to the hash lock.
       expect(index.ref).toBe(`${swap.lock.hash}:${BUYER_ACCOUNT}`);
-      expect(index.exchanges).toHaveLength(6);
+      // P7: the six D-N10 reads plus a view_access_key read for each proven line's key (payee, payer).
+      expect(index.exchanges).toHaveLength(8);
       const lockRead = index.exchanges[2].params as { method_name: string; args_base64: string };
       expect(lockRead.method_name).toBe("get_lock");
       expect(JSON.parse(Buffer.from(lockRead.args_base64, "base64").toString("utf8"))).toEqual({
@@ -1800,7 +1812,7 @@ describe("runSweep", () => {
       });
 
       const rpcFiles = await readdir(join(root, "raw", "rpc"));
-      expect(rpcFiles.length).toBe(6);
+      expect(rpcFiles.length).toBe(8);
 
       const board = JSON.parse(await readFile(join(root, "board.json"), "utf8"));
       const view = board.swaps.find((s: { swapId: string }) => s.swapId === swap.swapId);

@@ -506,8 +506,8 @@ describe("resolvePubkeys under a required proof policy", () => {
   });
 });
 
-describe("call sites still on the legacy-unproven policy", () => {
-  it("are exactly the ones the Rails stage has to migrate", () => {
+describe("no production call site uses the legacy-unproven policy", () => {
+  it("every resolver call in src/ requires a proof (the flows, replay, watcher, bundle and audit-export)", () => {
     const root = join(import.meta.dirname, "..", "src");
     const hits: string[] = [];
     const walk = (dir: string): void => {
@@ -520,12 +520,6 @@ describe("call sites still on the legacy-unproven policy", () => {
       }
     };
     walk(root);
-    expect(hits.sort()).toEqual([
-      "client/btc-rail.ts",
-      "client/evm-rail.ts",
-      "client/near-rail.ts",
-      "replay.ts",
-      "watcher.ts",
-    ]);
+    expect(hits.sort()).toEqual([]);
   });
 });

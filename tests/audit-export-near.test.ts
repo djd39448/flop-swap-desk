@@ -22,10 +22,10 @@ import { dealRoom, encodeFrame, generateHashLock, makeAccept, makeOffer, OFFER_R
 
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
-import { formatAccountLine } from "../src/rails/account-line.js";
 import { NEAR_SANDBOX_PIN, type NearRailConfig } from "../src/rails/near-htlc.js";
 import { nearCaptureKey } from "../src/rails/near-evidence.js";
 import { identity, record } from "./helpers/identity.js";
+import { nearSigner } from "./helpers/proven-lines.js";
 // @ts-expect-error plain .mjs, no type declarations
 import { loadNearCaptures, loadRails } from "../examples/audit-export.mjs";
 
@@ -40,8 +40,11 @@ const MIN = 60_000;
 
 const CONTRACT_ACCOUNT = "htlc.near-sandbox-flop";
 const USDC_ACCOUNT = "usdc.near-sandbox-flop";
-const PAYER_ACCOUNT = "buyer.near-sandbox-flop"; // buyer
-const PAYEE_ACCOUNT = "seller.near-sandbox-flop"; // seller
+// P7: the parties hold in-memory keys, so their account lines carry NEP-413 proofs.
+const PAYER_NEAR = nearSigner("buyer.near-sandbox-flop", 0x301); // buyer
+const PAYEE_NEAR = nearSigner("seller.near-sandbox-flop", 0x302); // seller
+const PAYER_ACCOUNT = PAYER_NEAR.accountId;
+const PAYEE_ACCOUNT = PAYEE_NEAR.accountId;
 const AMOUNT = "1000000";
 const BLOCK_HEIGHT = 42;
 const BLOCK_HASH = "244ZQ9cgj3CQ6bWBdytfrJMuMQ1jdXLFGnr4HhvtCTnM"; // a real 32-byte base58 value
@@ -121,8 +124,8 @@ function buildNearFixture(opts: { capturePayer?: string } = {}) {
   // posts the lock frame) and `replay.ts`'s own `beforeSeq: accepted.seq` rule.
   const dealRoomA = dealRoom(legAAccept.contract);
   const dealRoomARows = [
-    record(dealRoomA, 1, T0 + 4 * MIN, seller, formatAccountLine({ railId: "near-htlc", caip2: NEAR_SANDBOX_PIN.caip2, address: PAYEE_ACCOUNT })),
-    record(dealRoomA, 2, T0 + 4 * MIN + 1, buyer, formatAccountLine({ railId: "near-htlc", caip2: NEAR_SANDBOX_PIN.caip2, address: PAYER_ACCOUNT })),
+    record(dealRoomA, 1, T0 + 4 * MIN, seller, PAYEE_NEAR.line({ did: seller.did, contract: legAAccept.contract, caip2: NEAR_SANDBOX_PIN.caip2 })),
+    record(dealRoomA, 2, T0 + 4 * MIN + 1, buyer, PAYER_NEAR.line({ did: buyer.did, contract: legAAccept.contract, caip2: NEAR_SANDBOX_PIN.caip2 })),
     record(dealRoomA, 3, T0 + 4.5 * MIN, buyer, encodeFrame({
       type: "lock", from: buyer.did, contract: legAAccept.contract, rail: "near-htlc", ref: frameRef,
     })),
@@ -156,6 +159,12 @@ function buildNearFixture(opts: { capturePayer?: string } = {}) {
   });
   const keysBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 5), { keys: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
   const storageBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 6), { result: resultBytesOf(storageBalancePayload), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+  // P7: view_access_key for each proven line's (account, key) at the same finalized block.
+  const payeeKeyParams = { request_type: "view_access_key", account_id: PAYEE_ACCOUNT, public_key: PAYEE_NEAR.publicKey, block_id: BLOCK_HASH };
+  const payerKeyParams = { request_type: "view_access_key", account_id: PAYER_ACCOUNT, public_key: PAYER_NEAR.publicKey, block_id: BLOCK_HASH };
+  const fullAccess = { nonce: 0, permission: "FullAccess", block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH };
+  const payeeKeyBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 7), fullAccess);
+  const payerKeyBody = jsonRpcResult(nearId(nearRef, checkedAtMs, 8), fullAccess);
 
   // D-N10's fixed read order: status, block(final), get_lock (pinned to that block hash),
   // view_account and view_access_key_list of the contract (H8), storage_balance_of (pinned to the
@@ -235,6 +244,20 @@ function buildNearFixture(opts: { capturePayer?: string } = {}) {
         responseSha256: sha256Hex(storageBody),
         atMs: T0,
       },
+      {
+        method: "query",
+        params: payeeKeyParams,
+        requestBody: JSON.stringify({ jsonrpc: "2.0", id: nearId(nearRef, checkedAtMs, 7), method: "query", params: payeeKeyParams }),
+        responseSha256: sha256Hex(payeeKeyBody),
+        atMs: T0,
+      },
+      {
+        method: "query",
+        params: payerKeyParams,
+        requestBody: JSON.stringify({ jsonrpc: "2.0", id: nearId(nearRef, checkedAtMs, 8), method: "query", params: payerKeyParams }),
+        responseSha256: sha256Hex(payerKeyBody),
+        atMs: T0,
+      },
     ],
   };
 
@@ -242,7 +265,7 @@ function buildNearFixture(opts: { capturePayer?: string } = {}) {
   // (hashLock, legContract) key, exactly the value `src/watcher.ts` passes as `candidate.contract`.
   return {
     swapId, hashLock, ref: nearRef, legContract: legAAccept.contract, legAOffer, legAAccept, legBOffer, legBAccept, legATerms,
-    offerRows, dealRoomA, dealRoomARows, index, statusBody, blockBody, getLockBody, accountBody, keysBody, storageBody,
+    offerRows, dealRoomA, dealRoomARows, index, statusBody, blockBody, getLockBody, accountBody, keysBody, storageBody, payeeKeyBody, payerKeyBody,
   };
 }
 
@@ -261,6 +284,8 @@ async function writeWatchRoot(root: string, fixture: ReturnType<typeof buildNear
     [fixture.index.exchanges[3]!.responseSha256, fixture.accountBody],
     [fixture.index.exchanges[4]!.responseSha256, fixture.keysBody],
     [fixture.index.exchanges[5]!.responseSha256, fixture.storageBody],
+    [fixture.index.exchanges[6]!.responseSha256, fixture.payeeKeyBody],
+    [fixture.index.exchanges[7]!.responseSha256, fixture.payerKeyBody],
   ] as const) {
     await writeFile(join(root, "raw", "rpc", `${sha}.json`), body);
   }
@@ -415,8 +440,8 @@ describe("examples/audit-export.mjs — near-htlc leg end to end", () => {
     // tclk machine actually accepted (seq 3) — per G1's own rule (also applied on replay, mirrors
     // R2-3), this must neither add to nor conflict with what already resolved before the lock.
     fixture.dealRoomARows.push(
-      record(fixture.dealRoomA, 4, T0 + 5 * MIN, seller, formatAccountLine({
-        railId: "near-htlc", caip2: NEAR_SANDBOX_PIN.caip2, address: "someone-else.near-sandbox-flop",
+      record(fixture.dealRoomA, 4, T0 + 5 * MIN, seller, nearSigner("someone-else.near-sandbox-flop", 0x303).line({
+        did: seller.did, contract: fixture.legAAccept.contract, caip2: NEAR_SANDBOX_PIN.caip2,
       })),
     );
     await writeWatchRoot(root, fixture, { rails: { near: NEAR_CONFIG } });
