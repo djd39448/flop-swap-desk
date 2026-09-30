@@ -477,7 +477,15 @@ fn lock<'a>(
     if vault_key != *vault.key {
         return Err(HtlcError::WrongVaultAddress.into());
     }
-    if payee == *escrow.key || payee == *vault.key {
+    // A payee nobody can sign for would strand a claim's payout (NEAR H5 twin): the all-zero address,
+    // this program, the token program and the mint are refused, as are this lock's own accounts.
+    if payee == *escrow.key
+        || payee == *vault.key
+        || payee == SYSTEM_PROGRAM
+        || payee == ID
+        || payee == TOKEN_PROGRAM
+        || payee == USDC_MINT
+    {
         return Err(HtlcError::PayeeIsProgramAccount.into());
     }
 

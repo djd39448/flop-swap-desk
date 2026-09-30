@@ -10,7 +10,6 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 solana-program = "=5.1.0"
-spl-token-interface = "=3.0.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
@@ -21,3 +20,4 @@ custom-panic = []
 
 [dev-dependencies]
 solana-program-pack = "3"
+spl-token-interface = "=3.0.0"
