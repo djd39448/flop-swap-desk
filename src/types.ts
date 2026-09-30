@@ -6,6 +6,8 @@
 
 import type { LockTerms, OfferFrame, TranscriptFoldResult, TranscriptRecord } from "@flop-labs/tclk";
 
+import type { CustomRailRegistry } from "./rails/custom-rails.js";
+
 export type { LockTerms };
 
 /** `offer.job.proto` value that marks a tclk/1 offer as one leg of a swap. */
@@ -209,6 +211,9 @@ export interface SwapFoldInput {
   legB: readonly TranscriptRecord[];
   evidence?: SwapEvidence;
   nowMs: number;
+  /** SB3a: the caller-owned custom rail registry (never global) whose ids a leg's offer may name. Absent:
+   *  tclk's closed rail registry only, exactly as before. */
+  railRegistry?: CustomRailRegistry;
 }
 
 /** Policy knobs for SPEC §3.5; there is no safe universal default, so callers supply them. */
@@ -252,6 +257,9 @@ export interface BoardInput {
    *  than one active swap. */
   evidence?: ReadonlyMap<string, LegEvidence>;
   nowMs: number;
+  /** SB3a: the caller-owned custom rail registry (never global) whose ids a leg's offer may name. Absent:
+   *  tclk's closed rail registry only, exactly as before. */
+  railRegistry?: CustomRailRegistry;
 }
 
 /** One leg's rail evidence: the lock verdict plus the optional terminal-side observation. */

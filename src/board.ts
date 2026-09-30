@@ -265,12 +265,12 @@ export function buildBoard(input: BoardInput): Board {
     // tclk#194: `swapId` is not unique, so evidence is looked up by the two contract ids the
     // fold itself accepted for THIS pair, never by swapId. Fold once without evidence to learn
     // them; only when some evidence exists under those ids is the pair folded again with it.
-    const bare = foldSwap({ legA: legARecords, legB: legBRecords, nowMs: input.nowMs });
+    const bare = foldSwap({ legA: legARecords, legB: legBRecords, nowMs: input.nowMs, ...(input.railRegistry === undefined ? {} : { railRegistry: input.railRegistry }) });
     const evidence = pairEvidence(input.evidence, bare.legA?.state?.contract, bare.legB?.state?.contract);
     const view =
       evidence === undefined
         ? bare
-        : foldSwap({ legA: legARecords, legB: legBRecords, evidence, nowMs: input.nowMs });
+        : foldSwap({ legA: legARecords, legB: legBRecords, evidence, nowMs: input.nowMs, ...(input.railRegistry === undefined ? {} : { railRegistry: input.railRegistry }) });
     const sharedCount = swapIdCount.get(sameBuyerKey(legA)) ?? 0;
     if (sharedCount > 1) {
       view.reasons.push(

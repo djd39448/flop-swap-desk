@@ -367,7 +367,7 @@ export function foldSwap(input: SwapFoldInput): SwapView {
   view.swapId = legAClass.swapId;
   view.feeBps = legAClass.context.feeBps;
 
-  const legAOrientation = checkOrientation(legAOffer, legAClass.context);
+  const legAOrientation = checkOrientation(legAOffer, legAClass.context, input.railRegistry);
   if (!legAOrientation.ok) {
     reasons.push(legAOrientation.reason);
     view.status = "orientation-unsupported";
@@ -429,7 +429,7 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     return view;
   }
 
-  const legBOrientation = checkOrientation(legBOffer, legBClass.context);
+  const legBOrientation = checkOrientation(legBOffer, legBClass.context, input.railRegistry);
   if (!legBOrientation.ok) {
     reasons.push(legBOrientation.reason);
     view.status = "orientation-unsupported";

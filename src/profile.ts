@@ -10,6 +10,8 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import type { OfferFrame } from "@flop-labs/tclk";
 import { normalizeRailId } from "@flop-labs/tclk";
 
+import { normalizeRailIdWith, type CustomRailRegistry } from "./rails/custom-rails.js";
+
 import {
   FEE_BPS_MAX,
   FEE_BPS_PATTERN,
@@ -135,9 +137,10 @@ export type OrientationVerdict =
 /**
  * SPEC §3.1 (decision D-01): leg A is Buyer-opened as `payer` with a non-FLOP asset; leg B is
  * Seller-opened as `payer` with asset FLOP and rail set containing `flop-htlc`. Any other
- * orientation would move the secret away from the FLOP seller and flip R10.2.
+ * orientation would move the secret away from the FLOP seller and flip R10.2. `railRegistry` (SB3a) is the
+ * caller's own custom rail registry, when it has one: leg A may name a custom rail such as the Solana leg's.
  */
-export function checkOrientation(offer: OfferFrame, context: SwapContext): OrientationVerdict {
+export function checkOrientation(offer: OfferFrame, context: SwapContext, railRegistry?: CustomRailRegistry): OrientationVerdict {
   if (offer.role !== "payer") {
     return { ok: false, reason: `leg ${context.leg} must be opened by its payer (got role ${offer.role})` };
   }
@@ -146,7 +149,9 @@ export function checkOrientation(offer: OfferFrame, context: SwapContext): Orien
   }
   let rails: string[];
   try {
-    rails = offer.rails.map(normalizeRailId);
+    // SB3a: a caller-owned custom rail registry (never global) admits its own ids; every other rail keeps
+    // tclk's closed check, so with no registry this is exactly `normalizeRailId`.
+    rails = offer.rails.map((rail) => normalizeRailIdWith(rail, railRegistry));
   } catch {
     return { ok: false, reason: "offer names an unregistered rail" };
   }
