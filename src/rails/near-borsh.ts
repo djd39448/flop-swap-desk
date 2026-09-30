@@ -141,12 +141,19 @@ function writeSignature(w: BorshWriter, sig: Ed25519Signature): void {
  * access keys after setup finishes (`tests-near/helpers/sandbox.ts`) — never used by the rail
  * itself (`near-htlc.ts` never deletes a key), only by the test harness driving the sandbox.
  */
+/** An access key's permission. `"FullAccess"` is what this build's own accounts use; the
+ *  function-call form exists so a test can give an account a key that must NOT prove control of it
+ *  (P7: a NEP-413 proof by such a key is refused). */
+export type NearKeyPermission =
+  | "FullAccess"
+  | { functionCall: { allowance: bigint | null; receiverId: string; methodNames: readonly string[] } };
+
 export type NearAction =
   | { type: "CreateAccount" }
   | { type: "DeployContract"; code: Uint8Array }
   | { type: "FunctionCall"; methodName: string; args: Uint8Array; gas: bigint; deposit: bigint }
   | { type: "Transfer"; deposit: bigint }
-  | { type: "AddKey"; publicKey: Ed25519PublicKey; nonce: bigint; permission: "FullAccess" }
+  | { type: "AddKey"; publicKey: Ed25519PublicKey; nonce: bigint; permission: NearKeyPermission }
   | { type: "DeleteKey"; publicKey: Ed25519PublicKey };
 
 function writeAction(w: BorshWriter, action: NearAction): void {
@@ -173,8 +180,22 @@ function writeAction(w: BorshWriter, action: NearAction): void {
       w.writeU8(5);
       writePublicKey(w, action.publicKey);
       w.writeU64(action.nonce);
-      // AccessKeyPermission::FunctionCall = 0 (unused here), FullAccess = 1.
-      w.writeU8(1);
+      // AccessKeyPermission::FunctionCall = 0, FullAccess = 1.
+      if (action.permission === "FullAccess") {
+        w.writeU8(1);
+      } else {
+        const fc = action.permission.functionCall;
+        w.writeU8(0);
+        if (fc.allowance === null) {
+          w.writeU8(0);
+        } else {
+          w.writeU8(1);
+          w.writeU128(fc.allowance);
+        }
+        w.writeString(fc.receiverId);
+        w.writeU32(fc.methodNames.length);
+        for (const name of fc.methodNames) w.writeString(name);
+      }
       return;
     case "DeleteKey":
       w.writeU8(6);

@@ -380,8 +380,8 @@ export function formatPubkeyLine(input: {
 
 /**
  * The exact message the chain key must sign for a pubkey line (P7). The "account" the message
- * names is `<caip2>:<pubkey hex>`: the pubkey line names a key, not an address. (The Rails stage
- * verifier for `bip322` derives the P2WPKH address from that key itself.)
+ * names is `<caip2>:<pubkey hex>`: the pubkey line names a key, not an address. (The `bip322`
+ * verifier derives the P2WPKH address from that key itself.)
  */
 export function pubkeyProofMessage(input: {
   did: string;
@@ -606,6 +606,11 @@ export interface ResolveAccountsInput {
 export interface ResolvedAccounts {
   payer?: Address;
   payee?: Address;
+  /** The public key the party's proven line carries (NEAR's `nep413`), present only under a
+   *  `required` proof policy and only for a scheme that puts a key on the line. The NEAR evidence
+   *  reader must show it is a FullAccess key of the account at the finalized block. */
+  payerKey?: string;
+  payeeKey?: string;
   /** Every notable thing this resolution ignored or refused: a line for a different rail or
    *  chain, or conflicting lines from the same party. Empty when nothing did. */
   reasons: string[];
@@ -686,20 +691,26 @@ export function resolveAccounts(
       }
     }
 
+    // The address is the identity; a proof's public key (NEAR) is part of it under a required
+    // policy, so two lines naming one account with different keys are a conflict, never a pick.
+    const identity = input.proof.mode === "required" && parsed.proof?.publicKey !== undefined
+      ? `${parsed.address}\n${parsed.proof.publicKey}`
+      : parsed.address;
     const seen = addressesByDid.get(candidate.sender) ?? new Set<string>();
-    seen.add(parsed.address);
+    seen.add(identity);
     addressesByDid.set(candidate.sender, seen);
   }
 
-  function resolve(did: string, role: "payer" | "payee"): Address | undefined {
+  function resolve(did: string, role: "payer" | "payee"): { address: Address; key?: string } | undefined {
     const seen = addressesByDid.get(did);
     if (seen === undefined || seen.size === 0) return undefined;
     if (seen.size > 1) {
       reasons.push(`account-line: conflicting account lines for the ${role} (${did})`);
       return undefined;
     }
-    const [address] = seen;
-    return address as Address;
+    const [identity] = seen;
+    const [address, key] = identity!.split("\n");
+    return { address: address as Address, ...(key === undefined ? {} : { key }) };
   }
 
   const payer = resolve(input.payerDid, "payer");
@@ -707,7 +718,9 @@ export function resolveAccounts(
 
   return {
     reasons,
-    ...(payer === undefined ? {} : { payer }),
-    ...(payee === undefined ? {} : { payee }),
+    ...(payer === undefined ? {} : { payer: payer.address }),
+    ...(payee === undefined ? {} : { payee: payee.address }),
+    ...(payer?.key === undefined ? {} : { payerKey: payer.key }),
+    ...(payee?.key === undefined ? {} : { payeeKey: payee.key }),
   };
 }

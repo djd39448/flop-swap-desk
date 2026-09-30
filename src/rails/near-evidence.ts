@@ -127,6 +127,13 @@ export interface NearCapture {
 export interface NearAccounts {
   payee?: string;
   payer?: string;
+  /** P7: the public key (`ed25519:<base58>`) a party's proven `nep413` account line carries. When
+   *  set, the capture reads `view_access_key(account, key)` at the finalized block and
+   *  `nearEvidence` requires a FullAccess permission, else the leg does not verify (the proof
+   *  shows the key signed; only this read shows the key controls the account). Omitted for the
+   *  pre-proof fold, where nothing is checked. */
+  payeeKey?: string;
+  payerKey?: string;
 }
 
 export interface NearEvidenceInput {
@@ -476,6 +483,57 @@ function contractPinReason(
   return null;
 }
 
+/** P7: for each party whose proven line carries a public key, the capture's `view_access_key`
+ *  read for (account, key) must be bound to this capture at the finalized block, must target
+ *  exactly that account and key, and must show a FullAccess key (a function-call key, or a key the
+ *  account does not hold, never proves control of the account). `null` when every supplied key
+ *  passes (or none was supplied); otherwise the reason. */
+function accountKeyReason(
+  capture: NearCapture,
+  exchanges: readonly NearCaptureIndexExchange[],
+  accounts: NearAccounts,
+  block: { hash: string },
+): string | null {
+  const wanted: Array<{ role: string; account: string | undefined; key: string }> = [];
+  if (accounts.payeeKey !== undefined) wanted.push({ role: "payee", account: accounts.payee, key: accounts.payeeKey });
+  if (accounts.payerKey !== undefined) wanted.push({ role: "payer", account: accounts.payer, key: accounts.payerKey });
+  for (const { role, account, key } of wanted) {
+    if (account === undefined) return `near-htlc: the ${role}'s account line carries a key but no account (P7)`;
+    let found = false;
+    for (let i = 0; i < exchanges.length; i += 1) {
+      const candidate = exchangeAt(exchanges, i, "query");
+      if (candidate === null) continue;
+      const bound = bindExchange(capture, candidate, `view_access_key(${role})`);
+      if (bound.kind === "missing") continue;
+      const params = requestParamsObject(bound.request);
+      if (params === null || params.request_type !== "view_access_key") continue;
+      if (params.account_id !== account || params.public_key !== key) continue;
+      if (params.block_id !== block.hash) {
+        return `near-htlc: the ${role}'s view_access_key read is not at the finalized block (tampered, P7)`;
+      }
+      found = true;
+      if (bound.outcome.kind === "error") {
+        return `near-htlc: key ${key} is not an access key of the ${role} account "${account}" (P7)`;
+      }
+      const v = bound.outcome.value;
+      if (v === null || typeof v !== "object") return `near-htlc: malformed view_access_key result for the ${role} (P7)`;
+      const result = v as { error?: unknown; permission?: unknown; block_hash?: unknown };
+      if (typeof result.error === "string") {
+        return `near-htlc: key ${key} is not an access key of the ${role} account "${account}" (P7)`;
+      }
+      if (result.block_hash !== block.hash) {
+        return `near-htlc: the ${role}'s view_access_key result is not at the finalized block (P7)`;
+      }
+      if (result.permission !== "FullAccess") {
+        return `near-htlc: key ${key} is not a FullAccess key of the ${role} account "${account}" (P7)`;
+      }
+      break;
+    }
+    if (!found) return `missing/tampered capture: no view_access_key read for the ${role} account and key (P7)`;
+  }
+  return null;
+}
+
 // ── the pure decoder ─────────────────────────────────────────────────────────────────────────
 
 /**
@@ -629,6 +687,10 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
   // reviewed code, so this comes before any verdict.
   const pinReason = contractPinReason(capture, exchanges, capturedConfig, block);
   if (pinReason !== null) return { lock: { ...baseAtFinalizedView, railVerified: null, reason: pinReason } };
+
+  // P7: a proven account line's key must be a FullAccess key of that account at this same block.
+  const keyReason = accountKeyReason(capture, exchanges, accounts, block);
+  if (keyReason !== null) return { lock: { ...baseAtFinalizedView, railVerified: null, reason: keyReason } };
 
   // D-N10: Claiming/Refunding are transitional contract states — never a final RailObservation.
   if (lockView.status === "Claiming" || lockView.status === "Refunding") {
@@ -875,6 +937,28 @@ export async function captureNearLeg(
         });
       } catch (error) {
         // E2: same rule as the get_lock read above.
+        if (!(error instanceof RpcCaptureError)) {
+          return finish(error instanceof Error ? error.message : String(error));
+        }
+      }
+    }
+
+    // P7: a proven line's key must be shown to be a full-access key of its account, at the same
+    // finalized block as every read above.
+    const keyReads: Array<{ account: string | undefined; key: string | undefined }> = [
+      { account: accounts.payee, key: accounts.payeeKey },
+      { account: accounts.payer, key: accounts.payerKey },
+    ];
+    for (const { account, key } of keyReads) {
+      if (account === undefined || key === undefined) continue;
+      try {
+        await rpc.request({
+          method: "query",
+          params: { request_type: "view_access_key", account_id: account, public_key: key, block_id: block.hash },
+        });
+      } catch (error) {
+        // An unknown key is a JSON-RPC-level error reply: a completed read (`nearEvidence` refuses
+        // the leg on it). Anything else is a transport failure and sets `index.error`.
         if (!(error instanceof RpcCaptureError)) {
           return finish(error instanceof Error ? error.message : String(error));
         }

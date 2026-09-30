@@ -10,10 +10,10 @@
 //   field   := proof <scheme>:<signature>[ <key>]          (the trailing part of a line)
 //
 // This file is the shared core only: the message builder, the proof-field grammar, the verifier
-// interface (one verifier per scheme, pluggable) and two verifiers that need nothing but a
+// interface (one verifier per scheme, pluggable) and the two verifiers that need nothing but a
 // library call: `eip191` (EVM) and `ed25519` (Solana, and the signature step of NEAR's nep413).
-// `bip322` and `nep413` are deliberately NOT registered here: they plug into the same interface
-// in the Rails stage, and until they do, a line using them is unresolved (fail closed).
+// `bip322` (btc-proof.ts) and `nep413` (near-proof.ts) plug into the same interface and are
+// registered in `DEFAULT_PROOF_VERIFIERS` below.
 //
 // Verifiers are synchronous because every resolver (`resolveAccounts`, `resolvePubkeys`,
 // `foldCaptured`, the watcher) is a synchronous fold. `eip191` therefore recovers the signer
@@ -27,6 +27,9 @@ import { base58 } from "@scure/base";
 import { hashMessage } from "viem";
 import { publicKeyToAddress } from "viem/utils";
 import { normalizeRailId } from "@flop-labs/tclk";
+
+import { bip322Verifier } from "./btc-proof.js";
+import { nep413Verifier } from "./near-proof.js";
 
 export const ACCOUNT_PROOF_MESSAGE_PREFIX = "FLOP::swap::account-proof::v1";
 
@@ -212,9 +215,13 @@ export const ed25519Verifier: AccountProofVerifier = {
   },
 };
 
-/** The verifiers that exist in the shared core. `bip322` and `nep413` join in the Rails stage. */
+/** Every scheme this build verifies: `eip191` (EVM), `bip322` (`src/rails/btc-proof.ts`), `nep413`
+ *  (`src/rails/near-proof.ts`; the signature only, the key-on-account check is the NEAR evidence
+ *  reader's) and `ed25519` (Solana). */
 export const DEFAULT_PROOF_VERIFIERS: ProofVerifierRegistry = createProofVerifierRegistry([
   eip191Verifier,
+  bip322Verifier,
+  nep413Verifier,
   ed25519Verifier,
 ]);
 

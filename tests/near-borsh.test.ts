@@ -222,6 +222,27 @@ describe("action encoding shapes", () => {
     expect(tail[42]).toBe(1); // AccessKeyPermission::FullAccess
   });
 
+  it("AddKey (function call) writes permission tag 0x00, Option<u128> allowance, receiver_id and method_names", () => {
+    const publicKey: Ed25519PublicKey = { keyType: "ED25519", data: new Uint8Array(32).fill(9) };
+    const permission = { functionCall: { allowance: null, receiverId: "a.near", methodNames: ["m1", "x"] } } as const;
+    const bytes = encodeTransactionV0({ ...vector1Transaction(), actions: [{ type: "AddKey", publicKey, nonce: 0n, permission }] });
+    const expectedTail = Uint8Array.of(
+      0, // AccessKeyPermission::FunctionCall
+      0, // allowance: None
+      6, 0, 0, 0, ...new TextEncoder().encode("a.near"),
+      2, 0, 0, 0, // two method names
+      2, 0, 0, 0, ...new TextEncoder().encode("m1"),
+      1, 0, 0, 0, ...new TextEncoder().encode("x"),
+    );
+    expect(bytes.slice(-expectedTail.length)).toEqual(expectedTail);
+    const capped = encodeTransactionV0({
+      ...vector1Transaction(),
+      actions: [{ type: "AddKey", publicKey, nonce: 0n, permission: { functionCall: { allowance: 5n, receiverId: "a.near", methodNames: [] } } }],
+    });
+    const cappedTail = Uint8Array.of(0, 1, 5, ...new Uint8Array(15), 6, 0, 0, 0, ...new TextEncoder().encode("a.near"), 0, 0, 0, 0);
+    expect(capped.slice(-cappedTail.length)).toEqual(cappedTail);
+  });
+
   it("actions vec is u32-length-prefixed and preserves insertion order", () => {
     const tx: NearTransactionV0 = {
       ...vector1Transaction(),

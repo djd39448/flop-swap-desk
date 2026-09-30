@@ -1290,3 +1290,136 @@ describe("loadNearCapture", () => {
     expect(result.skipped).toEqual(["2026-09-29T00-01-00-000Z.json"]);
   });
 });
+
+// ── P7: a proven line's key must be a FullAccess key of its account, at the finalized block ────
+
+describe("nearEvidence -- P7: the proven line's key must be a FullAccess key of the account", () => {
+  const SELLER_KEY = `ed25519:${"1".repeat(44)}`;
+  const BUYER_KEY = `ed25519:${"2".repeat(44)}`;
+  const KEYED: NearAccounts = { ...ACCOUNTS, payeeKey: SELLER_KEY, payerKey: BUYER_KEY };
+
+  /** `view_access_key(account, key)` at the finalized block, positioned at `n` (ids are 1-based). */
+  function accessKeyExchange(opts: {
+    n: number;
+    account?: string;
+    key?: string;
+    blockId?: string;
+    permission?: unknown;
+    resultBlockHash?: string;
+    unknown?: "rpc-error" | "result-error";
+    malformed?: boolean;
+  }): ExchangeSpec {
+    const params = {
+      request_type: "view_access_key",
+      account_id: opts.account ?? SELLER_ACCOUNT,
+      public_key: opts.key ?? SELLER_KEY,
+      block_id: opts.blockId ?? BLOCK_HASH,
+    };
+    let body: string;
+    if (opts.unknown === "rpc-error") {
+      body = jsonRpcError(nearId(opts.n), -32000, "Server error");
+    } else if (opts.unknown === "result-error") {
+      body = jsonRpcResult(nearId(opts.n), { error: `access key ${opts.key ?? SELLER_KEY} does not exist while viewing`, block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH });
+    } else if (opts.malformed) {
+      body = jsonRpcResult(nearId(opts.n), "nope");
+    } else {
+      body = jsonRpcResult(nearId(opts.n), {
+        nonce: 0,
+        permission: opts.permission ?? "FullAccess",
+        block_height: BLOCK_HEIGHT,
+        block_hash: opts.resultBlockHash ?? BLOCK_HASH,
+      });
+    }
+    return { method: "query", params, body };
+  }
+
+  /** The standard six, then the payee's and the payer's key reads at positions 7 and 8. */
+  function keyed(payee: Parameters<typeof accessKeyExchange>[0] | false = { n: 7 }, payer: Parameters<typeof accessKeyExchange>[0] | false = { n: 8, account: BUYER_ACCOUNT, key: BUYER_KEY }): ExchangeSpec[] {
+    const specs = standardExchanges();
+    if (payee !== false) specs.push(accessKeyExchange(payee));
+    if (payer !== false) specs.push(accessKeyExchange(payer));
+    return specs;
+  }
+
+  it("FullAccess keys for both accounts at the finalized block -> verifies as before", () => {
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: KEYED, capture: buildCapture({ exchanges: keyed() }) });
+    expect(result.lock.railVerified).toBe(true);
+    expect(result.rail?.status).toBe("locked");
+  });
+
+  it("without any key in accounts nothing is checked (the pre-proof fold is unchanged)", () => {
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture: buildCapture({ exchanges: standardExchanges() }) });
+    expect(result.lock.railVerified).toBe(true);
+  });
+
+  it("a function-call key is refused", () => {
+    const capture = buildCapture({ exchanges: keyed({ n: 7, permission: { FunctionCall: { allowance: null, receiver_id: SELLER_ACCOUNT, method_names: [] } } }) });
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: KEYED, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toContain("not a FullAccess key");
+    expect(result.rail).toBeUndefined();
+  });
+
+  it("a key the account does not hold is refused (RPC error and result-error shapes)", () => {
+    for (const unknown of ["rpc-error", "result-error"] as const) {
+      const capture = buildCapture({ exchanges: keyed({ n: 7, unknown }) });
+      const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: KEYED, capture });
+      expect(result.lock.railVerified).toBeNull();
+      expect(result.lock.reason).toContain("is not an access key");
+      expect(result.rail).toBeUndefined();
+    }
+  });
+
+  it("a missing key read, a read for another account or key, a read at another block, or a wrong result block all fail closed", () => {
+    const cases: Array<[string, ExchangeSpec[], string]> = [
+      ["missing", keyed(false), "no view_access_key read for the payee"],
+      ["payer read missing", keyed({ n: 7 }, false), "no view_access_key read for the payer"],
+      ["another account", keyed({ n: 7, account: OTHER_ACCOUNT }), "no view_access_key read for the payee"],
+      ["another key", keyed({ n: 7, key: BUYER_KEY }), "no view_access_key read for the payee"],
+      ["another block", keyed({ n: 7, blockId: "5" + BLOCK_HASH.slice(1) }), "not at the finalized block"],
+      ["result at another block", keyed({ n: 7, resultBlockHash: "5" + BLOCK_HASH.slice(1) }), "not at the finalized block"],
+      ["malformed result", keyed({ n: 7, malformed: true }), "malformed view_access_key"],
+    ];
+    for (const [label, exchanges, reason] of cases) {
+      const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: KEYED, capture: buildCapture({ exchanges }) });
+      expect(result.lock.railVerified, label).toBeNull();
+      expect(result.lock.reason, label).toContain(reason);
+      expect(result.rail, label).toBeUndefined();
+    }
+  });
+
+  it("a key with no account is refused", () => {
+    const result = nearEvidence({ terms: TERMS, config: CONFIG, accounts: { payee: SELLER_ACCOUNT, payerKey: BUYER_KEY }, capture: buildCapture({ exchanges: keyed({ n: 7 }) }) });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toContain("carries a key but no account");
+  });
+
+  it("captureNearLeg reads view_access_key for each supplied key at the finalized block, and nearEvidence accepts it", async () => {
+    const nowMs = 1_700_000_900_000;
+    const fullAccess = { nonce: 0, permission: "FullAccess", block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH };
+    const results = [
+      { chain_id: PIN.chainId, protocol_version: 86, sync_info: {} },
+      { header: { height: BLOCK_HEIGHT, hash: BLOCK_HASH, timestamp_nanosec: TIMESTAMP_NS } },
+      { result: resultBytesOf(lockViewPayload()), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
+      { amount: "1000000000000000000000000", locked: "0", code_hash: HTLC_CODE_HASH, storage_usage: 200000, storage_paid_at: 0, block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
+      { keys: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
+      { result: resultBytesOf({ total: "1", available: "0" }), logs: [], block_height: BLOCK_HEIGHT, block_hash: BLOCK_HASH },
+      fullAccess,
+      fullAccess,
+    ];
+    const { fetch: fetchImpl, requests } = fakeFetch(results);
+    const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => nowMs });
+    const { index, exchanges } = await captureNearLeg(rpc, CONFIG, TERMS, KEYED, REF, nowMs);
+    expect(index.error).toBeUndefined();
+    expect(requests.slice(6).map((r) => r.params)).toEqual([
+      { request_type: "view_access_key", account_id: SELLER_ACCOUNT, public_key: SELLER_KEY, block_id: BLOCK_HASH },
+      { request_type: "view_access_key", account_id: BUYER_ACCOUNT, public_key: BUYER_KEY, block_id: BLOCK_HASH },
+    ]);
+    const bytes = new Map<string, Uint8Array>();
+    for (const exchange of exchanges) bytes.set(exchange.responseSha256, exchange.responseBytes);
+    expect(nearEvidence({ terms: TERMS, config: CONFIG, accounts: KEYED, capture: { index, bytes } }).lock.railVerified).toBe(true);
+    // The same capture replayed against a key the capture never read is refused.
+    const other = { ...KEYED, payeeKey: BUYER_KEY };
+    expect(nearEvidence({ terms: TERMS, config: CONFIG, accounts: other, capture: { index, bytes } }).lock.railVerified).toBeNull();
+  });
+});

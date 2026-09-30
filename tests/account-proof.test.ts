@@ -255,8 +255,8 @@ describe("ed25519 verifier (Solana-style address = key, and NEAR's signature ste
 });
 
 describe("the registry", () => {
-  it("holds eip191 and ed25519 only: bip322 and nep413 are Rails-stage plug-ins", () => {
-    expect([...DEFAULT_PROOF_VERIFIERS.keys()].sort()).toEqual(["ed25519", "eip191"]);
+  it("holds the four schemes this build verifies", () => {
+    expect([...DEFAULT_PROOF_VERIFIERS.keys()].sort()).toEqual(["bip322", "ed25519", "eip191", "nep413"]);
   });
   it("refuses a duplicate scheme", () => {
     expect(() => createProofVerifierRegistry([eip191Verifier, eip191Verifier])).toThrow();
@@ -447,16 +447,20 @@ describe("resolveAccounts with ed25519 (Solana-style, allowed explicitly)", () =
     expect(resolveAccounts([record(ROOM, 1, T0, buyer, nearLine(buyer.did, CONTRACT, "alice.testnet", otherPub))], input).payer).toBeUndefined();
   });
 
-  it("nep413 and bip322 lines are unresolved until their verifiers are plugged in", () => {
+  it("a nep413 line is unresolved when no nep413 verifier is registered, and when its signature is junk", () => {
     const l = formatAccountLine({
       railId: NEAR,
       caip2: NEAR_CAIP2,
       address: "alice.testnet",
       proof: { scheme: "nep413", signature: "abc", publicKey: "ed25519:abc" },
     });
-    const result = resolveAccounts([record(ROOM, 1, T0, buyer, l)], { ...input, proof: REQUIRED });
+    const bare = createProofVerifierRegistry([eip191Verifier, ed25519Verifier]);
+    const result = resolveAccounts([record(ROOM, 1, T0, buyer, l)], { ...input, proof: { mode: "required", verifiers: bare } });
     expect(result.payer).toBeUndefined();
     expect(result.reasons.join("\n")).toContain('no verifier for scheme "nep413"');
+    const junk = resolveAccounts([record(ROOM, 1, T0, buyer, l)], { ...input, proof: REQUIRED });
+    expect(junk.payer).toBeUndefined();
+    expect(junk.reasons.join("\n")).toContain("proof does not verify");
   });
 });
 
@@ -466,7 +470,7 @@ describe("resolvePubkeys under a required proof policy", () => {
   const pubkey = `02${"11".repeat(32)}`;
   const input = { contract: CONTRACT, payerDid: buyer.did, payeeDid: seller.did, rail: BTC, caip2: BTC_CAIP2, proof: REQUIRED };
 
-  it("a pubkey line without a proof, or with a bip322 proof but no bip322 verifier yet, is unresolved", () => {
+  it("a pubkey line without a proof, or with a bip322 proof that does not verify (or has no verifier), is unresolved", () => {
     const bare = formatPubkeyLine({ railId: BTC, caip2: BTC_CAIP2, pubkey });
     const r1 = resolvePubkeys([record(ROOM, 1, T0, buyer, bare)], input);
     expect(r1.payer).toBeUndefined();
@@ -474,7 +478,12 @@ describe("resolvePubkeys under a required proof policy", () => {
     const claimed = formatPubkeyLine({ railId: BTC, caip2: BTC_CAIP2, pubkey, proof: { scheme: "bip322", signature: "AAAA" } });
     const r2 = resolvePubkeys([record(ROOM, 1, T0, buyer, claimed)], input);
     expect(r2.payer).toBeUndefined();
-    expect(r2.reasons.join("\n")).toContain('no verifier for scheme "bip322"');
+    expect(r2.reasons.join("\n")).toContain("proof does not verify");
+    const r3 = resolvePubkeys([record(ROOM, 1, T0, buyer, claimed)], {
+      ...input,
+      proof: { mode: "required", verifiers: createProofVerifierRegistry([eip191Verifier]) },
+    });
+    expect(r3.reasons.join("\n")).toContain('no verifier for scheme "bip322"');
   });
 
   it("a plugged-in bip322-shaped verifier sees this DID, contract, rail and the key's message", () => {
