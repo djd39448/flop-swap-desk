@@ -95,6 +95,17 @@ per-finding rationale and the test that fails without each fix.
   deposit from their caller — anyone may call `claim` permissionlessly by design (the payee
   doesn't need a NEAR balance to be paid), and `refund` is restricted to the payer by account
   id instead.
+- **Hash-lock squatting is possible (H7, not fixed).** Locks are keyed by the hash lock alone.
+  Any holder of the configured token can lock 1 unit under a public hash lock first; the real
+  payer's own lock is then refused as a duplicate and returned in full. No funds move; the swap
+  ends with the other side refunding. The EVM rail has the same property. Keying locks by
+  (payer, hash lock) would close it but changes the contract API, the ref and the evidence, so it
+  is left as a decision.
+- **A revealed lock cannot be refunded (F4).** If the payee named in a lock never registers
+  storage on the token, a revealed lock can neither pay out nor be refunded; the payer's funds stay
+  in it. The payer keeps the preimage for the other leg.
+- **The token itself is not pinned by code hash.** The contract trusts one configured token
+  account id; that token's own code (upgradeable, in Circle's case) is outside this contract.
 - **Unaudited, testnet-only.** No formal audit; not intended for mainnet value.
 
 ## Gas and storage constants
