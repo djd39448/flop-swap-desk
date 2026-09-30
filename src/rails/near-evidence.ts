@@ -54,12 +54,12 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { hexToBytes } from "@noble/hashes/utils.js";
 
 import { checkNearRailConfig, NEAR_ASSET_ID, type NearRailConfig } from "./near-htlc.js";
+import { NEAR_HASH_LOCK_SHAPE, parseNearRef } from "./near-ref.js";
 import { readCapture, RpcCaptureError, type CapturingRpc, type Exchange } from "./rpc-capture.js";
 import type { LockEvidence, RailObservation } from "../types.js";
 
 export const NEAR_RAIL_ID = "near-htlc";
 
-const HASH_LOCK_SHAPE = /^0x[0-9a-f]{64}$/;
 /** NEAR's own base58 block-hash charset (Bitcoin/IPFS-style base58: no `0`, `O`, `I`, `l`) — a
  *  32-byte hash encodes to something in this length range depending on leading zero bytes;
  *  bounded loosely rather than to one exact length. */
@@ -67,11 +67,13 @@ const BLOCK_HASH_SHAPE = /^[1-9A-HJ-NP-Za-km-z]{20,44}$/;
 const SHA256_HEX_LOWER = /^[0-9a-f]{64}$/;
 
 /** Hoisted so it can run before any network call — mirrors `hashLockRefMismatch`
- *  (evm-evidence.ts) / `btcLockRefInvalid` (btc-evidence.ts): `terms.lock` must be `"hash"`,
- *  `ref` must equal `terms.statement` (D-N4: the ref IS the hash lock, exactly like EVM), and
- *  both must be a well-formed sha256 hash-lock shape. */
+ *  (evm-evidence.ts) / `btcLockRefInvalid` (btc-evidence.ts): `terms.lock` must be `"hash"`, and
+ *  `ref` must parse as `0x<hash lock>:<payer>` (near-ref.ts; squatting fix, replacing D-N4's
+ *  "the ref IS the hash lock") with its hash-lock part equal to `terms.statement`. */
 export function nearLockRefInvalid(terms: LockTerms, ref: string): boolean {
-  return terms.lock !== "hash" || !HASH_LOCK_SHAPE.test(ref) || ref !== terms.statement;
+  if (terms.lock !== "hash") return true;
+  const parsed = parseNearRef(ref);
+  return parsed === null || parsed.hashLock !== terms.statement;
 }
 
 /** One captured exchange as it sits in the index file — mirrors `EvmCaptureIndexExchange`/
@@ -84,9 +86,9 @@ export interface NearCaptureIndexExchange {
   atMs: number;
 }
 
-/** `raw/near/<hashLock>/<iso-stamp>.json` (D-N10) — `hashLock` is already filename-safe (`0x` +
- *  hex, no `:`), so unlike Bitcoin's `<txid>-<vout>` rewrite this uses the ref as-is, exactly
- *  like EVM's `raw/evm/<hashLock>/`. */
+/** One capture's index file (D-N10, E1): stored under `raw/near/<hashLock>/<legContract>/`; `ref`
+ *  is the full `0x<hash lock>:<payer>` ref (the directory carries only the hash-lock part, which
+ *  is filename-safe, so the payer never reaches a path). */
 export interface NearCaptureIndex {
   v: 1;
   rail: "near-htlc";
@@ -388,6 +390,8 @@ function preimageOpensHashLock(preimageHex0x: string, hashLockHex: string): bool
 }
 
 function firstFieldMismatch(args: {
+  /** The payer named by the ref (squatting fix): the on-chain payer must be exactly this account. */
+  refPayer: string;
   onChainPayee: string;
   onChainPayer: string;
   onChainToken: string;
@@ -399,7 +403,8 @@ function firstFieldMismatch(args: {
   token: string;
   terms: LockTerms;
 }): string | null {
-  const { onChainPayee, onChainPayer, onChainToken, onChainAmount, onChainClaimByMs, onChainRefundAfterMs, payee, payer, token, terms } = args;
+  const { refPayer, onChainPayee, onChainPayer, onChainToken, onChainAmount, onChainClaimByMs, onChainRefundAfterMs, payee, payer, token, terms } = args;
+  if (onChainPayer !== refPayer) return "near-htlc: on-chain payer differs from the payer named by the ref";
   if (onChainPayee !== payee) return "near-htlc: on-chain payee differs from the payee account line";
   if (onChainToken !== token) return "near-htlc: on-chain token differs from the configured USDC asset";
   if (!amountsEqual(onChainAmount, terms.amount)) return "near-htlc: on-chain amount differs from terms";
@@ -517,6 +522,8 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
   if (block === null) return { lock: { ...base2, railVerified: null, reason: "near-htlc: malformed block result" } };
 
   // Position 2: query call_function get_lock, pinned to the final block's own hash.
+  const refParts = parseNearRef(capture.index.ref);
+  if (refParts === null) return { lock: { ...base2, railVerified: false, reason: "near-htlc: ref is not 0x<hash lock>:<payer>" } };
   const lockBound = bindExchange(capture, exchangeAt(exchanges, 2, "query"), "get_lock");
   if (lockBound.kind === "missing") return { lock: { ...base2, railVerified: null, reason: lockBound.reason } };
   const lockParams = requestParamsObject(lockBound.request);
@@ -528,7 +535,12 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
     lockParams.method_name !== "get_lock" ||
     lockParams.block_id !== block.hash ||
     lockArgs === null ||
-    lockArgs.hash_lock !== capture.index.ref.slice(2)
+    // Squatting fix: the read must BIND to the ref's own pair — exactly `{hash_lock, payer}`, both
+    // equal to the ref's parts. A read of another payer's lock (a squatter's) under the same
+    // hash lock never verifies this leg.
+    Object.keys(lockArgs).length !== 2 ||
+    lockArgs.hash_lock !== refParts.hashLock.slice(2) ||
+    lockArgs.payer !== refParts.payer
   ) {
     return { lock: { ...base2, railVerified: null, reason: "near-htlc: the get_lock read does not target this lock at the finalized block (tampered)" } };
   }
@@ -565,6 +577,7 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
   }
   const token = config.assets.USDC;
   const mismatch = firstFieldMismatch({
+    refPayer: refParts.payer,
     onChainPayee: lockView.payee,
     onChainPayer: lockView.payer,
     onChainToken: lockView.token,
@@ -591,7 +604,7 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
     // refund is refused by the contract from this point on, H2) — it is its own outcome, with no
     // `RailObservation` attached at all (the fold shows "revealed" once the preimage itself
     // reaches a frame, never fabricated here from a status enum alone).
-    if (lockView.preimage !== null && preimageOpensHashLock(lockView.preimage, capture.index.ref.slice(2))) {
+    if (lockView.preimage !== null && preimageOpensHashLock(lockView.preimage, refParts.hashLock.slice(2))) {
       return {
         lock: {
           ...baseAtFinalizedView,
@@ -716,7 +729,9 @@ export async function captureNearLeg(
   if (nearLockRefInvalid(terms, ref)) {
     return { index: buildIndex(config, ref, nowMs, nonce, []), exchanges: [] };
   }
-  const hashLockHex = ref.slice(2);
+  const refParts = parseNearRef(ref);
+  if (refParts === null) return { index: buildIndex(config, ref, nowMs, nonce, []), exchanges: [] };
+  const hashLockHex = refParts.hashLock.slice(2);
 
   const before = rpc.exchanges().length;
   const finish = (error?: string) => {
@@ -742,7 +757,7 @@ export async function captureNearLeg(
     }
     if (block === null) return finish();
 
-    const lockArgsBase64 = Buffer.from(new TextEncoder().encode(JSON.stringify({ hash_lock: hashLockHex }))).toString("base64");
+    const lockArgsBase64 = Buffer.from(new TextEncoder().encode(JSON.stringify({ hash_lock: hashLockHex, payer: refParts.payer }))).toString("base64");
     try {
       await rpc.request({
         method: "query",
@@ -796,11 +811,17 @@ function isCaptureIndexCandidate(name: string): boolean {
   return name.endsWith(".json") && !name.includes(".tmp-");
 }
 
-function looksLikeCaptureIndexFile(value: unknown, ref: string): value is NearCaptureIndex {
+/** `want` is either a full ref (the index's own ref must equal it) or a bare hash lock (the
+ *  directory key an auditor walking `raw/near/` knows: the index's ref must be a valid ref whose
+ *  hash-lock part equals it; the caller then compares the ref itself against the accepted lock
+ *  frame's). */
+function looksLikeCaptureIndexFile(value: unknown, want: string): value is NearCaptureIndex {
   if (value === null || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   if (v.v !== 1 || v.rail !== "near-htlc") return false;
-  if (typeof v.ref !== "string" || v.ref !== ref || !HASH_LOCK_SHAPE.test(v.ref)) return false;
+  const indexRef = parseNearRef(v.ref);
+  if (indexRef === null) return false;
+  if (parseNearRef(want) !== null ? v.ref !== want : indexRef.hashLock !== want) return false;
   if (typeof v.nonce !== "string" || v.nonce.length === 0) return false;
   if (!Array.isArray(v.exchanges)) return false;
   for (const exchange of v.exchanges) {
@@ -855,12 +876,15 @@ export interface LoadNearCaptureResult {
  * read/parse/validate, the leg fails closed (`capture: null`) — it never falls back to an older
  * capture.
  */
-export async function loadNearCapture(root: string, ref: string, legContract: string): Promise<LoadNearCaptureResult> {
+export async function loadNearCapture(root: string, ref: string /* a full ref or a bare hash lock */, legContract: string): Promise<LoadNearCaptureResult> {
   // A malformed legContract can never resolve to real evidence and must never be allowed to walk
   // this out of `root` (the same discipline `readCapture`'s own SHA256_HEX guard applies) —
   // refused before ever touching the filesystem.
   if (!LEG_CONTRACT_SHAPE.test(legContract)) return { capture: null, skipped: [] };
-  const dir = nearCaptureDir(root, ref, legContract);
+  const wantParts = parseNearRef(ref);
+  const hashLockKey = wantParts === null ? ref : wantParts.hashLock;
+  if (!NEAR_HASH_LOCK_SHAPE.test(hashLockKey)) return { capture: null, skipped: [] };
+  const dir = nearCaptureDir(root, hashLockKey, legContract);
   let allEntries: string[];
   try {
     allEntries = await readdir(dir);
