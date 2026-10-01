@@ -220,6 +220,9 @@ function settlementViewForLeg(evidence: LockEvidence | undefined, rail: RailObse
   return "unverified";
 }
 
+/** R3-9: the reason the fold pushes when leg A is refunded after leg B was claimed. */
+export const LEG_A_REFUNDED_AFTER_B_CLAIMED = "leg A refunded after leg B was claimed: the Seller received neither leg";
+
 /** P5-NEAR-FIXES.md E3 + P5-NEAR-FIXES-R2.md V4: a leg's own `refund` frame never folds a chain
  *  leg to `refunded`/`refunded-a`/`refunded-b` on its own. For a leg whose accepted rail is a chain
  *  rail (anything but `paper`), `refunded` requires a bound rail observation that is `refunded`
@@ -503,6 +506,12 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     return view;
   }
   if (refundedA) {
+    // R3-9: leg A refunded although leg B was claimed (tclk state, or a bound final observation of leg B's own rail):
+    // the Seller received neither leg. That is a theft of the Seller's payout, not an ordinary refund; the distinct
+    // reason lets a reputation reader tell the two apart (this repo has no reputation emitter of its own).
+    if (legBState.status === "claimed" || (evidence.bRail?.status === "claimed" && evidence.bRail.final === true)) {
+      reasons.push(LEG_A_REFUNDED_AFTER_B_CLAIMED);
+    }
     view.status = "refunded-a";
     return view;
   }

@@ -109,6 +109,7 @@ import type { Exchange } from "../rails/rpc-capture.js";
 import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
 import { offerAcceptLockTerms } from "../swap.js";
 import { belowMinLockable, type ConnectedCounterAssetRail, type CounterAssetRail, type RailAccounts, type RailClaimRecord, type RailWriteEvidence } from "./counter-rail.js";
+import { chainClockProblem } from "./policy.js";
 import type { Signer, Venue } from "./venue.js";
 
 export interface SellerFlowOptions {
@@ -359,6 +360,13 @@ export class SellerFlow {
         `seller: refusing to accept leg A — ${offerA.amount} ${offerA.asset} is below this rail's minimum lockable amount ` +
           `${this.rail.minLockableAmount} (G6)`,
       );
+    }
+
+    // R3-7 (Solana only): refuse while the chain's finalized clock and the local clock disagree by more than the named
+    // bound (a rail without `chainClockMs` is never checked).
+    if (this.rail.chainClockMs !== undefined) {
+      const problem = chainClockProblem(await this.rail.chainClockMs(), this.clock(), this.rail.maxChainClockSkewMs);
+      if (problem !== null) throw new Error(`seller: refusing to accept leg A - ${problem}`);
     }
 
     const inclusionWindowMs = offerA.refundAfterMs - offerA.claimByMs;
@@ -862,9 +870,8 @@ export class SellerFlow {
         }
         // SOL-C4/C5: the secret is public on chain and the claim could not be completed: the reveal frame is owed
         // (it must land before refundAfterMs, G6), posted best-effort so a failing post never hides the real error.
-        if (isSol && this.publicClaimSignature !== undefined && options?.skipReveal !== true) {
-          await this.tryPostRevealForRetry(acceptA.contract, railRef, offerA.refundAfterMs);
-        }
+        // R3-10: no longer on Solana. A reveal frame is posted only once the escrow reads Claimed (consistent with
+        // the Buyer's rule): a claim that landed and failed pays nobody, so nothing is revealed for it here.
         // P5-NEAR-FIXES.md G1 (the flow-side twin of the adapter's own H1): a write's own
         // chain-level failure is never silently treated as success. `NearPayoutFailedError` means
         // the claim call itself ran and revealed the preimage on chain (the contract's own F4
@@ -937,16 +944,6 @@ export class SellerFlow {
       if (recovery.outcome === "failed-public" && this.publicClaimSignature === undefined) this.publicClaimSignature = record.signature;
     }
     return null;
-  }
-
-  /** SOL-C4/C5: post the reveal, but let a `RevealNotPostedError` pass (the secret is already public and the retry
-   *  claim is what pays the Seller); the post after a landed claim raises it if it is still missing. */
-  private async tryPostRevealForRetry(contract: string, ref: string, refundAfterMs: number): Promise<void> {
-    try {
-      await this.postRevealLatched(contract, ref, refundAfterMs, "the secret is public on chain");
-    } catch (error) {
-      if (!(error instanceof RevealNotPostedError)) throw error;
-    }
   }
 
   /** G6: post the leg-A reveal once per (contract, ref); retried a bounded number of times, then

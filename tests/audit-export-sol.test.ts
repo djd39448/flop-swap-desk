@@ -24,11 +24,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { dealRoom, OFFER_ROOM, paperNote, tryDecodeFrame, type AcceptFrame, type TranscriptRecord } from "@flop-labs/tclk";
+import { dealRoom, encodeFrame, OFFER_ROOM, PaperRail, paperNote, tryDecodeFrame, type AcceptFrame, type TranscriptRecord } from "@flop-labs/tclk";
 
 import { buildBoard } from "../src/board.js";
 import { writeBundle } from "../src/client/bundle.js";
+import { encodeFrameWith } from "../src/rails/custom-frames.js";
 import { SOL_RAIL_ID } from "../src/rails/custom-rails.js";
+import { LEG_A_REFUNDED_AFTER_B_CLAIMED } from "../src/swap.js";
 import { SOL_LOCAL_PIN } from "../src/rails/sol-htlc.js";
 import { solCaptureKey } from "../src/rails/sol-evidence.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
@@ -55,7 +57,7 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-type Kind = "locked" | "claimed" | "settled" | "refunded";
+type Kind = "locked" | "claimed" | "settled" | "refunded" | "stolen";
 type Swap = { swapId: string; status: string; settlementView: { a: string; b: string }; reasons: string[]; evidence: Record<string, any>; finalizedRefs: string[] };
 
 interface Built {
@@ -86,6 +88,18 @@ async function buildBundle(
   if (kind === "claimed" || kind === "settled") {
     await h.sellerFlow.claimLegA(p.statement);
     if (kind === "settled") await h.buyerFlow.claimLegB(await h.buyerFlow.learnSecret());
+  }
+  if (kind === "stolen") {
+    // R3-9: a third party claims leg B with the public secret, then leg A is refunded anyway (the flow's own guard
+    // refuses that, so the refund is made on the rail directly and its frames are posted as the Buyer would).
+    const legBContractStolen = (tryDecodeFrame(p.acceptBRecord.line) as AcceptFrame).contract;
+    await new PaperRail(h.noteStore, h.clock).claim(legBContractStolen, (h.sellerFlow as unknown as { hashLock: { preimage: string } }).hashLock.preimage);
+    h.setTime(p.offerA.refundAfterMs);
+    const connected = await h.buyerRail.connect(offerAcceptLockTerms(p.offerA, p.acceptA), { payer: h.buyerWallet.publicKey, payee: h.sellerWallet.publicKey });
+    await connected.refund(p.ref);
+    const roomStolen = dealRoom(p.acceptA.contract);
+    await h.venue.post(roomStolen, encodeFrame({ type: "refund", from: h.buyer.did, contract: p.acceptA.contract, ref: p.ref }), h.buyer);
+    await h.venue.post(roomStolen, encodeFrameWith({ type: "receipt", from: h.buyer.did, contract: p.acceptA.contract, outcome: "refunded", rail: SOL_RAIL_ID, ref: p.ref }, h.buyerRail.railRegistry), h.buyer);
   }
   if (kind === "refunded") {
     h.setTime(p.offerA.refundAfterMs);
@@ -182,6 +196,22 @@ describe("writeBundle with a Solana capture, replayed by examples/audit-export.m
       expect(swap2.settlementView.a).toBe("refunded");
       expect(swap2.evidence.aRail).toMatchObject({ status: "refunded", final: true });
       expect(swap2.status).toMatch(/refunded/);
+    } finally {
+      await rm(dir2, { recursive: true, force: true });
+    }
+  });
+
+  it("R3-9: leg A refunded after leg B was claimed folds to refunded-a with the distinct reason; an ordinary refund does not carry it", async () => {
+    const stolen = await buildBundle(root, "stolen");
+    const swap = swapOf(replay(root), stolen.swapId);
+    expect(swap.status).toBe("refunded-a");
+    expect(swap.reasons).toContain(LEG_A_REFUNDED_AFTER_B_CLAIMED);
+    expect(LEG_A_REFUNDED_AFTER_B_CLAIMED).toBe("leg A refunded after leg B was claimed: the Seller received neither leg");
+
+    const dir2 = await mkdtemp(join(tmpdir(), "sol-audit-ordinary-refund-"));
+    try {
+      const refunded = await buildBundle(dir2, "refunded");
+      expect(swapOf(replay(dir2), refunded.swapId).reasons).not.toContain(LEG_A_REFUNDED_AFTER_B_CLAIMED);
     } finally {
       await rm(dir2, { recursive: true, force: true });
     }

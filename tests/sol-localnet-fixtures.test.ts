@@ -186,9 +186,16 @@ describe("examples/audit-export.mjs - committed solana-localnet client-flow fixt
   const BASE58_TOKEN = /[1-9A-HJ-NP-Za-km-z]{38,95}/g;
   // A base64 run long enough to hold 64 bytes (88 chars with padding; 86 without).
   const BASE64_TOKEN = /[A-Za-z0-9+/]{86,88}(?:==)?/g;
-  const HEX32_TOKEN = /\b[0-9a-fA-F]{64}\b/g;
+  // R3-12: hex boundaries are lookarounds on the hex digits themselves, not a word boundary: a word boundary finds
+  // none between the `x` of a `0x` prefix (or an `_`) and the first digit, so a `0x`-prefixed seed slipped through.
+  const HEX32_TOKEN = /(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])/g;
   // A 128-hex token: the keypair (seed then public key) written as hex.
-  const HEX64_TOKEN = /\b[0-9a-fA-F]{128}\b/g;
+  const HEX64_TOKEN = /(?<![0-9a-fA-F])[0-9a-fA-F]{128}(?![0-9a-fA-F])/g;
+  // R3-12: the base64url twins (alphabet `-` and `_` in place of `+` and `/`, usually unpadded) of the three base64
+  // patterns above; decoded by mapping the two characters back.
+  const BASE64URL_TOKEN = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{86,88}(?:==)?(?![A-Za-z0-9_=-])/g;
+  const BASE64URL_32_TOKEN = /(?<![A-Za-z0-9_=-])[A-Za-z0-9_-]{43}=?(?![A-Za-z0-9_=-])/g;
+  const BASE64URL_RUN = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43,}={0,2}/g;
   // A bare 32-byte value in base64: 43 characters, or 44 with its one `=` (a seed or a public key).
   const BASE64_32_TOKEN = /(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{43}=?(?![A-Za-z0-9+/=])/g;
   // Any base64 run that can hold at least a 32-byte value: account data and signed transactions live in these.
@@ -223,6 +230,11 @@ describe("examples/audit-export.mjs - committed solana-localnet client-flow fixt
     }
   }
 
+  /** base64url decoded by mapping its two characters back to the standard alphabet. */
+  function tryBase64Url(token: string): Uint8Array | null {
+    return tryBase64(token.replace(/-/g, "+").replace(/_/g, "/"));
+  }
+
   function derive(seed: Uint8Array): Uint8Array | null {
     if (seed.length !== 32) return null;
     try {
@@ -252,6 +264,11 @@ describe("examples/audit-export.mjs - committed solana-localnet client-flow fixt
       }
       for (const m of text.matchAll(BASE64_RUN)) {
         const decoded = tryBase64(m[0]);
+        if (decoded === null) continue;
+        for (let offset = 0; offset + 32 <= decoded.length; offset += 1) known.add(bytesToHex(decoded.subarray(offset, offset + 32)));
+      }
+      for (const m of text.matchAll(BASE64URL_RUN)) {
+        const decoded = tryBase64Url(m[0]);
         if (decoded === null) continue;
         for (let offset = 0; offset + 32 <= decoded.length; offset += 1) known.add(bytesToHex(decoded.subarray(offset, offset + 32)));
       }
@@ -294,6 +311,18 @@ describe("examples/audit-export.mjs - committed solana-localnet client-flow fixt
       const decoded = tryBase64(m[0]);
       if (decoded !== null && decoded.length === 32 && seedDerivesKnownKey(decoded, knownPublicKeys)) {
         reasons.push(`a bare 32-byte base64 token derives a public key already present in this fixture: ${m[0].slice(0, 8)}...`);
+      }
+    }
+
+    for (const m of text.matchAll(BASE64URL_TOKEN)) {
+      const decoded = tryBase64Url(m[0]);
+      if (decoded !== null && isKeypair(decoded)) reasons.push(`a base64url token decodes to a keypair: ${m[0].slice(0, 8)}...`);
+    }
+
+    for (const m of text.matchAll(BASE64URL_32_TOKEN)) {
+      const decoded = tryBase64Url(m[0]);
+      if (decoded !== null && decoded.length === 32 && seedDerivesKnownKey(decoded, knownPublicKeys)) {
+        reasons.push(`a bare 32-byte base64url token derives a public key already present in this fixture: ${m[0].slice(0, 8)}...`);
       }
     }
 
@@ -444,6 +473,45 @@ describe("examples/audit-export.mjs - committed solana-localnet client-flow fixt
       (files, known) => {
         expect(known.has(bytesToHex(publicKey))).toBe(true);
         expect(flagged(files, known).map((f) => f.split(/[\\/]/).pop())).toEqual(["leak-b58.json", "leak-b64.json", "leak-hex.json"]);
+      },
+    );
+  });
+
+  const base64urlOf = (bytes: Uint8Array): string => base64.encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const leafName = (f: string): string | undefined => f.split(/[\\/]/).pop();
+
+  it("R3-12: flags a 0x-prefixed or underscore-joined hex seed and keypair, and a base64url seed and keypair", () => {
+    const { seed, publicKey, keypair } = keypairOf(251);
+    withScratchFixture(
+      (scratch) => {
+        writeFileSync(join(scratch, "raw", "rpc", "account.json"), JSON.stringify({ address: base58.encode(publicKey) }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak-0x-seed.json"), JSON.stringify({ x: "0x" + Buffer.from(seed).toString("hex") }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak-0x-keypair.json"), JSON.stringify({ x: "0x" + Buffer.from(keypair).toString("hex") }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak-underscore-seed.json"), JSON.stringify({ x: "key_" + Buffer.from(seed).toString("hex") }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak-url-seed.json"), JSON.stringify({ x: base64urlOf(seed) }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak-url-keypair.json"), JSON.stringify({ x: base64urlOf(keypair) }));
+      },
+      (files, known) => {
+        expect(
+          flagged(files, known)
+            .map(leafName)
+            .sort(),
+        ).toEqual(["leak-0x-keypair.json", "leak-0x-seed.json", "leak-underscore-seed.json", "leak-url-keypair.json", "leak-url-seed.json"]);
+      },
+    );
+  });
+
+  it("R3-12: a public key found only inside a base64url blob makes a base64url seed flaggable", () => {
+    const { seed, publicKey } = keypairOf(250);
+    const blob = Uint8Array.from([...new Uint8Array(41).fill(255), ...publicKey, ...new Uint8Array(50).fill(254)]);
+    withScratchFixture(
+      (scratch) => {
+        writeFileSync(join(scratch, "raw", "rpc", "account-data.json"), JSON.stringify({ data: base64urlOf(blob) }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak.json"), JSON.stringify({ x: base64urlOf(seed) }));
+      },
+      (files, known) => {
+        expect(known.has(bytesToHex(publicKey))).toBe(true);
+        expect(flagged(files, known).map(leafName)).toEqual(["leak.json"]);
       },
     );
   });

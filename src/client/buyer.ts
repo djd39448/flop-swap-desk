@@ -80,6 +80,7 @@ import { SOL_RAIL_ID } from "../rails/custom-rails.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { offerAcceptLockTerms } from "../swap.js";
 import { belowMinLockable, type CounterAssetRail, type RailAccounts, type RailBlockMarker, type RailWriteEvidence } from "./counter-rail.js";
+import { chainClockProblem } from "./policy.js";
 import type { Signer, Venue } from "./venue.js";
 
 export interface BuyerFlowOptions {
@@ -105,6 +106,14 @@ export interface BidParams {
   claimByMs: number;
   refundAfterMs: number;
   expiresMs: number;
+}
+
+/** R3-6: leg B was claimed by someone while leg A is still locked: leg A is owed to the Seller. */
+export class LegBClaimedError extends Error {
+  constructor() {
+    super("buyer: refusing to refund leg A - leg B was claimed with the public secret; leg A is owed to the Seller; settle by hand (R3-6)");
+    this.name = "LegBClaimedError";
+  }
 }
 
 /**
@@ -491,6 +500,14 @@ export class BuyerFlow {
 
     const connected = await this.rail.connect(termsA, accounts);
 
+    // R3-7 (Solana only): refuse to lock while the chain's finalized clock and the local clock disagree by more than the
+    // named bound. Known limit: the Buyer's protection on Solana is legB.refundAfterMs - legA.refundAfterMs; a halt or a
+    // clock lag longer than that is not covered.
+    if (this.rail.railId === SOL_RAIL_ID) {
+      const problem = chainClockProblem(await connected.chainTimeMs(), this.clock(), this.rail.maxChainClockSkewMs);
+      if (problem !== null) throw new Error(`buyer: refusing to lock leg A - ${problem}`);
+    }
+
     const fromBlock = await connected.currentBlockMarker();
 
     // G3 (client half of H2): build (and, for a rail that needs one, sign) the lock transaction
@@ -750,6 +767,14 @@ export class BuyerFlow {
     if (this.legBClaimed) {
       throw new Error("buyer: refusing to refund leg A — this flow already claimed leg B");
     }
+    // R3-6 (Solana): leg B's own record is read first. If anyone claimed leg B (the secret is public, so a third party
+    // can), leg A is owed to the Seller: a refund would leave the Seller with neither leg. Refuse with a distinct error.
+    // Known limit: after refund_after only a refund can move leg A, so a person must pay the Seller by hand.
+    if (this.rail.railId === SOL_RAIL_ID) {
+      const { acceptB } = this.requirePaired();
+      const legBRecord = await this.paperRail.read(acceptB.contract);
+      if (legBRecord !== null && legBRecord.status === "claimed") throw new LegBClaimedError();
+    }
     // On Solana (S2-1) `checkPendingClaim` reads only the escrow's own state at finalized (Claimed and its stored
     // preimage): no history scan, so nothing anyone can pad. A leak by a FAILED claim is not a payment and does not
     // stop the refund: the Buyer never claims leg B on it.
@@ -780,6 +805,13 @@ export class BuyerFlow {
         const priorEvidence = await connected.verifyLockFinal(termsA, railRef, this.lockedAccounts);
         if (priorEvidence.rail?.status === "refunded" && priorEvidence.rail.final) {
           this.legARefundEvidence = { ref: railRef, raw: [] };
+        } else if (this.rail.railId === SOL_RAIL_ID && priorEvidence.rail?.status === "claimed") {
+          // R3-8: the refund failed because the escrow was claimed in the finality-lag window (the claim was not final
+          // when the pre-check ran): route to the claim path instead of surfacing the refund's own refusal.
+          throw new Error(
+            "buyer: refusing to refund leg A - the lock was claimed (seen after the refund failed); " +
+              "call learnSecret() then claimLegB() instead of refundLegA() (R3-8)",
+          );
         } else {
           throw error;
         }

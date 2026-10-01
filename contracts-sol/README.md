@@ -144,6 +144,16 @@ The litesvm tests assume the default mint.
   this is safe only because Solana verifies transaction signatures with `verify_strict`, which rejects such
   keys, so nobody can sign as the all-zero address. Any other key, including other low-order encodings, fails
   closed (SB2 `sol-evidence.ts` / `connect()` must spell this out and test it).
+- **Client duties added in review round 3 (none changes the program).** (1) The Buyer must not refund leg A once
+  leg B has been claimed: the secret is public after any claim attempt, so a third party can claim leg B, and
+  after `refund_after_ms` only a refund can move leg A (every later claim fails with ClaimWindowClosed), so a
+  person must then pay the Seller by hand; the desk's `refundLegA` refuses with a distinct error. (2) The desk
+  refuses to lock leg A or accept a leg A offer when the chain's finalized clock and the local clock differ by
+  more than 60 s; the Buyer's protection is `legB.refund_after - legA.refund_after`, and a halt or lag longer than
+  that is not covered. (3) A claim carries `CreateIdempotent` for the payee's token account (payer: the claimer),
+  so a vanished payee account no longer makes a claim land and fail, and a compute limit and a priority fee
+  (`SetComputeUnitLimit`, `SetComputeUnitPrice`). (4) A tclk reveal frame is posted only once the escrow reads
+  Claimed, never for a claim that landed and failed.
 - **Gas/compute** is small (well under the default 200k units per instruction) and was not tuned.
 - **Unaudited, testnet/localnet-only.** Not for mainnet value.
 

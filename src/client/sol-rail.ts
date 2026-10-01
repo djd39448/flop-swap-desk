@@ -64,7 +64,7 @@ import type {
   RailEvidenceResult,
   RailWriteEvidence,
 } from "./counter-rail.js";
-import { SOL_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
+import { SOL_CHAIN_CLOCK_SKEW_MS, SOL_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
 
 export interface SolCounterRailOptions {
   config: SolRailConfig;
@@ -79,6 +79,9 @@ export interface SolCounterRailOptions {
   sleep?: SolHtlcRailOptions["sleep"];
   pollIntervalMs?: number;
   finalityTimeoutMs?: number;
+  /** Harness-only (R3-7): the live compressed-window scenarios run the flow clock tens of minutes behind the chain on
+   *  purpose, so they widen the bound. Never set by a product caller; the default is `SOL_CHAIN_CLOCK_SKEW_MS`. */
+  maxChainClockSkewMs?: number;
 }
 
 /** Only the payee's resolved wallet address is ever required to build a lock: the payer's own identity is the
@@ -323,10 +326,12 @@ class SolCounterRail implements CounterAssetRail {
   readonly assetId: string = SOL_ASSET_ID;
   /** This rail object's own registry (never process-global): the flows read the rail id through it. */
   readonly railRegistry: CustomRailRegistry = createSolRailRegistry();
+  readonly maxChainClockSkewMs: number;
   private readonly options: SolCounterRailOptions;
 
   constructor(options: SolCounterRailOptions) {
     this.options = options;
+    this.maxChainClockSkewMs = options.maxChainClockSkewMs ?? SOL_CHAIN_CLOCK_SKEW_MS;
     this.caip2 = options.config.pin.caip2;
   }
 
@@ -363,8 +368,14 @@ class SolCounterRail implements CounterAssetRail {
     };
   }
 
-  async connect(terms: LockTerms, accounts: RailAccounts): Promise<ConnectedCounterAssetRail> {
-    const solRail = await SolHtlcRail.connect({
+  /** R3-7: the finalized chain time, read through the same pinned connection every other call uses. */
+  async chainClockMs(): Promise<number> {
+    const solRail = await this.connectRaw();
+    return solRail.chainTimeMs();
+  }
+
+  private connectRaw(): Promise<SolHtlcRail> {
+    return SolHtlcRail.connect({
       config: this.options.config,
       rpc: this.options.rpc,
       signer: this.options.signer,
@@ -373,6 +384,10 @@ class SolCounterRail implements CounterAssetRail {
       ...(this.options.pollIntervalMs === undefined ? {} : { pollIntervalMs: this.options.pollIntervalMs }),
       ...(this.options.finalityTimeoutMs === undefined ? {} : { finalityTimeoutMs: this.options.finalityTimeoutMs }),
     });
+  }
+
+  async connect(terms: LockTerms, accounts: RailAccounts): Promise<ConnectedCounterAssetRail> {
+    const solRail = await this.connectRaw();
     return new ConnectedSolCounterRail(solRail, this.options, accounts, terms);
   }
 }

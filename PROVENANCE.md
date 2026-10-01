@@ -244,8 +244,8 @@ this repository.
   rail id (`SOL_RAIL_ID`, spelled once) without editing `vendor/tclk`, and frame emission through it.
   `src/rails/account-line.ts` and `account-proof.ts` gained the Solana helpers and the registry-aware proof
   message (`ed25519`, P7).
-- `src/client/sol-rail.ts` and `src/client/policy.ts`'s `SOL_LOCAL_POLICY` - the `CounterAssetRail` over the
-  adapter and its deadline policy; the Solana branches of `seller.ts`, `buyer.ts`, `bundle.ts`, `replay.ts`,
+- `src/client/sol-rail.ts` and `src/client/policy.ts`'s `SOL_LOCAL_POLICY` and `SOL_CHAIN_CLOCK_SKEW_MS` - the
+  `CounterAssetRail` over the adapter, its deadline policy and the 60 s chain-clock bound (round 3, R3-7); the Solana branches of `seller.ts`, `buyer.ts`, `bundle.ts`, `replay.ts`,
   `watcher.ts`, `bin/watch.mjs` and `examples/audit-export.mjs` (`rails.sol`, `raw/sol/<hash lock>/<leg contract>/`).
 - `tests-sol/helpers/validator.ts`, `run-validator.sh` - the live harness: spawns one throwaway
   `solana-test-validator` inside WSL with the reviewed `htlc.so` loaded at genesis, creates the mock USDC mint
@@ -262,11 +262,12 @@ real, local, ephemeral `solana-test-validator` this repo itself starts and stops
 service. They hold public chain reads, signed transactions and account-line proofs (signatures), and no key
 material: every account and key they name is a freshly generated, zero-value, in-memory keypair of that run.
 `tests/sol-localnet-fixtures.test.ts` replays them hermetically through `examples/audit-export.mjs` and scans
-every file for these shapes of key material on every `npm test` run (it checks those shapes, not every possible
-hiding place): field names, PEM and mnemonic shapes, a base58, base64 or 128-hex token that decodes to 64 bytes
-whose first 32 bytes derive its last 32 (a Solana keypair), any JSON array of 64 numbers (the `solana-keygen`
-file format), and any bare 32-byte base58, base64 or hex token that derives a public key already present in the
-same fixture (as a base58 address or as 32 bytes inside a decoded base64 blob) (each shape has a planted-leak
+every file under `fixtures/sol-localnet-2026-09-30/` for these shapes of key material on every `npm test` run (it
+checks those shapes, not every possible hiding place): field names, PEM and mnemonic shapes, a base58, base64,
+base64url or 128-hex token (hex with or without a `0x` prefix) that decodes to 64 bytes whose first 32 bytes derive
+its last 32 (a Solana keypair), any JSON array of 64 numbers (the `solana-keygen` file format), and any bare 32-byte
+base58, base64, base64url or hex token that derives a public key already present in the same fixture (as a base58
+address or as 32 bytes inside a decoded base64 or base64url blob) (each shape has a planted-leak
 test, and the real captured signatures, the
 same length as a keypair, are shown not to be flagged). `refunded-b` holds no Solana escrow and no Solana write
 (the Buyer never locked leg A): it carries one live read of the chain for the lock's ref that shows no escrow, and

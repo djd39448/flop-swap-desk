@@ -198,12 +198,16 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     const sellerCount = countingFetch(options.sellerFetch);
     const buyerRpc = v.createCapturingRpc({ fetch: buyerCount.fetch });
     const sellerRpc = v.createCapturingRpc({ fetch: sellerCount.fetch });
-    const buyerRail = createSolCounterRail({ config: v.config, rpc: buyerRpc, signer: buyerParty.signer as SolSigner, clock });
+    // R3-7: the compressed-window scenarios run the flow clock tens of minutes behind the chain on purpose (see the file
+    // header), so they widen the chain-clock bound; every other scenario keeps the product default of 60 s.
+    const skewBound = options.skewMs === undefined ? {} : { maxChainClockSkewMs: 24 * 60 * MINUTE };
+    const buyerRail = createSolCounterRail({ config: v.config, rpc: buyerRpc, signer: buyerParty.signer as SolSigner, clock, ...skewBound });
     const sellerRail = createSolCounterRail({
       config: v.config,
       rpc: sellerRpc,
       signer: sellerParty.signer as SolSigner,
       clock,
+      ...skewBound,
       ...(options.sellerSleep === undefined ? {} : { sleep: options.sellerSleep }),
     });
     const buyerFlow = new BuyerFlow({ identity: options.buyer, venue, paperRail: new PaperRail(noteStore, clock), rail: buyerRail, clock });
@@ -682,7 +686,7 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
 
   // -- 6 -----------------------------------------------------------------------------------------------------
 
-  it("scenario 6a: a claim that lands and FAILS publishes the secret; the Seller posts the reveal, retries at once in public-secret mode and is paid", async () => {
+  it("scenario 6a: a claim that lands and FAILS publishes the secret; the Seller retries at once in public-secret mode, is paid, and posts the reveal once the escrow reads Claimed", async () => {
     const seller = await v.createParty({});
     const failing = failingClaimFetch(seller, true);
     const h = setupSwap({ buyer: ident(13), seller: ident(14), sellerParty: seller, sellerFetch: failing.fetch, sellerSleep: failing.sleep });

@@ -786,9 +786,9 @@ transactions, leg B on tclk's paper rail; one scenario each):
   chain alone.
 - *a claim that lands and fails*: the Seller's claim is made to land and fail on the real chain (the payee's
   token account is closed just before the claim is forwarded, with its preflight skipped, which is the only way
-  a claim can land and fail). The secret is then public in a failed transaction. Either the Seller posts the
-  retry goes out at once in public-secret mode and the Seller is paid (the escrow's history shows exactly one
-  failed claim with program error 17 and the successful retry), the reveal frame following it. When no retry
+  a claim can land and fail). The secret is then public in a failed transaction. Either the retry goes out at once in
+  public-secret mode and the Seller is paid (the escrow's history shows exactly one failed claim with program error
+  17 and the successful retry), the reveal frame following it once the escrow reads Claimed. When no retry
   can land, nobody was paid: the Buyer does NOT claim leg B on the leaked secret (`learnSecret` and `claimLegB`
   refuse while the escrow is not Claimed), refunds leg A once the real chain time passes `refundAfterMs`, and
   the Seller refunds leg B. When the failed claim's reply was lost and the escrow's history was padded past 5000
@@ -807,10 +807,13 @@ transactions, leg B on tclk's paper rail; one scenario each):
 Three fixtures, `fixtures/sol-localnet-2026-09-30/{settled,refunded,refunded-b}/`, are captured from these
 runs and replayed hermetically by `tests/sol-localnet-fixtures.test.ts` through `examples/audit-export.mjs`,
 which also scans every committed file for these shapes of key material (each has a planted-leak test): field
-names, PEM and mnemonic text; a 64-byte keypair in base58, base64 or 128 hex characters; a JSON array of 64
-numbers; and a bare 32-byte seed in base58, base64 or hex whose derived public key is present in the same
-fixture, as a base58 address or as any 32 bytes inside a decoded base64 blob (account data, a signed
-transaction). It checks those shapes only: a seed whose public key appears nowhere in the fixture, a key that
+names, PEM and mnemonic text; a 64-byte keypair in base58, base64, base64url or 128 hex characters; a JSON array
+of 64 numbers; and a bare 32-byte seed in base58, base64, base64url or hex (with or without a `0x` prefix: hex is
+matched by lookarounds on the hex digits, not by a word boundary) whose derived public key is present in the same
+fixture, as a base58 address or as any 32 bytes inside a decoded base64 or base64url blob (account data, a signed
+transaction). The scan walks every file under `fixtures/sol-localnet-2026-09-30/` (each scenario directory on its own
+set of known public keys, so every capture, summary and `rails.json` in it is read);
+it does not read `src/`, `tests/` or any other directory. It checks those shapes only: a seed whose public key appears nowhere in the fixture, a key that
 was encrypted, chunked or otherwise transformed, and a value hidden inside a larger blob are not seen, so a
 clean scan is not a proof that no key material exists (the fixtures hold only keys of a throwaway, zero-value,
 in-memory run, and never a key file). To recapture them:
@@ -842,10 +845,25 @@ does not mean the Seller was paid (the program refuses every claim at or after `
 - *The Buyer claims leg B only once leg A reads Claimed at finalized.* `learnSecret` returns the escrow's
   stored preimage when the escrow is Claimed, and otherwise throws "leg A not claimed on chain yet"; a reveal
   frame alone, or a secret leaked by a failed claim, never lets the Buyer claim leg B, and `claimLegB` refuses
-  unless leg A is Claimed with that very secret. `refundLegA` refuses only when leg A is Claimed (and, on every
-  rail, once this flow claimed leg B). The Buyer never scans history, so nothing anyone can pad affects it. A
-  failed Seller claim therefore means the swap fails and both legs are refunded (the Buyer refunds leg A after
-  `refundAfterMs`, the Seller refunds leg B); nobody loses. EVM, Bitcoin and NEAR keep their own rules.
+  unless leg A is Claimed with that very secret. The Buyer never scans history, so nothing anyone can pad affects it.
+- *The Buyer refunds leg A only while leg B is unclaimed.* `refundLegA` refuses when leg A is Claimed (and, on every
+  rail, once this flow claimed leg B), and, on Solana, reads leg B's own record first: if leg B was claimed by
+  anyone (the secret is public once a claim has failed, so a third party can claim leg B with it), it throws
+  `LegBClaimedError` ("leg B was claimed with the public secret; leg A is owed to the Seller; settle by hand"). If a
+  claim of leg A only becomes final while the refund is being sent (the finality-lag window), the refund's own
+  failure is replaced by the routing error "call learnSecret() then claimLegB()". So a failed Seller claim means
+  the swap fails and both legs are refunded (the Buyer refunds leg A after `refundAfterMs`, the Seller refunds leg
+  B), and nobody loses if the Buyer follows this rule: refund leg A only while leg B is still unclaimed. Known
+  limit: after `refund_after_ms` only a refund can move leg A (the program refuses every later claim), so when leg B
+  was claimed first, a person must pay the Seller outside the protocol. A refund of leg A after leg B was claimed is
+  never an ordinary refund: the fold reports `refunded-a` with the reason "leg A refunded after leg B was claimed:
+  the Seller received neither leg" (`LEG_A_REFUNDED_AFTER_B_CLAIMED`, from `src/swap.ts`). This repository has no
+  reputation emitter; a reader that scores parties must key on that reason and must not count it as an ordinary
+  refund. EVM, Bitcoin and NEAR keep their own rules.
+- *The chain's clock is checked before value moves.* `lockLegA` and the Seller's `acceptLegA` refuse when the
+  chain's finalized clock and the local clock differ by more than 60 s (`SOL_CHAIN_CLOCK_SKEW_MS`). Known limit:
+  the Buyer's protection on Solana is `legB.refundAfterMs - legA.refundAfterMs`; a chain halt or a clock lag longer
+  than that is not covered by this check.
 - *The Seller records every claim signature before sending.* `claim` hands the signature and its
   `lastValidBlockHeight` to `onSigned` before anything is simulated or sent (and drops it again through
   `onNotBroadcast` when the claim provably never reached the network). At the start of every `claimLegA` the
@@ -859,26 +877,38 @@ does not mean the Seller was paid (the program refuses every claim at or after `
   the ordinary guarded claim; its only chain read for this is the escrow itself (Claimed with its own
   preimage). No path lets `SolHistoryTooLongError` block a claim. The whole-history scan stays on
   `SolHtlcRail.findClaimedPreimage` for third-party readers, where throwing past the limit is fine.
-- *Retry first, reveal after.* After a claim that landed and failed, the public-secret retry
+- *Retry first, reveal after, and only once Claimed.* After a claim that landed and failed, the public-secret retry
   (`claim(..., { retryPublicSecret: true, proofSignature })`, at most twice) is sent before any reveal post; the
   reveal post has a bounded timeout per attempt (`revealPostTimeoutMs`, default 10 s; an attempt that timed out
   is adopted from the deal room if it landed, never posted twice), so a stalled venue cannot hold up the retry or
-  the call.
+  the call. The reveal frame is posted only once the escrow reads Claimed (the same rule the Buyer follows): a
+  claim that landed and failed paid nobody, so no reveal frame is posted for it, and when no retry can land the
+  call ends without one.
 
 Before signing, the client rail checks who the escrow pays and its mint, amount and times against this leg's
 own terms, and refuses a claim with no resolved payee line. Both parties' proven `ed25519` lines are required,
 for the Seller's claim and for every evidence reader.
 
-**Restart is manual recovery (no rehydrate API yet).** A `SellerFlow` or `BuyerFlow` holds its swap state in
-memory only, and no constructor rebuilds it from a record. A runner that wants to resume after a crash must
-persist, per swap, and restore by hand: for the Seller, its minted secret (the preimage; losing it loses the
-claim), the accepted offers and accepts, the `lastValidBlockHeight` and signature of every claim it signed
-(`onSigned`; without them a claim that landed or failed while it was down cannot be resolved by signature, and a
-fresh flow does the ordinary guarded claim, which refuses an escrow that is already Claimed), and whether the
-leg B lock was attempted; for the Buyer, the prepared lock record (the payer-keyed ref and the prepared
-signature, recorded before `commitLock`), the resolved accounts and the leg B pairing. Until a rehydrate API
-exists, recovering after a restart means reading the escrow by its ref (`getEscrow`) and acting by hand: a Claimed
-escrow holds the preimage for the Buyer, a Locked one past `refund_after_ms` is refunded by the payer.
+**Restart: no flow can be resumed today.** A `SellerFlow` or `BuyerFlow` holds its swap state in memory only, and no
+constructor, method or file rebuilds it. A process that dies loses the flow, and a new flow object cannot continue
+that swap. What a crash costs at each step, and what a person must do (read the escrow by its ref with `getEscrow`
+and act by hand):
+
+| Crash after | What is lost | What a person must do |
+| --- | --- | --- |
+| The Seller accepted leg A (secret minted) | the preimage, so the claim is impossible | nothing is locked yet; start a new swap. Never reuse the offer |
+| The Seller locked leg B | the preimage (leg B can only be refunded) | after leg B's `refundAfterMs` the Seller refunds leg B by hand on the paper rail |
+| The Buyer prepared the lock, before it landed | the prepared ref and signature | read the escrow at the payer-keyed ref; if it exists, it is refundable by the Buyer after `refund_after_ms` |
+| The Buyer locked leg A | the flow state (accounts, ref, leg B pairing) | refund leg A by hand after `refund_after_ms` unless the escrow reads Claimed; never refund when leg B was claimed |
+| The Seller signed a claim, before it was recorded as landed | the signature and `lastValidBlockHeight` | read the escrow: Claimed means the Seller was paid (post the frames by hand); Locked means send a fresh claim before `refund_after_ms` |
+| The Seller claimed, before the reveal frame posted | the reveal and receipt latches | the Buyer reads the preimage off the Claimed escrow (`learnSecret` does not need the frame) and claims leg B |
+| The Buyer learned the secret, before it claimed leg B | the secret | read it from the Claimed escrow's stored preimage and claim leg B on the paper rail before leg B's `refundAfterMs` |
+
+The minimal persistence surface a future rehydrate API would need, per swap, is: the Seller's preimage, both
+accepted offers and accepts, every claim signature with its `lastValidBlockHeight` (what `onSigned` hands over),
+whether the leg B lock was attempted, and the reveal and receipt latches; for the Buyer, the prepared lock record
+(the payer-keyed ref and the prepared signature, recorded before `commitLock`), the resolved accounts, the leg B
+pairing and whether leg B was claimed. That is named future work; this round adds no rehydrate API.
 
 ### Known limits of the Solana leg
 

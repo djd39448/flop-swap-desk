@@ -271,6 +271,13 @@ export interface CounterAssetRail {
    *  never changes what is signed. Refuses an `address` that is not this party's own. */
   proveAccountLine(input: { address: string; did: string; contract: string; terms: LockTerms }): Promise<string>;
 
+  /** R3-7 (Solana only): the chain's own finalized clock, readable without any swap's terms or accounts, so a flow can
+   *  refuse to start when the chain and the local clock disagree by more than `SOL_CHAIN_CLOCK_SKEW_MS`. A rail that
+   *  leaves it out is never checked (EVM, Bitcoin and NEAR behave exactly as before). */
+  chainClockMs?(): Promise<number>;
+  /** R3-7: the bound the flows apply to `chainClockMs` (default `SOL_CHAIN_CLOCK_SKEW_MS`); a harness-only override. */
+  readonly maxChainClockSkewMs?: number;
+
   /** D-08: resolve the parties' chain identities from a leg's deal-room records — only a
    *  record that both verifies and matches this rail id/chain counts; per party, every one of
    *  its own matching lines must agree, or that party's own identity is unresolved (never

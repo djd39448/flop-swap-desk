@@ -18,12 +18,13 @@
 // refuses is never sent (nothing leaks); and the custom rail id is admitted only through the rail's own
 // registry while tclk's closed check stays in force for everyone else.
 
-import { dealRoom, encodeFrame, makeOffer, tryDecodeFrame, type LockTerms, type OfferFrame } from "@flop-labs/tclk";
+import { dealRoom, encodeFrame, makeOffer, PaperRail, tryDecodeFrame, type AcceptFrame, type LockTerms, type OfferFrame } from "@flop-labs/tclk";
 import { base58 } from "@scure/base";
 import { describe, expect, it } from "vitest";
 
 import { belowMinLockable } from "../src/client/counter-rail.js";
-import { SOL_LOCAL_POLICY } from "../src/client/policy.js";
+import { LegBClaimedError } from "../src/client/buyer.js";
+import { SOL_CHAIN_CLOCK_SKEW_MS, SOL_LOCAL_POLICY } from "../src/client/policy.js";
 import { RevealNotPostedError, SolClaimStarvedError } from "../src/client/seller.js";
 import { SOL_ASSET_ID, SOL_AMOUNT_FLOOR, SOL_CLAIM_LANDING_MARGIN_MS, SOL_HTLC_PROGRAM_ID, SolClaimFailedError, claimInstructionData, escrowAddress, vaultAddress } from "../src/rails/sol-htlc.js";
 import { InMemorySolSigner } from "../src/rails/sol-signer-memory.js";
@@ -629,7 +630,7 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Locked");
   });
 
-  it("the Seller posts the reveal (the secret is public regardless) and retries AT ONCE through the public-secret mode, and is paid", async () => {
+  it("after a claim that landed and failed the Seller retries AT ONCE through the public-secret mode, is paid, and posts the reveal only once the escrow reads Claimed", async () => {
     const h = solHarness();
     const p = await lockedFlow(h);
     armFailedClaim(h, { recreate: true });
@@ -643,13 +644,13 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     expect(framesIn(room, "receipt")).toHaveLength(1);
   });
 
-  it("a retry that cannot land leaves the reveal posted and throws the real reason; the next call retries in public-secret mode without a second reveal", async () => {
+  it("R3-10: a retry that cannot land posts no reveal (the escrow is not Claimed) and throws the real reason; the next call retries in public-secret mode and posts the one reveal once it is Claimed", async () => {
     const h = solHarness();
     const p = await lockedFlow(h);
     armFailedClaim(h, { recreate: false });
     await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/payee's associated token account/);
     const room = dealRoomOf(p.acceptA);
-    expect(framesIn(await h.venue.read(room), "reveal")).toHaveLength(1);
+    expect(framesIn(await h.venue.read(room), "reveal")).toHaveLength(0);
     expect(framesIn(await h.venue.read(room), "receipt")).toHaveLength(0);
     h.node.midFlight = undefined;
     h.node.afterLand = undefined;
@@ -672,7 +673,7 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     // each landing closes the account again (midFlight), each failure re-creates it (afterLand), so the pre-checks pass
     await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toBeInstanceOf(SolClaimFailedError);
     expect(h.node.history.filter((t) => t.kind === "claim" && t.err !== null)).toHaveLength(3);
-    expect(framesIn(await h.venue.read(dealRoomOf(p.acceptA)), "reveal")).toHaveLength(1);
+    expect(framesIn(await h.venue.read(dealRoomOf(p.acceptA)), "reveal")).toHaveLength(0); // R3-10: never Claimed, no reveal
   });
 
   it("the public-secret mode is only ever allowed after the chain shows the secret public: asked for with a private secret it refuses", async () => {
@@ -778,13 +779,13 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     expect(g.node.escrow(q.statement, g.buyerWallet.publicKey)?.status).toBe("Refunded");
   });
 
-  it("S2-1: a reveal frame alone never lets the Buyer claim leg B (the escrow is not Claimed)", async () => {
+  it("S2-1: a failed claim and its leaked secret never let the Buyer claim leg B (the escrow is not Claimed)", async () => {
     const h = solHarness();
     const p = await lockedFlow(h);
     armFailedClaim(h, { recreate: false });
-    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(); // posts the reveal frame
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(); // R3-10: posts no reveal frame (not Claimed)
     h.node.midFlight = undefined;
-    expect(framesIn(await h.venue.read(dealRoomOf(p.acceptA)), "reveal")).toHaveLength(1);
+    expect(framesIn(await h.venue.read(dealRoomOf(p.acceptA)), "reveal")).toHaveLength(0);
     await expect(h.buyerFlow.learnSecret()).rejects.toThrow(/leg A not claimed on chain yet/);
     await expect(h.buyerFlow.claimLegB(sellerSecret(h))).rejects.toThrow(/leg A is not Claimed on chain/);
     h.setTime(p.offerA.refundAfterMs);
@@ -920,7 +921,7 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     expect(h.node.tokenBalance(h.sellerWallet.publicKey)).toBe(1_000_000n);
   });
 
-  it("SOL-C5: a failed claim whose reply was lost still gets its reveal frame once the next call sees it on chain", async () => {
+  it("SOL-C5 (R3-10): a failed claim whose reply was lost gets no reveal frame (the escrow never reads Claimed)", async () => {
     const h = solHarness();
     const p = await lockedFlow(h);
     armFailedClaim(h, { recreate: false });
@@ -930,7 +931,7 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     h.node.midFlight = undefined;
     h.node.afterLand = undefined;
     await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/payee's associated token account/);
-    expect(framesIn(await h.venue.read(dealRoomOf(p.acceptA)), "reveal")).toHaveLength(1);
+    expect(framesIn(await h.venue.read(dealRoomOf(p.acceptA)), "reveal")).toHaveLength(0);
   });
 
 });
@@ -1177,5 +1178,95 @@ describe("R3-2/R3-3: a starved claim is reported, priced higher and re-signed; a
     await starveFirstClaim(h, p.statement);
     await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/not settled yet/);
     expect(h.node.sent.claim).toBe(0);
+  });
+});
+
+// -- R3-6 .. R3-8: the Buyer's refund, the chain clock, the finality-lag window ------------------------------------
+
+describe("R3-6: a claimed leg B stops the Buyer's refund of leg A", () => {
+  it("a third party claims leg B with the public secret after a failed Seller claim: refundLegA refuses with the distinct error and sends no refund", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    // the Seller's claim lands and FAILS (its payee account is frozen): the secret is public in that transaction
+    h.node.midFlight = (kind) => {
+      if (kind === "claim") h.node.freezeToken(h.sellerWallet.publicKeyBytes);
+    };
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow();
+    h.node.midFlight = undefined;
+    h.node.afterLand = undefined;
+    // a third party reads the secret off the failed transaction and claims leg B on the paper rail
+    const legBContract = (tryDecodeFrame(p.acceptBRecord.line) as AcceptFrame).contract;
+    await new PaperRail(h.noteStore, h.clock).claim(legBContract, sellerSecret(h));
+
+    h.setTime(p.offerA.refundAfterMs);
+    const refusal = h.buyerFlow.refundLegA();
+    await expect(refusal).rejects.toBeInstanceOf(LegBClaimedError);
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/leg B was claimed with the public secret; leg A is owed to the Seller; settle by hand/);
+    expect(h.node.sent.refund).toBe(0);
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Locked");
+  });
+
+  it("with leg B still locked the same Buyer's refund goes through (the guard reads leg B's own record)", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    h.setTime(p.offerA.refundAfterMs);
+    await h.buyerFlow.refundLegA();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Refunded");
+  });
+});
+
+describe("R3-7: the chain clock check on lockLegA and the Seller's acceptLegA", () => {
+  it("the named bound is 60 s", () => {
+    expect(SOL_CHAIN_CLOCK_SKEW_MS).toBe(60_000);
+  });
+
+  it("lockLegA refuses when the chain's finalized clock is more than the bound behind or ahead of the local clock, and sends nothing", async () => {
+    for (const skewMs of [-(SOL_CHAIN_CLOCK_SKEW_MS + 1_000), SOL_CHAIN_CLOCK_SKEW_MS + 1_000]) {
+      const h = solHarness();
+      await pairWithLines(h);
+      h.node.nowMs = h.clockRef.ms + skewMs;
+      await expect(h.buyerFlow.lockLegA()).rejects.toThrow(/refusing to lock leg A - the chain's finalized clock .* differ by .* more than 60000 ms \(R3-7\)/);
+      expect(h.node.sent.lock).toBe(0);
+    }
+  });
+
+  it("lockLegA accepts a skew inside the bound", async () => {
+    const h = solHarness();
+    await pairWithLines(h);
+    h.node.nowMs = h.clockRef.ms - (SOL_CHAIN_CLOCK_SKEW_MS - 1_000);
+    await h.buyerFlow.lockLegA();
+    expect(h.node.sent.lock).toBe(1);
+  });
+
+  it("the Seller's acceptLegA refuses a chain clock outside the bound and posts nothing", async () => {
+    const h = solHarness();
+    const legA = legADeadlines(6 * 60 * 60_000);
+    const offerA = await h.buyerFlow.bid({ swapId: computeSwapId(h.buyer.did, "00000001"), ...BID, claimByMs: legA.claimByMs, refundAfterMs: legA.refundAfterMs, expiresMs: T0 + 10 * 60_000 });
+    const before = (await h.venue.read("tclk-offers")).length;
+    h.node.nowMs = h.clockRef.ms + SOL_CHAIN_CLOCK_SKEW_MS + 1_000;
+    await expect(h.sellerFlow.acceptLegA(offerA, legBDeadlines(), legA.lockTimeMs)).rejects.toThrow(/refusing to accept leg A - the chain's finalized clock .* \(R3-7\)/);
+    expect((await h.venue.read("tclk-offers")).length).toBe(before);
+    h.node.nowMs = h.clockRef.ms;
+    await h.sellerFlow.acceptLegA(offerA, legBDeadlines(), legA.lockTimeMs);
+  });
+});
+
+describe("R3-8: a claim seen only after the refund failed routes to learnSecret()/claimLegB()", () => {
+  it("a relayer's claim lands between the pre-check and the refund: the Buyer is told to claim leg B, not shown the refund's own refusal", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    h.setTime(p.offerA.refundAfterMs);
+    const relayer = InMemorySolSigner.generate(new Uint8Array(32).fill(14));
+    const tx = await relayerClaim(h, p.statement, sellerSecret(h), relayer);
+    h.node.midFlight = (kind) => {
+      if (kind !== "refund") return;
+      // the claim landed just before refund_after_ms (the chain's own time then), and was not yet final when the
+      // refund's pre-check read the escrow
+      h.node.nowMs = p.offerA.refundAfterMs - 1_000;
+      h.node.executeAndLand(tx);
+      h.node.nowMs = p.offerA.refundAfterMs;
+    };
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/call learnSecret\(\) then claimLegB\(\) instead of refundLegA\(\) \(R3-8\)/);
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
   });
 });

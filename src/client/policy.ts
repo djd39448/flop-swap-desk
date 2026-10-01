@@ -153,3 +153,15 @@ export const SOL_LOCAL_POLICY: SolLocalPolicy = Object.freeze({
   finalityAMs: 20 * 60_000,
   claimInclusionMarginMs: 5 * 60_000,
 });
+
+/** R3-7: the largest gap between the chain's finalized clock and the local clock that `lockLegA` and the Seller's
+ *  `acceptLegA` accept. Known limit: the Buyer's protection on Solana is `legB.refundAfterMs - legA.refundAfterMs`; a
+ *  halt or a clock lag longer than that is not covered by this check. */
+export const SOL_CHAIN_CLOCK_SKEW_MS = 60_000;
+
+/** R3-7: the refusal text for a chain clock that is too far from the local clock; `null` when they agree. */
+export function chainClockProblem(chainMs: number, localMs: number, boundMs: number = SOL_CHAIN_CLOCK_SKEW_MS): string | null {
+  const gap = Math.abs(chainMs - localMs);
+  if (gap <= boundMs) return null;
+  return `the chain's finalized clock (${chainMs}) and the local clock (${localMs}) differ by ${gap} ms, more than ${boundMs} ms (R3-7)`;
+}
