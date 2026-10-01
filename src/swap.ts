@@ -220,8 +220,14 @@ function settlementViewForLeg(evidence: LockEvidence | undefined, rail: RailObse
   return "unverified";
 }
 
-/** R3-9: the reason the fold pushes when leg A is refunded after leg B was claimed. */
+/** R3-9 + R4-3: the reason the fold pushes when leg A is refunded after leg B was claimed, ONLY when leg B's claim is on a
+ *  value-bearing rail and its bound observation shows it before leg A's refund (chain time). */
 export const LEG_A_REFUNDED_AFTER_B_CLAIMED = "leg A refunded after leg B was claimed: the Seller received neither leg";
+
+/** R4-3: the neutral reason pushed when leg B reads claimed and leg A is refunded but the order or the value is not
+ *  proven (always the case for the unauthenticated paper rail: anyone holding the secret can write the note, even
+ *  after the fact). */
+export const LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN = "leg B claimed and leg A refunded; order or value not proven";
 
 /** P5-NEAR-FIXES.md E3 + P5-NEAR-FIXES-R2.md V4: a leg's own `refund` frame never folds a chain
  *  leg to `refunded`/`refunded-a`/`refunded-b` on its own. For a leg whose accepted rail is a chain
@@ -510,7 +516,21 @@ export function foldSwap(input: SwapFoldInput): SwapView {
     // the Seller received neither leg. That is a theft of the Seller's payout, not an ordinary refund; the distinct
     // reason lets a reputation reader tell the two apart (this repo has no reputation emitter of its own).
     if (legBState.status === "claimed" || (evidence.bRail?.status === "claimed" && evidence.bRail.final === true)) {
-      reasons.push(LEG_A_REFUNDED_AFTER_B_CLAIMED);
+      // R4-3: the theft reason needs value (leg B's claim bound on a non-paper rail) and order (that claim's chain time is
+      // before leg A's refund's chain time); a paper note, or a time that is missing on either side, is only neutral.
+      const bClaim = evidence.bRail;
+      const aRefund = evidence.aRail;
+      const proven =
+        bClaim !== undefined &&
+        bClaim.status === "claimed" &&
+        bClaim.final === true &&
+        bClaim.rail !== "paper" &&
+        aRefund?.status === "refunded" &&
+        aRefund.final === true &&
+        typeof bClaim.transitionAtMs === "number" &&
+        typeof aRefund.transitionAtMs === "number" &&
+        bClaim.transitionAtMs < aRefund.transitionAtMs;
+      reasons.push(proven ? LEG_A_REFUNDED_AFTER_B_CLAIMED : LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN);
     }
     view.status = "refunded-a";
     return view;

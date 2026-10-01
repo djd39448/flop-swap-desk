@@ -121,6 +121,10 @@ export interface RailObservation {
   final: boolean;
   checkedAtMs: number;
   finalizedRef?: string;
+  /** R4-3: the chain's own time (ms) of the claim or refund transition this observation reports (slot/block time as the
+   *  chain recorded it), when the reader could bind one. No reader sets it today; the fold's theft verdict needs it on
+   *  BOTH legs, so without it the fold stays neutral. */
+  transitionAtMs?: number;
   /** Binding (tclk#194 review, finding 1): what this observation is an observation OF. The fold
    *  (`src/swap.ts`) uses an observation only when every one of these equals the leg's own
    *  accepted offer/accept pair and its accepted lock frame — a bare `{status, final}` proves

@@ -30,7 +30,7 @@ import { buildBoard } from "../src/board.js";
 import { writeBundle } from "../src/client/bundle.js";
 import { encodeFrameWith } from "../src/rails/custom-frames.js";
 import { SOL_RAIL_ID } from "../src/rails/custom-rails.js";
-import { LEG_A_REFUNDED_AFTER_B_CLAIMED } from "../src/swap.js";
+import { LEG_A_REFUNDED_AFTER_B_CLAIMED, LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN } from "../src/swap.js";
 import { SOL_LOCAL_PIN } from "../src/rails/sol-htlc.js";
 import { solCaptureKey } from "../src/rails/sol-evidence.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
@@ -201,17 +201,20 @@ describe("writeBundle with a Solana capture, replayed by examples/audit-export.m
     }
   });
 
-  it("R3-9: leg A refunded after leg B was claimed folds to refunded-a with the distinct reason; an ordinary refund does not carry it", async () => {
+  it("R3-9/R4-3: leg A refunded after a PAPER leg-B claim folds to refunded-a with the neutral reason (the note is unauthenticated, so the framing probe cannot brand a theft); an ordinary refund carries neither", async () => {
     const stolen = await buildBundle(root, "stolen");
     const swap = swapOf(replay(root), stolen.swapId);
     expect(swap.status).toBe("refunded-a");
-    expect(swap.reasons).toContain(LEG_A_REFUNDED_AFTER_B_CLAIMED);
+    expect(swap.reasons).toContain(LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN);
+    expect(swap.reasons).not.toContain(LEG_A_REFUNDED_AFTER_B_CLAIMED);
+    expect(LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN).toBe("leg B claimed and leg A refunded; order or value not proven");
     expect(LEG_A_REFUNDED_AFTER_B_CLAIMED).toBe("leg A refunded after leg B was claimed: the Seller received neither leg");
 
     const dir2 = await mkdtemp(join(tmpdir(), "sol-audit-ordinary-refund-"));
     try {
       const refunded = await buildBundle(dir2, "refunded");
       expect(swapOf(replay(dir2), refunded.swapId).reasons).not.toContain(LEG_A_REFUNDED_AFTER_B_CLAIMED);
+      expect(swapOf(replay(dir2), refunded.swapId).reasons).not.toContain(LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN);
     } finally {
       await rm(dir2, { recursive: true, force: true });
     }

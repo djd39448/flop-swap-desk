@@ -15,7 +15,7 @@ import {
 import { describe, expect, it } from "vitest";
 
 import { legAContext, legBContext, swapId as computeSwapId } from "../src/profile.js";
-import { foldSwap } from "../src/swap.js";
+import { foldSwap, LEG_A_REFUNDED_AFTER_B_CLAIMED, LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN } from "../src/swap.js";
 import { identity, record, unsignedRecord } from "./helpers/identity.js";
 import { observe } from "./helpers/observations.js";
 import { scenario } from "./helpers/scenario.js";
@@ -683,6 +683,60 @@ describe("foldSwap — settlementView (H3, tclk PR #173 vocabulary)", () => {
       nowMs: T0 + 5 * MIN,
     });
     expect(view.settlementView).toEqual({ a: "funded", b: "none" });
+  });
+});
+
+describe("foldSwap — R4-3: the theft reason needs value and order", () => {
+  const s = build();
+  const legs = {
+    legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.refundA],
+    legB: [s.records.offerB, s.records.acceptB, s.records.lockB, s.records.revealB],
+  };
+  const nowMs = s.frames.offerB.refundAfterMs + 2 * MIN;
+
+  it("a value-bearing leg-B claim before leg A's refund (both chain times bound) names the theft", () => {
+    const view = foldSwap({
+      ...legs,
+      evidence: {
+        aRail: observe(s, "a", "refunded", T0 + 61 * MIN, { transitionAtMs: T0 + 61 * MIN }),
+        bRail: observe(s, "b", "claimed", T0 + 61 * MIN, { transitionAtMs: T0 + 30 * MIN }),
+      },
+      nowMs,
+    });
+    expect(view.status).toBe("refunded-a");
+    expect(view.reasons).toContain(LEG_A_REFUNDED_AFTER_B_CLAIMED);
+    expect(view.reasons).not.toContain(LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN);
+  });
+
+  it("the same claim AFTER leg A's refund, or with no chain time on either side, is only neutral", () => {
+    for (const [aAt, bAt] of [
+      [T0 + 30 * MIN, T0 + 61 * MIN],
+      [undefined, T0 + 30 * MIN],
+      [T0 + 61 * MIN, undefined],
+    ] as const) {
+      const view = foldSwap({
+        ...legs,
+        evidence: {
+          aRail: observe(s, "a", "refunded", T0 + 61 * MIN, aAt === undefined ? {} : { transitionAtMs: aAt }),
+          bRail: observe(s, "b", "claimed", T0 + 61 * MIN, bAt === undefined ? {} : { transitionAtMs: bAt }),
+        },
+        nowMs,
+      });
+      expect(view.reasons).toContain(LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN);
+      expect(view.reasons).not.toContain(LEG_A_REFUNDED_AFTER_B_CLAIMED);
+    }
+  });
+
+  it("a paper leg B (the framing probe: a Seller's after-the-fact paper note) is always neutral, even with times", () => {
+    const view = foldSwap({
+      ...legs,
+      evidence: {
+        aRail: observe(s, "a", "refunded", T0 + 61 * MIN, { transitionAtMs: T0 + 61 * MIN }),
+        bRail: observe(s, "b", "claimed", T0 + 61 * MIN, { transitionAtMs: T0 + 30 * MIN, rail: "paper" }),
+      },
+      nowMs,
+    });
+    expect(view.reasons).not.toContain(LEG_A_REFUNDED_AFTER_B_CLAIMED);
   });
 });
 
