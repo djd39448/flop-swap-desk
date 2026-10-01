@@ -175,7 +175,8 @@ export class BuyerFlow {
   /** P4-BTC-FIXES-R3.md K5: set once this leg's own `lock` frame has actually posted — see
    *  `announceLockA`. */
   private lockFramePosted = false;
-  /** R4-1: reasons `refundLegA` ignored a leg-B paper note that read claimed without being a proven claim. */
+  /** R4-1 / RR4-1: what `refundLegA` recorded about a leg-B paper note that read claimed — a proven claim ("the secret
+   *  is public and leg B's paper note reads claimed") or one ignored as not proven. Never a reason to refuse. */
   readonly refundNotes: string[] = [];
 
   /** G7: the refund's own write evidence, recorded the first time `refundLegA` actually
