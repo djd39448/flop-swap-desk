@@ -186,7 +186,7 @@ export class SolClaimStarvedError extends Error {
   readonly neverLandedClaims: number;
   constructor(neverLandedClaims: number, cause: unknown) {
     super(
-      `seller: secret broadcast but not landed (possibly seen): ${neverLandedClaims} claim(s) never landed and the claim could not be completed (${cause instanceof Error ? cause.message : String(cause)})`,
+      `seller: secret broadcast but not landed (possibly seen): ${neverLandedClaims} claim(s) never landed and the claim could not be completed (${cause instanceof Error ? cause.message : String(cause)}); leg B exposed until legB.refundAfterMs`,
       { cause },
     );
     this.name = "SolClaimStarvedError";

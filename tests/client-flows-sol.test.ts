@@ -1141,6 +1141,7 @@ describe("R3-2/R3-3: a starved claim is reported, priced higher and re-signed; a
     );
     expect(error).toBeInstanceOf(SolClaimStarvedError);
     expect((error as Error).message).toMatch(/secret broadcast but not landed \(possibly seen\)/);
+    expect((error as Error).message).toMatch(/leg B exposed until legB\.refundAfterMs/); // R4-4
     expect((error as SolClaimStarvedError).neverLandedClaims).toBe(1);
     expect(h.node.sent.claim).toBe(0);
   });

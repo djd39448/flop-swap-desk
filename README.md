@@ -846,20 +846,29 @@ does not mean the Seller was paid (the program refuses every claim at or after `
   stored preimage when the escrow is Claimed, and otherwise throws "leg A not claimed on chain yet"; a reveal
   frame alone, or a secret leaked by a failed claim, never lets the Buyer claim leg B, and `claimLegB` refuses
   unless leg A is Claimed with that very secret. The Buyer never scans history, so nothing anyone can pad affects it.
-- *The Buyer refunds leg A only while leg B is unclaimed.* `refundLegA` refuses when leg A is Claimed (and, on every
-  rail, once this flow claimed leg B), and, on Solana, reads leg B's own record first: if leg B was claimed by
-  anyone (the secret is public once a claim has failed, so a third party can claim leg B with it), it throws
-  `LegBClaimedError` ("leg B was claimed with the public secret; leg A is owed to the Seller; settle by hand"). If a
-  claim of leg A only becomes final while the refund is being sent (the finality-lag window), the refund's own
-  failure is replaced by the routing error "call learnSecret() then claimLegB()". So a failed Seller claim means
-  the swap fails and both legs are refunded (the Buyer refunds leg A after `refundAfterMs`, the Seller refunds leg
-  B), and nobody loses if the Buyer follows this rule: refund leg A only while leg B is still unclaimed. Known
+- *The Buyer refunds leg A only while leg B is unclaimed.* `refundLegA` first checks leg A itself: when leg A reads Claimed
+  (or this flow already claimed leg B) it routes to "call learnSecret() then claimLegB()", so a paid Seller never
+  sees "leg A is owed". Only then, on Solana, does it read leg B's own record. That record counts as a claim only when
+  it is a PROVEN claim: its lock, statement and refundAfterMs equal leg B's own terms and its secret opens the
+  statement; a note that fails this is ignored (the reason is kept in `refundNotes`) and does not block the refund.
+  On the paper rail the note is unauthenticated and anyone holding the secret can write it, so the refusal
+  `LegBClaimedError` ("leg B was claimed with the public secret; leg A is owed to the Seller; settle by hand") means
+  exactly "the secret is public and leg B reads claimed", nothing more. (When leg B is a value-bearing chain rail the
+  check has to use bound chain evidence instead.) If a claim of leg A only becomes final while the refund is being
+  sent (the finality-lag window), the refund's own failure is replaced by the routing error "call learnSecret() then
+  claimLegB()". The Buyer's rule (refund leg A only while leg B is unclaimed) prevents only the Buyer's OWN
+  refund-after-claim; it does not make the swap safe for everyone. Once the secret is public or possibly seen and the
+  Seller's claim cannot land before `legA.refundAfterMs`, leg B is claimable by anyone holding the secret until
+  `legB.refundAfterMs`, even after the Buyer's legitimate refund of leg A, and settling that needs a person. Known
   limit: after `refund_after_ms` only a refund can move leg A (the program refuses every later claim), so when leg B
-  was claimed first, a person must pay the Seller outside the protocol. A refund of leg A after leg B was claimed is
-  never an ordinary refund: the fold reports `refunded-a` with the reason "leg A refunded after leg B was claimed:
-  the Seller received neither leg" (`LEG_A_REFUNDED_AFTER_B_CLAIMED`, from `src/swap.ts`). This repository has no
-  reputation emitter; a reader that scores parties must key on that reason and must not count it as an ordinary
-  refund. EVM, Bitcoin and NEAR keep their own rules.
+  was claimed first, a person must pay the Seller outside the protocol. The fold's verdict on a refund of leg A after
+  a leg-B claim is graded: `refunded-a` with the reason "leg A refunded after leg B was claimed: the Seller received
+  neither leg" (`LEG_A_REFUNDED_AFTER_B_CLAIMED`, from `src/swap.ts`) ONLY when leg B's claim is on a value-bearing
+  rail and its bound observation shows it before leg A's refund (`transitionAtMs`, chain time); otherwise the neutral
+  reason "leg B claimed and leg A refunded; order or value not proven" (`LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN`). The
+  paper rail is always neutral (a Seller can write a paper note after the fact), and no reader binds a transition
+  time yet, so today every verdict is neutral. This repository has no reputation emitter; a reader that scores
+  parties must not count either reason as proof of theft. EVM, Bitcoin and NEAR keep their own rules.
 - *The chain's clock is checked before value moves.* `lockLegA` and the Seller's `acceptLegA` refuse when the
   chain's finalized clock and the local clock differ by more than 60 s (`SOL_CHAIN_CLOCK_SKEW_MS`). Known limit:
   the Buyer's protection on Solana is `legB.refundAfterMs - legA.refundAfterMs`; a chain halt or a clock lag longer
@@ -930,7 +939,9 @@ Only what the tests prove is claimed; the rest is written down.
   claim of the flow that never landed. The Seller then keeps claiming up to the landing bound (not the
   5-minute policy margin) and reports `neverLandedClaims` / `SolClaimStarvedError` ("secret broadcast but not
   landed, possibly seen"). Known limit: write-lock starvation on a busy cluster; the fee policy mitigates it,
-  nothing guarantees inclusion. In public-secret mode an undecided earlier retry never blocks the next claim.
+  nothing guarantees inclusion. A starved claim leaves the secret possibly seen: leg B is then exposed (claimable by
+  anyone holding the secret) until `legB.refundAfterMs`, even after the Buyer's legitimate refund of leg A, and
+  settling needs a person (`SolClaimStarvedError` says "leg B exposed until legB.refundAfterMs"). In public-secret mode an undecided earlier retry never blocks the next claim.
 
 - **A stray donation is adopted.** The vault is an ordinary token account, so anyone can add units to
   it, and the program pays the whole balance out. The adapter and the evidence reader therefore accept a
@@ -954,7 +965,8 @@ Only what the tests prove is claimed; the rest is written down.
   it is never a safety input. The Seller proves its own public secret from the one recorded transaction
   (`proofSignature`), and the Buyer claims leg B only once the escrow itself reads Claimed, so padding cannot
   stop a payment or make the Buyer lose a leg. The price of that rule: a secret leaked by a failed claim is not
-  acted on by the Buyer, so if the Seller cannot be paid the swap fails and both legs are refunded.
+  acted on by the Buyer, so if the Seller cannot be paid the swap fails, but "both legs are refunded" is not guaranteed: while the secret is public
+  leg B stays claimable by anyone holding it until `legB.refundAfterMs`, and a person must settle that.
 - **`simulateTransaction` receives the signed claim.** The claim is simulated first so a claim the
   runtime would refuse is never sent, but the simulation request carries the signed transaction and so
   the secret. Use an endpoint you trust for the Seller, as for the send path. A claim past its own
