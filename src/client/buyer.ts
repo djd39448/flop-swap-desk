@@ -108,12 +108,17 @@ export interface BidParams {
   expiresMs: number;
 }
 
-/** R3-6: leg B was claimed by someone while leg A is still locked: leg A is owed to the Seller. */
+/**
+ * R3-6 / RR4-1: reserved for a VALUE-BEARING leg-B rail whose claim is shown by bound chain evidence (the Buyer then
+ * holds leg B and must not also take leg A back). It is never thrown while leg B is the paper rail: a paper note is
+ * unauthenticated and moves no value, and the Seller (who always holds the secret) or anyone holding a leaked secret
+ * can write a valid "claimed" note at no cost, so obeying it would let them freeze the Buyer's real refund of leg A.
+ */
 export class LegBClaimedError extends Error {
   constructor() {
     super(
-      "buyer: refusing to refund leg A - leg B was claimed with the public secret; leg A is owed to the Seller; settle by hand " +
-        "(the paper note is unauthenticated: this means the secret is public and leg B reads claimed) (R3-6, R4-1)",
+      "buyer: refusing to refund leg A - leg B's value-bearing claim is shown on chain, so this Buyer already holds leg B; " +
+        "settle by hand (R3-6, RR4-1)",
     );
     this.name = "LegBClaimedError";
   }
@@ -786,14 +791,15 @@ export class BuyerFlow {
         );
       }
     }
-    // R3-6 + R4-1 (Solana): leg B's own record is read next. Leg B counts as claimed ONLY when the note is a proven claim:
-    // its lock, statement and refundAfterMs equal leg B's own terms AND its secret opens the statement. On the paper rail
-    // the note is UNAUTHENTICATED and anyone holding the secret can write it, so this refusal means exactly "the secret
-    // is public and leg B reads claimed", nothing more. (When leg B is a value-bearing chain rail the check must use
-    // bound chain evidence instead; this flow's leg B is the paper rail.) A forged note (no secret, or terms that do not
-    // match) is ignored, with a reason kept in `refundNotes`, and never blocks the refund.
-    // Known limit: after refund_after only a refund can move leg A, so a person must pay the Seller by hand.
-    if (this.rail.railId === SOL_RAIL_ID) {
+    // R3-6 / R4-1 / RR4-1 (Solana): leg B's own record is read next, and only before this flow's first refund
+    // broadcast (RR4-2: once a refund was sent, a note cannot stop it and must not stop the retry that posts its
+    // frames). This flow's leg B is the PAPER rail: its note is unauthenticated and moves no value, and the Seller (who
+    // always holds the secret) or anyone holding a leaked secret can write a valid "claimed" note at no cost. Obeying
+    // such a note would let them freeze the Buyer's real refund of leg A forever (round-4 re-review, proven), while a
+    // paper "claimed" means nobody was paid. So the note is only RECORDED in `refundNotes` (proven: "the secret is
+    // public and leg B's paper note reads claimed"; otherwise: ignored as not a proven claim) and the refund goes
+    // ahead. `LegBClaimedError` is reserved for a value-bearing leg-B rail with bound chain evidence (none in this build).
+    if (this.rail.railId === SOL_RAIL_ID && this.legARefundEvidence === undefined) {
       const { offerB, acceptB } = this.requirePaired();
       const legBRecord = await this.paperRail.read(acceptB.contract);
       if (legBRecord !== null && legBRecord.status === "claimed") {
@@ -803,9 +809,10 @@ export class BuyerFlow {
           legBRecord.statement === termsB.statement &&
           legBRecord.refundAfterMs === termsB.refundAfterMs &&
           verifySecret(termsB.lock, termsB.statement, legBRecord.secret ?? "");
-        if (proven) throw new LegBClaimedError();
         this.refundNotes.push(
-          "leg B's paper note reads claimed but is not a proven claim (terms differ or its secret does not open the statement): ignored (R4-1)",
+          proven
+            ? "leg B's paper note is a proven claim: the secret is public and leg B's paper note reads claimed; paper moves no value, so the refund of leg A goes ahead (RR4-1)"
+            : "leg B's paper note reads claimed but is not a proven claim (terms differ or its secret does not open the statement): ignored (R4-1)",
         );
       }
     }

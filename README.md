@@ -854,17 +854,18 @@ does not mean the Seller was paid (the program refuses every claim at or after `
   stored preimage when the escrow is Claimed, and otherwise throws "leg A not claimed on chain yet"; a reveal
   frame alone, or a secret leaked by a failed claim, never lets the Buyer claim leg B, and `claimLegB` refuses
   unless leg A is Claimed with that very secret. The Buyer never scans history, so nothing anyone can pad affects it.
-- *The Buyer refunds leg A only while leg B is unclaimed.* `refundLegA` first checks leg A itself: when leg A reads Claimed
+- *A paper note about leg B never stops the Buyer's refund of leg A.* `refundLegA` first checks leg A itself: when leg A reads Claimed
   (or this flow already claimed leg B) it routes to "call learnSecret() then claimLegB()", so a paid Seller never
-  sees "leg A is owed". Only then, on Solana, does it read leg B's own record. That record counts as a claim only when
-  it is a PROVEN claim: its lock, statement and refundAfterMs equal leg B's own terms and its secret opens the
-  statement; a note that fails this is ignored (the reason is kept in `refundNotes`) and does not block the refund.
-  On the paper rail the note is unauthenticated and anyone holding the secret can write it, so the refusal
-  `LegBClaimedError` ("leg B was claimed with the public secret; leg A is owed to the Seller; settle by hand") means
-  exactly "the secret is public and leg B reads claimed", nothing more. (When leg B is a value-bearing chain rail the
-  check has to use bound chain evidence instead.) If a claim of leg A only becomes final while the refund is being
+  sees a refund. Only then, on Solana and only before this flow's first refund broadcast, does it read leg B's own
+  record. In this build leg B is the paper rail, whose note is unauthenticated and moves no value: the Seller (who
+  always holds the secret) or anyone holding a leaked secret can write a valid "claimed" note at no cost, so obeying it
+  would let them freeze the Buyer's real refund of leg A (found and proven by the round-4 re-review). The note is
+  therefore only recorded in `refundNotes`: a proven note (its lock, statement and refundAfterMs equal leg B's terms
+  and its secret opens the statement) is recorded as "the secret is public and leg B's paper note reads claimed",
+  anything else as "not a proven claim", and the refund goes ahead either way. `LegBClaimedError` is reserved for a
+  future value-bearing leg-B rail whose claim is shown by bound chain evidence; nothing throws it while leg B is paper. If a claim of leg A only becomes final while the refund is being
   sent (the finality-lag window), the refund's own failure is replaced by the routing error "call learnSecret() then
-  claimLegB()". The Buyer's rule (refund leg A only while leg B is unclaimed) prevents only the Buyer's OWN
+  claimLegB()". The Buyer's rule (claim leg B only once leg A reads Claimed) prevents only the Buyer's OWN
   refund-after-claim; it does not make the swap safe for everyone. Once the secret is public or possibly seen and the
   Seller's claim cannot land before `legA.refundAfterMs`, leg B is claimable by anyone holding the secret until
   `legB.refundAfterMs`, even after the Buyer's legitimate refund of leg A, and settling that needs a person. Known

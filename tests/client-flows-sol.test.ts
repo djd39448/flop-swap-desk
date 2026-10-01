@@ -1185,8 +1185,8 @@ describe("R3-2/R3-3: a starved claim is reported, priced higher and re-signed; a
 
 // -- R3-6 .. R3-8: the Buyer's refund, the chain clock, the finality-lag window ------------------------------------
 
-describe("R3-6: a claimed leg B stops the Buyer's refund of leg A", () => {
-  it("a third party claims leg B with the public secret after a failed Seller claim: refundLegA refuses with the distinct error and sends no refund", async () => {
+describe("R3-6 / RR4-1: a paper leg-B note is recorded, never obeyed", () => {
+  it("a third party claims leg B (paper) with the public secret after a failed Seller claim: the Buyer's refund still goes through, with the note recorded", async () => {
     const h = solHarness();
     const p = await lockedFlow(h);
     // the Seller's claim lands and FAILS (its payee account is frozen): the secret is public in that transaction
@@ -1201,11 +1201,39 @@ describe("R3-6: a claimed leg B stops the Buyer's refund of leg A", () => {
     await new PaperRail(h.noteStore, h.clock).claim(legBContract, sellerSecret(h));
 
     h.setTime(p.offerA.refundAfterMs);
-    const refusal = h.buyerFlow.refundLegA();
-    await expect(refusal).rejects.toBeInstanceOf(LegBClaimedError);
-    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/leg B was claimed with the public secret; leg A is owed to the Seller; settle by hand/);
-    expect(h.node.sent.refund).toBe(0);
-    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Locked");
+    await h.buyerFlow.refundLegA();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Refunded");
+    expect(h.buyerFlow.refundNotes.join(" ")).toMatch(/proven claim: the secret is public and leg B's paper note reads claimed/);
+  });
+
+  it("RR4-1: the Seller claims its own paper leg B instead of leg A; the honest Buyer's refund is not frozen", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    const legBContract = (tryDecodeFrame(p.acceptBRecord.line) as AcceptFrame).contract;
+    await new PaperRail(h.noteStore, h.clock).claim(legBContract, sellerSecret(h));
+    h.setTime(p.offerA.refundAfterMs);
+    const outcome = await h.buyerFlow.refundLegA().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(outcome).not.toBeInstanceOf(LegBClaimedError);
+    expect(outcome).toBeNull();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Refunded");
+    expect(h.node.sent.refund).toBe(1);
+  });
+
+  it("RR4-2: a refund already sent is never blocked by a note that appears afterwards; the retry posts the refund frames", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    h.setTime(p.offerA.refundAfterMs);
+    failPosts(h, "refund", 1);
+    await expect(h.buyerFlow.refundLegA()).rejects.toThrow();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Refunded");
+    const legBContract = (tryDecodeFrame(p.acceptBRecord.line) as AcceptFrame).contract;
+    await new PaperRail(h.noteStore, h.clock).claim(legBContract, sellerSecret(h));
+    await h.buyerFlow.refundLegA();
+    expect(framesIn(await h.venue.read(dealRoomOf(p.acceptA)), "refund")).toHaveLength(1);
+    expect(h.node.sent.refund).toBe(1);
   });
 
   it("with leg B still locked the same Buyer's refund goes through (the guard reads leg B's own record)", async () => {
@@ -1252,18 +1280,14 @@ describe("R4-1/R4-2: the refund guard trusts only a proven leg-B claim and check
     expect(h.buyerFlow.refundNotes).toHaveLength(1);
   });
 
-  it("R4-1: a note carrying the right terms and a secret that opens the statement blocks the refund, and the error says what it means", async () => {
+  it("RR4-1: a proven paper note (right terms, a secret that opens the statement) is recorded and the refund goes ahead", async () => {
     const h = solHarness();
     const p = await lockedFlow(h);
     await forgeLegBNote(h, p, () => undefined);
     h.setTime(p.offerA.refundAfterMs);
-    const error = await h.buyerFlow.refundLegA().then(
-      () => null,
-      (e: unknown) => e,
-    );
-    expect(error).toBeInstanceOf(LegBClaimedError);
-    expect((error as Error).message).toMatch(/unauthenticated: this means the secret is public and leg B reads claimed/);
-    expect(h.node.sent.refund).toBe(0);
+    await h.buyerFlow.refundLegA();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Refunded");
+    expect(h.buyerFlow.refundNotes.join(" ")).toMatch(/paper moves no value, so the refund of leg A goes ahead/);
   });
 
   it("R4-2: when leg A itself is Claimed the Buyer gets the learnSecret()/claimLegB() routing even though leg B also reads claimed", async () => {
