@@ -892,7 +892,12 @@ does not mean the Seller was paid (the program refuses every claim at or after `
   is adopted from the deal room if it landed, never posted twice), so a stalled venue cannot hold up the retry or
   the call. The reveal frame is posted only once the escrow reads Claimed (the same rule the Buyer follows): a
   claim that landed and failed paid nobody, so no reveal frame is posted for it, and when no retry can land the
-  call ends without one.
+  call ends without one. The retry is bounded by the window: once chain or local time has reached
+  `refundAfterMs` no retry is sent (the original failure is reported). Inside the window it is still sent even
+  when landing, finality and the reveal post may not all fit before `refundAfterMs` (it is the only way to be paid),
+  and the reveal post is not attempted once venue time is past `refundAfterMs`: `RevealNotPostedError` is raised.
+  A claim that is Claimed on chain but whose reveal could not be recorded makes the fold push "leg A claimed on chain
+  but its reveal frame was not recorded" (`LEG_A_CLAIMED_REVEAL_NOT_RECORDED`).
 
 Before signing, the client rail checks who the escrow pays and its mint, amount and times against this leg's
 own terms, and refuses a claim with no resolved payee line. Both parties' proven `ed25519` lines are required,

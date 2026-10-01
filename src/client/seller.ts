@@ -863,9 +863,17 @@ export class SellerFlow {
           this.dropClaimRecord(error.signature); // resolved: it landed and failed
           // S2-4: the retry goes out first (it is what pays the Seller); the reveal frame follows the landed claim
           // (the post after the loop) or, when the retries are exhausted, just below.
+          // R4-5: a public-secret retry is bounded by the window it must land in. Once the chain's (or the local) time has
+          // reached refundAfterMs no claim can pay the Seller (the program refuses it) and the reveal frame is no longer
+          // accepted, so the effort stops here and the original failure is reported. Inside the window the retry is
+          // still sent even when landing + finality + the reveal post may not all fit: it is the only way to be paid,
+          // and the reveal post below then raises RevealNotPostedError when venue time has passed refundAfterMs.
           if (retries < SOL_PUBLIC_SECRET_RETRIES) {
-            retryPublicSecret = true;
-            continue;
+            const chainNowMs = Math.max(await connected.chainTimeMs(), this.clock());
+            if (chainNowMs < offerA.refundAfterMs) {
+              retryPublicSecret = true;
+              continue;
+            }
           }
         }
         // SOL-C4/C5: the secret is public on chain and the claim could not be completed: the reveal frame is owed
@@ -953,6 +961,13 @@ export class SellerFlow {
     if (this.revealPosted?.key === key) return this.revealPosted.record;
     let last: unknown;
     for (let attempt = 0; attempt < REVEAL_POST_ATTEMPTS; attempt++) {
+      // R4-5 (Solana): tclk's machine only accepts a reveal while the contract is still locked, and the buyer's refund
+      // frame may land from refundAfterMs on. Once venue time (the flow's clock, the same one the venue stamps with) is
+      // past it the post is not attempted: the claim is on chain but cannot be recorded. The fold reports it
+      // ("leg A claimed on chain but its reveal frame was not recorded").
+      if (this.rail.railId === SOL_RAIL_ID && this.clock() >= refundAfterMs) {
+        throw new RevealNotPostedError(refundAfterMs, last ?? new Error("venue time is at/after refundAfterMs"), `${detail}; not attempted after refundAfterMs`);
+      }
       try {
         const line = encodeFrame({ type: "reveal", from: this.identity.did, contract, ref, secret: this.hashLock!.preimage });
         const record =

@@ -15,7 +15,7 @@ import {
 import { describe, expect, it } from "vitest";
 
 import { legAContext, legBContext, swapId as computeSwapId } from "../src/profile.js";
-import { foldSwap, LEG_A_REFUNDED_AFTER_B_CLAIMED, LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN } from "../src/swap.js";
+import { foldSwap, LEG_A_CLAIMED_REVEAL_NOT_RECORDED, LEG_A_REFUNDED_AFTER_B_CLAIMED, LEG_A_REFUNDED_LEG_B_CLAIMED_UNPROVEN } from "../src/swap.js";
 import { identity, record, unsignedRecord } from "./helpers/identity.js";
 import { observe } from "./helpers/observations.js";
 import { scenario } from "./helpers/scenario.js";
@@ -683,6 +683,26 @@ describe("foldSwap — settlementView (H3, tclk PR #173 vocabulary)", () => {
       nowMs: T0 + 5 * MIN,
     });
     expect(view.settlementView).toEqual({ a: "funded", b: "none" });
+  });
+});
+
+describe("foldSwap — R4-5: leg A claimed on chain with no recorded reveal", () => {
+  it("pushes the reason when the bound observation says claimed and the transcript never revealed; not when the reveal is there", () => {
+    const s = build();
+    const without = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: { aRail: observe(s, "a", "claimed", T0 + 61 * MIN) },
+      nowMs: T0 + 61 * MIN,
+    });
+    expect(without.reasons).toContain(LEG_A_CLAIMED_REVEAL_NOT_RECORDED);
+    const withReveal = foldSwap({
+      legA: [s.records.offerA, s.records.acceptA, s.records.lockA, s.records.revealA],
+      legB: [s.records.offerB, s.records.acceptB, s.records.lockB],
+      evidence: { aRail: observe(s, "a", "claimed", T0 + 61 * MIN) },
+      nowMs: T0 + 61 * MIN,
+    });
+    expect(withReveal.reasons).not.toContain(LEG_A_CLAIMED_REVEAL_NOT_RECORDED);
   });
 });
 

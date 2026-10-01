@@ -224,6 +224,9 @@ function settlementViewForLeg(evidence: LockEvidence | undefined, rail: RailObse
  *  value-bearing rail and its bound observation shows it before leg A's refund (chain time). */
 export const LEG_A_REFUNDED_AFTER_B_CLAIMED = "leg A refunded after leg B was claimed: the Seller received neither leg";
 
+/** R4-5: the reason the fold pushes when leg A is claimed on chain but its reveal frame was never recorded. */
+export const LEG_A_CLAIMED_REVEAL_NOT_RECORDED = "leg A claimed on chain but its reveal frame was not recorded";
+
 /** R4-3: the neutral reason pushed when leg B reads claimed and leg A is refunded but the order or the value is not
  *  proven (always the case for the unauthenticated paper rail: anyone holding the secret can write the note, even
  *  after the fact). */
@@ -507,6 +510,11 @@ export function foldSwap(input: SwapFoldInput): SwapView {
   // refunded (a refund frame alone never does); only the paper rail folds from the frame alone.
   const refundedA = refundedFold("A", legAState, evidence.aRail, reasons);
   const refundedB = refundedFold("B", legBState, evidence.bRail, reasons);
+  // R4-5: leg A is claimed on chain (a bound, final observation) but the deal room never recorded its reveal: the claim
+  // is real, the transcript cannot show it (a late reveal is refused once leg A's refund frame lands).
+  if (evidence.aRail?.status === "claimed" && evidence.aRail.final === true && legAState.status !== "claimed" && !refundedA) {
+    reasons.push(LEG_A_CLAIMED_REVEAL_NOT_RECORDED);
+  }
   if (refundedA && refundedB) {
     view.status = "refunded";
     return view;

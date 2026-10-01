@@ -1282,6 +1282,41 @@ describe("R4-1/R4-2: the refund guard trusts only a proven leg-B claim and check
   });
 });
 
+describe("R4-5: a late public-secret retry and a late reveal", () => {
+  it("when the failed claim's landing already took the clock to refundAfterMs, no public-secret retry is sent and the original failure is reported", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    h.node.midFlight = (kind) => {
+      if (kind === "claim") h.node.freezeToken(h.sellerWallet.publicKeyBytes);
+    };
+    h.node.afterLand = (kind, failed) => {
+      if (kind === "claim" && failed) h.setTime(p.offerA.refundAfterMs);
+    };
+    const error = await h.sellerFlow.claimLegA(p.statement).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(SolClaimFailedError);
+    expect(h.node.history.filter((t) => t.kind === "claim")).toHaveLength(1);
+  });
+
+  it("a claim that landed but whose reveal could only be posted after refundAfterMs raises RevealNotPostedError and posts nothing", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    h.node.afterLand = (kind, failed) => {
+      if (kind === "claim" && !failed) h.setTime(p.offerA.refundAfterMs);
+    };
+    const error = await h.sellerFlow.claimLegA(p.statement).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(RevealNotPostedError);
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
+    const room = await h.venue.read(dealRoomOf(p.acceptA));
+    expect(room.some((r) => (tryDecodeFrame(r.line) as { type?: string } | null)?.type === "reveal")).toBe(false);
+  });
+});
+
 describe("R3-7: the chain clock check on lockLegA and the Seller's acceptLegA", () => {
   it("the named bound is 60 s", () => {
     expect(SOL_CHAIN_CLOCK_SKEW_MS).toBe(60_000);
