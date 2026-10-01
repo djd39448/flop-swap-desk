@@ -62,10 +62,14 @@ export class FakeSolChain {
   /** Wall time (ms) that the FINALIZED slot's block time reports (seconds resolution on the wire). */
   finalizedTimeMs = 1_800_000_000_000;
   blockhash = base58.encode(new Uint8Array(32).fill(0x42));
-  lastValidBlockHeight = 4_931 + 150;
+  lastValidBlockHeight = 4_931 + 151; // what the rail's clamp (R3-5, processed height + 151) yields, so it is the one reading
   statuses = new Map<string, FakeStatus>();
   transactions = new Map<string, { slot: number; blockTime: number | null; err: unknown; bytes: Uint8Array }>();
   addressSignatures = new Map<string, Array<{ signature: string; slot: number; err: unknown }>>();
+  /** R3-4: the lowest slot the node's ledger holds. */
+  firstAvailableBlock = 0;
+  /** R3-2: what getRecentPrioritizationFees answers. */
+  prioritizationFees: Array<{ slot: number; prioritizationFee: number }> = [];
   simulateErr: unknown = null;
   simulateLogs: string[] = [];
   /** Called with the decoded transaction when `sendTransaction` is answered. Default: a finalized success. */
@@ -86,6 +90,11 @@ export class FakeSolChain {
     const list = this.queued.get(method) ?? [];
     list.push(handler);
     this.queued.set(method, list);
+  }
+
+  /** getSignaturesForAddress calls that are NOT connect's own history probe (which asks about the program id, R3-4): a scan of an escrow's history. */
+  historyScans(): number {
+    return this.requests.filter((r) => r.method === "getSignaturesForAddress" && r.params[0] !== SOL_HTLC_PROGRAM_ID).length;
   }
 
   count(method: string): number {
@@ -144,6 +153,8 @@ export class FakeSolChain {
       }
       return list.slice(0, cfg.limit ?? 1000).map((e) => ({ signature: e.signature, slot: e.slot, err: e.err, blockTime: null, memo: null, confirmationStatus: "finalized" }));
     },
+    getFirstAvailableBlock: (_p, c) => c.firstAvailableBlock,
+    getRecentPrioritizationFees: (_p, c) => c.prioritizationFees,
     requestAirdrop: () => base58.encode(new Uint8Array(64).fill(1)),
   };
 

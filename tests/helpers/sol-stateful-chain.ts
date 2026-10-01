@@ -32,7 +32,7 @@ import { base58, base64 } from "@scure/base";
 import { CapturingRpc } from "../../src/rails/rpc-capture.js";
 import { SOL_HTLC_PROGRAM_ID, SOL_ESCROW_LEN, decodeEscrow, escrowAddress, vaultAddress, type SolEscrowView, type SolRailConfig } from "../../src/rails/sol-htlc.js";
 import { InMemorySolSigner } from "../../src/rails/sol-signer-memory.js";
-import { TOKEN_PROGRAM_ID, associatedTokenAddress, decodeTokenAccount } from "../../src/rails/sol-spl.js";
+import { ASSOCIATED_TOKEN_PROGRAM_ID, COMPUTE_BUDGET_PROGRAM_ID, TOKEN_PROGRAM_ID, associatedTokenAddress, decodeTokenAccount } from "../../src/rails/sol-spl.js";
 import { bytesEqual, decodeTransaction, pubkeyFromBase58, pubkeyToBase58, verifyTransactionSignatures, type SolTransaction } from "../../src/rails/sol-tx.js";
 import { FakeRpcError, FakeSolChain, escrowBytes, makeWorld, tokenAccountBytes, type World } from "./sol-fake-chain.js";
 
@@ -66,6 +66,8 @@ export class StatefulSolNode {
   /** Transactions the node ACCEPTED for sending, by kind (the preflight-rejected are not counted). */
   readonly sent: Record<Kind, number> = { lock: 0, claim: 0, refund: 0 };
   private blockhashCounter = 0;
+  /** Token accounts a claim transaction's CreateIdempotent created (kept for tests that count them). */
+  readonly createdByAta: string[] = [];
   /** Runs after the preflight and before execution. A test mutates the world here (move the clock, close an
    *  account) to make a transaction land and fail. Called for every kind; `kind` says which. */
   midFlight?: (kind: Kind, tx: SolTransaction) => void;
@@ -144,6 +146,17 @@ export class StatefulSolNode {
     this.chain.accounts.delete(pubkeyToBase58(associatedTokenAddress(ownerBytes, this.mint)));
   }
 
+  /** Freezes the owner's token account (a claim into it then fails on chain, as the token program refuses a frozen destination). */
+  freezeToken(owner: Uint8Array | string): void {
+    const ownerBytes = typeof owner === "string" ? pubkeyFromBase58(owner) : owner;
+    const key = associatedTokenAddress(ownerBytes, this.mint);
+    const existing = this.chain.get(key);
+    if (existing === undefined) return;
+    const data = existing.data.slice();
+    data[108] = 2;
+    this.chain.put(key, { ...existing, data });
+  }
+
   tokenBalance(owner: Uint8Array | string): bigint | null {
     const ownerBytes = typeof owner === "string" ? pubkeyFromBase58(owner) : owner;
     const account = this.chain.get(associatedTokenAddress(ownerBytes, this.mint));
@@ -185,10 +198,33 @@ export class StatefulSolNode {
 
   // -- the program -------------------------------------------------------------------------------------------
 
+  /** The compute-budget instructions are accepted and ignored (fees and compute are not modelled); the ATA
+   *  CreateIdempotent instructions are collected; exactly one other (program) instruction must remain. */
+  private split(tx: SolTransaction): { program: SolTransaction["message"]["instructions"][number][]; ata: Array<{ payer: Uint8Array; owner: Uint8Array; mint: Uint8Array }>; budget: number } {
+    const program: SolTransaction["message"]["instructions"][number][] = [];
+    const ata: Array<{ payer: Uint8Array; owner: Uint8Array; mint: Uint8Array }> = [];
+    let budget = 0;
+    for (const ix of tx.message.instructions) {
+      const id = pubkeyToBase58(tx.message.accountKeys[ix.programIdIndex] as Uint8Array);
+      if (id === COMPUTE_BUDGET_PROGRAM_ID) budget += 1;
+      else if (id === ASSOCIATED_TOKEN_PROGRAM_ID) {
+        const k = ix.accountIndexes.map((i) => tx.message.accountKeys[i] as Uint8Array);
+        ata.push({ payer: k[0] as Uint8Array, owner: k[2] as Uint8Array, mint: k[3] as Uint8Array });
+      } else program.push(ix);
+    }
+    return { program, ata, budget };
+  }
+
+  /** The program instruction of an executed transaction, for history indexing. */
+  programInstruction(tx: SolTransaction): SolTransaction["message"]["instructions"][number] | undefined {
+    return this.split(tx).program[0];
+  }
+
   private parse(tx: SolTransaction): Parsed | { err: unknown } {
     if (!verifyTransactionSignatures(tx)) return { err: "SignatureFailure" };
-    const ix = tx.message.instructions[0];
-    if (tx.message.instructions.length !== 1 || ix === undefined) return { err: CUSTOM(1) };
+    const split = this.split(tx);
+    const ix = split.program[0];
+    if (split.program.length !== 1 || ix === undefined) return { err: CUSTOM(1) };
     const programKey = tx.message.accountKeys[ix.programIdIndex];
     if (programKey === undefined || pubkeyToBase58(programKey) !== SOL_HTLC_PROGRAM_ID) return { err: "InvalidProgramForExecution" };
     const tag = ix.data[0];
@@ -203,7 +239,19 @@ export class StatefulSolNode {
     const parsed = this.parse(tx);
     if ("err" in parsed) return { kind: "claim", err: parsed.err };
     const now = Math.floor(this.chain.finalizedTimeMs / 1000) * 1000;
+    // CreateIdempotent runs before the program instruction inside the same transaction: it creates the token account
+    // when it is missing. A failed transaction (or a simulation) leaves nothing behind.
+    const created: string[] = [];
+    for (const a of this.split(tx).ata) {
+      const key = associatedTokenAddress(a.owner, a.mint);
+      if (this.chain.get(key) === undefined) {
+        this.chain.put(key, { lamports: 1, owner: TOKEN_PROGRAM_ID, data: tokenAccountBytes({ mint: a.mint, owner: a.owner, amount: 0n }), executable: false });
+        created.push(pubkeyToBase58(key));
+        this.createdByAta.push(pubkeyToBase58(key));
+      }
+    }
     const out = parsed.kind === "lock" ? this.lock(parsed, now, commit) : parsed.kind === "claim" ? this.claim(parsed, now, commit) : this.refund(parsed, now, commit);
+    if (!commit || out.err !== null) for (const key of created) this.chain.accounts.delete(key);
     return { kind: parsed.kind, err: out.err, ...(parsed.kind === "claim" ? { preimage: `0x${bytesToHex(parsed.data.slice(1))}` } : {}) };
   }
 
@@ -274,7 +322,7 @@ export class StatefulSolNode {
     const vault = this.tokenOf(vaultKey);
     if (vault === null || vault.amount < BigInt(escrow.amount)) return { err: CUSTOM(17) };
     const payee = this.tokenOf(payeeToken);
-    if (payee === null || !bytesEqual(payee.owner, pubkeyFromBase58(escrow.payee)) || !bytesEqual(payee.mint, this.mint)) return { err: CUSTOM(17) };
+    if (payee === null || payee.state !== "initialized" || !bytesEqual(payee.owner, pubkeyFromBase58(escrow.payee)) || !bytesEqual(payee.mint, this.mint)) return { err: CUSTOM(17) };
     if (commit) {
       const total = vault.amount;
       this.setTokenAmount(vaultKey, 0n);
@@ -339,7 +387,7 @@ export class StatefulSolNode {
     const slot = this.chain.finalizedSlot;
     this.chain.statuses.set(tx.signature, { slot, confirmations: null, err: done.err, confirmationStatus: "finalized" });
     this.chain.transactions.set(tx.signature, { slot, blockTime: Math.floor(this.chain.finalizedTimeMs / 1000), err: done.err, bytes: tx.bytes });
-    const ix = tx.message.instructions[0];
+    const ix = this.programInstruction(tx);
     if (ix !== undefined) {
       for (const index of ix.accountIndexes) {
         const key = pubkeyToBase58(tx.message.accountKeys[index] as Uint8Array);

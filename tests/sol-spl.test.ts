@@ -22,8 +22,13 @@ import {
   SPL_MINT_LEN,
   SPL_TOKEN_ACCOUNT_LEN,
   TOKEN_PROGRAM_ID,
+  COMPUTE_BUDGET_PROGRAM_ID,
   associatedTokenAddress,
   createAssociatedTokenAccountIdempotent,
+  setComputeUnitLimit,
+  setComputeUnitLimitData,
+  setComputeUnitPrice,
+  setComputeUnitPriceData,
   decodeMint,
   decodeTokenAccount,
   initializeAccount3,
@@ -128,6 +133,32 @@ describe("program-derived addresses computed with solana-program 5.1.0", () => {
     expect(text(ix.programId)).toBe(ASSOCIATED_TOKEN_PROGRAM_ID);
     expect(Array.from(ix.data)).toEqual([1]);
     expect(text(ix.accounts[1]?.pubkey ?? new Uint8Array(32))).toBe("6iiyETYN91h7yPA8rTL46pc69N3LF6LQBDVzq4hZS5uX");
+  });
+});
+
+describe("compute budget instructions (solana-compute-budget-interface test_to_instruction vectors)", () => {
+  // Source: anza-xyz/solana-sdk, compute-budget-interface/src/lib.rs, `test_to_instruction`:
+  //   set_compute_unit_limit(257).data == [2, 1, 1, 0, 0]; set_compute_unit_price(u64::MAX).data == [3, 255 x 8].
+  it("SetComputeUnitLimit(257) = [2, 1, 1, 0, 0]", () => {
+    expect(Array.from(setComputeUnitLimitData(257))).toEqual([2, 1, 1, 0, 0]);
+  });
+  it("SetComputeUnitPrice(u64::MAX) = [3, 255 x 8]", () => {
+    expect(Array.from(setComputeUnitPriceData(0xffff_ffff_ffff_ffffn))).toEqual([3, 255, 255, 255, 255, 255, 255, 255, 255]);
+    expect(Array.from(setComputeUnitPriceData(1n))).toEqual([3, 1, 0, 0, 0, 0, 0, 0, 0]);
+  });
+  it("the program id is ComputeBudget111... (bytes 03 06 46 6f e5 21 17 32 ff ec ad ba 72 c3 9b e7 bc 8c e5 bb c5 f7 12 6b 2c 43 9b 3a 40 00 00 00) and the instructions take no accounts", () => {
+    const hex = Array.from(pubkeyFromBase58(COMPUTE_BUDGET_PROGRAM_ID), (b) => b.toString(16).padStart(2, "0")).join(" ");
+    expect(hex).toBe("03 06 46 6f e5 21 17 32 ff ec ad ba 72 c3 9b e7 bc 8c e5 bb c5 f7 12 6b 2c 43 9b 3a 40 00 00 00");
+    for (const ix of [setComputeUnitLimit(257), setComputeUnitPrice(5n)]) {
+      expect(text(ix.programId)).toBe(COMPUTE_BUDGET_PROGRAM_ID);
+      expect(ix.accounts).toEqual([]);
+    }
+  });
+  it("range checks", () => {
+    expect(() => setComputeUnitLimitData(-1)).toThrow();
+    expect(() => setComputeUnitLimitData(2 ** 32)).toThrow();
+    expect(() => setComputeUnitPriceData(-1n)).toThrow();
+    expect(() => setComputeUnitPriceData(2n ** 64n)).toThrow();
   });
 });
 

@@ -110,7 +110,12 @@ function toWriteEvidence(evidence: SolWriteEvidence): RailWriteEvidence {
 }
 
 function toClaimRecord(record: SolPreparedRecord): RailClaimRecord {
-  return { signature: record.signature, blockhash: record.blockhash, lastValidBlockHeight: record.lastValidBlockHeight };
+  return {
+    signature: record.signature,
+    blockhash: record.blockhash,
+    lastValidBlockHeight: record.lastValidBlockHeight,
+    ...(record.signedSlot === undefined ? {} : { signedSlot: record.signedSlot }),
+  };
 }
 
 class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
@@ -185,6 +190,7 @@ class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
     const claimOptions: SolClaimOptions = {
       ...(options?.retryPublicSecret === true ? { retryPublicSecret: true } : {}),
       ...(options?.retryPublicSecret === true && options.proofSignature !== undefined ? { proofSignature: options.proofSignature } : {}),
+      ...(options?.priorityFeeAttempt === undefined ? {} : { priorityFeeAttempt: options.priorityFeeAttempt }),
       ...(options?.onNotBroadcast === undefined ? {} : { onNotBroadcast: (record: SolPreparedRecord) => options.onNotBroadcast?.(toClaimRecord(record)) }),
     };
     const onSigned = options?.onSigned === undefined ? undefined : (record: SolPreparedRecord) => options.onSigned?.(toClaimRecord(record));
@@ -197,7 +203,7 @@ class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
    *  itself carries a secret that opens this lock (polled until readable), never taken on anyone's word. */
   async recoverClaim(ref: string, record: RailClaimRecord): Promise<RailClaimRecovery> {
     try {
-      const evidence = await this.solRail.recoverBySignature({ kind: "claim", ref, signature: record.signature, blockhash: record.blockhash, lastValidBlockHeight: record.lastValidBlockHeight });
+      const evidence = await this.solRail.recoverBySignature({ kind: "claim", ref, signature: record.signature, blockhash: record.blockhash, lastValidBlockHeight: record.lastValidBlockHeight, ...(record.signedSlot === undefined ? {} : { signedSlot: record.signedSlot }) });
       if (evidence === null) return { outcome: "never-landed" };
       return { outcome: "landed", evidence: toWriteEvidence(evidence) };
     } catch (error) {

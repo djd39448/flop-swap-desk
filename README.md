@@ -884,6 +884,24 @@ escrow holds the preimage for the Buyer, a Locked one past `refund_after_ms` is 
 
 Only what the tests prove is claimed; the rest is written down.
 
+- **The endpoint must serve transaction history (checked at `connect()`).** "Never landed" and every
+  history-based proof rest on the node still holding the transactions. `connect()` probes once
+  (`getFirstAvailableBlock` and `getSignaturesForAddress` on the program id) and refuses an endpoint that
+  fails either (fail closed). Before a signature is believed never to have landed, the rail also asks
+  `getTransaction(signature, finalized)`, and a node whose ledger starts after the slot the transaction was
+  signed at is reported as pending, never as "never landed". The last valid block height used for the
+  landing bound and for expiry is `max(reported, processed block height + 151)`.
+- **A claim creates the payee's token account, and carries a priority fee.** Every claim is
+  `SetComputeUnitLimit`, `SetComputeUnitPrice`, `CreateIdempotent` (payer: the claimer; owner: the escrow's
+  payee) and the claim, so a payee account that vanishes between the simulation and the landing no longer
+  makes a claim land and fail (live test). The claimer's wallet therefore needs SOL for the account's rent.
+  A refund carries the two budget instructions. The price is the 75th percentile of recent fees over the
+  claim's writable accounts (floor 1,000, cap 1,000,000 micro-lamports per unit), doubled for each earlier
+  claim of the flow that never landed. The Seller then keeps claiming up to the landing bound (not the
+  5-minute policy margin) and reports `neverLandedClaims` / `SolClaimStarvedError` ("secret broadcast but not
+  landed, possibly seen"). Known limit: write-lock starvation on a busy cluster; the fee policy mitigates it,
+  nothing guarantees inclusion. In public-secret mode an undecided earlier retry never blocks the next claim.
+
 - **A stray donation is adopted.** The vault is an ordinary token account, so anyone can add units to
   it, and the program pays the whole balance out. The adapter and the evidence reader therefore accept a
   vault holding AT LEAST the amount (live test: a 1-unit donation after the lock lands, `commitLock` and

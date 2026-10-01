@@ -104,7 +104,7 @@ import { EVM_RAIL_ID } from "../rails/evm-evidence.js";
 import { NEAR_RAIL_ID } from "../rails/near-evidence.js";
 import { parseNearRef } from "../rails/near-ref.js";
 import { NearPayoutFailedError } from "../rails/near-htlc.js";
-import { SolClaimFailedError, parseSolRef } from "../rails/sol-htlc.js";
+import { SOL_CLAIM_LANDING_MARGIN_MS, SolClaimFailedError, SolNotLandedError, SolPendingError, parseSolRef } from "../rails/sol-htlc.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
 import { offerAcceptLockTerms } from "../swap.js";
@@ -176,6 +176,27 @@ export class RevealNotPostedError extends Error {
   }
 }
 
+/** R3-2: a Solana claim whose signed bytes were handed to the network but never landed (starved: the blockhash
+ *  expired with no status). The secret was BROADCAST, so it may have been seen, and the claim did not pay the
+ *  Seller. Thrown to the runner when the Seller cannot finish the claim (the landing bound passed, the attempts
+ *  ran out, or another refusal); `cause` is the final reason. A flow that later lands a claim reports the count in
+ *  the result's `neverLandedClaims` instead. Never a silent drop. */
+export class SolClaimStarvedError extends Error {
+  readonly neverLandedClaims: number;
+  constructor(neverLandedClaims: number, cause: unknown) {
+    super(
+      `seller: secret broadcast but not landed (possibly seen): ${neverLandedClaims} claim(s) never landed and the claim could not be completed (${cause instanceof Error ? cause.message : String(cause)})`,
+      { cause },
+    );
+    this.name = "SolClaimStarvedError";
+    this.neverLandedClaims = neverLandedClaims;
+  }
+}
+
+/** R3-2: the most claims re-signed (at a raised priority fee) after a never-landed outcome inside one `claimLegA`
+ *  call; the landing bound normally ends the effort first. */
+const SOL_NEVER_LANDED_MAX_RESIGNS = 6;
+
 /** Bounded immediate retries for the reveal post (G6). */
 const REVEAL_POST_ATTEMPTS = 3;
 
@@ -227,6 +248,9 @@ export class SellerFlow {
   // S2-2: every Solana claim this flow signed and has not yet resolved, latched BEFORE it is simulated or sent (signature,
   // blockhash, lastValidBlockHeight). `claimLegA` resolves each of them by signature before it does anything else.
   private claimRecords: RailClaimRecord[] = [];
+  // R3-2: how many of this flow's Solana claims were broadcast and never landed (secret possibly seen). Each raises
+  // the priority fee of the next claim and keeps the Seller claiming up to the landing bound.
+  private neverLandedClaims = 0;
   private readonly revealPostTimeoutMs: number;
   private receiptPosted?: { key: string; record: TranscriptRecord };
   private offerB?: OfferFrame;
@@ -559,7 +583,7 @@ export class SellerFlow {
   async claimLegA(
     hashLockHex: string,
     options?: { skipReveal?: boolean },
-  ): Promise<{ evidence: RailWriteEvidence; reveal?: TranscriptRecord; receipt: TranscriptRecord }> {
+  ): Promise<{ evidence: RailWriteEvidence; reveal?: TranscriptRecord; receipt: TranscriptRecord; neverLandedClaims?: number }> {
     const { offerA, acceptA } = this.requireAcceptedA();
     if (this.hashLock === undefined) throw new Error("seller: no secret minted for this flow");
     if (hashLockHex !== this.hashLock.hash) {
@@ -684,7 +708,7 @@ export class SellerFlow {
           ? undefined
           : await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, "claim already landed on chain");
         const receipt = await this.postReceiptLatched(acceptA.contract, railRef);
-        return { evidence: landed, ...(reveal === undefined ? {} : { reveal }), receipt };
+        return { evidence: landed, ...(reveal === undefined ? {} : { reveal }), receipt, ...this.neverLandedField() };
       }
     }
     if (this.rail.railId === NEAR_RAIL_ID || isSol) {
@@ -714,7 +738,11 @@ export class SellerFlow {
       }
     }
 
-    if (!skipDeadlineGuards) {
+    // R3-2: after a claim that never landed the secret may already have been seen, so the Seller keeps claiming up to
+    // the rail's own landing bound (refundAfterMs minus the landing margin) instead of stopping at the policy margin;
+    // the rail still refuses a claim that could land at or after refundAfterMs.
+    const possiblySeen = isSol && this.neverLandedClaims > 0;
+    if (!skipDeadlineGuards && !possiblySeen) {
       // B2/C3: read before verifyLockFinal (whose own capture drains this rail's exchange log
       // when it finishes). Neither the chain's own last block nor wall-clock alone is safe to
       // judge this against: an idle chain's `latest` block can lag real time indefinitely
@@ -775,8 +803,10 @@ export class SellerFlow {
     // freshly-read chain time, immediately before it actually broadcasts (defense in depth
     // against however long its own preimage-free pre-checks (E5) themselves take) — skipped
     // internally by the adapter itself on a revealed retry (H2/G3).
-    const notAfterMs = offerA.refundAfterMs - this.rail.policy.claimInclusionMarginMs;
+    const policyNotAfterMs = offerA.refundAfterMs - this.rail.policy.claimInclusionMarginMs;
+    let notAfterMs = possiblySeen ? offerA.refundAfterMs - SOL_CLAIM_LANDING_MARGIN_MS : policyNotAfterMs;
     let writeEvidence: RailWriteEvidence;
+    let resigns = 0;
     // SB3a: on Solana a claim retried because the chain already showed this flow's own secret public uses the
     // rail's public-secret mode (the rail proves that on chain again before it skips the bounds).
     let retryPublicSecret = isSol && skipDeadlineGuards;
@@ -785,6 +815,7 @@ export class SellerFlow {
       try {
         const solRecording = isSol
           ? {
+              ...(this.neverLandedClaims > 0 ? { priorityFeeAttempt: this.neverLandedClaims } : {}),
               onSigned: (record: RailClaimRecord): void => void this.claimRecords.push(record),
               onNotBroadcast: (record: RailClaimRecord): void => this.dropClaimRecord(record.signature),
             }
@@ -803,6 +834,18 @@ export class SellerFlow {
         break;
       } catch (error) {
         this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+        // R3-2: a claim that was broadcast and never landed (starved). The secret may have been seen; count it (the
+        // next claim is priced higher) and sign again while the rail's landing bound still allows it. The bound ends
+        // the effort with the starved error below, never a silent drop.
+        if (isSol && error instanceof SolNotLandedError) {
+          this.neverLandedClaims += 1;
+          this.dropClaimRecord(error.signature);
+          if (resigns < SOL_NEVER_LANDED_MAX_RESIGNS) {
+            resigns += 1;
+            notAfterMs = offerA.refundAfterMs - SOL_CLAIM_LANDING_MARGIN_MS;
+            continue;
+          }
+        }
         // S1 (contracts-sol/README.md): a Solana claim that landed and FAILED published the secret in its
         // instruction data. The reveal is posted (the secret is public regardless; it must land before
         // refundAfterMs, G6), and the claim is retried AT ONCE: the Buyer can read the secret off that failed
@@ -836,6 +879,9 @@ export class SellerFlow {
           // message carries the payout failure) replaces the bare payout error.
           await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, `payout failed: ${error.message}`);
         }
+        if (isSol && this.neverLandedClaims > 0 && !(error instanceof SolPendingError) && !(error instanceof SolClaimFailedError) && !(error instanceof RevealNotPostedError) && !(error instanceof SolClaimStarvedError)) {
+          throw new SolClaimStarvedError(this.neverLandedClaims, error);
+        }
         throw error;
       }
     }
@@ -853,7 +899,11 @@ export class SellerFlow {
     // ever the same value by coincidence for evm-htlc).
     const receipt = await this.postReceiptLatched(acceptA.contract, railRef);
 
-    return { evidence: writeEvidence, ...(reveal === undefined ? {} : { reveal }), receipt };
+    return { evidence: writeEvidence, ...(reveal === undefined ? {} : { reveal }), receipt, ...this.neverLandedField() };
+  }
+
+  private neverLandedField(): { neverLandedClaims?: number } {
+    return this.neverLandedClaims > 0 ? { neverLandedClaims: this.neverLandedClaims } : {};
   }
 
   private dropClaimRecord(signature: string): void {
@@ -868,8 +918,18 @@ export class SellerFlow {
   private async resolveRecordedClaims(connected: ConnectedCounterAssetRail, railRef: string): Promise<RailWriteEvidence | null> {
     if (connected.recoverClaim === undefined) return null;
     for (const record of [...this.claimRecords]) {
-      const recovery = await connected.recoverClaim(railRef, record);
+      let recovery;
+      try {
+        recovery = await connected.recoverClaim(railRef, record);
+      } catch (error) {
+        // R3-3: once the secret is public, an earlier retry that is still undecided must not hold up the next one
+        // (that wait is what a starved or slow retry would turn into a lost payout). The record stays latched (it may
+        // still land and is resolved on a later call); a fresh claim is signed now, and whichever lands first pays.
+        if (error instanceof SolPendingError && this.publicClaimSignature !== undefined) continue;
+        throw error;
+      }
       this.dropClaimRecord(record.signature);
+      if (recovery.outcome === "never-landed") this.neverLandedClaims += 1; // R3-2: broadcast, never landed: possibly seen
       if (recovery.outcome === "landed") {
         this.claimRecords = [];
         return recovery.evidence;

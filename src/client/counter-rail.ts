@@ -116,6 +116,8 @@ export interface RailClaimOptions {
   retryPublicSecret?: boolean;
   /** Solana only (SOL-C1): the signature of this flow's own failed claim, the retry's proof of a public secret. */
   proofSignature?: string;
+  /** Solana only (R3-2): how many earlier claims of this flow never landed; each raises the priority fee. */
+  priorityFeeAttempt?: number;
   /** Solana only (S2-2): called with the claim's signature and `lastValidBlockHeight` once it is signed and BEFORE
    *  anything is simulated or sent, so the caller can latch it and resolve it later (a lost reply, a crash). */
   onSigned?: (record: RailClaimRecord) => void | Promise<void>;
@@ -128,6 +130,8 @@ export interface RailClaimRecord {
   signature: string;
   blockhash: string;
   lastValidBlockHeight: number;
+  /** Solana only (R3-4): the slot the blockhash was read at (a node with no history back to it cannot prove "never landed"). */
+  signedSlot?: number;
 }
 
 /** Solana only (S2-2): what became of one recorded claim. `landed`: it (or another transaction with this secret)

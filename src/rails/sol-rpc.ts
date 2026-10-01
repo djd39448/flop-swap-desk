@@ -359,6 +359,22 @@ export class SolRpc {
     });
   }
 
+  /** The lowest slot the node has in its ledger (R3-4: a node that pruned history cannot prove "never landed"). */
+  async getFirstAvailableBlock(): Promise<number> {
+    return num(await this.call("getFirstAvailableBlock", []), "getFirstAvailableBlock result");
+  }
+
+  /** R3-2: recent per-slot prioritization fees (micro-lamports per compute unit) for transactions that locked
+   *  all of `addresses` as writable. */
+  async getRecentPrioritizationFees(addresses: readonly string[]): Promise<{ slot: number; prioritizationFee: number }[]> {
+    const result = await this.call("getRecentPrioritizationFees", [addresses]);
+    if (!Array.isArray(result)) throw new Error("sol-rpc: getRecentPrioritizationFees did not return an array");
+    return (result as unknown[]).map((entry) => {
+      const e = record(entry, "prioritization fee");
+      return { slot: num(e.slot, "slot"), prioritizationFee: num(e.prioritizationFee, "prioritizationFee") };
+    });
+  }
+
   /** LOCAL HARNESS ONLY: the validator faucet. Returns the airdrop transaction's signature. */
   async requestAirdrop(pubkey: string, lamports: number): Promise<string> {
     return str(await this.call("requestAirdrop", [pubkey, lamports]), "requestAirdrop result");

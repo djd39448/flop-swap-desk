@@ -24,11 +24,11 @@ import { describe, expect, it } from "vitest";
 
 import { belowMinLockable } from "../src/client/counter-rail.js";
 import { SOL_LOCAL_POLICY } from "../src/client/policy.js";
-import { RevealNotPostedError } from "../src/client/seller.js";
+import { RevealNotPostedError, SolClaimStarvedError } from "../src/client/seller.js";
 import { SOL_ASSET_ID, SOL_AMOUNT_FLOOR, SOL_CLAIM_LANDING_MARGIN_MS, SOL_HTLC_PROGRAM_ID, SolClaimFailedError, claimInstructionData, escrowAddress, vaultAddress } from "../src/rails/sol-htlc.js";
 import { InMemorySolSigner } from "../src/rails/sol-signer-memory.js";
 import { TOKEN_PROGRAM_ID, associatedTokenAddress } from "../src/rails/sol-spl.js";
-import { compileLegacyMessage, pubkeyFromBase58, signTransaction } from "../src/rails/sol-tx.js";
+import { compileLegacyMessage, decodeTransaction, pubkeyFromBase58, signTransaction } from "../src/rails/sol-tx.js";
 import { accountProofMessage, formatSolAccountLine } from "../src/rails/account-line.js";
 import { encodeFrameWith } from "../src/rails/custom-frames.js";
 import { SOL_RAIL_ID, createSolRailRegistry } from "../src/rails/custom-rails.js";
@@ -602,12 +602,12 @@ function decodeSignature(base64Tx: string): string {
 // -- S1: a claim that lands and FAILS publishes the secret -------------------------------------------------------
 
 describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the secret", () => {
-  /** Closes the payee's token account AFTER the claim's preflight and BEFORE it executes (the only way a claim can
-   *  land and fail); `recreate` restores it right after the failed landing, as a person fixing the account would. */
+  /** Freezes the payee's token account AFTER the claim's preflight and BEFORE it executes (the only way a claim can
+   *  land and fail now that the claim creates a missing account itself, R3-1); `recreate` restores it right after the failed landing, as a person fixing the account would. */
   function armFailedClaim(h: SolHarness, options: { recreate: boolean; times?: number }): void {
     let remaining = options.times ?? 1;
     h.node.midFlight = (kind) => {
-      if (kind === "claim" && remaining > 0) h.node.closeToken(h.sellerWallet.publicKeyBytes);
+      if (kind === "claim" && remaining > 0) h.node.freezeToken(h.sellerWallet.publicKeyBytes);
     };
     h.node.afterLand = (kind, failed) => {
       if (kind === "claim" && failed) {
@@ -719,7 +719,7 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     h.setTime(p.offerA.claimByMs + 60_000);
     await h.sellerFlow.claimLegA(p.statement);
     expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
-    expect(h.node.chain.count("getSignaturesForAddress")).toBe(0);
+    expect(h.node.chain.historyScans()).toBe(0);
   });
 
   // -- S2-1: the Buyer claims leg B only once leg A reads Claimed at finalized; it never scans history ---------------
@@ -750,11 +750,11 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     const h = solHarness();
     const p = await lockedFlow(h);
     await h.sellerFlow.claimLegA(p.statement, { skipReveal: true });
-    const before = h.node.chain.count("getSignaturesForAddress");
+    const before = h.node.chain.historyScans();
     const secret = await h.buyerFlow.learnSecret();
     expect(secret).toBe(sellerSecret(h));
     await h.buyerFlow.claimLegB(secret);
-    expect(h.node.chain.count("getSignaturesForAddress")).toBe(before); // the Buyer never scans history
+    expect(h.node.chain.historyScans()).toBe(before); // the Buyer never scans history
     h.setTime(p.offerA.refundAfterMs);
     await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/already claimed leg B/);
     expect(h.node.sent.refund).toBe(0);
@@ -768,7 +768,7 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     await h.sellerFlow.claimLegA(p.statement, { skipReveal: true });
     padEscrowHistory(h, p.statement, 5100);
     await h.buyerFlow.claimLegB(await h.buyerFlow.learnSecret());
-    expect(h.node.chain.count("getSignaturesForAddress")).toBe(0);
+    expect(h.node.chain.historyScans()).toBe(0);
 
     const g = solHarness({ buyerSeed: 21, sellerSeed: 22 });
     const q = await lockedFlow(g);
@@ -804,7 +804,7 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     expect(second.receipt).toBeDefined();
     expect(h.node.sent.claim).toBe(1);
     expect(h.node.tokenBalance(h.sellerWallet.publicKey)).toBe(1_000_000n);
-    expect(h.node.chain.count("getSignaturesForAddress")).toBe(0);
+    expect(h.node.chain.historyScans()).toBe(0);
   });
 
   it("S2-2: a FAILED claim, its reply lost, then 5001 padding entries: the retry proves the secret public by the recorded signature and pays the Seller", async () => {
@@ -821,7 +821,7 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     expect(result.receipt).toBeDefined();
     expect(h.node.tokenBalance(h.sellerWallet.publicKey)).toBe(1_000_000n);
     expect(h.node.history.filter((t) => t.kind === "claim").map((t) => t.err !== null)).toEqual([true, false]);
-    expect(h.node.chain.count("getSignaturesForAddress")).toBe(0);
+    expect(h.node.chain.historyScans()).toBe(0);
   });
 
   it("S2-2: a claim still pending (SolPendingError) blocks a second claim until its blockhash expires; then the retry pays the Seller past 5001 padding entries", async () => {
@@ -877,7 +877,7 @@ describe("S1 (contracts-sol/README.md): a claim that lands and fails leaks the s
     expect(result.receipt).toBeDefined();
     expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
     expect(h.node.tokenBalance(h.sellerWallet.publicKey)).toBe(1_000_000n);
-    expect(h.node.chain.count("getSignaturesForAddress")).toBe(0);
+    expect(h.node.chain.historyScans()).toBe(0);
   });
 
   // -- S2-4: retry first, reveal after -----------------------------------------------------------------------------
@@ -978,10 +978,10 @@ describe("learnSecret", () => {
     const h = solHarness();
     const p = await lockedFlow(h);
     await h.sellerFlow.claimLegA(p.statement);
-    const before = h.node.chain.count("getSignaturesForAddress");
+    const before = h.node.chain.historyScans();
     const secret = await h.buyerFlow.learnSecret();
     expect(secret).toBe(sellerSecret(h));
-    expect(h.node.chain.count("getSignaturesForAddress")).toBe(before);
+    expect(h.node.chain.historyScans()).toBe(before);
   });
 
   it("throws while the escrow is not Claimed on chain (S2-1)", async () => {
@@ -1068,5 +1068,114 @@ describe("the rail wrapper's own refusals", () => {
     const result = await c.verifyLockFinal(termsOf(p as never), p.ref, { payee: h.sellerWallet.publicKey });
     expect(result.lock.railVerified).not.toBe(true);
     expect(result.rail).toBeUndefined();
+  });
+});
+
+// -- round 3 (P6-SOL-FIXES-R3.md R3-2, R3-3): starved claims and a pending retry -------------------------------------------
+
+describe("R3-2/R3-3: a starved claim is reported, priced higher and re-signed; a pending retry never blocks a public secret", () => {
+  /** The price (micro-lamports per unit) of every claim transaction the node was sent, oldest first. */
+  function sentClaimPrices(h: SolHarness): bigint[] {
+    return h.node.chain.requests
+      .filter((r) => r.method === "sendTransaction")
+      .map((r) => decodeTransaction(Buffer.from(r.params[0] as string, "base64")))
+      .filter((tx) => tx.message.instructions.some((ix) => ix.data.length === 33 && ix.data[0] === 1))
+      .map((tx) => new DataView(tx.message.instructions[1]!.data.buffer, tx.message.instructions[1]!.data.byteOffset + 1, 8).getBigUint64(0, true));
+  }
+
+  /** Signs and sends one claim the node accepts and never lands (the network starved it). */
+  async function starveFirstClaim(h: SolHarness, statement: string): Promise<void> {
+    h.node.chain.once("sendTransaction", (params) => decodeSignature(params[0] as string));
+    await expect(h.sellerFlow.claimLegA(statement)).rejects.toThrow(/not settled yet|Pending/i);
+  }
+
+  it("a claim that never landed is re-signed at a doubled price, lands, and the result says the secret was possibly seen", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    await starveFirstClaim(h, p.statement);
+    h.node.chain.finalizedHeight = h.node.chain.lastValidBlockHeight + 1; // its blockhash expired with no status
+    const result = await h.sellerFlow.claimLegA(p.statement);
+    expect(result.neverLandedClaims).toBe(1);
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
+    const prices = sentClaimPrices(h);
+    expect(prices).toHaveLength(2);
+    expect(prices[1]).toBe((prices[0] as bigint) * 2n);
+  });
+
+  it("a clean claim reports no never-landed count", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    const result = await h.sellerFlow.claimLegA(p.statement);
+    expect(result.neverLandedClaims).toBeUndefined();
+  });
+
+  it("after a never-landed claim the Seller keeps claiming past the 5-minute policy margin, up to the landing bound", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    await starveFirstClaim(h, p.statement);
+    h.node.chain.finalizedHeight = h.node.chain.lastValidBlockHeight + 1;
+    h.setTime(p.offerA.refundAfterMs - 3 * 60_000); // inside the 5-minute margin, outside the 2-minute landing margin
+    const result = await h.sellerFlow.claimLegA(p.statement);
+    expect(result.receipt).toBeDefined();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
+  });
+
+  it("without a never-landed claim the same late moment is still refused by the policy margin (the relaxation is only for a possibly-seen secret)", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    h.setTime(p.offerA.refundAfterMs - 3 * 60_000);
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/claimByMs|claim-inclusion margin/);
+    expect(h.node.sent.claim).toBe(0);
+  });
+
+  it("past the landing bound the end of the effort is SolClaimStarvedError ('secret broadcast but not landed (possibly seen)'), never a silent drop", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    await starveFirstClaim(h, p.statement);
+    h.node.chain.finalizedHeight = h.node.chain.lastValidBlockHeight + 1;
+    h.setTime(p.offerA.refundAfterMs - 60_000); // inside the landing margin: no claim can be guaranteed to land or be dropped in time
+    const error = await h.sellerFlow.claimLegA(p.statement).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(SolClaimStarvedError);
+    expect((error as Error).message).toMatch(/secret broadcast but not landed \(possibly seen\)/);
+    expect((error as SolClaimStarvedError).neverLandedClaims).toBe(1);
+    expect(h.node.sent.claim).toBe(0);
+  });
+
+  it("R3-3: in public-secret mode an earlier retry that is still undecided does not block the next claim", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    // claim 1 lands and FAILS (secret public); claim 2 (the retry) is accepted by the node and starved
+    let frozen = false;
+    h.node.midFlight = (kind) => {
+      if (kind === "claim" && !frozen) {
+        frozen = true;
+        h.node.freezeToken(h.sellerWallet.publicKeyBytes);
+      }
+    };
+    h.node.afterLand = (kind, failed) => {
+      if (kind === "claim" && failed) {
+        h.node.fundToken(h.sellerWallet.publicKeyBytes, 0n); // the account is fixed again
+        h.node.chain.once("sendTransaction", (params) => decodeSignature(params[0] as string));
+      }
+    };
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/not settled yet|Pending/i);
+    expect(h.node.history.filter((t) => t.kind === "claim").map((t) => t.err !== null)).toEqual([true]);
+    expect((h.sellerFlow as unknown as { claimRecords: unknown[] }).claimRecords).toHaveLength(1); // the starved retry, still latched
+    // the retry is still undecided (its blockhash has not expired): the Seller must not wait for it
+    const result = await h.sellerFlow.claimLegA(p.statement);
+    expect(result.receipt).toBeDefined();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
+    expect(h.node.tokenBalance(h.sellerWallet.publicKey)).toBe(1_000_000n);
+  });
+
+  it("R3-3: while the secret is still private an undecided claim DOES block the next one (the rule stays)", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    await starveFirstClaim(h, p.statement);
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/not settled yet/);
+    expect(h.node.sent.claim).toBe(0);
   });
 });

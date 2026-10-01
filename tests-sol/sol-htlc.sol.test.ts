@@ -26,8 +26,10 @@ import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js";
 import { CapturingRpc, verifiedExchangeBytes, type Exchange } from "../src/rails/rpc-capture.js";
 import { captureSolLeg, solEvidence, type SolAccounts, type SolCapture } from "../src/rails/sol-evidence.js";
 import {
+  SOL_CLAIM_COMPUTE_UNIT_LIMIT,
   SOL_CLAIM_LANDING_MARGIN_MS,
   SOL_DEVNET_PIN,
+  SOL_REFUND_COMPUTE_UNIT_LIMIT,
   SolClaimFailedError,
   SolClaimTooLateError,
   SolHtlcRail,
@@ -256,7 +258,9 @@ describe("sol-htlc (solana-test-validator)", () => {
     const { escrow } = await sellerRail.getEscrow(record.ref);
     expect(escrow).toMatchObject({ status: "Claimed", revealed: true, preimage });
     expect(await v.usdcBalanceOf(v.seller.address)).toBe(sellerBefore + 666n);
-    measured("claim", await txMeta(evidence.signature));
+    const claimMeta = await txMeta(evidence.signature);
+    measured("claim", claimMeta);
+    expect(claimMeta.computeUnits).toBeLessThanOrEqual(SOL_CLAIM_COMPUTE_UNIT_LIMIT); // R3-2: the named limit covers the measured use
     // The Buyer reads the secret off the chain.
     expect(await buyerRail.findClaimedPreimage(record.ref)).toBe(preimage);
     // A second claim is refused up front (not Locked any more).
@@ -303,7 +307,9 @@ describe("sol-htlc (solana-test-validator)", () => {
     const { escrow } = await buyerRail.getEscrow(record.ref);
     expect(escrow?.status).toBe("Refunded");
     expect(await v.usdcBalanceOf(v.buyer.address)).toBe(before);
-    measured("refund", await txMeta(evidence.signature));
+    const refundMeta = await txMeta(evidence.signature);
+    measured("refund", refundMeta);
+    expect(refundMeta.computeUnits).toBeLessThanOrEqual(SOL_REFUND_COMPUTE_UNIT_LIMIT); // R3-2
     // After a refund a claim is refused up front.
     await expect(sellerRail.claim(record.ref, preimage, claimByMs)).rejects.toThrow(/not in a claimable "Locked" state/);
     // Only the payer can refund.
@@ -364,7 +370,7 @@ describe("sol-htlc (solana-test-validator)", () => {
     expect(await v.usdcBalanceOf(v.buyer.address)).toBe(before - 10n);
   });
 
-  it("failed claim (payee token account missing): refused by the pre-check; forced past it, it fails on chain, is reported as a failed claim, leaves the escrow Locked and refundable, and the Buyer recovers the secret from the failed transaction", async () => {
+  it("failed claim (a hand-built claim with no token-account creation, payee token account missing): it fails on chain, is reported as a failed claim, leaves the escrow Locked and refundable, and the Buyer recovers the secret from the failed transaction", async () => {
     const { preimage, hashLock } = newSecret();
     const payee = await v.createParty({ tokenAccount: false, sol: 1 });
     const { rail: buyerRail } = await connect(v.buyer);
@@ -376,12 +382,10 @@ describe("sol-htlc (solana-test-validator)", () => {
     const { record } = await lockOn(buyerRail, hashLock, amount, payee.address, claimByMs, refundAfterMs);
     expect(await v.usdcBalanceOf(v.buyer.address)).toBe(before - 444n);
 
-    // 1. The adapter's pre-check refuses: no token account for the payee, so nothing is signed or sent.
-    const { rail: payeeRail, rpc: payeeRpc } = await connect(payee);
-    await expect(payeeRail.claim(record.ref, preimage, refundAfterMs - SOL_CLAIM_LANDING_MARGIN_MS - 1000)).rejects.toThrow(/associated token account does not exist/);
-    expect(sendCount(payeeRpc)).toBe(0);
+    // 1. (R3-1: the adapter's own claim would now create the payee's token account and succeed; see the R3-1 test.)
+    const { rail: payeeRail } = await connect(payee);
 
-    // 2. Forced past the pre-check (a hand-built claim sent with preflight skipped): it LANDS and FAILS.
+    // 2. A hand-built claim without the token-account creation, sent with preflight skipped: it LANDS and FAILS.
     const forced = await rawWrite("claim", record.ref, v.buyer.address, payee.address, preimage, payee);
     const sol = new SolRpc(v.createCapturingRpc());
     expect(await sol.sendTransaction(forced.tx.bytes, { skipPreflight: true })).toBe(forced.record.signature);
@@ -427,6 +431,57 @@ describe("sol-htlc (solana-test-validator)", () => {
     await buyerRail.refund(record.ref);
     expect((await buyerRail.getEscrow(record.ref)).escrow?.status).toBe("Refunded");
     expect(await v.usdcBalanceOf(v.buyer.address)).toBe(before);
+  });
+
+  it("R3-1: the payee's token account is closed between the simulation and the send; the claim still lands Claimed in ONE transaction, because it creates the account itself (and the measured compute units stay under the named limit)", async () => {
+    const { preimage, hashLock } = newSecret();
+    const payee = await v.createParty({}); // has its (empty) associated token account
+    const { rail: buyerRail } = await connect(v.buyer);
+    const now = await nowMs(buyerRail);
+    const claimByMs = now + 10 * MINUTE;
+    const refundAfterMs = now + 20 * MINUTE;
+    const { record } = await lockOn(buyerRail, hashLock, "555", payee.address, claimByMs, refundAfterMs);
+
+    // CloseAccount (SPL tag 9): the payee's own account, balance 0, rent back to the payee.
+    const close: SolInstruction = {
+      programId: pubkeyFromBase58(TOKEN_PROGRAM_ID),
+      accounts: [
+        { pubkey: pubkeyFromBase58(payee.tokenAccount as string), isSigner: false, isWritable: true },
+        { pubkey: payee.signer.publicKeyBytes, isSigner: false, isWritable: true },
+        { pubkey: payee.signer.publicKeyBytes, isSigner: true, isWritable: false },
+      ],
+      data: Uint8Array.of(9),
+    };
+    let sends = 0;
+    let closed = false;
+    const closing: typeof fetch = async (input, init) => {
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as { method?: string }) : {};
+      if (body.method === "sendTransaction") {
+        sends += 1;
+        if (!closed) {
+          // the claim was simulated (the account existed) and is about to be sent: the account is closed first
+          closed = true;
+          await sendFinalized(payee, [close]);
+          const probe = new SolRpc(v.createCapturingRpc());
+          expect((await probe.getAccountInfo(payee.tokenAccount as string, { commitment: "finalized" })).account).toBeNull();
+        }
+      }
+      return fetch(input, init);
+    };
+    const { rail: payeeRail } = await connect(payee, v.config, v.createCapturingRpc({ fetch: closing }));
+    expect(await v.usdcBalanceOf(payee.address)).toBe(0n); // the account exists when the claim's own pre-checks and simulation run
+
+    const evidence = await payeeRail.claim(record.ref, preimage, claimByMs);
+    expect(closed).toBe(true);
+    expect(sends).toBe(1); // one transaction, no retry
+    expect((await payeeRail.getEscrow(record.ref)).escrow).toMatchObject({ status: "Claimed", revealed: true, preimage });
+    expect(await v.usdcBalanceOf(payee.address)).toBe(555n);
+    const meta = await txMeta(evidence.signature);
+    expect(meta.err).toBeNull();
+    measured("claim that creates the payee's token account", meta);
+    expect(meta.computeUnits).toBeLessThanOrEqual(SOL_CLAIM_COMPUTE_UNIT_LIMIT);
+    // the preimage is still found in the transaction: the Claim instruction sits after the budget and creation instructions
+    expect(await buyerRail.preimageFromSignature(record.ref, evidence.signature)).toBe(preimage);
   });
 
   it("a claim signed with a blockhash that then expires is never included: rejected typed at preflight, dropped if forced, escrow stays Locked, recovery says never landed", async () => {

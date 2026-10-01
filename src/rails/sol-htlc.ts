@@ -39,6 +39,9 @@ import {
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
   associatedTokenAddress,
+  createAssociatedTokenAccountIdempotent,
+  setComputeUnitLimit,
+  setComputeUnitPrice,
   decodeMint,
   decodeTokenAccount,
 } from "./sol-spl.js";
@@ -92,6 +95,26 @@ export const SOL_EXPIRY_MARGIN_MS = 30_000;
  *  `refund_after_ms`, sized to one full blockhash lifetime at the slow estimate plus the margin (so 120 s).
  *  Mainnet-like clusters need the same; the localnet harness uses windows longer than this. */
 export const SOL_CLAIM_LANDING_MARGIN_MS = SOL_BLOCKHASH_VALIDITY_BLOCKS * SOL_SLOW_BLOCK_MS + SOL_EXPIRY_MARGIN_MS;
+
+/** R3-5: a blockhash named by a block at height h is valid through block h + 150, so the last valid height a node
+ *  reports can be at most (its processed height + 150). The landing bound and every expiry decision use
+ *  max(reported, processed block height + this), so a node that under-reports cannot shorten the bound. */
+export const SOL_LAST_VALID_HEIGHT_CLAMP_BLOCKS = SOL_BLOCKHASH_VALIDITY_BLOCKS + 1;
+
+/** R3-2: the compute-unit limit every claim carries. MEASURED on the local validator (Agave 4.3.0): 12,982 units
+ *  for a claim into an existing token account, 22,061 to 29,561 when the claim creates the account (two runs; the account creation varies); refund 7,258
+ *  (tests-sol/sol-htlc.sol.test.ts asserts the measured use stays under these limits) with headroom. A limit far above use would make the priority fee (price x limit) cost more
+ *  than needed. */
+export const SOL_CLAIM_COMPUTE_UNIT_LIMIT = 50_000;
+/** A refund (no token-account creation) is smaller. */
+export const SOL_REFUND_COMPUTE_UNIT_LIMIT = 15_000;
+/** R3-2 priority-fee policy, micro-lamports per compute unit: the 75th percentile of the recent fees paid over the
+ *  writable accounts, never below the floor, doubled for each earlier claim that never landed, never above the cap
+ *  (the cap bounds the cost: 30k units x 1,000,000 micro-lamports = 30,000 lamports). */
+export const SOL_PRIORITY_FEE_FLOOR_MICRO_LAMPORTS = 1_000n;
+export const SOL_PRIORITY_FEE_CAP_MICRO_LAMPORTS = 1_000_000n;
+/** The most doublings applied (further never-landed claims reuse the highest price). */
+export const SOL_PRIORITY_FEE_MAX_RAISES = 10;
 
 /** `findClaimedPreimage` scans an escrow's whole finalized history (SOL-C1: a fixed small window let anyone bury a
  *  failed claim under padding). This is only a runaway guard: a history longer than this makes the scan THROW
@@ -520,6 +543,9 @@ export interface SolPreparedRecord {
   signature: string;
   blockhash: string;
   lastValidBlockHeight: number;
+  /** R3-4: the slot the blockhash was read at. A node whose ledger starts after it cannot show a transaction signed
+   *  then, so "no status" from such a node is pending, never "never landed". */
+  signedSlot?: number;
   /** Lock only: the exact terms that were signed (public data), needed to verify a recovered lock. */
   terms?: SolHtlcTerms;
 }
@@ -578,6 +604,8 @@ export interface SolClaimOptions {
   /** SOL-C1: the signature of the claim that landed and failed (`SolClaimFailedError.signature`). The retry is then
    *  proven by fetching exactly that transaction, not by scanning the escrow's history, which anyone can pad. */
   proofSignature?: string;
+  /** R3-2: how many earlier claims of this flow never landed; each doubles the priority fee (bounded). */
+  priorityFeeAttempt?: number;
   /** S2-2: called when the claim was signed and recorded (`onSigned`) but provably never handed to the network
    *  (the simulation or the last-moment guard refused, or the node's preflight rejected it). The caller may then
    *  drop the recorded signature: it can never land. NOT called for a transport failure during the send itself. */
@@ -631,6 +659,7 @@ export class SolHtlcRail {
     const rail = new SolHtlcRail(options, check.config);
     await rail.assertPinnedChain();
     await rail.assertProgram();
+    await rail.assertHistory();
     // connect's own exchanges never linger into a later write's snapshot-at-start
     options.rpc.drain();
     return rail;
@@ -707,6 +736,17 @@ export class SolHtlcRail {
       throw new Error("sol-htlc: refusing to connect - the configured mint is not a classic SPL mint");
     }
     if (!decodeMint(mint.data).isInitialized) throw new Error("sol-htlc: refusing to connect - the configured mint is not initialised");
+  }
+
+  /** R3-4: the endpoint must serve transaction history ("never landed" and every history-based proof rest on it).
+   *  A node that does not (or that fails the probe for any reason) is refused: fail closed. */
+  private async assertHistory(): Promise<void> {
+    try {
+      await this.sol.getFirstAvailableBlock();
+      await this.sol.getSignaturesForAddress(this.config.programId, { commitment: "finalized", limit: 1 });
+    } catch (error) {
+      throw new Error(`sol-htlc: refusing to connect - the endpoint does not serve transaction history (${error instanceof Error ? error.message : String(error)})`);
+    }
   }
 
   // -- reads ----------------------------------------------------------------------------------------------
@@ -793,27 +833,55 @@ export class SolHtlcRail {
   // -- blockhash, signing ---------------------------------------------------------------------------------
 
   private async buildAndSign(
-    record: Omit<SolPreparedRecord, "signature" | "blockhash" | "lastValidBlockHeight">,
-    instruction: SolInstruction,
-    plan: { blockhash: string; lastValidBlockHeight: number },
+    record: Omit<SolPreparedRecord, "signature" | "blockhash" | "lastValidBlockHeight" | "signedSlot">,
+    instructions: readonly SolInstruction[],
+    plan: { blockhash: string; lastValidBlockHeight: number; contextSlot?: number },
     guard?: () => Promise<void>,
   ): Promise<SolPreparedWrite> {
     const message = compileLegacyMessage({
       feePayer: this.signer.publicKeyBytes,
       recentBlockhash: pubkeyFromBase58(plan.blockhash),
-      instructions: [instruction],
+      instructions,
     });
     const tx = await signTransaction(message, [this.signer]);
-    const full: SolPreparedRecord = { ...record, signature: tx.signature, blockhash: plan.blockhash, lastValidBlockHeight: plan.lastValidBlockHeight };
+    const full: SolPreparedRecord = {
+      ...record,
+      signature: tx.signature,
+      blockhash: plan.blockhash,
+      lastValidBlockHeight: plan.lastValidBlockHeight,
+      ...(plan.contextSlot === undefined ? {} : { signedSlot: plan.contextSlot }),
+    };
     return { record: full, tx, ...(guard === undefined ? {} : { guard }) };
   }
 
   /** A blockhash from `confirmed` (longest life) with the FINALIZED block height (the conservative,
    *  lower reading: more blocks remaining means a later possible landing). */
-  private async blockhashPlan(): Promise<{ blockhash: string; lastValidBlockHeight: number; finalizedHeight: number }> {
+  private async blockhashPlan(): Promise<{ blockhash: string; lastValidBlockHeight: number; finalizedHeight: number; contextSlot: number }> {
     const latest = await this.sol.getLatestBlockhash("confirmed");
     const finalizedHeight = await this.sol.getBlockHeight("finalized");
-    return { blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight, finalizedHeight };
+    // R3-5: never trust a reported last-valid height lower than the processed height plus one full lifetime.
+    const processedHeight = await this.sol.getBlockHeight("processed");
+    const lastValidBlockHeight = Math.max(latest.lastValidBlockHeight, processedHeight + SOL_LAST_VALID_HEIGHT_CLAMP_BLOCKS);
+    return { blockhash: latest.blockhash, lastValidBlockHeight, finalizedHeight, contextSlot: latest.contextSlot };
+  }
+
+  /** R3-2: the compute-budget instructions every claim and refund carries. The price is the 75th percentile of the
+   *  recent fees over the writable accounts (floor and cap apply), doubled `attempt` times (bounded). */
+  private async budgetInstructions(limit: number, writable: readonly Uint8Array[], attempt: number): Promise<SolInstruction[]> {
+    let observed = 0n;
+    try {
+      const fees = (await this.sol.getRecentPrioritizationFees(writable.map(pubkeyToBase58)))
+        .map((entry) => BigInt(Math.max(0, Math.floor(entry.prioritizationFee))))
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      if (fees.length > 0) observed = fees[Math.min(fees.length - 1, Math.ceil(fees.length * 0.75) - 1)] as bigint;
+    } catch {
+      // a node that cannot price fees must not stop a claim: the floor (raised per attempt) still applies
+    }
+    let price = observed > SOL_PRIORITY_FEE_FLOOR_MICRO_LAMPORTS ? observed : SOL_PRIORITY_FEE_FLOOR_MICRO_LAMPORTS;
+    const raises = Math.min(Math.max(0, Math.floor(attempt)), SOL_PRIORITY_FEE_MAX_RAISES);
+    for (let i = 0; i < raises; i += 1) price *= 2n;
+    if (price > SOL_PRIORITY_FEE_CAP_MICRO_LAMPORTS) price = SOL_PRIORITY_FEE_CAP_MICRO_LAMPORTS;
+    return [setComputeUnitLimit(limit), setComputeUnitPrice(price)];
   }
 
   /** The latest time (ms) a transaction signed with `lastValidBlockHeight` could still be executed:
@@ -834,18 +902,36 @@ export class SolHtlcRail {
   /** Polls until the signature is FINALIZED, provably dead, or the timeout passes. The order matters: the
    *  finalized block height is read BEFORE the status, so a null status after a height past
    *  `lastValidBlockHeight` means no block that could hold the transaction is missing its status. */
-  private async awaitFinalized(signature: string, lastValidBlockHeight: number): Promise<SolSignatureStatus> {
+  private async awaitFinalized(signature: string, lastValidBlockHeight: number, signedSlot?: number): Promise<SolSignatureStatus> {
     const deadline = this.clock() + this.finalityTimeoutMs;
     for (;;) {
       const height = await this.sol.getBlockHeight("finalized");
       const [status] = await this.sol.getSignatureStatuses([signature]);
       if (status !== undefined && status !== null && status.confirmationStatus === "finalized") return status;
-      if ((status === undefined || status === null) && height > lastValidBlockHeight) throw new SolNotLandedError(signature);
+      if ((status === undefined || status === null) && height > lastValidBlockHeight) {
+        const found = await this.confirmNeverLanded(signature, signedSlot);
+        if (found === null) throw new SolNotLandedError(signature);
+        return found;
+      }
       if (this.clock() >= deadline) {
         throw new SolPendingError(signature, status === undefined || status === null ? "no status yet" : `status ${String(status.confirmationStatus)}`);
       }
       await this.sleep(this.pollIntervalMs);
     }
+  }
+
+  /** R3-4: before "never landed" is believed, ask for the transaction itself at finalized (a different path than the
+   *  status cache) and confirm the node's ledger reaches back to where the transaction was signed. Returns a
+   *  finalized status when the transaction exists after all, `null` when it is confirmed absent, and throws
+   *  `SolPendingError` when this node cannot speak for the record's slot range. */
+  private async confirmNeverLanded(signature: string, signedSlot?: number): Promise<SolSignatureStatus | null> {
+    const fetched = await this.sol.getTransaction(signature, "finalized");
+    if (fetched !== null) return { slot: fetched.slot, confirmations: null, err: fetched.err, confirmationStatus: "finalized" };
+    if (signedSlot !== undefined) {
+      const first = await this.sol.getFirstAvailableBlock();
+      if (first > signedSlot) throw new SolPendingError(signature, `the node's ledger starts at slot ${first}, after the slot ${signedSlot} this transaction was signed at: it has no history for that range`);
+    }
+    return null;
   }
 
   /** The chain-confirmed check for one write, given the finalized status. Throws the kind's typed error. */
@@ -948,7 +1034,7 @@ export class SolHtlcRail {
       if (reported !== record.signature) {
         throw new Error(`sol-htlc: the node reported signature ${reported}, not the recorded ${record.signature}`);
       }
-      const status = await this.awaitFinalized(record.signature, record.lastValidBlockHeight);
+      const status = await this.awaitFinalized(record.signature, record.lastValidBlockHeight, record.signedSlot);
       return await this.confirmWrite(record, status, raw, claimPreimage);
     } catch (error) {
       // S2-2: a refusal before the send, or a preflight rejection by the node, means the signed bytes never
@@ -1000,7 +1086,7 @@ export class SolHtlcRail {
       data: lockInstructionData(terms),
     };
     const plan = await this.blockhashPlan();
-    this.prepared = await this.buildAndSign({ kind: "lock", ref, terms }, instruction, plan);
+    this.prepared = await this.buildAndSign({ kind: "lock", ref, terms }, [instruction], plan);
     return this.prepared.record;
   }
 
@@ -1070,8 +1156,15 @@ export class SolHtlcRail {
     if (decodeTokenAccount((second.accounts[0] as SolAccountInfo).data).amount < BigInt(view.amount)) {
       throw new Error("sol-htlc: refusing to claim - the vault holds less than the escrow amount");
     }
-    const payeeProblem = this.tokenAccountProblem(second.accounts[1] ?? null, this.mint, payeeBytes);
-    if (payeeProblem !== null) throw new Error(`sol-htlc: refusing to claim - the payee's associated token account ${payeeProblem} (the payout would fail)`);
+    // R3-1: the claim creates the payee's associated token account itself (CreateIdempotent, paid by this signer), so
+    // an account that is absent (or only a pre-funded, empty system account at that address) is fine; an account that
+    // exists must still be a usable one (initialised, not frozen, this mint, this owner).
+    const payeeAccount = second.accounts[1] ?? null;
+    const payeeAbsent = payeeAccount === null || (payeeAccount.owner === SYSTEM_PROGRAM_ID && payeeAccount.data.length === 0);
+    if (!payeeAbsent) {
+      const payeeProblem = this.tokenAccountProblem(payeeAccount, this.mint, payeeBytes);
+      if (payeeProblem !== null) throw new Error(`sol-htlc: refusing to claim - the payee's associated token account ${payeeProblem} (the payout would fail)`);
+    }
 
     const retry = options.retryPublicSecret === true;
     if (retry) {
@@ -1116,6 +1209,10 @@ export class SolHtlcRail {
       ],
       data: claimInstructionData(preimageBytes),
     };
+    // R3-1/R3-2: compute budget, then the payee's token account (created if it is gone, also after the pre-check
+    // read it), then the claim itself.
+    const budget = await this.budgetInstructions(SOL_CLAIM_COMPUTE_UNIT_LIMIT, [escrow, vault, payeeToken], options.priorityFeeAttempt ?? 0);
+    const ensurePayeeAccount = createAssociatedTokenAccountIdempotent({ payer: this.signer.publicKeyBytes, owner: payeeBytes, mint: this.mint });
     const refundAfterMs = view.refundAfterMs;
     // The LAST reads before broadcast: fresh chain time and finalized height, judged against the client
     // bound and against the landing bound of THIS blockhash.
@@ -1136,7 +1233,7 @@ export class SolHtlcRail {
         throw new SolClaimTooLateError(`sol-htlc: refusing to broadcast claim - it could still land as late as ${latest} ms, after refundAfterMs ${refundAfterMs} minus the margin`);
       }
     };
-    const prepared = await this.buildAndSign({ kind: "claim", ref }, instruction, plan, guard);
+    const prepared = await this.buildAndSign({ kind: "claim", ref }, [...budget, ensurePayeeAccount, instruction], plan, guard);
     if (options.onNotBroadcast !== undefined) prepared.onNotBroadcast = options.onNotBroadcast;
     if (onSigned !== undefined) await onSigned(prepared.record);
     return this.sendPrepared(prepared, preimage);
@@ -1151,7 +1248,7 @@ export class SolHtlcRail {
    * and the payer's associated token account is a usable destination. Then the common write path (record via
    * `onSigned`, simulate, send, FINALIZED, confirm Refunded).
    */
-  async refund(ref: string, onSigned?: (record: SolPreparedRecord) => void | Promise<void>): Promise<SolWriteEvidence> {
+  async refund(ref: string, onSigned?: (record: SolPreparedRecord) => void | Promise<void>, options: { priorityFeeAttempt?: number } = {}): Promise<SolWriteEvidence> {
     const parsed = this.requireRef(ref);
     if (parsed.payer !== this.signer.publicKey) {
       throw new Error("sol-htlc: refund must be signed by the payer's own key (the ref's payer must equal the signer)");
@@ -1182,7 +1279,8 @@ export class SolHtlcRail {
       data: refundInstructionData(),
     };
     const plan = await this.blockhashPlan();
-    const prepared = await this.buildAndSign({ kind: "refund", ref }, instruction, plan);
+    const budget = await this.budgetInstructions(SOL_REFUND_COMPUTE_UNIT_LIMIT, [escrow, vault, payerToken], options.priorityFeeAttempt ?? 0);
+    const prepared = await this.buildAndSign({ kind: "refund", ref }, [...budget, instruction], plan);
     if (onSigned !== undefined) await onSigned(prepared.record);
     return this.sendPrepared(prepared);
   }
@@ -1206,8 +1304,10 @@ export class SolHtlcRail {
     const height = await this.sol.getBlockHeight("finalized");
     const [status] = await this.sol.getSignatureStatuses([record.signature]);
     if (status === undefined || status === null) {
-      if (height > record.lastValidBlockHeight) return null;
-      throw new SolPendingError(record.signature, "no status yet and the blockhash has not expired");
+      if (height <= record.lastValidBlockHeight) throw new SolPendingError(record.signature, "no status yet and the blockhash has not expired");
+      const found = await this.confirmNeverLanded(record.signature, record.signedSlot);
+      if (found === null) return null;
+      return this.confirmWrite(record, found, raw);
     }
     if (status.confirmationStatus !== "finalized") {
       throw new SolPendingError(record.signature, `status ${String(status.confirmationStatus)}, not finalized yet`);

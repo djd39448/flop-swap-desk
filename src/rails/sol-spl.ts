@@ -20,6 +20,7 @@ import { concatBytes, findProgramAddress, pubkeyFromBase58, type SolAccountMeta,
 export const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
 export const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 export const ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+export const COMPUTE_BUDGET_PROGRAM_ID = "ComputeBudget111111111111111111111111111111";
 export const BPF_LOADER_UPGRADEABLE_ID = "BPFLoaderUpgradeab1e11111111111111111111111";
 
 export const SPL_MINT_LEN = 82;
@@ -74,6 +75,30 @@ export function initializeMint2Data(decimals: number, mintAuthority: Uint8Array,
     mintAuthority,
     freezeAuthority === null ? Uint8Array.of(0) : concatBytes(Uint8Array.of(1), freezeAuthority),
   );
+}
+
+// --- compute budget (R3-2) -----------------------------------------------------------------------------------
+// Instruction data: the solana-compute-budget-interface enum index, then the little-endian value. Pinned in
+// tests/sol-spl.test.ts to that crate's `test_to_instruction` (anza-xyz/solana-sdk, compute-budget-interface/src/lib.rs):
+// limit 257 = [2,1,1,0,0], price u64::MAX = [3, 255 x8].
+
+export function setComputeUnitLimitData(units: number): Uint8Array {
+  if (!Number.isInteger(units) || units < 0 || units > 0xffff_ffff) throw new Error("sol-spl: compute unit limit must fit u32");
+  return concatBytes(Uint8Array.of(2), u32le(units));
+}
+
+export function setComputeUnitPriceData(microLamports: bigint): Uint8Array {
+  return concatBytes(Uint8Array.of(3), u64le(microLamports));
+}
+
+/** ComputeBudget `SetComputeUnitLimit`; no accounts. */
+export function setComputeUnitLimit(units: number): SolInstruction {
+  return { programId: pubkeyFromBase58(COMPUTE_BUDGET_PROGRAM_ID), accounts: [], data: setComputeUnitLimitData(units) };
+}
+
+/** ComputeBudget `SetComputeUnitPrice` (micro-lamports per compute unit); no accounts. */
+export function setComputeUnitPrice(microLamports: bigint): SolInstruction {
+  return { programId: pubkeyFromBase58(COMPUTE_BUDGET_PROGRAM_ID), accounts: [], data: setComputeUnitPriceData(microLamports) };
 }
 
 // --- instructions ------------------------------------------------------------------------------------------

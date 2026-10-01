@@ -43,7 +43,7 @@ import {
   type SolPreparedRecord,
   type SolRailConfig,
 } from "../src/rails/sol-htlc.js";
-import { SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID, decodeTokenAccount } from "../src/rails/sol-spl.js";
+import { ASSOCIATED_TOKEN_PROGRAM_ID, COMPUTE_BUDGET_PROGRAM_ID, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID, decodeTokenAccount } from "../src/rails/sol-spl.js";
 import { InMemorySolSigner } from "../src/rails/sol-signer-memory.js";
 import { compileLegacyMessage, findProgramAddress, isOnCurve, pubkeyFromBase58, pubkeyToBase58, signTransaction, type SolTransaction } from "../src/rails/sol-tx.js";
 import {
@@ -163,11 +163,11 @@ describe("refs", () => {
 // -- connect ----------------------------------------------------------------------------------------------
 
 describe("SolHtlcRail.connect", () => {
-  it("reads the genesis, the program account, then ProgramData and the mint at one context, and drains its own exchanges", async () => {
+  it("reads the genesis, the program account, then ProgramData and the mint at one context, probes that history is served (R3-4), and drains its own exchanges", async () => {
     const w = makeWorld();
     const rail = await railFor(w);
     expect(rail).toBeInstanceOf(SolHtlcRail);
-    expect(w.chain.requests.map((r) => r.method)).toEqual(["getGenesisHash", "getAccountInfo", "getMultipleAccounts"]);
+    expect(w.chain.requests.map((r) => r.method)).toEqual(["getGenesisHash", "getAccountInfo", "getMultipleAccounts", "getFirstAvailableBlock", "getSignaturesForAddress"]);
     expect(w.rpc.exchanges()).toHaveLength(0);
   });
 
@@ -317,7 +317,8 @@ describe("prepareLock / commitLock", () => {
     expect(record.ref).toBe(w.ref);
     expect(base58.decode(record.signature)).toHaveLength(64);
     expect(record.blockhash).toBe(w.chain.blockhash);
-    expect(record.lastValidBlockHeight).toBe(w.chain.lastValidBlockHeight);
+    // R3-5: max(reported, processed block height + 151)
+    expect(record.lastValidBlockHeight).toBe(Math.max(w.chain.lastValidBlockHeight, w.chain.confirmedHeight + 151));
     expect(w.chain.count("sendTransaction")).toBe(0); // nothing sent yet: record-before-send
 
     const evidence = await rail.commitLock();
@@ -532,7 +533,7 @@ describe("prepareLock / commitLock", () => {
     w2.chain.onSend = () => undefined;
     const rail2 = await railFor(w2);
     await rail2.prepareLock(w2.terms);
-    w2.chain.finalizedHeight = w2.chain.lastValidBlockHeight + 1;
+    w2.chain.finalizedHeight = w2.chain.confirmedHeight + 151 + 1; // past the clamped last valid height (R3-5)
     await expect(rail2.commitLock()).rejects.toBeInstanceOf(SolNotLandedError);
   });
 
@@ -616,7 +617,10 @@ describe("claim", () => {
 
     const tx = sent[0] as SolTransaction;
     const keys = tx.message.accountKeys.map(pubkeyToBase58);
-    const ix = tx.message.instructions[0]!;
+    // R3-1/R3-2: SetComputeUnitLimit, SetComputeUnitPrice, CreateIdempotent for the payee's token account, then the claim
+    const names = tx.message.instructions.map((i) => keys[i.programIdIndex]);
+    expect(names).toEqual([COMPUTE_BUDGET_PROGRAM_ID, COMPUTE_BUDGET_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, SOL_HTLC_PROGRAM_ID]);
+    const ix = tx.message.instructions[3]!;
     expect(Array.from(ix.data)).toEqual(Array.from(claimInstructionData(w.preimage)));
     expect(ix.data).toHaveLength(33);
     expect(ix.accountIndexes.map((i) => keys[i])).toEqual([pubkeyToBase58(w.keys.escrow), pubkeyToBase58(w.keys.vault), w.config.assets.USDC, pubkeyToBase58(w.keys.sellerToken), TOKEN_PROGRAM_ID]);
@@ -636,15 +640,11 @@ describe("claim", () => {
     expect(w.chain.requests.length).toBe(before);
   });
 
-  it("no-secret pre-checks: a missing, Claimed or Refunded escrow, a payee account that is missing, frozen, for another mint or owned by someone else, or a short vault, are refused and nothing is sent", async () => {
+  it("no-secret pre-checks: a missing, Claimed or Refunded escrow, a payee account that is frozen, for another mint or owned by someone else, or a short vault, are refused and nothing is sent", async () => {
     const cases: Array<[string, (w: World) => void, RegExp]> = [
       ["no escrow", () => undefined, /got none/],
       ["claimed", (w) => putLockedEscrow(w, { status: "Claimed", preimage: w.preimage }), /got Claimed/],
       ["refunded", (w) => putLockedEscrow(w, { status: "Refunded" }), /got Refunded/],
-      ["payee ata missing", (w) => {
-        putLockedEscrow(w);
-        w.chain.accounts.delete(pubkeyToBase58(w.keys.sellerToken));
-      }, /payee's associated token account does not exist/],
       ["payee ata frozen", (w) => {
         putLockedEscrow(w);
         w.chain.get(w.keys.sellerToken)!.data[108] = 2;
@@ -718,6 +718,7 @@ describe("claim", () => {
     putLockedEscrow(w);
     claimOnSend(w);
     w.chain.lastValidBlockHeight = w.chain.finalizedHeight + 100; // 100 blocks * 600 = 60 s + 30 s < 130 s
+    w.chain.confirmedHeight = w.chain.finalizedHeight - 52; // R3-5: a node whose processed height agrees with that last valid height
     const rail = await railFor(w, w.seller);
     await expect(rail.claim(w.ref, w.preimageHex, w.terms.claimByMs)).resolves.toMatchObject({ ref: w.ref });
   });
@@ -849,8 +850,9 @@ describe("findClaimedPreimage (S1: a failed claim publishes the secret)", () => 
     const w = makeWorld();
     putLockedEscrow(w, { status: "Claimed", preimage: w.preimage, amount: 0n });
     const rail = await railFor(w);
+    w.chain.requests.length = 0; // connect's own history probe (R3-4) is not a scan
     expect(await rail.findClaimedPreimage(w.ref)).toBe(w.preimageHex);
-    expect(w.chain.count("getSignaturesForAddress")).toBe(0);
+    expect(w.chain.historyScans()).toBe(0);
   });
 
   it("finds the secret in a FAILED claim's instruction data while the escrow is still Locked and refundable", async () => {
@@ -925,10 +927,11 @@ describe("findClaimedPreimage (S1: a failed claim publishes the secret)", () => 
     const wrong = await claimTx(w, new Uint8Array(32).fill(3));
     history(w, [{ tx: wrong, err: CUSTOM(20) }, { tx: good, err: CUSTOM(19) }]);
     const rail = await railFor(w);
+    w.chain.requests.length = 0; // connect's own history probe (R3-4) is not a scan
     expect(await rail.preimageFromSignature(w.ref, good.signature)).toBe(w.preimageHex);
     expect(await rail.preimageFromSignature(w.ref, wrong.signature)).toBeNull();
     expect(await rail.preimageFromSignature(w.ref, "missing")).toBeNull();
-    expect(w.chain.count("getSignaturesForAddress")).toBe(0);
+    expect(w.chain.historyScans()).toBe(0);
   });
 
   it("skips a transaction the node no longer has or that is not a legacy transaction, and finds the claim after it", async () => {
@@ -967,7 +970,8 @@ describe("refund", () => {
     expect(evidence.signature).toBe(recorded[0]?.signature);
     const tx = sent[0] as SolTransaction;
     const keys = tx.message.accountKeys.map(pubkeyToBase58);
-    const ix = tx.message.instructions[0]!;
+    expect(tx.message.instructions.map((i) => keys[i.programIdIndex])).toEqual([COMPUTE_BUDGET_PROGRAM_ID, COMPUTE_BUDGET_PROGRAM_ID, SOL_HTLC_PROGRAM_ID]);
+    const ix = tx.message.instructions[2]!;
     expect(Array.from(ix.data)).toEqual([2]);
     expect(ix.accountIndexes.map((i) => keys[i])).toEqual([w.buyer.publicKey, pubkeyToBase58(w.keys.escrow), pubkeyToBase58(w.keys.vault), w.config.assets.USDC, pubkeyToBase58(w.keys.buyerToken), TOKEN_PROGRAM_ID]);
   });

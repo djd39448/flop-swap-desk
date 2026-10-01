@@ -128,8 +128,9 @@ describe("SOL-A2: a claim whose secret is already public can be retried inside t
     historyWithFailedClaim(w, await claimTx(w));
     claimOnSend(w);
     const rail = await railFor(w, w.seller);
+    w.chain.requests.length = 0; // connect's own history probe (R3-4) is not a scan
     await expect(rail.claim(w.ref, w.preimageHex, w.terms.claimByMs, undefined, { retryPublicSecret: true })).rejects.toThrow(/no claim carrying this preimage/);
-    expect(w.chain.count("getSignaturesForAddress")).toBe(0);
+    expect(w.chain.historyScans()).toBe(0);
     expect(w.chain.count("sendTransaction")).toBe(0);
   });
 

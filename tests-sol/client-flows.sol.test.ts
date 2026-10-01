@@ -69,7 +69,7 @@ import { CapturingRpc, verifiedExchangeBytes, type Exchange } from "../src/rails
 import { captureSolLeg, solEvidence, type SolAccounts, type SolCapture } from "../src/rails/sol-evidence.js";
 import { SolHtlcRail, escrowAddress, type SolSigner } from "../src/rails/sol-htlc.js";
 import { SolRpc } from "../src/rails/sol-rpc.js";
-import { TOKEN_PROGRAM_ID, createAssociatedTokenAccountIdempotent } from "../src/rails/sol-spl.js";
+import { TOKEN_PROGRAM_ID } from "../src/rails/sol-spl.js";
 import { compileLegacyMessage, pubkeyFromBase58, pubkeyToBase58, signTransaction, type SolInstruction } from "../src/rails/sol-tx.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
 import { identity, record, type Identity } from "../tests/helpers/identity.js";
@@ -314,8 +314,29 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     };
   }
 
-  function createOwnTokenAccount(party: SolParty): SolInstruction {
-    return createAssociatedTokenAccountIdempotent({ payer: party.signer.publicKeyBytes, owner: party.signer.publicKeyBytes, mint: pubkeyFromBase58(v.mint) });
+  /** System program `Transfer` (bincode: u32 tag 2, lamports u64). */
+  function systemTransfer(from: SolParty, to: string, lamports: bigint): SolInstruction {
+    const data = new Uint8Array(12);
+    const view = new DataView(data.buffer);
+    view.setUint32(0, 2, true);
+    view.setBigUint64(4, lamports, true);
+    return {
+      programId: pubkeyFromBase58("11111111111111111111111111111111"),
+      accounts: [
+        { pubkey: from.signer.publicKeyBytes, isSigner: true, isWritable: true },
+        { pubkey: pubkeyFromBase58(to), isSigner: false, isWritable: true },
+      ],
+      data,
+    };
+  }
+
+  /** The SOL a "starved" Seller is left with: above the rent-exempt minimum of an empty system account (890,880) so the
+   *  claim's fee can be paid and the account stays valid, far below what creating a token account needs (2,039,280). */
+  const STARVED_LAMPORTS = 1_000_000n;
+
+  /** The Seller's SOL is topped up again (what a person fixing the problem would do). */
+  async function topUpSeller(seller: SolParty): Promise<void> {
+    await sendFrom(v.buyer, [systemTransfer(v.buyer, seller.address, 5_000_000_000n)], "finalized");
   }
 
   /** Wraps `inner` (or the platform `fetch`) and counts the `sendTransaction` requests that pass through. */
@@ -346,13 +367,14 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
   }
 
   /**
-   * Makes the Seller's FIRST claim land and FAIL on the real chain: when the claim is about to be sent, the payee's
-   * associated token account is closed (and confirmed) and the claim is forwarded with its preflight skipped, so
-   * the program runs it, finds no payee token account and fails (BadTokenAccount) after the secret is public in
-   * its instruction data. This models the only way a claim can land and fail (the account vanishing between the
-   * flow's checks and the landing); the claim itself, its simulation and its pre-checks are the adapter's own.
-   * With `recreate`, the account is created again as soon as the failed claim landed, and the rail's poll sleep
-   * waits for that to be FINALIZED, as a person fixing the account would.
+   * Makes the Seller's FIRST claim land and FAIL on the real chain. Since R3-1 the claim creates the payee's token
+   * account itself, so the account vanishing is no longer a failure; what is: the claim's creation of that account is
+   * paid by the Seller wallet (the payer), and when that wallet cannot fund the rent the transaction lands (the fee is
+   * paid) and fails with the secret public in its instruction data. So when the claim is about to be sent, the payee's
+   * associated token account is closed (and confirmed), the Seller's SOL is drained to `STARVED_LAMPORTS`, and the
+   * claim is forwarded with its preflight skipped. The claim itself, its simulation and its pre-checks are the
+   * adapter's own. With `recreate`, the Seller's SOL is topped up as soon as the failed claim landed (the retry then
+   * creates the token account itself), and the rail's poll sleep waits for that to be FINALIZED.
    */
   function failingClaimFetch(seller: SolParty, recreate: boolean): { fetch: typeof fetch; sleep: (ms: number) => Promise<void>; state: { pending: Promise<void> | null; claimSignature: string | null } } {
     const state: { armed: boolean; pending: Promise<void> | null; claimSignature: string | null } = { armed: true, pending: null, claimSignature: null };
@@ -360,7 +382,10 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
       const body = typeof init?.body === "string" ? (JSON.parse(init.body) as { method?: string; params?: unknown[] }) : {};
       if (!state.armed || body.method !== "sendTransaction" || !Array.isArray(body.params)) return fetch(input, init);
       state.armed = false;
-      await sendFrom(seller, [closeOwnTokenAccount(seller)], "confirmed");
+      await sendFrom(seller, [closeOwnTokenAccount(seller)], "finalized");
+      const have = BigInt(await v.lamportsOf(seller.address));
+      const fee = 5_000n;
+      if (have > STARVED_LAMPORTS + fee) await sendFrom(seller, [systemTransfer(seller, v.buyer.address, have - STARVED_LAMPORTS - fee)], "finalized");
       const config = { ...((body.params[1] as Record<string, unknown> | undefined) ?? {}), skipPreflight: true };
       const forwarded = { ...body, params: [body.params[0], config, ...body.params.slice(2)] };
       const response = await fetch(input, { ...init, body: JSON.stringify(forwarded) });
@@ -376,7 +401,7 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
             if (Date.now() >= deadline) throw new Error("test: the failing claim never landed");
             await sleep(300);
           }
-          await sendFrom(seller, [createOwnTokenAccount(seller)], "finalized");
+          await topUpSeller(seller);
         })();
         state.pending.catch(() => undefined);
       }
@@ -670,7 +695,7 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     expect(claimed.receipt).toBeDefined();
     expect(failing.state.claimSignature).not.toBeNull();
 
-    // On chain: the escrow's history holds exactly one FAILED claim (BadTokenAccount, program error 17) and the
+    // On chain: the escrow's history holds exactly one FAILED claim (the payee's token account could not be funded) and the
     // successful retry; the failed one carries the preimage in its instruction data, which is how the secret
     // became public.
     const sol = new SolRpc(v.createCapturingRpc());
@@ -679,7 +704,8 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     const failedOnes = history.filter((entry) => entry.err !== null);
     expect(failedOnes).toHaveLength(1);
     expect(failedOnes[0]?.signature).toBe(failing.state.claimSignature);
-    expect(failedOnes[0]?.err).toEqual({ InstructionError: [0, { Custom: 17 }] });
+    // the failure is the claim's own creation of the payee's token account (instruction 2: budget, price, create, claim)
+    expect((failedOnes[0]?.err as { InstructionError?: unknown[] } | null)?.InstructionError?.[0]).toBe(2);
     expect(await escrowStatus(ref)).toBe("Claimed");
     expect(await v.usdcBalanceOf(seller.address)).toBe(500_000n);
 
@@ -707,9 +733,9 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     const room = dealRoom(p.acceptA.contract);
     h.skew.ms = 0;
 
-    // The claim lands and fails; no reveal frame is posted and the retry is refused by the adapter's own pre-check
-    // (the payee's token account is gone), so the Seller is left unpaid with the secret public on chain.
-    await expect(h.sellerFlow.claimLegA(lockA.hashLock, { skipReveal: true })).rejects.toThrow(/associated token account/);
+    // The claim lands and fails; no reveal frame is posted and the retry is refused by its own simulation (the Seller
+    // cannot fund the payee's token account), so the Seller is left unpaid with the secret public on chain.
+    await expect(h.sellerFlow.claimLegA(lockA.hashLock, { skipReveal: true })).rejects.toThrow(/simulate failed/);
     expect(framesIn(await h.venue.read(room), "reveal")).toHaveLength(0);
     expect(await escrowStatus(ref)).toBe("Locked");
 
@@ -764,7 +790,7 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
       await sleep(1000);
     }
     expect(await escrowStatus(ref)).toBe("Locked");
-    await sendFrom(seller, [createOwnTokenAccount(seller)], "finalized"); // the payee fixes its account
+    await topUpSeller(seller); // the Seller's SOL is topped up; the retry creates the payee's token account itself
     expect(await padAddressHistory(v, escrowKey(h.buyerParty.address, p.statement), 5001)).toBeGreaterThan(5000);
 
     const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
