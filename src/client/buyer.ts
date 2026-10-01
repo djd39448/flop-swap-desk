@@ -111,7 +111,10 @@ export interface BidParams {
 /** R3-6: leg B was claimed by someone while leg A is still locked: leg A is owed to the Seller. */
 export class LegBClaimedError extends Error {
   constructor() {
-    super("buyer: refusing to refund leg A - leg B was claimed with the public secret; leg A is owed to the Seller; settle by hand (R3-6)");
+    super(
+      "buyer: refusing to refund leg A - leg B was claimed with the public secret; leg A is owed to the Seller; settle by hand " +
+        "(the paper note is unauthenticated: this means the secret is public and leg B reads claimed) (R3-6, R4-1)",
+    );
     this.name = "LegBClaimedError";
   }
 }
@@ -167,6 +170,9 @@ export class BuyerFlow {
   /** P4-BTC-FIXES-R3.md K5: set once this leg's own `lock` frame has actually posted — see
    *  `announceLockA`. */
   private lockFramePosted = false;
+  /** R4-1: reasons `refundLegA` ignored a leg-B paper note that read claimed without being a proven claim. */
+  readonly refundNotes: string[] = [];
+
   /** G7: the refund's own write evidence, recorded the first time `refundLegA` actually
    *  broadcasts — a later call (made because the first one found the refund not yet confirmed)
    *  must never re-broadcast; it just re-checks. */
@@ -767,23 +773,39 @@ export class BuyerFlow {
     if (this.legBClaimed) {
       throw new Error("buyer: refusing to refund leg A — this flow already claimed leg B");
     }
-    // R3-6 (Solana): leg B's own record is read first. If anyone claimed leg B (the secret is public, so a third party
-    // can), leg A is owed to the Seller: a refund would leave the Seller with neither leg. Refuse with a distinct error.
-    // Known limit: after refund_after only a refund can move leg A, so a person must pay the Seller by hand.
-    if (this.rail.railId === SOL_RAIL_ID) {
-      const { acceptB } = this.requirePaired();
-      const legBRecord = await this.paperRail.read(acceptB.contract);
-      if (legBRecord !== null && legBRecord.status === "claimed") throw new LegBClaimedError();
-    }
-    // On Solana (S2-1) `checkPendingClaim` reads only the escrow's own state at finalized (Claimed and its stored
-    // preimage): no history scan, so nothing anyone can pad. A leak by a FAILED claim is not a payment and does not
-    // stop the refund: the Buyer never claims leg B on it.
+    // R4-2 (Solana): leg A's own Claimed state is checked FIRST. On Solana (S2-1) `checkPendingClaim` reads only the
+    // escrow's own state at finalized (Claimed and its stored preimage): no history scan, so nothing anyone can pad. A
+    // paid Seller must always get the "call learnSecret() then claimLegB()" routing, never "leg A is owed". A leak by a
+    // FAILED claim is not a payment and does not stop the refund: the Buyer never claims leg B on it.
     if (connected.checkPendingClaim !== undefined) {
       const pendingSecret = await connected.checkPendingClaim(railRef, this.lockedFromBlock);
       if (pendingSecret !== null) {
         throw new Error(
           "buyer: refusing to refund leg A — the lock has been claimed (on chain or already broadcast); " +
             "call learnSecret() then claimLegB() instead of refundLegA() (K2)",
+        );
+      }
+    }
+    // R3-6 + R4-1 (Solana): leg B's own record is read next. Leg B counts as claimed ONLY when the note is a proven claim:
+    // its lock, statement and refundAfterMs equal leg B's own terms AND its secret opens the statement. On the paper rail
+    // the note is UNAUTHENTICATED and anyone holding the secret can write it, so this refusal means exactly "the secret
+    // is public and leg B reads claimed", nothing more. (When leg B is a value-bearing chain rail the check must use
+    // bound chain evidence instead; this flow's leg B is the paper rail.) A forged note (no secret, or terms that do not
+    // match) is ignored, with a reason kept in `refundNotes`, and never blocks the refund.
+    // Known limit: after refund_after only a refund can move leg A, so a person must pay the Seller by hand.
+    if (this.rail.railId === SOL_RAIL_ID) {
+      const { offerB, acceptB } = this.requirePaired();
+      const legBRecord = await this.paperRail.read(acceptB.contract);
+      if (legBRecord !== null && legBRecord.status === "claimed") {
+        const termsB = offerAcceptLockTerms(offerB, acceptB);
+        const proven =
+          legBRecord.lock === termsB.lock &&
+          legBRecord.statement === termsB.statement &&
+          legBRecord.refundAfterMs === termsB.refundAfterMs &&
+          verifySecret(termsB.lock, termsB.statement, legBRecord.secret ?? "");
+        if (proven) throw new LegBClaimedError();
+        this.refundNotes.push(
+          "leg B's paper note reads claimed but is not a proven claim (terms differ or its secret does not open the statement): ignored (R4-1)",
         );
       }
     }

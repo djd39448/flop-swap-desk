@@ -18,7 +18,7 @@
 // refuses is never sent (nothing leaks); and the custom rail id is admitted only through the rail's own
 // registry while tclk's closed check stays in force for everyone else.
 
-import { dealRoom, encodeFrame, makeOffer, PaperRail, tryDecodeFrame, type AcceptFrame, type LockTerms, type OfferFrame } from "@flop-labs/tclk";
+import { dealRoom, decodePaperRecord, encodeFrame, encodePaperRecord, makeOffer, paperNote, PaperRail, tryDecodeFrame, type AcceptFrame, type LockTerms, type OfferFrame } from "@flop-labs/tclk";
 import { base58 } from "@scure/base";
 import { describe, expect, it } from "vitest";
 
@@ -1212,6 +1212,72 @@ describe("R3-6: a claimed leg B stops the Buyer's refund of leg A", () => {
     h.setTime(p.offerA.refundAfterMs);
     await h.buyerFlow.refundLegA();
     expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Refunded");
+  });
+});
+
+describe("R4-1/R4-2: the refund guard trusts only a proven leg-B claim and checks leg A's own Claimed first", () => {
+  /** Overwrites leg B's paper note with an arbitrary "claimed" line (the namespace is world-writable). */
+  async function forgeLegBNote(h: SolHarness, p: { acceptBRecord: { line: string } }, mutate: (r: { lock: "hash"; statement: string; refundAfterMs: number; secret: string }) => void): Promise<void> {
+    const legBContract = (tryDecodeFrame(p.acceptBRecord.line) as AcceptFrame).contract;
+    const { ns, key } = paperNote(legBContract);
+    const current = decodePaperRecord((await h.noteStore.get(ns, key)) as string);
+    const record = { lock: "hash" as const, statement: current!.statement, refundAfterMs: current!.refundAfterMs, secret: sellerSecret(h) };
+    mutate(record);
+    await h.noteStore.set(ns, key, encodePaperRecord({ status: "claimed", ...record }));
+  }
+
+  it("R4-1: a forged note with a secret that does not open the statement does not block the refund", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    await forgeLegBNote(h, p, (r) => {
+      r.secret = "0x" + "11".repeat(32);
+    });
+    h.setTime(p.offerA.refundAfterMs);
+    await h.buyerFlow.refundLegA();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Refunded");
+    expect(h.buyerFlow.refundNotes.join(" ")).toMatch(/not a proven claim/);
+  });
+
+  it("R4-1: a note whose terms do not match leg B (even with a real secret) does not block the refund", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    await forgeLegBNote(h, p, (r) => {
+      r.refundAfterMs += 1;
+    });
+    h.setTime(p.offerA.refundAfterMs);
+    await h.buyerFlow.refundLegA();
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Refunded");
+    expect(h.buyerFlow.refundNotes).toHaveLength(1);
+  });
+
+  it("R4-1: a note carrying the right terms and a secret that opens the statement blocks the refund, and the error says what it means", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    await forgeLegBNote(h, p, () => undefined);
+    h.setTime(p.offerA.refundAfterMs);
+    const error = await h.buyerFlow.refundLegA().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(LegBClaimedError);
+    expect((error as Error).message).toMatch(/unauthenticated: this means the secret is public and leg B reads claimed/);
+    expect(h.node.sent.refund).toBe(0);
+  });
+
+  it("R4-2: when leg A itself is Claimed the Buyer gets the learnSecret()/claimLegB() routing even though leg B also reads claimed", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    await h.sellerFlow.claimLegA(p.statement);
+    const legBContract = (tryDecodeFrame(p.acceptBRecord.line) as AcceptFrame).contract;
+    await new PaperRail(h.noteStore, h.clock).claim(legBContract, sellerSecret(h));
+    h.setTime(p.offerA.refundAfterMs);
+    const error = await h.buyerFlow.refundLegA().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).not.toBeInstanceOf(LegBClaimedError);
+    expect((error as Error).message).toMatch(/call learnSecret\(\) then claimLegB\(\) instead of refundLegA\(\)/);
+    expect(h.node.sent.refund).toBe(0);
   });
 });
 
