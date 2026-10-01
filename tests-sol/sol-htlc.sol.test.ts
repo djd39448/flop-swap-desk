@@ -654,7 +654,7 @@ describe("sol-htlc (solana-test-validator)", () => {
     while (Date.now() <= claimByMs + 1000) await sleep(500);
     await expect(payeeRail.claim(record.ref, preimage, claimByMs)).rejects.toThrow(/has already passed|SolClaimTooLate|landing/);
     const sendsBefore = sendCount(payeeRpc);
-    const evidence = await payeeRail.claim(record.ref, preimage, claimByMs, undefined, { retryPublicSecret: true });
+    const evidence = await payeeRail.claim(record.ref, preimage, claimByMs, undefined, { retryPublicSecret: true, proofSignature: forced.record.signature });
     expect(sendCount(payeeRpc)).toBe(sendsBefore + 1);
     expect(evidence.ref).toBe(record.ref);
     expect((await payeeRail.getEscrow(record.ref)).escrow).toMatchObject({ status: "Claimed", preimage });

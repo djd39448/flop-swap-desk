@@ -541,6 +541,9 @@ interface SolPreparedWrite {
   tx: SolTransaction;
   /** Runs after simulation, as the LAST read before broadcast. */
   guard?: () => Promise<void>;
+  /** S2-2: called when the write failed BEFORE anything was handed to the network (the simulation or the guard
+   *  refused, or the node's preflight rejected it), so a caller that recorded the signature may drop the record. */
+  onNotBroadcast?: (record: SolPreparedRecord) => void | Promise<void>;
 }
 
 // --- the rail ------------------------------------------------------------------------------------------------
@@ -575,6 +578,10 @@ export interface SolClaimOptions {
   /** SOL-C1: the signature of the claim that landed and failed (`SolClaimFailedError.signature`). The retry is then
    *  proven by fetching exactly that transaction, not by scanning the escrow's history, which anyone can pad. */
   proofSignature?: string;
+  /** S2-2: called when the claim was signed and recorded (`onSigned`) but provably never handed to the network
+   *  (the simulation or the last-moment guard refused, or the node's preflight rejected it). The caller may then
+   *  drop the recorded signature: it can never land. NOT called for a transport failure during the send itself. */
+  onNotBroadcast?: (record: SolPreparedRecord) => void | Promise<void>;
 }
 
 /**
@@ -932,15 +939,24 @@ export class SolHtlcRail {
     const raw = (): string[] => this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256);
     const { record, tx } = prepared;
     this.rpc.setIdNamespace(`write:${record.ref}:${this.clock()}`);
+    let handedToNetwork = false;
     try {
       await this.simulateOrThrow(tx);
       if (prepared.guard !== undefined) await prepared.guard();
+      handedToNetwork = true;
       const reported = await this.sol.sendTransaction(tx.bytes, { preflightCommitment: "confirmed" });
       if (reported !== record.signature) {
         throw new Error(`sol-htlc: the node reported signature ${reported}, not the recorded ${record.signature}`);
       }
       const status = await this.awaitFinalized(record.signature, record.lastValidBlockHeight);
       return await this.confirmWrite(record, status, raw, claimPreimage);
+    } catch (error) {
+      // S2-2: a refusal before the send, or a preflight rejection by the node, means the signed bytes never
+      // reached the network: the recorded signature can never land and need not be resolved later.
+      if (prepared.onNotBroadcast !== undefined && (!handedToNetwork || (error instanceof SolSimulationFailedError && error.phase === "preflight"))) {
+        await prepared.onNotBroadcast(record);
+      }
+      throw error;
     } finally {
       this.rpc.setIdNamespace(undefined);
     }
@@ -1061,12 +1077,11 @@ export class SolHtlcRail {
     if (retry) {
       // SOL-A2: the retry mode exists only for a secret that is ALREADY public, and that is proven on chain,
       // never taken on the caller's word.
-      const proven =
-        options.proofSignature !== undefined
-          ? ((await this.preimageFromSignature(ref, options.proofSignature)) ?? (await this.findClaimedPreimage(ref)))
-          : await this.findClaimedPreimage(ref);
+      // S2-2/S2-3: the proof is exactly the named finalized transaction (polled until it is finalized), never a scan
+      // of the escrow's history, which anyone can pad past any limit.
+      const proven = options.proofSignature === undefined ? null : await this.awaitPreimageFromSignature(ref, options.proofSignature);
       if (proven !== preimage) {
-        throw new Error("sol-htlc: refusing a public-secret retry - no claim carrying this preimage was found in this escrow's on-chain history");
+        throw new Error("sol-htlc: refusing a public-secret retry - no claim carrying this preimage was found in the named transaction (proofSignature)");
       }
     }
 
@@ -1122,6 +1137,7 @@ export class SolHtlcRail {
       }
     };
     const prepared = await this.buildAndSign({ kind: "claim", ref }, instruction, plan, guard);
+    if (options.onNotBroadcast !== undefined) prepared.onNotBroadcast = options.onNotBroadcast;
     if (onSigned !== undefined) await onSigned(prepared.record);
     return this.sendPrepared(prepared, preimage);
   }
@@ -1247,6 +1263,33 @@ export class SolHtlcRail {
     const fetched = await this.sol.getTransaction(signature, "finalized");
     if (fetched === null || fetched.transaction === null) return null;
     return this.preimageFromTransaction(fetched.transaction, escrow, opens);
+  }
+
+  /** S2-2: like `preimageFromSignature`, but polls until the named transaction is readable at finalized (a signature
+   *  already known finalized can still lag `getTransaction` for a moment) and throws `SolPendingError` when it is
+   *  not readable within the finality timeout. `null` only when the finalized transaction carries no claim that
+   *  opens this hash lock. Never scans the escrow's history. */
+  async awaitPreimageFromSignature(ref: string, signature: string): Promise<string | null> {
+    const parsed = this.requireRef(ref);
+    const hashLockBytes = hexToBytes(parsed.hashLock.slice(2));
+    const opens = (bytes: Uint8Array): boolean => bytes.length === 32 && bytesEqual(sha256(bytes), hashLockBytes);
+    const { escrow } = this.escrowKeys(parsed);
+    const deadline = this.clock() + this.finalityTimeoutMs;
+    for (;;) {
+      const fetched = await this.sol.getTransaction(signature, "finalized");
+      if (fetched !== null && fetched.transaction !== null) return this.preimageFromTransaction(fetched.transaction, escrow, opens);
+      if (this.clock() >= deadline) throw new SolPendingError(signature, "the transaction is not readable at finalized yet");
+      await this.sleep(this.pollIntervalMs);
+    }
+  }
+
+  /** S2-3: the preimage stored in the escrow itself, read at finalized: the escrow is `Claimed` and its stored
+   *  preimage opens the hash lock. One account read; no history, so nothing anyone can pad. `null` otherwise. */
+  async claimedPreimage(ref: string): Promise<string | null> {
+    const parsed = this.requireRef(ref);
+    const { escrow: view } = await this.getEscrow(ref);
+    if (view === null || view.status !== "Claimed" || view.preimage === null) return null;
+    return bytesEqual(sha256(hexToBytes(view.preimage.slice(2))), hexToBytes(parsed.hashLock.slice(2))) ? view.preimage : null;
   }
 
   private preimageFromTransaction(tx: SolTransaction, escrow: Uint8Array, opens: (bytes: Uint8Array) => boolean): string | null {

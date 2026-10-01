@@ -39,6 +39,8 @@ export interface SolHarnessOptions {
   /** Fund the Buyer's and Seller's token accounts (default: Buyer 5 USDC, Seller an empty account). */
   buyerBalance?: bigint | null;
   sellerAccount?: boolean;
+  /** S2-4: the Seller's bound on one reveal post attempt (default: the flow's own). */
+  revealPostTimeoutMs?: number;
 }
 
 export function solHarness(options: SolHarnessOptions = {}) {
@@ -67,7 +69,7 @@ export function solHarness(options: SolHarnessOptions = {}) {
   const sellerRail = createSolCounterRail({ ...railOptions, rpc: node.rpc(), signer: sellerWallet });
 
   const buyerFlow = new BuyerFlow({ identity: buyer, venue, paperRail: new PaperRail(noteStore, clock), rail: buyerRail, clock });
-  const sellerFlow = new SellerFlow({ identity: seller, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock });
+  const sellerFlow = new SellerFlow({ identity: seller, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock, ...(options.revealPostTimeoutMs === undefined ? {} : { revealPostTimeoutMs: options.revealPostTimeoutMs }) });
   return { node, buyer, seller, buyerWallet, sellerWallet, buyerRail, sellerRail, venue, noteStore, clockRef, clock, setTime, buyerFlow, sellerFlow };
 }
 
@@ -141,4 +143,20 @@ export function failPosts(h: { venue: MemoryVenue }, type: string, count: number
     return original(room, line, id);
   };
   return { failed: () => failed };
+}
+
+/** Make `venue.post` never answer for frames of `type` (a stalled venue): the returned promise stays pending. */
+export function stallPosts(h: { venue: MemoryVenue }, type: string): { stalled: () => number } {
+  const venue = h.venue as unknown as { post: (room: string, line: string, id: unknown) => Promise<unknown> };
+  const original = venue.post.bind(venue);
+  let stalled = 0;
+  venue.post = (room, line, id) => {
+    const frame = tryDecodeFrame(line) as { type?: string } | null;
+    if (frame?.type === type) {
+      stalled += 1;
+      return new Promise<never>(() => undefined);
+    }
+    return original(room, line, id);
+  };
+  return { stalled: () => stalled };
 }

@@ -262,12 +262,15 @@ real, local, ephemeral `solana-test-validator` this repo itself starts and stops
 service. They hold public chain reads, signed transactions and account-line proofs (signatures), and no key
 material: every account and key they name is a freshly generated, zero-value, in-memory keypair of that run.
 `tests/sol-localnet-fixtures.test.ts` replays them hermetically through `examples/audit-export.mjs` and scans
-every file for key material on every `npm test` run: field names, PEM and mnemonic shapes, a base58 or base64
-token that decodes to 64 bytes whose first 32 bytes derive its last 32 (a Solana keypair), any JSON array of 64
-numbers (the `solana-keygen` file format), and any bare 32-byte base58 or hex token that derives a public key
-already present in the same fixture (each shape has a planted-leak test, and the real captured signatures, the
-same length as a keypair, are shown not to be flagged). `refunded-b` carries no Solana bytes at all (the Buyer
-never locked leg A).
+every file for these shapes of key material on every `npm test` run (it checks those shapes, not every possible
+hiding place): field names, PEM and mnemonic shapes, a base58, base64 or 128-hex token that decodes to 64 bytes
+whose first 32 bytes derive its last 32 (a Solana keypair), any JSON array of 64 numbers (the `solana-keygen`
+file format), and any bare 32-byte base58, base64 or hex token that derives a public key already present in the
+same fixture (as a base58 address or as 32 bytes inside a decoded base64 blob) (each shape has a planted-leak
+test, and the real captured signatures, the
+same length as a keypair, are shown not to be flagged). `refunded-b` holds no Solana escrow and no Solana write
+(the Buyer never locked leg A): it carries one live read of the chain for the lock's ref that shows no escrow, and
+`rails.json`.
 
 ## Settlement-view vocabulary — pinned to tclk PR #173
 

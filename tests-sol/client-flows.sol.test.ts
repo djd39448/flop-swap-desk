@@ -29,11 +29,15 @@
 //   1 settled; 2 refunded (the Buyer refunds leg A after the real chain time passes refundAfterMs, the Seller
 //   refunds leg B); 3 refunded-b; 4 a claim is refused before the lock is final (before any lock frame, and with
 //   a lock frame posted while the lock is only `confirmed`); 5 the Buyer learns the secret with no reveal frame;
-//   6 a claim that LANDS and FAILS publishes the secret, the flows route correctly (reveal posted, retry at once
-//   in public-secret mode and paid; or no retry possible and the Buyer learns the secret from the failed
-//   transaction and refuses to refund); 7 a squat by another payer does not block; 8 lost replies are recovered
-//   (the lock by `reconcileLockA`, the claim by recognising the landed claim from the chain); 9 a mirror pair
-//   cannot borrow the evidence (P7: its copies of the victim's lines do not resolve).
+//   6 a claim that LANDS and FAILS publishes the secret, the flows route correctly (retry at once in
+//   public-secret mode and paid, the reveal posted after it; or no retry possible: the Buyer never claims leg B
+//   on a secret leaked by a failed claim, refunds leg A once the window passes, and the Seller refunds leg B;
+//   or the failed claim's reply was lost and the escrow's history was padded past 5000 entries: the recorded
+//   signature still proves the secret public and the retry pays the Seller); 7 a squat by another payer does
+//   not block; 8 lost replies are recovered (the lock by `reconcileLockA`, the claim by the recorded signature,
+//   even with the escrow's history padded past 5000 entries); 9 a mirror pair cannot borrow the evidence (P7: its
+//   copies of the victim's lines do not resolve); 5b 5001 padding entries before the first claim do not stop it
+//   (the Seller never scans history).
 //
 // Fixtures `fixtures/sol-localnet-2026-09-30/{settled,refunded,refunded-b}/`, regenerated only with
 // `CAPTURE_SOL_FIXTURES=1` (mirrors `CAPTURE_NEAR_FIXTURES`); every other run writes to a fresh `mkdtemp`
@@ -69,6 +73,7 @@ import { TOKEN_PROGRAM_ID, createAssociatedTokenAccountIdempotent } from "../src
 import { compileLegacyMessage, pubkeyFromBase58, pubkeyToBase58, signTransaction, type SolInstruction } from "../src/rails/sol-tx.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
 import { identity, record, type Identity } from "../tests/helpers/identity.js";
+import { padAddressHistory } from "./helpers/padding.js";
 import { startSolValidator, type SolParty, type SolValidatorHandle } from "./helpers/validator.js";
 
 const execFileAsync = promisify(execFile);
@@ -634,6 +639,22 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     await h.buyerFlow.claimLegB(secret);
   }, 360_000);
 
+  it("scenario 5b (S2-3): 5001 padding entries on the escrow before the first claim do not stop it: the Seller never scans history and the claim lands", async () => {
+    const h = setupSwap({ buyer: ident(31), seller: ident(32) });
+    const p = await pairWithLines("0000000b", h, honestLegA(h.clock()));
+    const ref = refOf(p, h);
+    const sellerBefore = (await v.usdcBalanceOf(h.sellerParty.address)) ?? 0n;
+    const lockA = await h.buyerFlow.lockLegA();
+    const padded = await padAddressHistory(v, escrowKey(h.buyerParty.address, p.statement), 5001);
+    expect(padded).toBeGreaterThan(5000); // the padding reached the escrow's history: a whole-history scan would now throw
+    const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
+    expect(claimed.receipt).toBeDefined();
+    expect(await escrowStatus(ref)).toBe("Claimed");
+    expect(await v.usdcBalanceOf(h.sellerParty.address)).toBe(sellerBefore + 500_000n);
+    const secret = await h.buyerFlow.learnSecret(); // the Buyer reads the escrow only: padding never affects it
+    await h.buyerFlow.claimLegB(secret);
+  }, 900_000);
+
   // -- 6 -----------------------------------------------------------------------------------------------------
 
   it("scenario 6a: a claim that lands and FAILS publishes the secret; the Seller posts the reveal, retries at once in public-secret mode and is paid", async () => {
@@ -671,14 +692,20 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     await h.buyerFlow.claimLegB(secret);
   }, 600_000);
 
-  it("scenario 6b: a failed claim whose retry cannot land leaves the secret public on chain only; the Buyer refuses to refund into it, learns the secret from the failed transaction and claims leg B", async () => {
+  it("scenario 6b (S2-1): a failed Seller claim with the secret public and no retry possible: the Buyer never claims leg B, refunds leg A after the window, the Seller refunds leg B", async () => {
+    // COMPRESSED window (see the file header), as in scenario 2.
+    const refundAfterMs = Date.now() + 7 * MINUTE;
     const seller = await v.createParty({});
     const failing = failingClaimFetch(seller, false);
-    const h = setupSwap({ buyer: ident(15), seller: ident(16), sellerParty: seller, sellerFetch: failing.fetch });
-    const p = await pairWithLines("00000007", h, honestLegA(h.clock()));
+    const h = setupSwap({ buyer: ident(15), seller: ident(16), sellerParty: seller, sellerFetch: failing.fetch, skewMs: -(48 * MINUTE - 7 * MINUTE) });
+    const t0 = h.clock();
+    const legA: LegWindows = { lockTimeMs: t0, claimByMs: refundAfterMs - 5 * MINUTE - 1000, refundAfterMs, expiresMs: t0 + 30 * MINUTE };
+    const p = await pairWithLines("00000007", h, legA);
     const ref = refOf(p, h);
+    const buyerBefore = (await v.usdcBalanceOf(h.buyerParty.address)) as bigint;
     const lockA = await h.buyerFlow.lockLegA();
     const room = dealRoom(p.acceptA.contract);
+    h.skew.ms = 0;
 
     // The claim lands and fails; no reveal frame is posted and the retry is refused by the adapter's own pre-check
     // (the payee's token account is gone), so the Seller is left unpaid with the secret public on chain.
@@ -686,19 +713,69 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     expect(framesIn(await h.venue.read(room), "reveal")).toHaveLength(0);
     expect(await escrowStatus(ref)).toBe("Locked");
 
-    // The refund window of the flow clock opens: the Buyer must still NOT refund (the lock is claimable with a
-    // public secret), and nothing is sent.
-    h.skew.ms = 48 * MINUTE;
+    // The Buyer never learns the secret from the failed transaction and never claims leg B: nobody was paid.
     const sendsBefore = h.buyerSends();
-    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/the secret is public and leg B is still claimable; call learnSecret\(\) then claimLegB\(\)/);
-    await expect(h.buyerFlow.refundLegA()).rejects.toThrow(/call learnSecret/); // on every retry, not only the first
+    await expect(h.buyerFlow.learnSecret()).rejects.toThrow(/leg A not claimed on chain yet/);
+    await expect(h.buyerFlow.claimLegB((h.sellerFlow as unknown as { hashLock: { preimage: string } }).hashLock.preimage)).rejects.toThrow(/leg A is not Claimed on chain/);
     expect(h.buyerSends()).toBe(sendsBefore);
 
-    // With no reveal frame, the Buyer learns the secret from the failed transaction's instruction data.
-    const secret = await h.buyerFlow.learnSecret();
-    expect(verifyHashPreimage(lockA.hashLock, secret)).toBe(true);
-    await h.buyerFlow.claimLegB(secret);
-  }, 600_000);
+    // Once the REAL chain time passes refundAfterMs the Buyer refunds leg A (the program refuses every claim now).
+    await waitChainTime(refundAfterMs);
+    const refundA = await h.buyerFlow.refundLegA();
+    expect(refundA.txHash).toMatch(/^[1-9A-HJ-NP-Za-km-z]{60,100}$/);
+    expect(await escrowStatus(ref)).toBe("Refunded");
+    expect(await v.usdcBalanceOf(h.buyerParty.address)).toBe(buyerBefore); // refunded in full
+    expect(await v.usdcBalanceOf(seller.address)).toBeNull(); // the Seller's account stayed closed: it was never paid
+
+    // Leg B was never claimed: the Seller refunds it (paper rail, flow clock only).
+    h.skew.ms = 25 * HOUR;
+    const refundB = await h.sellerFlow.refundLegB();
+    expect(refundB.refund).toBeDefined();
+  }, 900_000);
+
+  it("scenario 6d (S2-2): a FAILED claim whose reply was lost, then 5001 padding entries: the retry resolves the recorded signature, proves the secret public by it and pays the Seller", async () => {
+    const seller = await v.createParty({});
+    const failing = failingClaimFetch(seller, false);
+    let lose = true;
+    const lossyFailing: typeof fetch = async (input, init) => {
+      const response = await failing.fetch(input, init);
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as { method?: string }) : {};
+      if (lose && body.method === "sendTransaction") {
+        lose = false;
+        await response.arrayBuffer();
+        throw new Error("connection reset while reading the reply");
+      }
+      return response;
+    };
+    const h = setupSwap({ buyer: ident(33), seller: ident(34), sellerParty: seller, sellerFetch: lossyFailing });
+    const p = await pairWithLines("0000000c", h, honestLegA(h.clock()));
+    const ref = refOf(p, h);
+    const lockA = await h.buyerFlow.lockLegA();
+
+    await expect(h.sellerFlow.claimLegA(lockA.hashLock)).rejects.toThrow(/connection reset/);
+    expect(failing.state.claimSignature).not.toBeNull();
+    const signature = failing.state.claimSignature as string;
+    // the failed claim lands (finalized, with its error) while nobody is watching
+    const sol = new SolRpc(v.createCapturingRpc());
+    for (const deadline = Date.now() + 180_000; ; ) {
+      const [status] = await sol.getSignatureStatuses([signature]);
+      if (status !== undefined && status !== null && status.confirmationStatus === "finalized") break;
+      if (Date.now() >= deadline) throw new Error("test: the failed claim never finalized");
+      await sleep(1000);
+    }
+    expect(await escrowStatus(ref)).toBe("Locked");
+    await sendFrom(seller, [createOwnTokenAccount(seller)], "finalized"); // the payee fixes its account
+    expect(await padAddressHistory(v, escrowKey(h.buyerParty.address, p.statement), 5001)).toBeGreaterThan(5000);
+
+    const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
+    expect(claimed.receipt).toBeDefined();
+    expect(await escrowStatus(ref)).toBe("Claimed");
+    expect(await v.usdcBalanceOf(seller.address)).toBe(500_000n);
+    const room = await h.venue.read(dealRoom(p.acceptA.contract));
+    expect(framesIn(room, "reveal")).toHaveLength(1);
+    expect(framesIn(room, "receipt")).toHaveLength(1);
+    await h.buyerFlow.claimLegB(await h.buyerFlow.learnSecret());
+  }, 1_200_000);
 
   // -- 7 -----------------------------------------------------------------------------------------------------
 
@@ -760,6 +837,8 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/connection reset/);
     const sendsAfterLoss = h.sellerSends();
     await waitEscrowStatus(ref, "Claimed");
+    // S2-2: 5001 padding entries on the escrow: the retry resolves the recorded signature, never a history scan
+    expect(await padAddressHistory(v, escrowKey(h.buyerParty.address, p.statement), 5001)).toBeGreaterThan(5000);
     const second = await h.sellerFlow.claimLegA(p.statement);
     expect(second.receipt).toBeDefined();
     expect(h.sellerSends()).toBe(sendsAfterLoss); // nothing was sent again

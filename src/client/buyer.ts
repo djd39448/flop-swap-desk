@@ -47,9 +47,12 @@
 // id tclk's closed registry does not know, so the leg A offer (`bid`), the `lock` frame and the `refunded`
 // receipt are built and encoded through the rail's OWN registry (`CounterAssetRail.railRegistry`, never
 // global; `src/rails/custom-frames.ts`). Everything else is the rail-agnostic flow: the lock frame is posted
-// only after the adapter confirmed the escrow at FINALIZED, a refund is refused once the chain (the escrow's
-// own stored preimage OR the history of a FAILED claim, which leaks the secret) shows the lock claimed, and
-// the Buyer then learns the secret from the chain and claims leg B.
+// only after the adapter confirmed the escrow at FINALIZED, a refund is refused once the escrow itself reads
+// Claimed at finalized, and the Buyer then learns the secret from the escrow's stored preimage and claims leg B.
+// S2-1: on this rail the Buyer claims leg B ONLY once leg A reads Claimed at finalized, and it never scans
+// history. A secret leaked by a FAILED claim is not a payment (a failed claim leaves no state, and the program
+// refuses every claim at or after refund_after_ms), so claiming leg B on it would either cost the Seller leg B
+// or freeze leg A; a failed Seller claim simply means the swap fails and both legs are refunded.
 //
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
 // P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3; P4-BTC-SPEC.md §7a;
@@ -162,10 +165,8 @@ export class BuyerFlow {
   /** G7: `refundLegA`'s own refund/receipt frames are posted at most once — set only once the
    *  evidence reader itself confirms the refund. */
   private legARefundFramesPosted = false;
-  // SOL-C2: the secret this flow has learned (from the reveal frame or the chain) and whether it has claimed leg B
-  // with it. On Solana a leak by a failed claim leaves no account state, so the chain read alone cannot be the only
-  // thing that stops a refund of leg A after leg B was claimed.
-  private learnedSecret?: string;
+  // The Buyer never refunds leg A after it claimed leg B (every rail). On Solana (S2-1) leg B is claimed only once leg A
+  // reads Claimed, so this latch can never contradict the chain there.
   private legBClaimed = false;
   /** B5: every leg-A write this flow has made so far (`lockLegA`'s lock, `refundLegA`'s
    *  refund), in call order — see the identical field on `SellerFlow`. */
@@ -627,11 +628,21 @@ export class BuyerFlow {
     // `prepareLock` before `commitLock` ever runs), but it is kept as a last resort.
     const railRef = this.lockedRailRef ?? hashLock;
 
-    const fromFrame = await this.revealFromFrames(acceptA.contract, railRef, hashLock);
-    if (fromFrame !== null) {
-      this.learnedSecret = fromFrame;
-      return fromFrame;
+    // S2-1 (Solana): the secret counts only once the escrow itself reads Claimed at finalized, and it is taken from the
+    // escrow's stored preimage. A reveal frame alone, or a secret leaked by a FAILED claim, never lets the Buyer
+    // claim leg B: a failed claim leaves no state and the Seller may not have been paid.
+    if (this.rail.railId === SOL_RAIL_ID) {
+      if (this.lockedAccounts === undefined) {
+        throw new Error("buyer: refusing to guess the secret — leg A accounts were never resolved (G1)");
+      }
+      const connectedSol = await this.rail.connect(offerAcceptLockTerms(offerA, acceptA), this.lockedAccounts);
+      const stored = await connectedSol.findClaimedPreimage(railRef, this.lockedFromBlock);
+      if (stored === null) throw new Error("buyer: leg A not claimed on chain yet (the escrow does not read Claimed at finalized)");
+      return stored;
     }
+
+    const fromFrame = await this.revealFromFrames(acceptA.contract, railRef, hashLock);
+    if (fromFrame !== null) return fromFrame;
 
     // P4-BTC-FIXES.md G1: use the accounts frozen at lock time — never re-read/re-resolve the
     // room here (a line posted after funding must neither help nor hinder this read).
@@ -644,7 +655,6 @@ export class BuyerFlow {
     if (preimage === null) {
       throw new Error("buyer: refusing to guess the secret — no reveal frame and no Claimed log yet");
     }
-    this.learnedSecret = preimage;
     return preimage;
   }
 
@@ -656,9 +666,21 @@ export class BuyerFlow {
     if (!verifySecret(termsB.lock, termsB.statement, secret)) {
       throw new Error("buyer: refusing to claim leg B — secret does not open its statement");
     }
+    // S2-1 (Solana): leg B is claimed only while leg A reads Claimed at finalized with this very secret.
+    if (this.rail.railId === SOL_RAIL_ID) {
+      const { offerA, acceptA } = this.requirePaired();
+      const railRef = this.lockedRailRef ?? this.lockedHashLock;
+      if (railRef === undefined || this.lockedAccounts === undefined) {
+        throw new Error("buyer: refusing to claim leg B — leg A was never locked by this flow");
+      }
+      const connectedSol = await this.rail.connect(offerAcceptLockTerms(offerA, acceptA), this.lockedAccounts);
+      const stored = await connectedSol.findClaimedPreimage(railRef, this.lockedFromBlock);
+      if (stored === null || stored !== secret) {
+        throw new Error("buyer: refusing to claim leg B — leg A is not Claimed on chain with this secret yet (S2-1)");
+      }
+    }
     await this.paperRail.claim(acceptB.contract, secret);
-    this.learnedSecret = secret;
-    this.legBClaimed = true; // SOL-C2
+    this.legBClaimed = true;
     const reveal = await this.venue.post(
       dealRoom(acceptB.contract),
       encodeFrame({ type: "reveal", from: this.identity.did, contract: acceptB.contract, ref: acceptB.contract, secret }),
@@ -724,31 +746,14 @@ export class BuyerFlow {
     // replace the Buyer's pending refund with a higher-fee claim (full replace-by-fee); a retry
     // that skipped this check kept answering "not yet confirmed" instead of routing the Buyer to
     // learnSecret()/claimLegB() while its window on leg B was still open.
-    // SOL-C2: this flow already claimed leg B with the public secret; refunding leg A now would take both legs.
+    // This flow already claimed leg B: refunding leg A now would take both legs.
     if (this.legBClaimed) {
-      throw new Error("buyer: refusing to refund leg A — this flow already claimed leg B with the public secret (SOL-C2)");
+      throw new Error("buyer: refusing to refund leg A — this flow already claimed leg B");
     }
-    if (this.rail.railId === SOL_RAIL_ID) {
-      // SOL-C2/C3: on Solana a leak leaves no account state, so the secret is looked for in three places (the latch,
-      // the Seller's reveal frame, the escrow's history). A public secret forbids the refund only while it is still
-      // USABLE: leg B still verifies as locked and before its refundAfterMs. Otherwise refusing protects no one and
-      // would freeze leg A forever, because the program refuses every claim at/after refund_after_ms.
-      const secret =
-        this.learnedSecret ??
-        (await this.revealFromFrames(acceptA.contract, railRef, this.lockedHashLock)) ??
-        (connected.checkPendingClaim === undefined ? null : await connected.checkPendingClaim(railRef, this.lockedFromBlock));
-      if (secret !== null) {
-        const { offerB, acceptB } = this.requirePaired();
-        const termsB = offerAcceptLockTerms(offerB, acceptB);
-        const legBUsable = this.clock() < offerB.refundAfterMs && (await this.paperRail.verifyLock(termsB, acceptB.contract));
-        if (legBUsable) {
-          throw new Error(
-            "buyer: refusing to refund leg A — the secret is public and leg B is still claimable; " +
-              "call learnSecret() then claimLegB() instead of refundLegA() (K2/SOL-C3)",
-          );
-        }
-      }
-    } else if (connected.checkPendingClaim !== undefined) {
+    // On Solana (S2-1) `checkPendingClaim` reads only the escrow's own state at finalized (Claimed and its stored
+    // preimage): no history scan, so nothing anyone can pad. A leak by a FAILED claim is not a payment and does not
+    // stop the refund: the Buyer never claims leg B on it.
+    if (connected.checkPendingClaim !== undefined) {
       const pendingSecret = await connected.checkPendingClaim(railRef, this.lockedFromBlock);
       if (pendingSecret !== null) {
         throw new Error(

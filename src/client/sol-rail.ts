@@ -15,9 +15,13 @@
 //     lands and FAILS publishes the secret in its instruction data; that is `SolClaimFailedError`
 //     (`secretPublic`), and the Seller flow retries at once through `options.retryPublicSecret` (the rail proves
 //     on chain that the secret is public before it skips the bounds).
-//   - `findClaimedPreimage` / `checkPendingClaim` read the escrow's stored preimage AND the escrow's own
-//     transaction history, so a secret leaked by a FAILED claim is found too: the Buyer learns it from the
-//     failed transaction and does not refund into it.
+//   - `findClaimedPreimage` / `checkPendingClaim` (S2-1/S2-3) read ONLY the escrow's own state at finalized: the
+//     preimage it stores once it is Claimed. A secret leaked by a FAILED claim is deliberately not looked for (it
+//     is not a payment; the Buyer claims leg B only once leg A reads Claimed), and no flow ever scans the escrow's
+//     history, which anyone can pad past any limit. The whole-history scan stays on `SolHtlcRail` for third-party
+//     readers.
+//   - `claim` hands every signature it signs to `options.onSigned` BEFORE anything is simulated or sent, and
+//     `recoverClaim` resolves one recorded signature (landed, failed with the secret public, never landed) (S2-2).
 //   - Before it signs a claim this wrapper reads the escrow and checks who it pays and the amount and times
 //     against THIS leg's own terms (NEAR H12's twin), and refuses a claim with no resolved payee.
 //
@@ -37,10 +41,13 @@ import { captureSolLeg, solEvidence, type SolAccounts, type SolCapture } from ".
 import {
   SOL_AMOUNT_FLOOR,
   SOL_ASSET_ID,
+  SolClaimFailedError,
   SolHtlcRail,
   parseSolRef,
   type SolHtlcRailOptions,
+  type SolClaimOptions,
   type SolHtlcTerms,
+  type SolPreparedRecord,
   type SolRailConfig,
   type SolSigner,
   type SolWriteEvidence,
@@ -52,6 +59,8 @@ import type {
   RailAccounts,
   RailBlockMarker,
   RailClaimOptions,
+  RailClaimRecord,
+  RailClaimRecovery,
   RailEvidenceResult,
   RailWriteEvidence,
 } from "./counter-rail.js";
@@ -98,6 +107,10 @@ function toWriteEvidence(evidence: SolWriteEvidence): RailWriteEvidence {
     raw: evidence.raw,
     ...(evidence.claimedByAnotherTransaction === true ? { claimedByAnotherTransaction: true as const } : {}),
   };
+}
+
+function toClaimRecord(record: SolPreparedRecord): RailClaimRecord {
+  return { signature: record.signature, blockhash: record.blockhash, lastValidBlockHeight: record.lastValidBlockHeight };
 }
 
 class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
@@ -169,8 +182,32 @@ class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
     if (escrow === null) throw new Error("sol-rail: refusing to claim - no escrow exists for this ref");
     const problem = escrowTermsProblem(escrow, expected, this.options.config.assets.USDC, this.accounts.payer);
     if (problem !== null) throw new Error(`sol-rail: refusing to claim - ${problem}`);
-    const evidence = await this.solRail.claim(ref, secret, notAfterMs, undefined, options?.retryPublicSecret === true ? { retryPublicSecret: true, ...(options.proofSignature === undefined ? {} : { proofSignature: options.proofSignature }) } : {});
+    const claimOptions: SolClaimOptions = {
+      ...(options?.retryPublicSecret === true ? { retryPublicSecret: true } : {}),
+      ...(options?.retryPublicSecret === true && options.proofSignature !== undefined ? { proofSignature: options.proofSignature } : {}),
+      ...(options?.onNotBroadcast === undefined ? {} : { onNotBroadcast: (record: SolPreparedRecord) => options.onNotBroadcast?.(toClaimRecord(record)) }),
+    };
+    const onSigned = options?.onSigned === undefined ? undefined : (record: SolPreparedRecord) => options.onSigned?.(toClaimRecord(record));
+    const evidence = await this.solRail.claim(ref, secret, notAfterMs, onSigned, claimOptions);
     return toWriteEvidence(evidence);
+  }
+
+  /** S2-2: resolves one recorded claim by its signature. `SolPendingError` while undecided; a transport failure
+   *  rethrown unchanged. A claim that landed and FAILED is `failed-public` only when that finalized transaction
+   *  itself carries a secret that opens this lock (polled until readable), never taken on anyone's word. */
+  async recoverClaim(ref: string, record: RailClaimRecord): Promise<RailClaimRecovery> {
+    try {
+      const evidence = await this.solRail.recoverBySignature({ kind: "claim", ref, signature: record.signature, blockhash: record.blockhash, lastValidBlockHeight: record.lastValidBlockHeight });
+      if (evidence === null) return { outcome: "never-landed" };
+      return { outcome: "landed", evidence: toWriteEvidence(evidence) };
+    } catch (error) {
+      if (error instanceof SolClaimFailedError) {
+        const carried = await this.solRail.awaitPreimageFromSignature(ref, record.signature);
+        if (carried === null) return { outcome: "never-landed" }; // failed, and it published no secret that opens this lock
+        return { outcome: "failed-public" };
+      }
+      throw error;
+    }
   }
 
   /** `SolHtlcRail.refund` itself re-checks (against fresh finalized reads) that the caller's signer IS the
@@ -183,11 +220,12 @@ class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
   // silently drop out of in a way a resend of different bytes would fix; a lost reply is recovered by the
   // recorded signature (`SolHtlcRail.recoverBySignature`), never by a resend.
 
-  /** The Buyer's own pending-claim check, run before a refund is ever built. On Solana it reads the escrow's
-   *  stored preimage and the escrow's own transaction history, so a secret published by a FAILED claim (S1) is
-   *  found too: the Buyer then routes to `learnSecret`/`claimLegB` instead of refunding. */
+  /** The Buyer's own pending-claim check, run before a refund is ever built. On Solana (S2-1/S2-3) this reads ONLY the
+   *  escrow's own state at finalized: the preimage it stores once it is Claimed. A secret leaked by a FAILED claim
+   *  does not mean the Seller was paid (a failed claim leaves no state), so it is deliberately not looked for: the
+   *  Buyer claims leg B only after leg A reads Claimed, and never scans history. */
   async checkPendingClaim(ref: string, _fromMarker?: RailBlockMarker): Promise<string | null> {
-    return this.solRail.checkPendingClaim(ref);
+    return this.solRail.claimedPreimage(ref);
   }
 
   /** Capture live, then decide (`src/rails/sol-evidence.ts`): one finalized view, never throws for a chain-state
@@ -205,10 +243,11 @@ class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
     return solEvidence({ terms, config: this.options.config, accounts: solAccounts, capture });
   }
 
-  /** How the Buyer learns `s` when the Seller claims on chain without posting a reveal frame, or when a claim
-   *  FAILED and leaked it: the escrow's stored preimage, else the escrow's own transaction history. */
+  /** How the Buyer learns `s` (S2-1): the preimage stored in the escrow once it is Claimed at finalized, and nothing
+   *  else. No history scan on this rail's flows (the whole-history scan stays on `SolHtlcRail` for third-party
+   *  readers): a scan can be padded past any limit, and a failed claim's leak is not a payment. */
   async findClaimedPreimage(ref: string, _fromMarker?: RailBlockMarker): Promise<string | null> {
-    return this.solRail.findClaimedPreimage(ref);
+    return this.solRail.claimedPreimage(ref);
   }
 
   /** The chain's own FINALIZED slot time - never wall-clock. */

@@ -10,15 +10,21 @@
 // `refunded-b` (the Buyer never locks leg A) carries a live read of the chain that shows no escrow for the
 // lock's ref, so it proves the paper-rail fold and the absence of any Solana lock or write. `npm test` builds `dist/` first, which this spawn depends on.
 //
-// The second half is the key-discipline scan: no committed fixture may hold anything shaped like a Solana
-// private key. A bare length or format heuristic cannot tell a routine public value apart from key material
-// (a transaction signature is 64 bytes of base58, exactly the length of a base58 keypair), so the scan uses
-// EXACT checks, each deriving a real ed25519 public key from candidate bytes and comparing it byte for byte:
-// a token that decodes to 64 bytes whose first 32 bytes derive its last 32 (the keypair shape: base58 and
-// base64), and a bare 32-byte token (base58 or hex) whose derived public key is one already present in the
-// same fixture (a seed). On top of those, two shape checks with no derivation: any JSON array of 64 numbers
-// (the `solana-keygen` file format) and the field-name, PEM and mnemonic heuristics. Every shape has a
-// planted-leak test, and the real captured signatures are shown NOT to be flagged.
+// The second half is the key-discipline scan: no committed fixture may hold a Solana private key in the shapes
+// listed here. It is a scan for those shapes, NOT a proof that no key material exists. A bare length or format
+// heuristic cannot tell a routine public value apart from key material (a transaction signature is 64 bytes of
+// base58, exactly the length of a base58 keypair), so the scan uses EXACT checks, each deriving a real ed25519
+// public key from candidate bytes and comparing it byte for byte:
+//   - a token that decodes to 64 bytes whose first 32 bytes derive its last 32 (the keypair shape) in base58,
+//     base64 (88 chars) and hex (128 chars);
+//   - a bare 32-byte token in base58, hex or base64 (a seed) whose derived public key is one already present in
+//     the same fixture scenario, where "present" means a base58 token that decodes to 32 bytes OR any 32-byte
+//     window of any decoded base64 run (account data, transaction bytes: an address sits inside those as raw bytes).
+// On top of those, two shape checks with no derivation: any JSON array of 64 numbers (the `solana-keygen` file
+// format) and the field-name, PEM and mnemonic heuristics. Every shape has a planted-leak test, and the real
+// captured signatures are shown NOT to be flagged. What it cannot see: a seed whose public key appears nowhere in
+// its fixture scenario, a key split or otherwise transformed (encrypted, XOR-ed, chunked), or a 32-byte value
+// hidden inside a larger decoded blob and never presented as a token of its own.
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -29,7 +35,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 
 import { ed25519 } from "@noble/curves/ed25519.js";
-import { hexToBytes } from "@noble/hashes/utils.js";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { base58, base64 } from "@scure/base";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -181,6 +187,12 @@ describe("examples/audit-export.mjs - committed solana-localnet client-flow fixt
   // A base64 run long enough to hold 64 bytes (88 chars with padding; 86 without).
   const BASE64_TOKEN = /[A-Za-z0-9+/]{86,88}(?:==)?/g;
   const HEX32_TOKEN = /\b[0-9a-fA-F]{64}\b/g;
+  // A 128-hex token: the keypair (seed then public key) written as hex.
+  const HEX64_TOKEN = /\b[0-9a-fA-F]{128}\b/g;
+  // A bare 32-byte value in base64: 43 characters, or 44 with its one `=` (a seed or a public key).
+  const BASE64_32_TOKEN = /(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{43}=?(?![A-Za-z0-9+/=])/g;
+  // Any base64 run that can hold at least a 32-byte value: account data and signed transactions live in these.
+  const BASE64_RUN = /(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{43,}={0,2}/g;
   // A JSON array of exactly 64 small non-negative integers: the `solana-keygen` keypair file format.
   const JSON_64_NUMBERS = /\[\s*(?:\d{1,3}\s*,\s*){63}\d{1,3}\s*\]/g;
 
@@ -227,17 +239,30 @@ describe("examples/audit-export.mjs - committed solana-localnet client-flow fixt
     return derived !== null && equalBytes(derived, bytes.slice(32, 64));
   }
 
-  /** Every base58 token across `files` that decodes to exactly 32 bytes (a candidate public key: a Solana
-   *  address IS the ed25519 public key), re-encoded so lookups are a plain string compare. */
+  /** The public keys present in `files`, as hex keys (a Solana address IS the ed25519 public key): every base58
+   *  token that decodes to exactly 32 bytes, and every 32-byte window of every decoded base64 run (an address sits
+   *  inside account data and inside a signed transaction as raw bytes, and is never a token of its own there). */
   function collectKnownPublicKeys(files: readonly string[]): Set<string> {
     const known = new Set<string>();
     for (const file of files) {
-      for (const m of readFileSync(file, "utf8").matchAll(BASE58_TOKEN)) {
+      const text = readFileSync(file, "utf8");
+      for (const m of text.matchAll(BASE58_TOKEN)) {
         const decoded = tryBase58(m[0]);
-        if (decoded !== null && decoded.length === 32) known.add(base58.encode(decoded));
+        if (decoded !== null && decoded.length === 32) known.add(bytesToHex(decoded));
+      }
+      for (const m of text.matchAll(BASE64_RUN)) {
+        const decoded = tryBase64(m[0]);
+        if (decoded === null) continue;
+        for (let offset = 0; offset + 32 <= decoded.length; offset += 1) known.add(bytesToHex(decoded.subarray(offset, offset + 32)));
       }
     }
     return known;
+  }
+
+  /** `true` when the public key derived from `seed` (32 bytes) is one already present in this fixture scenario. */
+  function seedDerivesKnownKey(seed: Uint8Array, knownPublicKeys: ReadonlySet<string>): boolean {
+    const derived = derive(seed);
+    return derived !== null && knownPublicKeys.has(bytesToHex(derived));
   }
 
   /** Every reason `text` was flagged (empty when clean). `knownPublicKeys` is this fixture's own set. */
@@ -255,11 +280,8 @@ describe("examples/audit-export.mjs - committed solana-localnet client-flow fixt
       if (decoded === null) continue;
       if (decoded.length === 64 && isKeypair(decoded)) {
         reasons.push(`a base58 token decodes to 64 bytes whose first 32 bytes derive its own last 32 (keypair shape): ${m[0].slice(0, 8)}...`);
-      } else if (decoded.length === 32) {
-        const derived = derive(decoded);
-        if (derived !== null && knownPublicKeys.has(base58.encode(derived))) {
-          reasons.push(`a bare 32-byte base58 token derives a public key already present in this fixture: ${m[0].slice(0, 8)}...`);
-        }
+      } else if (decoded.length === 32 && seedDerivesKnownKey(decoded, knownPublicKeys)) {
+        reasons.push(`a bare 32-byte base58 token derives a public key already present in this fixture: ${m[0].slice(0, 8)}...`);
       }
     }
 
@@ -268,11 +290,21 @@ describe("examples/audit-export.mjs - committed solana-localnet client-flow fixt
       if (decoded !== null && isKeypair(decoded)) reasons.push(`a base64 token decodes to a keypair: ${m[0].slice(0, 8)}...`);
     }
 
+    for (const m of text.matchAll(BASE64_32_TOKEN)) {
+      const decoded = tryBase64(m[0]);
+      if (decoded !== null && decoded.length === 32 && seedDerivesKnownKey(decoded, knownPublicKeys)) {
+        reasons.push(`a bare 32-byte base64 token derives a public key already present in this fixture: ${m[0].slice(0, 8)}...`);
+      }
+    }
+
     for (const m of text.matchAll(HEX32_TOKEN)) {
-      const derived = derive(hexToBytes(m[0]));
-      if (derived !== null && knownPublicKeys.has(base58.encode(derived))) {
+      if (seedDerivesKnownKey(hexToBytes(m[0]), knownPublicKeys)) {
         reasons.push(`a bare 32-byte hex token derives a public key already present in this fixture: ${m[0].slice(0, 8)}...`);
       }
+    }
+
+    for (const m of text.matchAll(HEX64_TOKEN)) {
+      if (isKeypair(hexToBytes(m[0]))) reasons.push(`a 128-hex token is a keypair (first 32 bytes derive the last 32): ${m[0].slice(0, 8)}...`);
     }
     return reasons;
   }
@@ -373,12 +405,64 @@ describe("examples/audit-export.mjs - committed solana-localnet client-flow fixt
     );
   });
 
+  it("shape 6 (128-hex keypair): flags a keypair written as 128 hex characters under an unrelated field name", () => {
+    const { keypair } = keypairOf(17);
+    withScratchFixture(
+      (scratch) => writeFileSync(join(scratch, "raw", "rpc", "hex-keypair.json"), JSON.stringify({ note: "a value", blob: Buffer.from(keypair).toString("hex") })),
+      (files, known) => {
+        const reasons = scanForKeyMaterial(readFileSync(files[0] as string, "utf8"), known);
+        expect(reasons.some((r) => r.includes("128-hex token is a keypair"))).toBe(true);
+      },
+    );
+  });
+
+  it("shape 7 (base64 32-byte seed): flags a seed in base64 (padded and unpadded) whose public key is elsewhere in the SAME fixture", () => {
+    const { seed, publicKey } = keypairOf(18);
+    withScratchFixture(
+      (scratch) => {
+        writeFileSync(join(scratch, "raw", "rpc", "account.json"), JSON.stringify({ address: base58.encode(publicKey) }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak-b64.json"), JSON.stringify({ some_hash: base64.encode(seed) }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak-b64-unpadded.json"), JSON.stringify({ some_hash: base64.encode(seed).replace(/=+$/, "") }));
+      },
+      (files, known) => {
+        expect(flagged(files, known).map((f) => f.split(/[\\/]/).pop())).toEqual(["leak-b64-unpadded.json", "leak-b64.json"]);
+      },
+    );
+  });
+
+  it("shape 8 (public key found only in decoded bytes): a seed whose public key sits inside a base64 blob (account data) is flagged, in every encoding", () => {
+    const { seed, publicKey } = keypairOf(19);
+    // the address is never a token of its own: it is raw bytes in the middle of a base64 account-data blob
+    const blob = Uint8Array.from([...new Uint8Array(40).fill(7), ...publicKey, ...new Uint8Array(51).fill(9)]);
+    withScratchFixture(
+      (scratch) => {
+        writeFileSync(join(scratch, "raw", "rpc", "account-data.json"), JSON.stringify({ data: [base64.encode(blob), "base64"] }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak-b58.json"), JSON.stringify({ x: base58.encode(seed) }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak-hex.json"), JSON.stringify({ x: Buffer.from(seed).toString("hex") }));
+        writeFileSync(join(scratch, "raw", "rpc", "leak-b64.json"), JSON.stringify({ x: base64.encode(seed) }));
+      },
+      (files, known) => {
+        expect(known.has(bytesToHex(publicKey))).toBe(true);
+        expect(flagged(files, known).map((f) => f.split(/[\\/]/).pop())).toEqual(["leak-b58.json", "leak-b64.json", "leak-hex.json"]);
+      },
+    );
+  });
+
   it("no false positive: a random 32-byte hash that is not a seed of any public key in the fixture is not flagged", () => {
     const { publicKey } = keypairOf(15);
     withScratchFixture(
       (scratch) => {
         writeFileSync(join(scratch, "raw", "rpc", "account.json"), JSON.stringify({ address: base58.encode(publicKey) }));
-        writeFileSync(join(scratch, "raw", "rpc", "unrelated.json"), JSON.stringify({ hash: base58.encode(new Uint8Array(32).fill(16)), array: [1, 2, 3] }));
+        writeFileSync(
+          join(scratch, "raw", "rpc", "unrelated.json"),
+          JSON.stringify({
+            hash: base58.encode(new Uint8Array(32).fill(16)),
+            hex: Buffer.from(new Uint8Array(32).fill(16)).toString("hex"),
+            hex64: Buffer.from(new Uint8Array(64).fill(17)).toString("hex"),
+            b64: base64.encode(new Uint8Array(32).fill(16)),
+            array: [1, 2, 3],
+          }),
+        );
       },
       (files, known) => expect(flagged(files, known)).toEqual([]),
     );

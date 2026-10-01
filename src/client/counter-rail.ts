@@ -116,7 +116,28 @@ export interface RailClaimOptions {
   retryPublicSecret?: boolean;
   /** Solana only (SOL-C1): the signature of this flow's own failed claim, the retry's proof of a public secret. */
   proofSignature?: string;
+  /** Solana only (S2-2): called with the claim's signature and `lastValidBlockHeight` once it is signed and BEFORE
+   *  anything is simulated or sent, so the caller can latch it and resolve it later (a lost reply, a crash). */
+  onSigned?: (record: RailClaimRecord) => void | Promise<void>;
+  /** Solana only (S2-2): called when a recorded claim was provably never handed to the network (nothing to resolve). */
+  onNotBroadcast?: (record: RailClaimRecord) => void | Promise<void>;
 }
+
+/** Solana only (S2-2): what a Seller records about one claim it signed, enough to resolve it later by signature. */
+export interface RailClaimRecord {
+  signature: string;
+  blockhash: string;
+  lastValidBlockHeight: number;
+}
+
+/** Solana only (S2-2): what became of one recorded claim. `landed`: it (or another transaction with this secret)
+ *  claimed the lock; `failed-public`: it landed and FAILED, so the secret is public and `record.signature` proves it;
+ *  `never-landed`: its blockhash expired with no status, it can never land. A claim that is not decided yet is a
+ *  thrown `SolPendingError` (check again shortly); never one of these. */
+export type RailClaimRecovery =
+  | { outcome: "landed"; evidence: RailWriteEvidence }
+  | { outcome: "failed-public" }
+  | { outcome: "never-landed" };
 
 /**
  * P4-BTC-FIXES.md G3 (client half of H2)/G2's own "record before sending" rule, generalised
@@ -169,6 +190,9 @@ export interface ConnectedCounterAssetRail {
    *  rail's own adapter wraps unchanged. */
   claim(ref: string, secret: string, notAfterMs: number, options?: RailClaimOptions): Promise<RailWriteEvidence>;
   refund(ref: string): Promise<RailWriteEvidence>;
+  /** Solana only (S2-2): resolve one recorded claim by its signature (never by a scan or a resend). Optional: a rail
+   *  with no such concept omits it. */
+  recoverClaim?(ref: string, record: RailClaimRecord): Promise<RailClaimRecovery>;
   /** P4-BTC-FIXES-R2.md R2-1: on a refund retry (this connected handle's own `refund()` already
    *  broadcast once), re-check the chain and re-send `priorEvidence`'s own EXACT bytes
    *  (`priorEvidence.rawTx`) if they have genuinely dropped (not in the mempool, not confirmed)

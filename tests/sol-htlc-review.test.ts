@@ -111,14 +111,26 @@ describe("SOL-A2: a claim whose secret is already public can be retried inside t
   it("with retryPublicSecret and an on-chain proof the claim is sent, even past notAfterMs and the landing bound", async () => {
     const w = tight();
     putLockedEscrow(w);
-    historyWithFailedClaim(w, await claimTx(w));
+    const failed = await claimTx(w);
+    historyWithFailedClaim(w, failed);
     claimOnSend(w);
     w.now.ms = NOW + 60_000; // already past notAfterMs (NOW + 5 s)
     w.chain.finalizedTimeMs = NOW + 60_000;
     const rail = await railFor(w, w.seller);
-    await expect(rail.claim(w.ref, w.preimageHex, w.terms.claimByMs, undefined, { retryPublicSecret: true })).resolves.toMatchObject({ ref: w.ref });
+    await expect(rail.claim(w.ref, w.preimageHex, w.terms.claimByMs, undefined, { retryPublicSecret: true, proofSignature: failed.signature })).resolves.toMatchObject({ ref: w.ref });
     expect(w.chain.count("simulateTransaction")).toBe(1);
     expect(w.chain.count("sendTransaction")).toBe(1);
+  });
+
+  it("S2-2/S2-3: the proof is the named transaction only: a failed claim sitting in the escrow's history is not a proof without its signature", async () => {
+    const w = tight();
+    putLockedEscrow(w);
+    historyWithFailedClaim(w, await claimTx(w));
+    claimOnSend(w);
+    const rail = await railFor(w, w.seller);
+    await expect(rail.claim(w.ref, w.preimageHex, w.terms.claimByMs, undefined, { retryPublicSecret: true })).rejects.toThrow(/no claim carrying this preimage/);
+    expect(w.chain.count("getSignaturesForAddress")).toBe(0);
+    expect(w.chain.count("sendTransaction")).toBe(0);
   });
 
   it("the flag needs on-chain proof that this preimage is public: without a failed claim in the history it is refused and nothing is signed or sent", async () => {
@@ -134,18 +146,20 @@ describe("SOL-A2: a claim whose secret is already public can be retried inside t
   it("the retry still stops once chain time is at/after refundAfterMs, and still needs a Locked escrow and a simulation that passes", async () => {
     const w = tight();
     putLockedEscrow(w);
-    historyWithFailedClaim(w, await claimTx(w));
+    const failed = await claimTx(w);
+    historyWithFailedClaim(w, failed);
     claimOnSend(w);
     const rail = await railFor(w, w.seller);
     w.now.ms = NOW + 130_000;
-    await expect(rail.claim(w.ref, w.preimageHex, w.terms.claimByMs, undefined, { retryPublicSecret: true })).rejects.toThrow(/at\/after refundAfterMs/);
+    await expect(rail.claim(w.ref, w.preimageHex, w.terms.claimByMs, undefined, { retryPublicSecret: true, proofSignature: failed.signature })).rejects.toThrow(/at\/after refundAfterMs/);
 
     const w2 = tight();
     putLockedEscrow(w2);
-    historyWithFailedClaim(w2, await claimTx(w2));
+    const failed2 = await claimTx(w2);
+    historyWithFailedClaim(w2, failed2);
     w2.chain.simulateErr = CUSTOM(17);
     const rail2 = await railFor(w2, w2.seller);
-    await expect(rail2.claim(w2.ref, w2.preimageHex, w2.terms.claimByMs, undefined, { retryPublicSecret: true })).rejects.toThrow();
+    await expect(rail2.claim(w2.ref, w2.preimageHex, w2.terms.claimByMs, undefined, { retryPublicSecret: true, proofSignature: failed2.signature })).rejects.toThrow();
     expect(w2.chain.count("sendTransaction")).toBe(0);
   });
 });

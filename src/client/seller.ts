@@ -67,11 +67,12 @@
 // (the `claimed` receipt) and the orientation check of leg A's offer read the rail id through the rail's OWN
 // registry (`CounterAssetRail.railRegistry`, never global). Like NEAR, a Solana lock's ref is
 // `0x<hash lock>:<payer>` (checked against this Seller's own hash lock, the payer taken from the authenticated
-// lock frame), and `claimLegA` first reads whether this flow's own secret is already public on chain (a claim
-// that landed, or one that FAILED and leaked it in its instruction data, contracts-sol/README.md S1). A claim
-// that fails with the secret public is never just rethrown: the reveal is posted (the secret is public
-// regardless) and the claim is retried at once through `options.retryPublicSecret`, which the rail allows only
-// after proving on chain that the secret is public.
+// lock frame), and `claimLegA` first resolves every claim signature this flow recorded (S2-2: each is latched
+// before it is simulated or sent; it landed, failed with the secret public, or never landed). The flow never scans
+// history (S2-3): a flow that never signed a claim does the ordinary guarded claim. A claim that fails with the
+// secret public is never just rethrown: it is retried at once through `options.retryPublicSecret`, which the rail
+// allows only after proving the secret public from THAT recorded transaction, and the reveal follows the retry
+// (S2-4; each reveal attempt is bounded by a timeout).
 //
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
 // B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a;
@@ -107,7 +108,7 @@ import { SolClaimFailedError, parseSolRef } from "../rails/sol-htlc.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
 import { offerAcceptLockTerms } from "../swap.js";
-import { belowMinLockable, type CounterAssetRail, type RailAccounts, type RailWriteEvidence } from "./counter-rail.js";
+import { belowMinLockable, type ConnectedCounterAssetRail, type CounterAssetRail, type RailAccounts, type RailClaimRecord, type RailWriteEvidence } from "./counter-rail.js";
 import type { Signer, Venue } from "./venue.js";
 
 export interface SellerFlowOptions {
@@ -123,6 +124,9 @@ export interface SellerFlowOptions {
   rail: CounterAssetRail;
   /** Wall-clock ms, injected — never `Date.now()` inside this class (house rule). */
   clock: () => number;
+  /** S2-4, Solana only: how long one reveal-frame post may take before that attempt is abandoned (a stalled venue
+   *  must never hold up the claim retry or the call). Default 10 s. A real timer, not the injected clock. */
+  revealPostTimeoutMs?: number;
 }
 
 export interface AcceptLegAResult {
@@ -175,6 +179,9 @@ export class RevealNotPostedError extends Error {
 /** Bounded immediate retries for the reveal post (G6). */
 const REVEAL_POST_ATTEMPTS = 3;
 
+/** S2-4: the default bound on one reveal post attempt on the Solana rail. */
+const SOL_REVEAL_POST_TIMEOUT_MS = 10_000;
+
 /** SB3a: how many times `claimLegA` retries, at once, a Solana claim that FAILED with the secret already
  *  public (each retry is a fresh signed transaction; the rail proves the secret is public before it skips the
  *  deadline bounds, and refuses once chain time reaches `refund_after_ms`). */
@@ -217,6 +224,10 @@ export class SellerFlow {
   private revealPosted?: { key: string; record: TranscriptRecord };
   // SOL-C1: the signature of this flow's own claim that landed and failed on Solana (its instruction data holds the secret).
   private publicClaimSignature?: string;
+  // S2-2: every Solana claim this flow signed and has not yet resolved, latched BEFORE it is simulated or sent (signature,
+  // blockhash, lastValidBlockHeight). `claimLegA` resolves each of them by signature before it does anything else.
+  private claimRecords: RailClaimRecord[] = [];
+  private readonly revealPostTimeoutMs: number;
   private receiptPosted?: { key: string; record: TranscriptRecord };
   private offerB?: OfferFrame;
   private hashLock?: HashLock;
@@ -250,6 +261,7 @@ export class SellerFlow {
     this.paperRail = options.paperRail;
     this.rail = options.rail;
     this.clock = options.clock;
+    this.revealPostTimeoutMs = options.revealPostTimeoutMs ?? SOL_REVEAL_POST_TIMEOUT_MS;
   }
 
   /** B5: every leg-A write this flow has made so far, in call order. */
@@ -656,12 +668,26 @@ export class SellerFlow {
     // revealed-retry concept for this to protect against — a lost-reply retry on those rails is
     // already handled by their own rail-level idempotency/simulation, unchanged by this build.
     let skipDeadlineGuards = false;
-    // SB3a: the same read for the Solana rail: its `findClaimedPreimage` also finds a secret leaked by a FAILED
-    // claim (S1), and a retry of such a claim is the rail's own public-secret mode, never a fresh private claim.
+    // SB3a/S2-2/S2-3: on the Solana rail this flow never scans history. Every claim it signed was latched before it was
+    // sent; each is resolved here by its signature (landed, failed with the secret public, or never landed), and only
+    // a failed one makes the secret public. A flow that never signed a claim has no leak of its own to find and does
+    // the ordinary guarded claim; its one read of the escrow (Claimed with its own preimage) cannot be padded.
     const isSol = this.rail.railId === SOL_RAIL_ID;
+    if (isSol) {
+      const landed = await this.resolveRecordedClaims(connected, railRef);
+      if (landed !== null) {
+        if (this.frozenLegAAccounts === undefined) {
+          this.frozenLegAAccounts = accounts;
+          this.frozenLegARailRef = railRef;
+        }
+        const reveal = options?.skipReveal === true
+          ? undefined
+          : await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, "claim already landed on chain");
+        const receipt = await this.postReceiptLatched(acceptA.contract, railRef);
+        return { evidence: landed, ...(reveal === undefined ? {} : { reveal }), receipt };
+      }
+    }
     if (this.rail.railId === NEAR_RAIL_ID || isSol) {
-      // SOL-C1: a failed claim this flow itself sent is remembered (with its signature), so the retry never
-      // depends on a bounded or pruned history read that someone else could have pushed it out of.
       const priorPreimage = isSol && this.publicClaimSignature !== undefined ? this.hashLock.preimage : await connected.findClaimedPreimage(railRef);
       const revealedIsOwn = priorPreimage !== null && priorPreimage === this.hashLock.preimage;
 
@@ -682,9 +708,9 @@ export class SellerFlow {
         }
         // G3: revealed, but not (or no longer) finally claimed — fall through to a claim retry
         // below, skipping the deadline guards the adapter's own H2 rule already permits skipping.
+        // S2-4: on Solana the retry is sent BEFORE any reveal post (the retry is what pays the Seller; the reveal
+        // frame follows it, and is posted best-effort if the retry cannot land).
         skipDeadlineGuards = true;
-        // SOL-C5: the secret is public on chain, so the reveal frame is owed now, whether or not the retry lands.
-        if (isSol && options?.skipReveal !== true) await this.tryPostRevealForRetry(acceptA.contract, railRef, offerA.refundAfterMs);
       }
     }
 
@@ -757,13 +783,23 @@ export class SellerFlow {
     for (let retries = 0; ; retries += 1) {
       const before = connected.exchanges.length;
       try {
+        const solRecording = isSol
+          ? {
+              onSigned: (record: RailClaimRecord): void => void this.claimRecords.push(record),
+              onNotBroadcast: (record: RailClaimRecord): void => this.dropClaimRecord(record.signature),
+            }
+          : {};
         writeEvidence = retryPublicSecret
           ? await connected.claim(railRef, this.hashLock.preimage, notAfterMs, {
               retryPublicSecret: true,
               ...(this.publicClaimSignature === undefined ? {} : { proofSignature: this.publicClaimSignature }),
+              ...solRecording,
             })
-          : await connected.claim(railRef, this.hashLock.preimage, notAfterMs);
+          : isSol
+            ? await connected.claim(railRef, this.hashLock.preimage, notAfterMs, solRecording)
+            : await connected.claim(railRef, this.hashLock.preimage, notAfterMs);
         this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+        if (writeEvidence.txHash !== undefined) this.dropClaimRecord(writeEvidence.txHash); // resolved: it landed
         break;
       } catch (error) {
         this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
@@ -773,14 +809,18 @@ export class SellerFlow {
         // transaction and claim leg B, so the Seller's only protection is to be paid before the window closes.
         if (error instanceof SolClaimFailedError && error.secretPublic) {
           this.publicClaimSignature = error.signature; // SOL-C1
-          // SOL-C4: the retry is what pays the Seller; a reveal post that keeps failing must not stop it. A reveal
-          // still unposted when the claim lands is raised by the post after the loop.
-          if (options?.skipReveal !== true) {
-            await this.tryPostRevealForRetry(acceptA.contract, railRef, offerA.refundAfterMs);
+          this.dropClaimRecord(error.signature); // resolved: it landed and failed
+          // S2-4: the retry goes out first (it is what pays the Seller); the reveal frame follows the landed claim
+          // (the post after the loop) or, when the retries are exhausted, just below.
+          if (retries < SOL_PUBLIC_SECRET_RETRIES) {
+            retryPublicSecret = true;
+            continue;
           }
-          if (retries >= SOL_PUBLIC_SECRET_RETRIES) throw error;
-          retryPublicSecret = true;
-          continue;
+        }
+        // SOL-C4/C5: the secret is public on chain and the claim could not be completed: the reveal frame is owed
+        // (it must land before refundAfterMs, G6), posted best-effort so a failing post never hides the real error.
+        if (isSol && this.publicClaimSignature !== undefined && options?.skipReveal !== true) {
+          await this.tryPostRevealForRetry(acceptA.contract, railRef, offerA.refundAfterMs);
         }
         // P5-NEAR-FIXES.md G1 (the flow-side twin of the adapter's own H1): a write's own
         // chain-level failure is never silently treated as success. `NearPayoutFailedError` means
@@ -816,6 +856,29 @@ export class SellerFlow {
     return { evidence: writeEvidence, ...(reveal === undefined ? {} : { reveal }), receipt };
   }
 
+  private dropClaimRecord(signature: string): void {
+    this.claimRecords = this.claimRecords.filter((record) => record.signature !== signature);
+  }
+
+  /** S2-2 (Solana): resolves every recorded claim by its signature, oldest first, before anything new is signed.
+   *  Returns the evidence of a claim that LANDED (the Seller was paid: nothing more to send), else `null`. A claim
+   *  that landed and FAILED sets the public-secret proof (its own signature); one that never landed is dropped. A
+   *  claim that is not decided yet (`SolPendingError`) or a transport failure propagates and keeps its record: the
+   *  caller retries `claimLegA` later, and no second claim is signed while an earlier one could still land. */
+  private async resolveRecordedClaims(connected: ConnectedCounterAssetRail, railRef: string): Promise<RailWriteEvidence | null> {
+    if (connected.recoverClaim === undefined) return null;
+    for (const record of [...this.claimRecords]) {
+      const recovery = await connected.recoverClaim(railRef, record);
+      this.dropClaimRecord(record.signature);
+      if (recovery.outcome === "landed") {
+        this.claimRecords = [];
+        return recovery.evidence;
+      }
+      if (recovery.outcome === "failed-public" && this.publicClaimSignature === undefined) this.publicClaimSignature = record.signature;
+    }
+    return null;
+  }
+
   /** SOL-C4/C5: post the reveal, but let a `RevealNotPostedError` pass (the secret is already public and the retry
    *  claim is what pays the Seller); the post after a landed claim raises it if it is still missing. */
   private async tryPostRevealForRetry(contract: string, ref: string, refundAfterMs: number): Promise<void> {
@@ -834,18 +897,62 @@ export class SellerFlow {
     let last: unknown;
     for (let attempt = 0; attempt < REVEAL_POST_ATTEMPTS; attempt++) {
       try {
-        const record = await this.venue.post(
-          dealRoom(contract),
-          encodeFrame({ type: "reveal", from: this.identity.did, contract, ref, secret: this.hashLock!.preimage }),
-          this.identity,
-        );
+        const line = encodeFrame({ type: "reveal", from: this.identity.did, contract, ref, secret: this.hashLock!.preimage });
+        const record =
+          this.rail.railId === SOL_RAIL_ID
+            ? await this.postBounded(dealRoom(contract), line)
+            : await this.venue.post(dealRoom(contract), line, this.identity);
         this.revealPosted = { key, record };
         return record;
       } catch (error) {
         last = error;
+        // S2-4: an attempt that timed out may still have landed; adopt it instead of posting a second reveal.
+        if (this.rail.railId === SOL_RAIL_ID) {
+          const adopted = await this.findOwnRevealBounded(contract, ref);
+          if (adopted !== null) {
+            this.revealPosted = { key, record: adopted };
+            return adopted;
+          }
+        }
       }
     }
     throw new RevealNotPostedError(refundAfterMs, last, detail);
+  }
+
+  /** S2-4: one venue call bounded by `revealPostTimeoutMs` (a real timer): a stalled venue rejects instead of hanging. */
+  private bounded<T>(work: Promise<T>, what: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`seller: ${what} did not answer within ${this.revealPostTimeoutMs} ms`)), this.revealPostTimeoutMs);
+      work.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error: unknown) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private postBounded(room: string, line: string): Promise<TranscriptRecord> {
+    return this.bounded(this.venue.post(room, line, this.identity), "the reveal post");
+  }
+
+  /** This Seller's own reveal frame already in leg A's deal room (from an attempt whose answer was lost), or null. */
+  private async findOwnRevealBounded(contract: string, ref: string): Promise<TranscriptRecord | null> {
+    try {
+      const records = await this.bounded(this.venue.read(dealRoom(contract)), "the deal room read");
+      for (const record of records) {
+        if (record.sender !== this.identity.did || !verifyTranscriptRecord(record).ok) continue;
+        const frame = tryDecodeFrame(record.line);
+        if (frame !== null && frame.type === "reveal" && frame.contract === contract && frame.ref === ref && frame.secret === this.hashLock?.preimage) return record;
+      }
+    } catch {
+      // a venue that cannot answer is the same as no adoption: the next attempt posts
+    }
+    return null;
   }
 
   /** G6: post the leg-A `claimed` receipt once per (contract, ref). */

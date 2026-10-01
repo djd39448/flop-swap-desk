@@ -127,12 +127,18 @@ The litesvm tests assume the default mint.
   leg-B safety from leg A's `refund_after_ms`, never from `claim_by_ms`; SB2/SB3 terms validation must refuse
   terms where legB.refundAfter minus legA.refundAfter is smaller than the Buyer's landing margin even when
   claimBy leaves room, and an evidence reader must not treat `claim_by_ms` as a bound on disclosure.
-- **Not yet run on a real validator (SB-int).** Lock, Claim and Refund (including the prefunded lock, the
-  CPIs made without the callee in `account_infos`, the executable-flag checks and the rent path) are proven
-  only in litesvm 0.17; `smoke.sh` exercises only an unknown-tag simulation. A runtime difference would be a
-  liveness failure, not a fund loss (every failure is atomic). SB-int must run them end to end on
-  `solana-test-validator` (mock mint created at its fixed address with `--account`) before the `.so` hash is
-  pinned.
+- **What runs on a real validator, and what does not.** The reviewed `htlc.so` is loaded at genesis into a
+  throwaway `solana-test-validator` (mock mint at its fixed address) by two live suites, run with
+  `npm run test:sol`: `tests-sol/sol-htlc.sol.test.ts` drives the adapter and evidence reader through Lock,
+  Claim and Refund on real signed transactions (the window boundaries, a wrong preimage, a squat, a duplicate
+  lock, a failed claim that leaves the escrow Locked and refundable, an expired blockhash, lost replies, a
+  stray donation, a relayer that claims first), and `tests-sol/client-flows.sol.test.ts` runs the Seller and
+  Buyer flows end to end (settled, refunded, refunded-b, a claim that lands and fails, lost replies, padded
+  history, a mirror pair), which exercises the CPIs, the executable-flag checks and the rent path for real. Not
+  covered live: a lock whose escrow address was prefunded by a third party (litesvm only), a validator under a
+  slot-time stall, and any cluster other than the local one. A runtime difference would be a liveness failure,
+  not a fund loss (every failure is atomic); the `.so` hash pin is what ties the suites to the reviewed
+  program.
 - **Upgrade-authority rule the evidence reader inherits.** Accept a ProgramData authority of exactly `None`
   (tag 0) or `Some` of the 32 zero bytes, nothing broader. The zero bytes are a small-order ed25519 point;
   this is safe only because Solana verifies transaction signatures with `verify_strict`, which rejects such
