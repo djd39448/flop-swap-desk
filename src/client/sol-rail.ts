@@ -82,6 +82,9 @@ export interface SolCounterRailOptions {
   /** Harness-only (R3-7): the live compressed-window scenarios run the flow clock tens of minutes behind the chain on
    *  purpose, so they widen the bound. Never set by a product caller; the default is `SOL_CHAIN_CLOCK_SKEW_MS`. */
   maxChainClockSkewMs?: number;
+  /** R4-6: a `maxChainClockSkewMs` above `SOL_CHAIN_CLOCK_SKEW_MS` is refused unless this explicit unsafe flag is set.
+   *  Test harnesses only: a wide bound removes the protection the clock check gives the Buyer. */
+  unsafeAllowWideClockSkewForTests?: boolean;
 }
 
 /** Only the payee's resolved wallet address is ever required to build a lock: the payer's own identity is the
@@ -331,7 +334,13 @@ class SolCounterRail implements CounterAssetRail {
 
   constructor(options: SolCounterRailOptions) {
     this.options = options;
-    this.maxChainClockSkewMs = options.maxChainClockSkewMs ?? SOL_CHAIN_CLOCK_SKEW_MS;
+    const skewMs = options.maxChainClockSkewMs ?? SOL_CHAIN_CLOCK_SKEW_MS;
+    if (skewMs > SOL_CHAIN_CLOCK_SKEW_MS && options.unsafeAllowWideClockSkewForTests !== true) {
+      throw new Error(
+        `sol-rail: maxChainClockSkewMs ${skewMs} is above the ${SOL_CHAIN_CLOCK_SKEW_MS} ms bound; refused unless unsafeAllowWideClockSkewForTests is set (R4-6)`,
+      );
+    }
+    this.maxChainClockSkewMs = skewMs;
     this.caip2 = options.config.pin.caip2;
   }
 

@@ -200,7 +200,7 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     const sellerRpc = v.createCapturingRpc({ fetch: sellerCount.fetch });
     // R3-7: the compressed-window scenarios run the flow clock tens of minutes behind the chain on purpose (see the file
     // header), so they widen the chain-clock bound; every other scenario keeps the product default of 60 s.
-    const skewBound = options.skewMs === undefined ? {} : { maxChainClockSkewMs: 24 * 60 * MINUTE };
+    const skewBound = options.skewMs === undefined ? {} : { maxChainClockSkewMs: 24 * 60 * MINUTE, unsafeAllowWideClockSkewForTests: true };
     const buyerRail = createSolCounterRail({ config: v.config, rpc: buyerRpc, signer: buyerParty.signer as SolSigner, clock, ...skewBound });
     const sellerRail = createSolCounterRail({
       config: v.config,

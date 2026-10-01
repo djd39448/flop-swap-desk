@@ -533,6 +533,13 @@ export class SellerFlow {
         throw new Error("seller: refusing to lock leg B — accept contract id does not match this offer/accept pair (B1)");
       }
 
+      // R4-6 (Solana only): re-check the chain clock right before leg B's value moves (acceptLegA checked it much
+      // earlier). Before the E2 latch, so a refusal leaves the flow free to retry once the clocks agree again.
+      if (this.rail.chainClockMs !== undefined) {
+        const problem = chainClockProblem(await this.rail.chainClockMs(), this.clock(), this.rail.maxChainClockSkewMs);
+        if (problem !== null) throw new Error(`seller: refusing to lock leg B - ${problem}`);
+      }
+
       const acceptB = frame;
       const termsB = offerAcceptLockTerms(offerB, acceptB);
       // E2: latch the attempted accept *before* calling `paperRail.lock` — if that call throws
@@ -750,6 +757,20 @@ export class SellerFlow {
     // the rail's own landing bound (refundAfterMs minus the landing margin) instead of stopping at the policy margin;
     // the rail still refuses a claim that could land at or after refundAfterMs.
     const possiblySeen = isSol && this.neverLandedClaims > 0;
+    if (possiblySeen && !skipDeadlineGuards) {
+      // R4-6: the possibly-seen path skips the policy-margin guards below, but it keeps a flow-level lock confirmation
+      // (the rail's own pre-read of the escrow is then not the only one): leg A must still verify as locked.
+      const confirm = await connected.verifyLockFinal(termsA, railRef, accounts);
+      if (confirm.lock.railVerified !== true) {
+        throw new Error(
+          `seller: refusing to claim leg A on the possibly-seen path before verifyLockFinal(A) is true (R4-6): ${confirm.lock.reason ?? "unverified"}`,
+        );
+      }
+      if (this.frozenLegAAccounts === undefined) {
+        this.frozenLegAAccounts = accounts;
+        this.frozenLegARailRef = railRef;
+      }
+    }
     if (!skipDeadlineGuards && !possiblySeen) {
       // B2/C3: read before verifyLockFinal (whose own capture drains this rail's exchange log
       // when it finishes). Neither the chain's own last block nor wall-clock alone is safe to

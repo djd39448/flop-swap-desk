@@ -25,6 +25,7 @@ import { describe, expect, it } from "vitest";
 import { belowMinLockable } from "../src/client/counter-rail.js";
 import { LegBClaimedError } from "../src/client/buyer.js";
 import { SOL_CHAIN_CLOCK_SKEW_MS, SOL_LOCAL_POLICY } from "../src/client/policy.js";
+import { createSolCounterRail } from "../src/client/sol-rail.js";
 import { RevealNotPostedError, SolClaimStarvedError } from "../src/client/seller.js";
 import { SOL_ASSET_ID, SOL_AMOUNT_FLOOR, SOL_CLAIM_LANDING_MARGIN_MS, SOL_HTLC_PROGRAM_ID, SolClaimFailedError, claimInstructionData, escrowAddress, vaultAddress } from "../src/rails/sol-htlc.js";
 import { InMemorySolSigner } from "../src/rails/sol-signer-memory.js";
@@ -1314,6 +1315,51 @@ describe("R4-5: a late public-secret retry and a late reveal", () => {
     expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
     const room = await h.venue.read(dealRoomOf(p.acceptA));
     expect(room.some((r) => (tryDecodeFrame(r.line) as { type?: string } | null)?.type === "reveal")).toBe(false);
+  });
+});
+
+describe("R4-6: hardening", () => {
+  it("a chain-clock bound above the default is refused unless the explicit unsafe test flag is set", () => {
+    const h = solHarness();
+    const base = { config: h.node.config, clock: h.node.clock, rpc: h.node.rpc(), signer: h.sellerWallet };
+    expect(() => createSolCounterRail({ ...base, maxChainClockSkewMs: SOL_CHAIN_CLOCK_SKEW_MS + 1 })).toThrow(/above the 60000 ms bound.*R4-6/);
+    expect(() => createSolCounterRail({ ...base, maxChainClockSkewMs: SOL_CHAIN_CLOCK_SKEW_MS + 1, unsafeAllowWideClockSkewForTests: true })).not.toThrow();
+    expect(() => createSolCounterRail({ ...base, maxChainClockSkewMs: SOL_CHAIN_CLOCK_SKEW_MS })).not.toThrow();
+  });
+
+  it("the Seller's lockLegB re-checks the chain clock: a skewed chain refuses, locks nothing, and the same call works once the clocks agree", async () => {
+    const h = solHarness();
+    const legA = legADeadlines(6 * 60 * 60_000);
+    const offerA = await h.buyerFlow.bid({ swapId: computeSwapId(h.buyer.did, "00000001"), ...BID, claimByMs: legA.claimByMs, refundAfterMs: legA.refundAfterMs, expiresMs: T0 + 10 * 60_000 });
+    const { acceptARecord, offerBRecord } = await h.sellerFlow.acceptLegA(offerA, legBDeadlines(), legA.lockTimeMs);
+    const { acceptBRecord } = await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, legA.lockTimeMs);
+    h.node.nowMs = h.clockRef.ms + SOL_CHAIN_CLOCK_SKEW_MS + 1_000;
+    await expect(h.sellerFlow.lockLegB(acceptBRecord)).rejects.toThrow(/refusing to lock leg B - the chain's finalized clock/);
+    expect(await h.noteStore.get(...Object.values(paperNote((tryDecodeFrame(acceptBRecord.line) as AcceptFrame).contract)) as [string, string])).toBeNull();
+    h.node.nowMs = h.clockRef.ms;
+    await h.sellerFlow.lockLegB(acceptBRecord);
+  });
+
+  it("the possibly-seen claim path keeps a flow-level lock confirmation (verifyLockFinal runs before the re-signed claim)", async () => {
+    const h = solHarness();
+    const p = await lockedFlow(h);
+    h.node.chain.once("sendTransaction", (params) => decodeSignature(params[0] as string));
+    await expect(h.sellerFlow.claimLegA(p.statement)).rejects.toThrow(/not settled yet|Pending/i);
+    h.node.chain.finalizedHeight = h.node.chain.lastValidBlockHeight + 1;
+    let confirmations = 0;
+    const originalConnect = h.sellerRail.connect.bind(h.sellerRail);
+    h.sellerRail.connect = async (...args) => {
+      const connected = await originalConnect(...args);
+      const original = connected.verifyLockFinal.bind(connected);
+      connected.verifyLockFinal = async (...a) => {
+        confirmations += 1;
+        return original(...a);
+      };
+      return connected;
+    };
+    const result = await h.sellerFlow.claimLegA(p.statement);
+    expect(result.neverLandedClaims).toBe(1);
+    expect(confirmations).toBeGreaterThanOrEqual(1);
   });
 });
 
