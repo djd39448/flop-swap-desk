@@ -153,7 +153,11 @@ The litesvm tests assume the default mint.
   that is not covered. (3) A claim carries `CreateIdempotent` for the payee's token account (payer: the claimer),
   so a vanished payee account no longer makes a claim land and fail, and a compute limit and a priority fee
   (`SetComputeUnitLimit`, `SetComputeUnitPrice`). (4) A tclk reveal frame is posted only once the escrow reads
-  Claimed, never for a claim that landed and failed.
+  Claimed, never for a claim that landed and failed. (5) Round 4: the Buyer's refund guard counts leg B as claimed
+  only for a proven paper note (the note is unauthenticated: it means the secret is public and leg B reads claimed),
+  and the Buyer's rule prevents only the Buyer's own refund-after-claim: once the secret is public or possibly seen
+  and the Seller's claim cannot land before `legA.refund_after`, leg B stays claimable by anyone holding the secret
+  until `legB.refund_after`, so settling needs a person.
 - **Gas/compute** is small (well under the default 200k units per instruction) and was not tuned.
 - **Unaudited, testnet/localnet-only.** Not for mainnet value.
 

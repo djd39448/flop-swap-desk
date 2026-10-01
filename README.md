@@ -772,7 +772,8 @@ the real validator with the real program (`tests-sol/client-flows.sol.test.ts`, 
 transactions, leg B on tclk's paper rail; one scenario each):
 
 - *settled*: bid, accept, both proven `ed25519` account lines, lock, claim, the Buyer learns the secret from
-  the Seller's reveal frame and claims leg B; balances move by exactly the amount.
+  the Claimed escrow's stored preimage (`learnSecret` reads the chain; a reveal frame alone is never enough) and
+  claims leg B; balances move by exactly the amount.
 - *refunded*: the Seller never claims; the Buyer's refund is refused by the flow while its clock is early, and
   by the adapter while the chain's own finalized time has not reached `refundAfterMs` even though wall time
   has (nothing is sent); once the real chain time passes it the refund lands, the Buyer is repaid in full and
@@ -784,9 +785,14 @@ transactions, leg B on tclk's paper rail; one scenario each):
   claim goes through.
 - *no reveal frame*: the Seller claims with the reveal suppressed and the Buyer learns the secret from the
   chain alone.
-- *a claim that lands and fails*: the Seller's claim is made to land and fail on the real chain (the payee's
-  token account is closed just before the claim is forwarded, with its preflight skipped, which is the only way
-  a claim can land and fail). The secret is then public in a failed transaction. Either the retry goes out at once in
+- *a claim that lands and fails*: the Seller's claim is made to land and fail on the real chain. Since the claim
+  creates the payee's token account itself, a vanished account no longer fails it; what does is the claimer's own
+  wallet being unable to pay the rent of that account. Just before the claim is forwarded the test closes the
+  payee's token account, drains the Seller's SOL and forwards the claim with its preflight skipped, so it lands
+  and fails inside its own create-account instruction (`InstructionError` index 2: compute limit, price, create,
+  claim) with the preimage in its data; this is a test device, nothing in the product does it, and a transaction
+  frozen mid-flight or landing late fails differently (a late landing at or after `refund_after_ms` fails with
+  `ClaimWindowClosed`). The secret is then public in a failed transaction. Either the retry goes out at once in
   public-secret mode and the Seller is paid (the escrow's history shows exactly one failed claim with program error
   17 and the successful retry), the reveal frame following it once the escrow reads Claimed. When no retry
   can land, nobody was paid: the Buyer does NOT claim leg B on the leaked secret (`learnSecret` and `claimLegB`
@@ -806,7 +812,9 @@ transactions, leg B on tclk's paper rail; one scenario each):
 
 Three fixtures, `fixtures/sol-localnet-2026-09-30/{settled,refunded,refunded-b}/`, are captured from these
 runs and replayed hermetically by `tests/sol-localnet-fixtures.test.ts` through `examples/audit-export.mjs`,
-which also scans every committed file for these shapes of key material (each has a planted-leak test): field
+which also scans every committed file for these shapes of key material (each has a planted-leak test; every
+base58, base64 and base64url shape is matched as a STANDALONE token only, so a key embedded in a longer token or
+glued to a prefix or suffix is not seen): field
 names, PEM and mnemonic text; a 64-byte keypair in base58, base64, base64url or 128 hex characters; a JSON array
 of 64 numbers; and a bare 32-byte seed in base58, base64, base64url or hex (with or without a `0x` prefix: hex is
 matched by lookarounds on the hex digits, not by a word boundary) whose derived public key is present in the same
@@ -878,7 +886,10 @@ does not mean the Seller was paid (the program refuses every claim at or after `
   `onNotBroadcast` when the claim provably never reached the network). At the start of every `claimLegA` the
   Seller resolves each recorded signature by that signature: landed (nothing more to send; frames post once),
   landed and failed (the secret is public and that transaction proves it), or never landed (its blockhash
-  expired with no status). A signature that is not decided yet (`SolPendingError`) or a transport error while
+  expired with no status). A never-landed claim is dropped and counted (`neverLandedClaims`), and the secret is then
+  treated as possibly seen: the next claim is re-signed at a doubled priority fee, bounded by the landing bound
+  instead of the policy margin, and still preceded by a flow-level `verifyLockFinal` confirmation that leg A is
+  locked; past the bound the end of the effort is `SolClaimStarvedError`, never a silent drop. A signature that is not decided yet (`SolPendingError`) or a transport error while
   resolving it stops the call with the record kept: no second claim is signed while an earlier one could still
   land. Proof of a public secret is always that one named finalized transaction, polled until it is readable,
   never a scan.
@@ -941,7 +952,9 @@ Only what the tests prove is claimed; the rest is written down.
   makes a claim land and fail (live test). The claimer's wallet therefore needs SOL for the account's rent.
   A refund carries the two budget instructions. The price is the 75th percentile of recent fees over the
   claim's writable accounts (floor 1,000, cap 1,000,000 micro-lamports per unit), doubled for each earlier
-  claim of the flow that never landed. The Seller then keeps claiming up to the landing bound (not the
+  claim of the flow that never landed (at most 10 doublings, never above the cap). The priority fee is therefore
+  bounded: at most 1,000,000 micro-lamports x 50,000 compute units = 50 lamports per claim (15 per refund at
+  15,000 units), on top of the 5,000-lamport base fee and the payee account's rent. The Seller then keeps claiming up to the landing bound (not the
   5-minute policy margin) and reports `neverLandedClaims` / `SolClaimStarvedError` ("secret broadcast but not
   landed, possibly seen"). Known limit: write-lock starvation on a busy cluster; the fee policy mitigates it,
   nothing guarantees inclusion. A starved claim leaves the secret possibly seen: leg B is then exposed (claimable by
@@ -1019,8 +1032,9 @@ Only what the tests prove is claimed; the rest is written down.
   the clock. Everything the chain decides is not compressed (the adapter judges windows against the chain's own
   finalized time, the program against its own clock; a scenario shows the adapter refusing a refund when wall
   time has passed `refundAfterMs` but the chain has not). The "claim lands and fails" scenarios close the
-  payee's token account just before the claim is forwarded, with its preflight skipped, because that is the
-  only way a claim can land and fail; nothing in the product does that.
+  payee's token account and drain the Seller's SOL just before the claim is forwarded, with its preflight
+  skipped, so the claim's own account creation fails (the claim creates the account itself, so closing it alone
+  no longer makes a claim fail); nothing in the product does that.
 - **Not exercised end to end live:** a lost reply on a refund (hermetic: `tests/client-flows-sol.test.ts`;
   the adapter's own recovery by signature is live in `tests-sol/sol-htlc.sol.test.ts`), a claim whose blockhash
   expires (adapter live suite), and evidence capture under network latency (see the limit above). Timing
