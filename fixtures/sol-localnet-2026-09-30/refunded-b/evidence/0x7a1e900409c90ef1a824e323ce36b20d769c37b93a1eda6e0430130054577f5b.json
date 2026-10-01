@@ -1,11 +1,11 @@
 {
   "swapId": "0x7a1e900409c90ef1a824e323ce36b20d769c37b93a1eda6e0430130054577f5b",
   "legA": {
-    "contract": "0x871295c371887e8a106c1261e8e53f77e4caee110ad57fca6d09f4f88e2ebb6b",
+    "contract": "0xcfc683ef954c6eb629d1464f579c17f61e81269752810c5c4cf4c46e1578898d",
     "rail": "trustcore.sol-htlc-v1"
   },
   "legB": {
-    "contract": "0xddf59860554a9f9ef044466d777dc2e2521c75cd51bd9fb34aaec5e36693a923",
+    "contract": "0xd4e983b767005bf20cb3aa13ba5ae071e1726580ffd005fecf22c65c7c232ca7",
     "rail": "paper"
   },
   "feeBps": 0,
@@ -17,11 +17,11 @@
       "evidence": {}
     }
   ],
-  "startedAtMs": 1790800194744,
-  "finishedAtMs": 1790890194777,
+  "startedAtMs": 1790830006602,
+  "finishedAtMs": 1790920006651,
   "status": "refunded-b",
   "finalizedRefs": [
-    "paper:sha256:f6ae5af50ed357134cd8188f7310f62fbdc314a843bf18d7735996cb5c9834c8",
-    "solana-localnet-flop:final:1125"
+    "paper:sha256:fbd6c7355e8d867a7b34d7bd8274370d56a0b2e72c8bec8be71efda87ce83225",
+    "solana-localnet-flop:final:1207"
   ]
 }

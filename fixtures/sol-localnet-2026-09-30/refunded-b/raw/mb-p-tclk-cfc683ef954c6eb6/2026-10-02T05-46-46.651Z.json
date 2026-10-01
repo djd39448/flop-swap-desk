@@ -1,0 +1,25 @@
+{
+ "room": "mb-p-tclk-cfc683ef954c6eb6",
+ "count": 2,
+ "first_seq": 1,
+ "last_seq": 2,
+ "generation": 1,
+ "messages": [
+  {
+   "seq": 1,
+   "ts": "2026-10-01T04:46:46.627Z",
+   "from": "did:key:z6Mkon22vwz9JoNpGDxCrGZRgeNFTdRTwXYYN3fvAhA3K19x",
+   "text": "swap1 account trustcore.sol-htlc-v1 solana:localnet-flop:FoMc1217imfGt8EZUEBhJ5q4HHrY6r1dUU47bft7e5qZ proof ed25519:945d106a7169be774cfb97b8d2b4f30b651c6da7f57778039c5449039c5cb690b88bffc1203322c67bc70423e1a4c0603f78b2f2e5fa97e2034301e0ab385401",
+   "nonce": "10001",
+   "sig": "AcMdYMkozl-EYbhPvg38XcaGp6DAoUxKWg_7lg78Kov3J-aiLhj9BYoxJQOKnrDTSGDa6Vyyp-aY9x8KbVXgCQ"
+  },
+  {
+   "seq": 2,
+   "ts": "2026-10-01T04:46:46.635Z",
+   "from": "did:key:z6MkmtWtY63GQVBrpMyRJWEzsnxfsGkemu6CtMDwGTv4RYj2",
+   "text": "swap1 account trustcore.sol-htlc-v1 solana:localnet-flop:2VfHfVEeaC924UQv6em3pA3ZJHniZ9cp36xKi4gzKm76 proof ed25519:21dcb7ad1ada1d5acdcde1f925242c1aa09ffd16dfe26881c60eef2016924e568e96373a541c5a4090c6925e74a1e138500161f6626fe41a9c66485af9f09c0e",
+   "nonce": "10002",
+   "sig": "dZf3SP0_kEsN6A-ijLa10nPAwMoovcf2i_dFIuVYcBQXoJz2dr67MEg2pElDvqHkXEmx6cbwycrGNYAHJqeYAw"
+  }
+ ]
+}

@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"context":{"apiVersion":"4.3.0","slot":172},"value":[{"confirmationStatus":"confirmed","confirmations":7,"err":null,"slot":166,"status":{"Ok":null}}]},"id":"write:0xa8a62fb9993dfe3e64c34835413add0a5783cb3264cdd6678dd8f03cb50310c1:2VfHfVEeaC924UQv6em3pA3ZJHniZ9cp36xKi4gzKm76:1790827096718:14"}

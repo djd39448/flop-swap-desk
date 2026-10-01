@@ -1,0 +1,113 @@
+{
+  "v": 1,
+  "rail": "trustcore.sol-htlc-v1",
+  "ref": "0xa8a62fb9993dfe3e64c34835413add0a5783cb3264cdd6678dd8f03cb50310c1:2VfHfVEeaC924UQv6em3pA3ZJHniZ9cp36xKi4gzKm76",
+  "pin": "solana-localnet-flop",
+  "caip2": "solana:localnet-flop",
+  "endpoint": "http://127.0.0.1:53893",
+  "checkedAtMs": 1790920005979,
+  "config": {
+    "pin": {
+      "name": "solana-localnet-flop",
+      "caip2": "solana:localnet-flop",
+      "commitment": "finalized"
+    },
+    "endpoint": "http://127.0.0.1:53893",
+    "programId": "GedsjashYAxaoETcwBZQR1YgBbuEaK8QiiKu2qi6xe6C",
+    "programHash": "ae1a357bc2efd927e8538b6a56ef469085f63d7f486bda142af40b65448f1967",
+    "assets": {
+      "USDC": "91cjWuWZvm24ttxccaWHkAcXQcDw1jce4PNqknzRNSMz"
+    }
+  },
+  "nonce": "9b6ea67704fb6a1a",
+  "exchanges": [
+    {
+      "method": "getGenesisHash",
+      "params": [],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xa8a62fb9993dfe3e64c34835413add0a5783cb3264cdd6678dd8f03cb50310c1:2VfHfVEeaC924UQv6em3pA3ZJHniZ9cp36xKi4gzKm76:1790920005979:9b6ea67704fb6a1a:1\",\"method\":\"getGenesisHash\",\"params\":[]}",
+      "responseSha256": "11ba439812b732d266acb6188bd6b21986c7d8971e50096d2704be8a620ae7fa",
+      "atMs": 1790830006111
+    },
+    {
+      "method": "getSlot",
+      "params": [
+        {
+          "commitment": "finalized"
+        }
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xa8a62fb9993dfe3e64c34835413add0a5783cb3264cdd6678dd8f03cb50310c1:2VfHfVEeaC924UQv6em3pA3ZJHniZ9cp36xKi4gzKm76:1790920005979:9b6ea67704fb6a1a:2\",\"method\":\"getSlot\",\"params\":[{\"commitment\":\"finalized\"}]}",
+      "responseSha256": "6a46b004abca9146b517d2b014dfb453f7044d0477316c5b9b67a0df6fab8a9f",
+      "atMs": 1790830006112
+    },
+    {
+      "method": "getAccountInfo",
+      "params": [
+        "FWcd5jxxgCoX6ePaiFVS4cNeRnNJBdTqZuLGLX38n8Ch",
+        {
+          "encoding": "base64",
+          "commitment": "finalized",
+          "minContextSlot": 1206
+        }
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xa8a62fb9993dfe3e64c34835413add0a5783cb3264cdd6678dd8f03cb50310c1:2VfHfVEeaC924UQv6em3pA3ZJHniZ9cp36xKi4gzKm76:1790920005979:9b6ea67704fb6a1a:3\",\"method\":\"getAccountInfo\",\"params\":[\"FWcd5jxxgCoX6ePaiFVS4cNeRnNJBdTqZuLGLX38n8Ch\",{\"encoding\":\"base64\",\"commitment\":\"finalized\",\"minContextSlot\":1206}]}",
+      "responseSha256": "2a93518b56baf3541e06add0d1a1c59bf175a6165f8a98692b531c84eaae9f9b",
+      "atMs": 1790830006113
+    },
+    {
+      "method": "getAccountInfo",
+      "params": [
+        "5qtFwvWahTd4eL9g9wux2KCFH1pMbc55Tvp3QRPzhn98",
+        {
+          "encoding": "base64",
+          "commitment": "finalized",
+          "minContextSlot": 1206
+        }
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xa8a62fb9993dfe3e64c34835413add0a5783cb3264cdd6678dd8f03cb50310c1:2VfHfVEeaC924UQv6em3pA3ZJHniZ9cp36xKi4gzKm76:1790920005979:9b6ea67704fb6a1a:4\",\"method\":\"getAccountInfo\",\"params\":[\"5qtFwvWahTd4eL9g9wux2KCFH1pMbc55Tvp3QRPzhn98\",{\"encoding\":\"base64\",\"commitment\":\"finalized\",\"minContextSlot\":1206}]}",
+      "responseSha256": "db77cf5415b3ce994dc945b144858d3e1e7a73edfc1942bade0ad54b853c9175",
+      "atMs": 1790830006113
+    },
+    {
+      "method": "getAccountInfo",
+      "params": [
+        "GedsjashYAxaoETcwBZQR1YgBbuEaK8QiiKu2qi6xe6C",
+        {
+          "encoding": "base64",
+          "commitment": "finalized",
+          "minContextSlot": 1206
+        }
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xa8a62fb9993dfe3e64c34835413add0a5783cb3264cdd6678dd8f03cb50310c1:2VfHfVEeaC924UQv6em3pA3ZJHniZ9cp36xKi4gzKm76:1790920005979:9b6ea67704fb6a1a:5\",\"method\":\"getAccountInfo\",\"params\":[\"GedsjashYAxaoETcwBZQR1YgBbuEaK8QiiKu2qi6xe6C\",{\"encoding\":\"base64\",\"commitment\":\"finalized\",\"minContextSlot\":1206}]}",
+      "responseSha256": "dae8be7c4e96b19f06f3f918f79437665ea8231310d3bf03a08a332ddb1a15b0",
+      "atMs": 1790830006114
+    },
+    {
+      "method": "getAccountInfo",
+      "params": [
+        "GeqvDSBXT99ma5Vp7BVKmBqfkK8REWBvh9YmoVHmuLiC",
+        {
+          "encoding": "base64",
+          "commitment": "finalized",
+          "minContextSlot": 1206
+        }
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xa8a62fb9993dfe3e64c34835413add0a5783cb3264cdd6678dd8f03cb50310c1:2VfHfVEeaC924UQv6em3pA3ZJHniZ9cp36xKi4gzKm76:1790920005979:9b6ea67704fb6a1a:6\",\"method\":\"getAccountInfo\",\"params\":[\"GeqvDSBXT99ma5Vp7BVKmBqfkK8REWBvh9YmoVHmuLiC\",{\"encoding\":\"base64\",\"commitment\":\"finalized\",\"minContextSlot\":1206}]}",
+      "responseSha256": "4176f3777941916b22fbf5b3d5602711240fb864258bc4f0463a4a7cf35e2bc2",
+      "atMs": 1790830006115
+    },
+    {
+      "method": "getAccountInfo",
+      "params": [
+        "GXRR8PTxQJhYdjvaig6Uer9ha4VBrmjXs6xs4HmpYdWQ",
+        {
+          "encoding": "base64",
+          "commitment": "finalized",
+          "minContextSlot": 1206
+        }
+      ],
+      "requestBody": "{\"jsonrpc\":\"2.0\",\"id\":\"0xa8a62fb9993dfe3e64c34835413add0a5783cb3264cdd6678dd8f03cb50310c1:2VfHfVEeaC924UQv6em3pA3ZJHniZ9cp36xKi4gzKm76:1790920005979:9b6ea67704fb6a1a:7\",\"method\":\"getAccountInfo\",\"params\":[\"GXRR8PTxQJhYdjvaig6Uer9ha4VBrmjXs6xs4HmpYdWQ\",{\"encoding\":\"base64\",\"commitment\":\"finalized\",\"minContextSlot\":1206}]}",
+      "responseSha256": "497316b1e038b02436a34c38786640899531fc63571d25edf60f5c38416dbdc9",
+      "atMs": 1790830006116
+    }
+  ]
+}
