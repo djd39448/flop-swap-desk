@@ -260,6 +260,41 @@ export function transactionHashBytes(tx: NearTransactionV0): Uint8Array {
   return sha256(encodeTransactionV0(tx));
 }
 
+/**
+ * P8-RESUME-SPEC.md "Rail seam": the fields of a signed transaction a resuming caller needs to judge a persisted
+ * `signedTxBase64` WITHOUT a general borsh decoder: the signer account, the signing key, the nonce (what decides
+ * whether the transaction can still be accepted: it must exceed the access key's current nonce) and the transaction
+ * hash recomputed from the bytes (sha256 of everything before the trailing 65-byte signature, base58, the same form
+ * `buildSignedTransaction` records). Reads only the leading fields `encodeTransactionV0` writes and the fixed-size
+ * signature tail; throws on anything that does not fit that layout, never guesses.
+ */
+export function decodeSignedTransactionHeader(signedBytes: Uint8Array): {
+  signerId: string;
+  publicKey: Ed25519PublicKey;
+  nonce: bigint;
+  txHashBase58: string;
+} {
+  const SIGNATURE_BYTES = 1 + 64; // KeyType tag + ed25519 signature
+  if (signedBytes.length < 4 + 1 + 33 + 8 + SIGNATURE_BYTES) throw new Error("near-borsh: signed transaction is too short");
+  const view = new DataView(signedBytes.buffer, signedBytes.byteOffset, signedBytes.byteLength);
+  let offset = 0;
+  const idLength = view.getUint32(offset, true);
+  offset += 4;
+  if (idLength === 0 || idLength > 64 || offset + idLength + 33 + 8 > signedBytes.length - SIGNATURE_BYTES) {
+    throw new Error("near-borsh: signed transaction has an implausible signer id length");
+  }
+  const signerId = new TextDecoder("utf-8", { fatal: true }).decode(signedBytes.subarray(offset, offset + idLength));
+  offset += idLength;
+  if (signedBytes[offset] !== 0) throw new Error("near-borsh: signed transaction key is not ed25519");
+  offset += 1;
+  const publicKey: Ed25519PublicKey = { keyType: "ED25519", data: signedBytes.slice(offset, offset + 32) };
+  offset += 32;
+  const nonce = view.getBigUint64(offset, true);
+  if (signedBytes[signedBytes.length - SIGNATURE_BYTES] !== 0) throw new Error("near-borsh: signed transaction signature is not ed25519");
+  const txBytes = signedBytes.subarray(0, signedBytes.length - SIGNATURE_BYTES);
+  return { signerId, publicKey, nonce, txHashBase58: base58.encode(sha256(txBytes)) };
+}
+
 export interface BuiltSignedTransaction {
   signed: NearSignedTransaction;
   /** The unsigned transaction's own borsh bytes (what `hash` is a sha256 of). */

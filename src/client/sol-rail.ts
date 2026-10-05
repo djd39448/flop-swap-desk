@@ -43,6 +43,7 @@ import {
   SOL_ASSET_ID,
   SolClaimFailedError,
   SolHtlcRail,
+  SolPendingError,
   parseSolRef,
   type SolHtlcRailOptions,
   type SolClaimOptions,
@@ -52,17 +53,21 @@ import {
   type SolSigner,
   type SolWriteEvidence,
 } from "../rails/sol-htlc.js";
-import type {
-  ConnectedCounterAssetRail,
-  CounterAssetRail,
-  PreparedLock,
-  RailAccounts,
-  RailBlockMarker,
-  RailClaimOptions,
-  RailClaimRecord,
-  RailClaimRecovery,
-  RailEvidenceResult,
-  RailWriteEvidence,
+import {
+  RailRecoveryRefusedError,
+  type ConnectedCounterAssetRail,
+  type CounterAssetRail,
+  type LockRecovery,
+  type LockRecoveryOutcome,
+  type PreparedLock,
+  type RailAccounts,
+  type RailBlockMarker,
+  type RailClaimOptions,
+  type RailClaimRecord,
+  type RailClaimRecovery,
+  type RailEvidenceResult,
+  type RailRefundOptions,
+  type RailWriteEvidence,
 } from "./counter-rail.js";
 import { SOL_CHAIN_CLOCK_SKEW_MS, SOL_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
 
@@ -115,13 +120,18 @@ function toWriteEvidence(evidence: SolWriteEvidence): RailWriteEvidence {
   };
 }
 
-function toClaimRecord(record: SolPreparedRecord): RailClaimRecord {
+function toClaimRecord(record: Pick<SolPreparedRecord, "signature" | "blockhash" | "lastValidBlockHeight" | "signedSlot">): RailClaimRecord {
   return {
     signature: record.signature,
     blockhash: record.blockhash,
     lastValidBlockHeight: record.lastValidBlockHeight,
     ...(record.signedSlot === undefined ? {} : { signedSlot: record.signedSlot }),
   };
+}
+
+/** P8: the recovery handle of one signed Solana transaction (a lock or a refund): what `recoverBySignature` needs. */
+function toRecovery(record: SolPreparedRecord): LockRecovery {
+  return { chain: "sol", ...toClaimRecord(record) };
 }
 
 class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
@@ -167,7 +177,57 @@ class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
   async prepareLock(terms: LockTerms, feeBps: number): Promise<PreparedLock> {
     if (feeBps !== 0) throw new Error("sol-rail: this deployment has no fee; declared feeBps must be 0");
     const record = await this.solRail.prepareLock(toSolHtlcTerms(terms, this.accounts));
-    return { ref: record.ref };
+    // P8: the signature, blockhash, last valid height and signing slot, for the caller to persist BEFORE `commitLock`.
+    return { ref: record.ref, recovery: toRecovery(record) };
+  }
+
+  /**
+   * P8-RESUME-SPEC.md "Buyer lock A", Solana: resolves the ONE lock transaction `prepareLock` signed, by its recorded
+   * signature (`SolHtlcRail.recoverBySignature`), never by signing again. `landed`: finalized and the escrow holds this
+   * leg's terms. `pending`: no status yet while the blockhash is still valid, finalization not reached, or this node's
+   * ledger starts after the slot the transaction was signed at (`SolPendingError`; ask again later, sign nothing).
+   * `never-landed`: the blockhash expired with no status, the transaction itself is absent at finalized, and the
+   * node's ledger reaches back to the signing slot; the transaction can no longer land, a fresh `prepareLock` is
+   * allowed (it refuses an existing escrow). A finalized failure of the transaction (`SolLockRefusedError`, ...) and
+   * a transport failure propagate unchanged. The signed bytes are not part of the handle, so there is no re-send.
+   */
+  async recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome> {
+    const handle = this.requireSolHandle(prepared.ref, prepared.recovery);
+    return this.recoverBySignature({ kind: "lock", ref: prepared.ref, ...handle, terms: toSolHtlcTerms(this.terms, this.accounts) });
+  }
+
+  /** P8-RESUME-SPEC.md "Buyer refund A", Solana: the refund twin of `recoverLock`, over the handle `refund`'s
+   *  `onSigned` recorded. A finalized failure (`SolRefundFailedError`) propagates unchanged. */
+  async recoverRefund(ref: string, recovery: LockRecovery): Promise<LockRecoveryOutcome> {
+    const handle = this.requireSolHandle(ref, recovery);
+    return this.recoverBySignature({ kind: "refund", ref, ...handle });
+  }
+
+  private requireSolHandle(ref: string, recovery: LockRecovery | undefined): RailClaimRecord {
+    if (recovery === undefined) {
+      throw new RailRecoveryRefusedError("no-handle", ref, "sol-htlc needs the signature, blockhash and last valid height recorded at prepare time");
+    }
+    if (recovery.chain !== "sol") {
+      throw new RailRecoveryRefusedError("handle-mismatch", ref, `a ${recovery.chain} recovery handle was given to the sol-htlc rail`);
+    }
+    const parsed = parseSolRef(ref);
+    if (parsed === null || parsed.payer !== this.options.signer.publicKey || (this.terms.lock === "hash" && parsed.hashLock !== this.terms.statement)) {
+      throw new RailRecoveryRefusedError("handle-mismatch", ref, "ref is not 0x<hash lock>:<payer> for this leg's own hash lock and this signer");
+    }
+    if (typeof recovery.signature !== "string" || recovery.signature === "" || !Number.isSafeInteger(recovery.lastValidBlockHeight) || recovery.lastValidBlockHeight < 0) {
+      throw new RailRecoveryRefusedError("handle-mismatch", ref, "the recorded signature or last valid block height is unusable");
+    }
+    return toClaimRecord(recovery);
+  }
+
+  private async recoverBySignature(record: SolPreparedRecord): Promise<LockRecoveryOutcome> {
+    try {
+      const evidence = await this.solRail.recoverBySignature(record);
+      return evidence === null ? "never-landed" : "landed";
+    } catch (error) {
+      if (error instanceof SolPendingError) return "pending";
+      throw error;
+    }
   }
 
   /** Sends exactly what `prepareLock` most recently built. Returns evidence only after the escrow at FINALIZED
@@ -224,8 +284,11 @@ class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
 
   /** `SolHtlcRail.refund` itself re-checks (against fresh finalized reads) that the caller's signer IS the
    *  escrow's payer and that chain time has reached `refund_after_ms`, before signing. */
-  async refund(ref: string): Promise<RailWriteEvidence> {
-    return toWriteEvidence(await this.solRail.refund(ref));
+  async refund(ref: string, options?: RailRefundOptions): Promise<RailWriteEvidence> {
+    // P8: a refund records its signature through `onSigned` before anything is simulated or sent, like a claim does.
+    const onSigned = options?.onSigned === undefined ? undefined : (record: SolPreparedRecord) => options.onSigned?.(toRecovery(record));
+    const onNotBroadcast = options?.onNotBroadcast === undefined ? undefined : (record: SolPreparedRecord) => options.onNotBroadcast?.(toRecovery(record));
+    return toWriteEvidence(await this.solRail.refund(ref, onSigned, onNotBroadcast === undefined ? {} : { onNotBroadcast }));
   }
 
   // `resendRefundIfDropped` is deliberately not implemented: Solana has no mempool a signed transaction can

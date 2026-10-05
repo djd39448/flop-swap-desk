@@ -28,7 +28,10 @@
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
 import { accountProofMessage, formatAccountLine, resolveAccounts } from "../rails/account-line.js";
+import { base58 } from "@scure/base";
+
 import type { AccountProof } from "../rails/account-proof.js";
+import { decodeSignedTransactionHeader } from "../rails/near-borsh.js";
 import { nearEvidence, captureNearLeg, NEAR_RAIL_ID, type NearAccounts, type NearCapture } from "../rails/near-evidence.js";
 import {
   NEAR_AMOUNT_FLOOR,
@@ -41,16 +44,20 @@ import {
 } from "../rails/near-htlc.js";
 import { nep413Verifier, signNep413 } from "../rails/near-proof.js";
 import { parseNearRef } from "../rails/near-ref.js";
-import { NearRpc } from "../rails/near-rpc.js";
+import { NearRpc, NearTimeoutError } from "../rails/near-rpc.js";
 import { verifiedExchangeBytes, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
-import type {
-  ConnectedCounterAssetRail,
-  CounterAssetRail,
-  PreparedLock,
-  RailAccounts,
-  RailBlockMarker,
-  RailEvidenceResult,
-  RailWriteEvidence,
+import {
+  RailRecoveryRefusedError,
+  type ConnectedCounterAssetRail,
+  type CounterAssetRail,
+  type LockRecovery,
+  type LockRecoveryOutcome,
+  type PreparedLock,
+  type RailAccounts,
+  type RailBlockMarker,
+  type RailEvidenceResult,
+  type RailRefundOptions,
+  type RailWriteEvidence,
 } from "./counter-rail.js";
 import { NEAR_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
 
@@ -138,8 +145,68 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
       throw new Error("near-rail: this deployment has no fee; declared feeBps must be 0");
     }
     const nearTerms = toNearHtlcTerms(terms, this.accounts);
-    const { ref } = await this.nearRail.prepareLock(nearTerms);
-    return { ref };
+    const { ref, txHash, signedTxBase64 } = await this.nearRail.prepareLock(nearTerms);
+    // P8: the transaction hash and the complete signed bytes, for the caller to persist BEFORE `commitLock`.
+    return { ref, recovery: { chain: "near", txHash, signedTxBase64 } };
+  }
+
+  /**
+   * P8-RESUME-SPEC.md "Buyer lock A", NEAR: what became of the ONE lock transaction `prepareLock` signed. Reads, in
+   * this order: the access key's final nonce FIRST (a view that only moves forward, so a landing after it cannot be
+   * missed by the reads below); then the transaction by its hash (`recoverByTxHash`; a hash the node holds is
+   * `landed`, a node still waiting for finality is `pending`); then the lock itself by its payer-keyed ref (a row
+   * there is `landed` even if the node has forgotten the transaction); and only if all three show nothing, the
+   * nonce: at or past the transaction's own means it can never be accepted, `never-landed`; below it, `pending`
+   * (it may still be in flight or may never have been sent; nothing new is signed either way). A typed chain failure
+   * of the transaction (`NearTxFailedError`, `NearLockRefusedError`, `NearLockUnknownError`) propagates unchanged.
+   */
+  async recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome> {
+    return this.recoverWrite(prepared.ref, prepared.recovery, "lock");
+  }
+
+  /** P8-RESUME-SPEC.md "Buyer refund A", NEAR: the refund twin of `recoverLock`, over the handle `refund`'s
+   *  `onSigned` recorded. `landed` also when the lock reads `Refunded`. */
+  async recoverRefund(ref: string, recovery: LockRecovery): Promise<LockRecoveryOutcome> {
+    return this.recoverWrite(ref, recovery, "refund");
+  }
+
+  private async recoverWrite(ref: string, recovery: LockRecovery | undefined, kind: "lock" | "refund"): Promise<LockRecoveryOutcome> {
+    if (recovery === undefined) {
+      throw new RailRecoveryRefusedError("no-handle", ref, "near-htlc needs the transaction hash and signed bytes recorded at prepare time");
+    }
+    if (recovery.chain !== "near") {
+      throw new RailRecoveryRefusedError("handle-mismatch", ref, `a ${recovery.chain} recovery handle was given to the near-htlc rail`);
+    }
+    const signer = this.options.signer;
+    const refParts = parseNearRef(ref);
+    if (this.terms.lock !== "hash" || refParts === null || refParts.payer !== signer.accountId || refParts.hashLock !== this.terms.statement) {
+      throw new RailRecoveryRefusedError("handle-mismatch", ref, "ref is not 0x<hash lock>:<payer> for this leg's own hash lock and this signer");
+    }
+    let header: ReturnType<typeof decodeSignedTransactionHeader>;
+    try {
+      header = decodeSignedTransactionHeader(Uint8Array.from(Buffer.from(recovery.signedTxBase64, "base64")));
+    } catch (error) {
+      throw new RailRecoveryRefusedError("handle-mismatch", ref, `the recorded signed transaction does not decode: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (header.txHashBase58 !== recovery.txHash) {
+      throw new RailRecoveryRefusedError("handle-mismatch", ref, "the recorded signed transaction does not hash to the recorded transaction hash");
+    }
+    if (header.signerId !== signer.accountId || `ed25519:${base58.encode(header.publicKey.data)}` !== signer.publicKey) {
+      throw new RailRecoveryRefusedError("handle-mismatch", ref, "the recorded transaction was not signed by this rail's own account and key");
+    }
+
+    const keyNonce = await this.nearRail.finalAccessKeyNonce();
+    try {
+      const evidence = await this.nearRail.recoverByTxHash(recovery.txHash, signer.accountId, ref);
+      if (evidence !== null) return "landed";
+    } catch (error) {
+      // The node's wait for FINAL ran out: the transaction may still land. Not "unknown", and not an error.
+      if (error instanceof NearTimeoutError) return "pending";
+      throw error;
+    }
+    const lock = await this.nearRail.readLock(ref);
+    if (lock !== null && (kind === "lock" || lock.status === "Refunded")) return "landed";
+    return keyNonce >= header.nonce ? "never-landed" : "pending";
   }
 
   /** Sends exactly what `prepareLock` most recently built and signed — `NearHtlcRail.commitLock`
@@ -166,8 +233,14 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
   /** `NearHtlcRail.refund` itself re-checks (against a fresh `Locked` read) that the caller's
    *  own signer IS the lock's payer and that chain time has reached `refundAfterMs`, before ever
    *  signing — this wrapper adds no behaviour of its own. */
-  async refund(ref: string): Promise<RailWriteEvidence> {
-    const evidence = await this.nearRail.refund(ref);
+  async refund(ref: string, options?: RailRefundOptions): Promise<RailWriteEvidence> {
+    // P8: the signed refund's hash and bytes go to the recorder after signing and before anything is sent.
+    const evidence = await this.nearRail.refund(ref, {
+      ...(options?.onSigned === undefined ? {} : { onSigned: (signed: { txHash: string; signedTxBase64: string }) => options.onSigned?.({ chain: "near", ...signed }) }),
+      ...(options?.onNotBroadcast === undefined
+        ? {}
+        : { onNotSent: (signed: { txHash: string; signedTxBase64: string }) => options.onNotBroadcast?.({ chain: "near", ...signed }) }),
+    });
     return toWriteEvidence(evidence);
   }
 

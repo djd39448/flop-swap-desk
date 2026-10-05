@@ -9,7 +9,7 @@
 //
 // Design source: flop-contrib/handoff/P4-BTC-SPEC.md §7a.
 
-import type { Address, Hex } from "viem";
+import { isAddressEqual, type Address, type Hex } from "viem";
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
 import { accountProofMessage, formatAccountLine, resolveAccounts } from "../rails/account-line.js";
@@ -18,14 +18,17 @@ import { EVM_RAIL_ID, type EvmAccounts } from "../rails/evm-evidence.js";
 import { EvmHtlcRail, type EvmRailConfig } from "../rails/evm-htlc.js";
 import type { CapturingRpc, Exchange } from "../rails/rpc-capture.js";
 import type { AddressBook } from "../vendor/evm-hash-rail.js";
-import type {
-  ConnectedCounterAssetRail,
-  CounterAssetRail,
-  PreparedLock,
-  RailAccounts,
-  RailBlockMarker,
-  RailEvidenceResult,
-  RailWriteEvidence,
+import {
+  RailRecoveryRefusedError,
+  type ConnectedCounterAssetRail,
+  type CounterAssetRail,
+  type LockRecoveryOutcome,
+  type PreparedLock,
+  type RailAccounts,
+  type RailBlockMarker,
+  type RailEvidenceResult,
+  type RailRefundOptions,
+  type RailWriteEvidence,
 } from "./counter-rail.js";
 import { EVM_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
 
@@ -132,8 +135,32 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
     return this.rail.claim(ref as Hex, secret as Hex, notAfterMs);
   }
 
-  async refund(ref: string): Promise<RailWriteEvidence> {
+  /** P8: `evm-htlc` takes the recorder options for interface symmetry and never calls them: the node signs and sends
+   *  in one JSON-RPC call, so there is no signed refund to hand over before the send. A repeated refund after a crash
+   *  is recognised from the lock's own state (`verifyLockFinal` reads `refunded`), not from a handle. */
+  async refund(ref: string, _options?: RailRefundOptions): Promise<RailWriteEvidence> {
     return this.rail.refund(ref as Hex);
+  }
+
+  /**
+   * P8-RESUME-SPEC.md "Buyer lock A", EVM: no handle exists or is needed, the ref IS the hash lock. A row stored
+   * under it at the latest block, owned by this account as payer, is `landed` (whatever its status: a claim or refund
+   * already moved it on). No row is `never-landed` in the weak sense this rail can offer: EVM cannot prove a
+   * transaction is not still pending in some node's pool, but a repeated `approve` is harmless and a repeated `lock`
+   * reverts on the contract's duplicate hash-lock check, so re-running `commitLock` cannot lock twice. A row owned by
+   * another payer can never be turned into this party's lock: `RailRecoveryRefusedError("lock-conflict")`.
+   */
+  async recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome> {
+    const row = await this.rail.readLock(prepared.ref as Hex);
+    if (row === null) return "never-landed";
+    if (!isAddressEqual(row.payer, this.account)) {
+      throw new RailRecoveryRefusedError(
+        "lock-conflict",
+        prepared.ref,
+        `a lock already exists under this hash lock with payer ${row.payer}, not this account ${this.account}`,
+      );
+    }
+    return "landed";
   }
 
   async verifyLockFinal(terms: LockTerms, ref: string, accounts: RailAccounts): Promise<RailEvidenceResult> {

@@ -21,6 +21,8 @@
 // Design source: flop-contrib/handoff/P4-BTC-SPEC.md §4, §6, §7a;
 // flop-contrib/handoff/research/btc-regtest-probe-2026-09-28.md.
 
+import { hexToBytes } from "@noble/hashes/utils.js";
+import { Transaction } from "@scure/btc-signer";
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
 import { formatPubkeyLine, pubkeyProofMessage, resolvePubkeys } from "../rails/account-line.js";
@@ -30,6 +32,7 @@ import { btcEvidence, captureBtcLeg, BTC_RAIL_ID, type BtcAccounts, type BtcCapt
 import {
   assetIdFor,
   BTC_MIN_LOCKABLE_SATS,
+  BtcBroadcastRefusedError,
   BtcHtlcRail,
   type BtcHtlcTerms,
   type BtcRailConfig,
@@ -38,14 +41,18 @@ import {
   type PreparedFunding,
 } from "../rails/btc-htlc.js";
 import { verifiedExchangeBytes, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
-import type {
-  ConnectedCounterAssetRail,
-  CounterAssetRail,
-  PreparedLock,
-  RailAccounts,
-  RailBlockMarker,
-  RailEvidenceResult,
-  RailWriteEvidence,
+import {
+  RailRecoveryRefusedError,
+  type ConnectedCounterAssetRail,
+  type CounterAssetRail,
+  type LockRecovery,
+  type LockRecoveryOutcome,
+  type PreparedLock,
+  type RailAccounts,
+  type RailBlockMarker,
+  type RailEvidenceResult,
+  type RailRefundOptions,
+  type RailWriteEvidence,
 } from "./counter-rail.js";
 import { BTC_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
 
@@ -99,6 +106,39 @@ function toWriteEvidence(evidence: { ref: string; txid: string; blockHeight: num
     raw: evidence.raw,
     ...(evidence.rawTx === undefined ? {} : { rawTx: evidence.rawTx }),
   };
+}
+
+const TXID_SHAPE = /^[0-9a-f]{64}$/;
+const OUTPOINT_SHAPE = /^([0-9a-f]{64}):[0-9]+$/;
+
+/** P8: a Bitcoin recovery handle (`{ chain: "btc", txid, rawTx }`), checked for shape and for internal consistency
+ *  (the bytes hash to the txid) before anything is asked of the node. `ref` is the funding outpoint of a lock, or
+ *  the funding outpoint a refund spends; `fundingTxidMustMatch` is true for a lock handle, whose txid IS the ref's. */
+function requireBtcHandle(ref: string, recovery: LockRecovery | undefined, fundingTxidMustMatch: boolean): { txid: string; rawTx: string } {
+  if (recovery === undefined) {
+    throw new RailRecoveryRefusedError("no-handle", ref, "btc-htlc needs the funding transaction's txid and bytes recorded at prepareLock");
+  }
+  if (recovery.chain !== "btc") {
+    throw new RailRecoveryRefusedError("handle-mismatch", ref, `a ${recovery.chain} recovery handle was given to the btc-htlc rail`);
+  }
+  if (!TXID_SHAPE.test(recovery.txid) || !/^([0-9a-f]{2})+$/.test(recovery.rawTx)) {
+    throw new RailRecoveryRefusedError("handle-mismatch", ref, "the recorded txid or rawTx is not lowercase hex of the expected shape");
+  }
+  const outpoint = OUTPOINT_SHAPE.exec(ref);
+  if (outpoint === null) throw new RailRecoveryRefusedError("handle-mismatch", ref, 'ref is not "<64-hex txid>:<vout>"');
+  if (fundingTxidMustMatch && outpoint[1] !== recovery.txid) {
+    throw new RailRecoveryRefusedError("handle-mismatch", ref, "the recorded funding txid is not the txid of this ref's outpoint");
+  }
+  let decoded: string;
+  try {
+    decoded = Transaction.fromRaw(hexToBytes(recovery.rawTx), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
+  } catch {
+    throw new RailRecoveryRefusedError("handle-mismatch", ref, "the recorded rawTx does not decode as a transaction");
+  }
+  if (decoded !== recovery.txid) {
+    throw new RailRecoveryRefusedError("handle-mismatch", ref, "the recorded rawTx does not hash to the recorded txid");
+  }
+  return { txid: recovery.txid, rawTx: recovery.rawTx };
 }
 
 class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
@@ -169,7 +209,36 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
     const btcTerms = toBtcHtlcTerms(terms, this.accounts);
     const prepared = await this.btcRail.prepareFunding(btcTerms, this.ownWallet());
     this.prepared = prepared;
-    return { ref: prepared.ref };
+    // P8: the funding transaction's txid and exact signed bytes, for the caller to persist BEFORE `commitLock`.
+    return { ref: prepared.ref, recovery: { chain: "btc", txid: prepared.txid, rawTx: prepared.rawTx } };
+  }
+
+  /**
+   * P8-RESUME-SPEC.md "Buyer lock A", Bitcoin: never re-prepares. The node is asked about the persisted funding txid
+   * (`recoverFunding`): known (mempool or chain) is `landed`. Unknown: the IDENTICAL persisted bytes are re-sent
+   * (`rebroadcastFunding`: `testmempoolaccept` then `sendrawtransaction`, "already known" counting as success) and an
+   * accepted re-send is `landed`. A node that refuses the bytes (inputs spent, a conflicting transaction, policy)
+   * throws `RailRecoveryRefusedError("rebroadcast-refused")`: a second funding could double-spend the swap's inputs
+   * or create a second outpoint, so a person decides. This rail never answers `pending` or `never-landed`, and no
+   * wallet call (`walletcreatefundedpsbt`, `walletprocesspsbt`) is ever made here.
+   */
+  async recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome> {
+    const handle = requireBtcHandle(prepared.ref, prepared.recovery, true);
+    const known = await this.btcRail.recoverFunding(handle.txid);
+    if (known.broadcast) return "landed";
+    try {
+      await this.btcRail.rebroadcastFunding(prepared.ref, handle.rawTx);
+    } catch (error) {
+      if (error instanceof BtcBroadcastRefusedError) {
+        throw new RailRecoveryRefusedError(
+          "rebroadcast-refused",
+          prepared.ref,
+          `the node refuses the recorded funding transaction ${handle.txid} (${error.reason}); it was not re-prepared`,
+        );
+      }
+      throw error;
+    }
+    return "landed";
   }
 
   /** G3: broadcasts exactly what `prepareLock` most recently prepared. */
@@ -192,10 +261,36 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
     return toWriteEvidence(evidence);
   }
 
-  async refund(ref: string): Promise<RailWriteEvidence> {
+  async refund(ref: string, options?: RailRefundOptions): Promise<RailWriteEvidence> {
     const btcTerms = toBtcHtlcTerms(this.terms, this.accounts);
-    const evidence = await this.btcRail.refund(ref, btcTerms, this.ownWallet(), this.options.destinationAddress);
+    // P8: the refund's txid and exact bytes go to the recorder after signing and before anything is sent.
+    const evidence = await this.btcRail.refund(ref, btcTerms, this.ownWallet(), this.options.destinationAddress, {
+      ...(options?.onSigned === undefined ? {} : { onSigned: (signed: { txid: string; rawTx: string }) => options.onSigned?.({ chain: "btc", ...signed }) }),
+      ...(options?.onNotBroadcast === undefined
+        ? {}
+        : { onNotBroadcast: (signed: { txid: string; rawTx: string }) => options.onNotBroadcast?.({ chain: "btc", ...signed }) }),
+    });
     return toWriteEvidence(evidence);
+  }
+
+  /**
+   * P8-RESUME-SPEC.md "Buyer refund A", Bitcoin: resolves the ONE refund this flow signed, from its recorded txid and
+   * bytes. Known to the node: `landed` once it has a confirmation, else `pending`. Unknown: `resendRefundIfDropped`
+   * decides (it re-sends the IDENTICAL bytes only while the funding output is still unspent by anyone, mempool
+   * included, and never builds a second refund): re-sent is `pending`; not re-sent means that output is spent by
+   * another transaction (a claim), so this refund can no longer land: `never-landed` (a caller then routes to
+   * `learnSecret`). The txid is looked up once more before that verdict, so a refund that reached the node between
+   * the two reads is never called dead.
+   */
+  async recoverRefund(ref: string, recovery: LockRecovery): Promise<LockRecoveryOutcome> {
+    const handle = requireBtcHandle(ref, recovery, false);
+    const known = await this.btcRail.recoverFunding(handle.txid);
+    if (known.broadcast) return known.confirmations !== null && known.confirmations >= 1 ? "landed" : "pending";
+    const result = await this.btcRail.resendRefundIfDropped(ref, handle.txid, handle.rawTx);
+    if (result.resent) return "pending";
+    const again = await this.btcRail.recoverFunding(handle.txid);
+    if (again.broadcast) return again.confirmations !== null && again.confirmations >= 1 ? "landed" : "pending";
+    return "never-landed";
   }
 
   /** P4-BTC-FIXES-R2.md R2-1: re-check the chain and re-send `priorEvidence`'s own recorded

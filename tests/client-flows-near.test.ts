@@ -47,6 +47,7 @@ import {
   belowMinLockable,
   type ConnectedCounterAssetRail,
   type CounterAssetRail,
+  type LockRecoveryOutcome,
   type PreparedLock,
   type RailAccounts,
   type RailBlockMarker,
@@ -92,6 +93,8 @@ function unimplemented(name: string): never {
 
 interface FakeRailScript {
   prepareLock?: () => Promise<PreparedLock>;
+  /** P8: the interface now carries `recoverLock`; no existing scenario calls it (these flows do not resume yet). */
+  recoverLock?: () => Promise<LockRecoveryOutcome>;
   commitLock?: () => Promise<RailWriteEvidence>;
   claim?: (ref?: string) => Promise<RailWriteEvidence>;
   refund?: () => Promise<RailWriteEvidence>;
@@ -134,6 +137,9 @@ class FakeConnectedRail implements ConnectedCounterAssetRail {
   }
   async prepareLock(): Promise<PreparedLock> {
     return (this.script.prepareLock ?? (() => unimplemented("prepareLock")))();
+  }
+  async recoverLock(): Promise<LockRecoveryOutcome> {
+    return (this.script.recoverLock ?? (() => unimplemented("recoverLock")))();
   }
   async commitLock(): Promise<RailWriteEvidence> {
     return (this.script.commitLock ?? (() => unimplemented("commitLock")))();

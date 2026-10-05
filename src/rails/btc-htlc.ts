@@ -258,6 +258,22 @@ function validateTerms(terms: BtcHtlcTerms): void {
   }
 }
 
+/**
+ * P8-RESUME-SPEC.md: `testmempoolaccept` refused a transaction, so `sendrawtransaction` was never called and the
+ * bytes provably never reached the network. Thrown from the same place, with the same message, the plain `Error`
+ * used to be (`reason` is Core's own reject reason, e.g. `missing-inputs` or `txn-mempool-conflict`), so a caller
+ * that matched on the message sees no change; a resume caller matches on the class instead. A transport failure
+ * (the node unreachable, a malformed reply) is NOT this error: whether that transaction reached the node is unknown.
+ */
+export class BtcBroadcastRefusedError extends Error {
+  readonly reason: string;
+  constructor(reason: string | undefined) {
+    super(`btc-htlc: refusing to broadcast — testmempoolaccept rejected it (${reason ?? "no reason given"})`);
+    this.name = "BtcBroadcastRefusedError";
+    this.reason = reason ?? "no reason given";
+  }
+}
+
 /** P4-BTC-FIXES-R2.md R2-2: Core's own "No such mempool or blockchain transaction"/"Transaction
  *  not in mempool" answer (code -5) is the ONLY legitimate negative result for a lookup by txid
  *  — any other error (a transport failure, a malformed response, a rejected auth header) must
@@ -401,6 +417,16 @@ export interface WriteEvidence {
   rawTx?: string;
 }
 
+/**
+ * P8-RESUME-SPEC.md: the recorder `BtcHtlcRail.refund` accepts. `onSigned` is awaited with the refund's txid and
+ * exact signed bytes after signing and before anything is sent; `onNotBroadcast` is called with the same pair when
+ * `testmempoolaccept` refused the transaction (it provably never reached the network). Omitted: no behaviour change.
+ */
+export interface BtcRefundOptions {
+  onSigned?: (signed: { txid: string; rawTx: string }) => void | Promise<void>;
+  onNotBroadcast?: (signed: { txid: string; rawTx: string }) => void | Promise<void>;
+}
+
 export interface BtcHtlcRailOptions {
   config: BtcRailConfig;
   rpc: CapturingRpc;
@@ -526,7 +552,7 @@ export class BtcHtlcRail {
       if (expectedTxid !== undefined && reason !== undefined && BtcHtlcRail.ALREADY_KNOWN_REJECT_REASONS.has(reason)) {
         return expectedTxid;
       }
-      throw new Error(`btc-htlc: refusing to broadcast — testmempoolaccept rejected it (${reason ?? "no reason given"})`);
+      throw new BtcBroadcastRefusedError(reason);
     }
     return await this.request<string>("sendrawtransaction", [rawHex]);
   }
@@ -641,6 +667,33 @@ export class BtcHtlcRail {
     const before = this.rpc.exchanges().length;
     const txid = await this.broadcastOrThrow(prepared.rawTx);
     return this.finishWriteEvidence(prepared.ref, txid, before);
+  }
+
+  /**
+   * P8-RESUME-SPEC.md "Buyer lock A": re-send a funding transaction that `prepareFunding` built and a caller
+   * persisted (`rawTx`, with its `ref`) when the process died around `broadcastFunding` and the node does not know
+   * the txid. Never builds or signs anything: the identical bytes are checked locally against the ref's own txid
+   * (so a swapped or truncated `rawTx` is refused before any call), then `testmempoolaccept` + `sendrawtransaction`
+   * exactly as `broadcastFunding` does, except that Core's "already known" answer counts as success (the first
+   * broadcast, or a concurrent resend, got there first; resending identical bytes cannot create a second outpoint).
+   * A refusal by `testmempoolaccept` (inputs spent, a conflicting transaction, a policy rejection) is a
+   * `BtcBroadcastRefusedError`: a caller must NOT answer it by funding again.
+   */
+  async rebroadcastFunding(ref: string, rawTx: string): Promise<WriteEvidence> {
+    const { txid: refTxid } = parseOutpointRef(ref);
+    let decodedTxid: string;
+    try {
+      decodedTxid = Transaction.fromRaw(hexToBytes(rawTx), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
+    } catch {
+      throw new Error("btc-htlc: the recorded funding rawTx does not decode as a transaction");
+    }
+    if (decodedTxid !== refTxid) {
+      throw new Error("btc-htlc: the recorded funding rawTx does not hash to the ref's txid — refusing to broadcast it");
+    }
+    await this.assertPinnedChain();
+    const before = this.rpc.exchanges().length;
+    const txid = await this.broadcastOrThrow(rawTx, refTxid);
+    return this.finishWriteEvidence(ref, txid, before);
   }
 
   /**
@@ -831,7 +884,13 @@ export class BtcHtlcRail {
    * Q4) — then runs `testmempoolaccept`, which is what actually rejects it as "non-final" before
    * MTP passes `T` and accepts it after.
    */
-  async refund(ref: string, terms: BtcHtlcTerms, buyer: BtcWalletHandle, destinationAddress: string): Promise<WriteEvidence> {
+  async refund(
+    ref: string,
+    terms: BtcHtlcTerms,
+    buyer: BtcWalletHandle,
+    destinationAddress: string,
+    options: BtcRefundOptions = {},
+  ): Promise<WriteEvidence> {
     const { txid: fundTxid, vout: fundVout } = parseOutpointRef(ref);
     validateTerms(terms);
     if (buyer.key.pubkey.toLowerCase() !== terms.payerPubkey.toLowerCase()) {
@@ -876,7 +935,18 @@ export class BtcHtlcRail {
     // deterministic txid, known from the signed bytes alone, before ever broadcasting.
     const refundTxid = Transaction.fromRaw(hexToBytes(processed.hex), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
 
-    const txid = await this.broadcastOrThrow(processed.hex, refundTxid);
+    // P8-RESUME-SPEC.md rule 1: the signed bytes are handed to the caller (awaited) BEFORE anything is sent, so a
+    // restart can find this one refund again instead of signing a second.
+    const signed = { txid: refundTxid, rawTx: processed.hex };
+    if (options.onSigned !== undefined) await options.onSigned(signed);
+    let txid: string;
+    try {
+      txid = await this.broadcastOrThrow(processed.hex, refundTxid);
+    } catch (error) {
+      // `testmempoolaccept` refused it: `sendrawtransaction` was never called, so these bytes never reached the network.
+      if (error instanceof BtcBroadcastRefusedError && options.onNotBroadcast !== undefined) await options.onNotBroadcast(signed);
+      throw error;
+    }
     // R2-1: record the exact signed bytes broadcast, so a later retry can re-send the IDENTICAL
     // transaction if it drops out of the mempool without confirming (`resendRefundIfDropped`).
     return this.finishWriteEvidence(ref, txid, before, processed.hex);

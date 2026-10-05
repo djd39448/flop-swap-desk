@@ -361,6 +361,20 @@ export interface WriteEvidence {
   raw: string[];
 }
 
+/** P8-RESUME-SPEC.md: the on-chain status of a lock that exists (the contract's `None` is reported as no record). */
+export type EvmLockStatus = "Locked" | "Claimed" | "Refunded";
+
+/** P8-RESUME-SPEC.md: one `locks(hashLock)` row, decoded. */
+export interface EvmLockRecord {
+  status: EvmLockStatus;
+  payer: Address;
+  payee: Address;
+  token: Address;
+  amount: bigint;
+  claimByMs: bigint;
+  refundAfterMs: bigint;
+}
+
 export interface EvmHtlcRailOptions {
   config: EvmRailConfig;
   /** The transport every read and write goes through — also this rail's `CaptureSink`. */
@@ -794,6 +808,28 @@ export class EvmHtlcRail {
     // swap's worth of polling, and so a later write's own snapshot-at-start starts clean.
     this.rpc.drain();
     return result;
+  }
+
+  /**
+   * P8-RESUME-SPEC.md "Buyer lock A": the lock stored under `hashLock` at the latest block (`locks(hashLock)`), or
+   * `null` when the contract holds none (status `None`). A plain read, no write, no secret. It is the EVM recovery
+   * handle: the ref of an EVM lock IS its hash lock, so a restarted Buyer finds out whether its `approve` + `lock`
+   * pair landed by asking the contract, and a repeated `lock` for a hash lock that already has a row reverts on the
+   * contract's own duplicate check. Throws on a status byte outside 0..3 (a node that does not speak for this
+   * contract) and on a transport failure; neither is ever folded into `null`.
+   */
+  async readLock(hashLock: Hex): Promise<EvmLockRecord | null> {
+    const [payer, payee, token, amount, claimByMs, refundAfterMs, status] = await this.publicClient.readContract({
+      address: this.config.contract,
+      abi: EVM_HASH_RAIL_ABI,
+      functionName: "locks",
+      args: [hashLock],
+    });
+    if (status === 0) return null;
+    const names: Record<number, EvmLockStatus> = { 1: "Locked", 2: "Claimed", 3: "Refunded" };
+    const name = names[status];
+    if (name === undefined) throw new Error(`evm-htlc: locks(hashLock) returned an unknown status byte ${String(status)}`);
+    return { status: name, payer, payee, token, amount, claimByMs, refundAfterMs };
   }
 
   /** §2.2 point 4: bounded `eth_getLogs` for `Claimed(hashLock, preimage)`; returns the

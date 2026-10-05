@@ -468,7 +468,8 @@ interface NearPreparedWrite {
   lockTerms?: NearHtlcTerms;
 }
 
-interface NearLockView {
+/** P8: one `get_lock` row, decoded (`NearHtlcRail.readLock`). */
+export interface NearLockView {
   status: "Locked" | "Claiming" | "Claimed" | "Refunding" | "Refunded";
   payer: string;
   payee: string;
@@ -524,6 +525,17 @@ function successValueAmount(status: unknown): string | null {
 }
 
 // --- The rail ------------------------------------------------------------------------------------
+
+/**
+ * P8-RESUME-SPEC.md: the recorder `NearHtlcRail.refund` accepts. `onSigned` is awaited with the refund's transaction
+ * hash and complete signed bytes after signing and before anything is sent. `onNotSent` is called with the same pair
+ * when the refund provably never reached the network (the chain pin check that precedes the send failed). Omitted:
+ * no behaviour change.
+ */
+export interface NearRefundOptions {
+  onSigned?: (signed: { txHash: string; signedTxBase64: string }) => void | Promise<void>;
+  onNotSent?: (signed: { txHash: string; signedTxBase64: string }) => void | Promise<void>;
+}
 
 export interface NearHtlcRailOptions {
   config: NearRailConfig;
@@ -672,9 +684,20 @@ export class NearHtlcRail {
    *  already succeeded (S1), and `ft_transfer_call`'s own receiver-side `ft_on_transfer` can
    *  refuse the transfer while the token contract still reports `Success` for the transfer call
    *  itself (S3) — `kind`-specific below. */
-  private async sendPrepared(prepared: NearPreparedWrite, options: { pinChecked?: boolean } = {}): Promise<NearWriteEvidence> {
+  private async sendPrepared(
+    prepared: NearPreparedWrite,
+    options: { pinChecked?: boolean; onNotSent?: () => void | Promise<void> } = {},
+  ): Promise<NearWriteEvidence> {
     // H13: `claim` runs this check itself, BEFORE its deadline guard (the guard is the last read).
-    if (options.pinChecked !== true) await this.assertPinnedChain();
+    if (options.pinChecked !== true) {
+      try {
+        await this.assertPinnedChain();
+      } catch (error) {
+        // P8: nothing has been sent yet, so a caller that recorded this write may drop its record.
+        if (options.onNotSent !== undefined) await options.onNotSent();
+        throw error;
+      }
+    }
     const before = this.rpc.exchanges().length;
     // D1 (mirrors evm-htlc.ts's identical use): a comparably unique id for this write's own
     // captured exchanges, so a long-lived rail instance's ids never collide across two different
@@ -776,7 +799,7 @@ export class NearHtlcRail {
    * (near-ref.ts; squatting fix, replacing D-N4 "ref = hash lock": known before any write), not the tx hash. A caller records this
    * return value before ever calling `commitLock()`.
    */
-  async prepareLock(terms: NearHtlcTerms): Promise<{ ref: string; txHash: string }> {
+  async prepareLock(terms: NearHtlcTerms): Promise<{ ref: string; txHash: string; signedTxBase64: string }> {
     validateTerms(terms, this.config);
     await this.assertPinnedChain();
     const tokenAccount = this.resolveAsset(NEAR_ASSET_ID);
@@ -798,7 +821,8 @@ export class NearHtlcRail {
     // The ref names the payer (this signer) too: locks are keyed by (payer, hash lock).
     const ref = formatNearRef(terms.hashLock, this.signer.accountId);
     this.prepared = { ref, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "lock", lockTerms: terms };
-    return { ref, txHash: built.txHash };
+    // P8: the signed bytes ride along with the hash, so a caller can persist the whole recovery handle before `commitLock`.
+    return { ref, txHash: built.txHash, signedTxBase64: built.signedTxBase64 };
   }
 
   /** Sends exactly the transaction `prepareLock` most recently built and signed. Throws if
@@ -940,7 +964,7 @@ export class NearHtlcRail {
    * the payer's own wallet"), and chain time has reached `refundAfterMs` — all against a fresh
    * `final` read — before anything is built or signed.
    */
-  async refund(ref: string): Promise<NearWriteEvidence> {
+  async refund(ref: string, options: NearRefundOptions = {}): Promise<NearWriteEvidence> {
     const { hashLock, payer } = requireNearRef(ref);
     // The contract keys a refund by (predecessor, hash lock): only the payer's own signer can
     // ever reach its own lock, so a ref naming another payer is refused before anything is signed.
@@ -969,7 +993,33 @@ export class NearHtlcRail {
       deposit: 0n,
     };
     const built = await this.buildAndSign(this.config.contract, [action]);
-    return this.sendPrepared({ ref, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "refund" });
+    // P8-RESUME-SPEC.md rule 1: the signed refund's hash and bytes go to the caller (awaited) BEFORE anything is sent.
+    const signed = { txHash: built.txHash, signedTxBase64: built.signedTxBase64 };
+    if (options.onSigned !== undefined) await options.onSigned(signed);
+    return this.sendPrepared(
+      { ref, txHash: built.txHash, signedTxBase64: built.signedTxBase64, kind: "refund" },
+      options.onNotSent === undefined ? {} : { onNotSent: () => options.onNotSent?.(signed) },
+    );
+  }
+
+  /**
+   * P8-RESUME-SPEC.md: the lock stored under `ref` (`0x<hash lock>:<payer>`) at the final block, or `null` when none
+   * exists. A plain `get_lock` read; a transport failure or a malformed answer throws, it is never folded into
+   * `null` (the permissive `lockRecorded` in `src/client/near-rail.ts` does fold, which is why a recovery must not
+   * use it to decide "nothing is there").
+   */
+  async readLock(ref: string): Promise<NearLockView | null> {
+    return this.getLock(ref);
+  }
+
+  /**
+   * P8-RESUME-SPEC.md: this signer's access key nonce at the final block. A signed transaction with nonce `n` can
+   * only be accepted while `n` is greater than this value, so a value at or past `n` means that transaction can
+   * never land (the "nonce can no longer accept it" proof `recoverLock` uses for `never-landed`).
+   */
+  async finalAccessKeyNonce(): Promise<bigint> {
+    const key = await this.near.viewAccessKey(this.signer.accountId, this.signer.publicKey);
+    return BigInt(key.nonce);
   }
 
   /**

@@ -1248,7 +1248,11 @@ export class SolHtlcRail {
    * and the payer's associated token account is a usable destination. Then the common write path (record via
    * `onSigned`, simulate, send, FINALIZED, confirm Refunded).
    */
-  async refund(ref: string, onSigned?: (record: SolPreparedRecord) => void | Promise<void>, options: { priorityFeeAttempt?: number } = {}): Promise<SolWriteEvidence> {
+  async refund(
+    ref: string,
+    onSigned?: (record: SolPreparedRecord) => void | Promise<void>,
+    options: { priorityFeeAttempt?: number; onNotBroadcast?: (record: SolPreparedRecord) => void | Promise<void> } = {},
+  ): Promise<SolWriteEvidence> {
     const parsed = this.requireRef(ref);
     if (parsed.payer !== this.signer.publicKey) {
       throw new Error("sol-htlc: refund must be signed by the payer's own key (the ref's payer must equal the signer)");
@@ -1281,6 +1285,8 @@ export class SolHtlcRail {
     const plan = await this.blockhashPlan();
     const budget = await this.budgetInstructions(SOL_REFUND_COMPUTE_UNIT_LIMIT, [escrow, vault, payerToken], options.priorityFeeAttempt ?? 0);
     const prepared = await this.buildAndSign({ kind: "refund", ref }, [...budget, instruction], plan);
+    // P8: like a claim, a refund that provably never reached the network lets the caller drop its recorded signature.
+    if (options.onNotBroadcast !== undefined) prepared.onNotBroadcast = options.onNotBroadcast;
     if (onSigned !== undefined) await onSigned(prepared.record);
     return this.sendPrepared(prepared);
   }
