@@ -6,7 +6,7 @@
 // Two real in-memory wallets (throwaway seeds, never a real key), both parties' token accounts funded on the
 // fake node, one shared in-memory venue and one shared paper-rail note store (leg B).
 
-import { dealRoom, MemoryNoteStore, PaperRail, tryDecodeFrame, type TranscriptRecord } from "@flop-labs/tclk";
+import { dealRoom, generateHashLock, MemoryNoteStore, PaperRail, tryDecodeFrame, type HashLock, type TranscriptRecord } from "@flop-labs/tclk";
 
 import { BuyerFlow } from "../../src/client/buyer.js";
 import { createSolCounterRail } from "../../src/client/sol-rail.js";
@@ -41,6 +41,9 @@ export interface SolHarnessOptions {
   sellerAccount?: boolean;
   /** S2-4: the Seller's bound on one reveal post attempt (default: the flow's own). */
   revealPostTimeoutMs?: number;
+  /** P8: the secret the Seller mints (the flow keeps its secret in a `#private` field, so a test that needs to know it
+   *  injects it). Default: a fresh random lock, returned as `sellerLock`. */
+  sellerLock?: HashLock;
 }
 
 export function solHarness(options: SolHarnessOptions = {}) {
@@ -69,8 +72,17 @@ export function solHarness(options: SolHarnessOptions = {}) {
   const sellerRail = createSolCounterRail({ ...railOptions, rpc: node.rpc(), signer: sellerWallet });
 
   const buyerFlow = new BuyerFlow({ identity: buyer, venue, paperRail: new PaperRail(noteStore, clock), rail: buyerRail, clock });
-  const sellerFlow = new SellerFlow({ identity: seller, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock, ...(options.revealPostTimeoutMs === undefined ? {} : { revealPostTimeoutMs: options.revealPostTimeoutMs }) });
-  return { node, buyer, seller, buyerWallet, sellerWallet, buyerRail, sellerRail, venue, noteStore, clockRef, clock, setTime, buyerFlow, sellerFlow };
+  const sellerLock = options.sellerLock ?? generateHashLock();
+  const sellerFlow = new SellerFlow({
+    identity: seller,
+    venue,
+    paperRail: new PaperRail(noteStore, clock),
+    rail: sellerRail,
+    clock,
+    mintHashLock: () => sellerLock,
+    ...(options.revealPostTimeoutMs === undefined ? {} : { revealPostTimeoutMs: options.revealPostTimeoutMs }),
+  });
+  return { node, buyer, seller, buyerWallet, sellerWallet, buyerRail, sellerRail, venue, noteStore, clockRef, clock, setTime, buyerFlow, sellerFlow, sellerLock };
 }
 
 export type SolHarness = ReturnType<typeof solHarness>;

@@ -590,11 +590,11 @@ describe("refusals and recoveries of the claim", () => {
   });
 });
 
-/** The Seller's minted secret: the flow keeps it private, so the test reads what the chain will show: a
- *  relayer needs the preimage, which a real relayer learns from a public reveal; here the test derives it from
- *  the SellerFlow's private field, the only place a hermetic test may look. */
+/** The Seller's minted secret: the flow keeps it in a `#private` field (P8, rule 5), so the harness injects the
+ *  lock the Seller mints (`mintHashLock`) and the test reads it back from there: a relayer needs the preimage,
+ *  which a real relayer learns from a public reveal. */
 function sellerSecret(h: SolHarness): string {
-  return (h.sellerFlow as unknown as { hashLock: { preimage: string } }).hashLock.preimage;
+  return h.sellerLock.preimage;
 }
 function decodeSignature(base64Tx: string): string {
   // the transaction id of a legacy transaction: its first 64 bytes after the one-byte signature count

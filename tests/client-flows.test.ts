@@ -38,6 +38,7 @@ import {
   makeOffer,
   tryDecodeFrame,
   type AcceptFrame,
+  type HashLock,
   type NoteStore,
   type OfferFrame,
   type TranscriptRecord,
@@ -198,7 +199,11 @@ interface Harness {
   sellerFlow: SellerFlow;
 }
 
-function harness(buyerTag: number, sellerTag: number, opts?: { buyerRpc?: CapturingRpc; sellerRpc?: CapturingRpc }): Harness {
+function harness(
+  buyerTag: number,
+  sellerTag: number,
+  opts?: { buyerRpc?: CapturingRpc; sellerRpc?: CapturingRpc; mintHashLock?: () => HashLock },
+): Harness {
   const buyer = ident(buyerTag);
   const seller = ident(sellerTag);
   const clockRef = { ms: T0 };
@@ -219,6 +224,7 @@ function harness(buyerTag: number, sellerTag: number, opts?: { buyerRpc?: Captur
     paperRail: new PaperRail(noteStore, clock),
     rail: createEvmCounterRail({ config, rpc: opts?.sellerRpc ?? unreachableRpc(), account: SELLER_ACCOUNT, clock }),
     clock,
+    ...(opts?.mintHashLock === undefined ? {} : { mintHashLock: opts.mintHashLock }),
   });
   return { buyer, seller, venue, clockRef, clock, buyerFlow, sellerFlow };
 }
@@ -590,16 +596,17 @@ describe("SellerFlow.claimLegA — B2", () => {
       // 1 minute before claimByMs; only 2 minutes remain before refundAfterMs.
       eth_getBlockByNumber: () => ({ result: { timestamp: numberToHex(Math.floor((claimByMs - 60_000) / 1000)) } }),
     });
-    const h = harness(46, 47, { sellerRpc: rpc });
-    const { offerA, acceptARecord } = await bidAndAcceptA(h, "00000001");
+    // P8: the flow keeps its secret in an ES #private field now, so the secret is injected (`mintHashLock`) instead of
+    // being assigned from outside; acceptLegA below mints exactly this lock.
     const hashLock = generateHashLock();
+    const h = harness(46, 47, { sellerRpc: rpc, mintHashLock: () => hashLock });
+    const { offerA, acceptARecord } = await bidAndAcceptA(h, "00000001");
     const acceptA = makeAccept(offerA, { from: h.seller.did, statement: hashLock.hash });
     const tamperedOfferA: OfferFrame = { ...offerA, claimByMs, refundAfterMs };
     // Deliberately bypasses acceptLegA's own margin guard — see the comment above.
     Object.assign(h.sellerFlow as unknown as Record<string, unknown>, {
       offerA: tamperedOfferA,
       acceptA: { ...acceptA, ref: tamperedOfferA.id },
-      hashLock,
     });
     void acceptARecord;
     await expect(h.sellerFlow.claimLegA(hashLock.hash)).rejects.toThrow(/claim-inclusion margin.*remains before refundAfterMs/);
@@ -635,15 +642,14 @@ describe("SellerFlow.claimLegA — C3 (chain time that cannot freeze)", () => {
       // above the margin, and short of claimByMs too: chain time alone says this is entirely safe.
       eth_getBlockByNumber: () => ({ result: { timestamp: numberToHex(Math.floor((T0 + 50 * 60_000) / 1000)) } }),
     });
-    const h = harness(68, 69, { sellerRpc: rpc });
+    const hashLock = generateHashLock(); // P8: injected, see the note on the test above
+    const h = harness(68, 69, { sellerRpc: rpc, mintHashLock: () => hashLock });
     const { offerA } = await bidAndAcceptA(h, "00000001");
-    const hashLock = generateHashLock();
     const acceptA = makeAccept(offerA, { from: h.seller.did, statement: hashLock.hash });
     const tamperedOfferA: OfferFrame = { ...offerA, claimByMs, refundAfterMs };
     Object.assign(h.sellerFlow as unknown as Record<string, unknown>, {
       offerA: tamperedOfferA,
       acceptA: { ...acceptA, ref: tamperedOfferA.id },
-      hashLock,
     });
     // Wall-clock has moved to T0+59min: still short of claimByMs (T0+61min), but only 4 minutes
     // before refundAfterMs — below the 5-minute margin.

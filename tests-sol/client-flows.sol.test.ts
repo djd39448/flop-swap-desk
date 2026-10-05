@@ -52,7 +52,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { MemoryNoteStore, OFFER_ROOM, PaperRail, dealRoom, paperNote, tryDecodeFrame, verifyHashPreimage, type LockTerms, type TranscriptRecord } from "@flop-labs/tclk";
+import { MemoryNoteStore, OFFER_ROOM, PaperRail, dealRoom, generateHashLock, paperNote, tryDecodeFrame, verifyHashPreimage, type LockTerms, type TranscriptRecord } from "@flop-labs/tclk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
@@ -211,8 +211,10 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
       ...(options.sellerSleep === undefined ? {} : { sleep: options.sellerSleep }),
     });
     const buyerFlow = new BuyerFlow({ identity: options.buyer, venue, paperRail: new PaperRail(noteStore, clock), rail: buyerRail, clock });
-    const sellerFlow = new SellerFlow({ identity: options.seller, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock });
-    return { buyer: options.buyer, seller: options.seller, buyerParty, sellerParty, skew, clock, venue, noteStore, buyerRpc, sellerRpc, buyerSends: buyerCount.sends, sellerSends: sellerCount.sends, buyerRail, sellerRail, buyerFlow, sellerFlow };
+    // P8: the Seller keeps its secret in a #private field, so the harness injects the lock it mints and tests read it here.
+    const sellerLock = generateHashLock();
+    const sellerFlow = new SellerFlow({ identity: options.seller, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock, mintHashLock: () => sellerLock });
+    return { buyer: options.buyer, seller: options.seller, buyerParty, sellerParty, skew, clock, venue, noteStore, buyerRpc, sellerRpc, buyerSends: buyerCount.sends, sellerSends: sellerCount.sends, buyerRail, sellerRail, buyerFlow, sellerFlow, sellerLock };
   }
 
   /** The chain's own FINALIZED slot time (what the adapter's claim and refund windows are judged against). */
@@ -746,7 +748,7 @@ describe("Seller/Buyer client flows against a real solana-test-validator", () =>
     // The Buyer never learns the secret from the failed transaction and never claims leg B: nobody was paid.
     const sendsBefore = h.buyerSends();
     await expect(h.buyerFlow.learnSecret()).rejects.toThrow(/leg A not claimed on chain yet/);
-    await expect(h.buyerFlow.claimLegB((h.sellerFlow as unknown as { hashLock: { preimage: string } }).hashLock.preimage)).rejects.toThrow(/leg A is not Claimed on chain/);
+    await expect(h.buyerFlow.claimLegB(h.sellerLock.preimage)).rejects.toThrow(/leg A is not Claimed on chain/);
     expect(h.buyerSends()).toBe(sendsBefore);
 
     // Once the REAL chain time passes refundAfterMs the Buyer refunds leg A (the program refuses every claim now).

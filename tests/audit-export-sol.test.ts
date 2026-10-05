@@ -93,7 +93,7 @@ async function buildBundle(
     // R3-9: a third party claims leg B with the public secret, then leg A is refunded anyway (the flow's own guard
     // refuses that, so the refund is made on the rail directly and its frames are posted as the Buyer would).
     const legBContractStolen = (tryDecodeFrame(p.acceptBRecord.line) as AcceptFrame).contract;
-    await new PaperRail(h.noteStore, h.clock).claim(legBContractStolen, (h.sellerFlow as unknown as { hashLock: { preimage: string } }).hashLock.preimage);
+    await new PaperRail(h.noteStore, h.clock).claim(legBContractStolen, h.sellerLock.preimage); // P8: the Seller's secret is injected by the harness (mintHashLock), not read out of the flow
     h.setTime(p.offerA.refundAfterMs);
     const connected = await h.buyerRail.connect(offerAcceptLockTerms(p.offerA, p.acceptA), { payer: h.buyerWallet.publicKey, payee: h.sellerWallet.publicKey });
     await connected.refund(p.ref);

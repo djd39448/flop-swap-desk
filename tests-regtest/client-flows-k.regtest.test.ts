@@ -9,7 +9,7 @@
 //
 // Design source: flop-contrib/handoff/P4-BTC-FIXES-R3.md K1, K2.
 
-import { MemoryNoteStore, PaperRail } from "@flop-labs/tclk";
+import { MemoryNoteStore, PaperRail, generateHashLock } from "@flop-labs/tclk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
@@ -71,7 +71,9 @@ function setupSwap(node: BitcoindHandle, config: BtcRailConfig, buyer: Party, se
   });
 
   const buyerFlow = new BuyerFlow({ identity: buyer.identity, venue, paperRail: new PaperRail(noteStore, clock), rail: buyerRail, clock });
-  const sellerFlow = new SellerFlow({ identity: seller.identity, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock });
+  // P8: the Seller keeps its secret in a #private field, so the harness injects the lock it mints and tests read it here.
+  const sellerLock = generateHashLock();
+  const sellerFlow = new SellerFlow({ identity: seller.identity, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock, mintHashLock: () => sellerLock });
 
   async function warpTo(nowMs: number): Promise<void> {
     clockRef.ms = nowMs;
@@ -82,7 +84,7 @@ function setupSwap(node: BitcoindHandle, config: BtcRailConfig, buyer: Party, se
     await node.mine(n);
   }
 
-  return { clockRef, clock, venue, noteStore, buyerFlow, sellerFlow, buyerRail, sellerRail, warpTo, mineBlocks };
+  return { clockRef, clock, venue, noteStore, buyerFlow, sellerFlow, sellerLock, buyerRail, sellerRail, warpTo, mineBlocks };
 }
 
 type Swap = ReturnType<typeof setupSwap>;
@@ -148,7 +150,7 @@ describe("K1/K2 — a pending (unmined) claim, on a real bitcoind mempool", () =
     expect(mempool).toHaveLength(1); // the claim really is only in the mempool
 
     const secret = await h.buyerFlow.learnSecret();
-    expect(secret).toBe((h.sellerFlow as unknown as { hashLock: { preimage: string } }).hashLock.preimage);
+    expect(secret).toBe(h.sellerLock.preimage);
 
     // And the secret genuinely settles leg B (SPEC's own promise: a learned secret always works).
     const claimed = await h.buyerFlow.claimLegB(secret);
@@ -266,6 +268,6 @@ describe("K2 — a lost claim reply still lets the Seller post its reveal and re
     // merely the two frames.
     await h.mineBlocks(2);
     const secret = await h.buyerFlow.learnSecret();
-    expect(secret).toBe((h.sellerFlow as unknown as { hashLock: { preimage: string } }).hashLock.preimage);
+    expect(secret).toBe(h.sellerLock.preimage);
   }, 120_000);
 });

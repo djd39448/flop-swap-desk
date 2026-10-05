@@ -13,7 +13,7 @@
 //
 // Design source: flop-contrib/handoff/P4-BTC-FIXES.md G1, G2, G3, G4, G8, G9.
 
-import { MemoryNoteStore, PaperRail, dealRoom, encodeFrame, tryDecodeFrame, verifyTranscriptRecord } from "@flop-labs/tclk";
+import { MemoryNoteStore, PaperRail, dealRoom, encodeFrame, generateHashLock, tryDecodeFrame, verifyTranscriptRecord } from "@flop-labs/tclk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
@@ -74,7 +74,9 @@ function setupSwap(node: BitcoindHandle, config: BtcRailConfig, buyer: Party, se
   });
 
   const buyerFlow = new BuyerFlow({ identity: buyer.identity, venue, paperRail: new PaperRail(noteStore, clock), rail: buyerRail, clock });
-  const sellerFlow = new SellerFlow({ identity: seller.identity, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock });
+  // P8: the Seller keeps its secret in a #private field, so the harness injects the lock it mints and tests read it here.
+  const sellerLock = generateHashLock();
+  const sellerFlow = new SellerFlow({ identity: seller.identity, venue, paperRail: new PaperRail(noteStore, clock), rail: sellerRail, clock, mintHashLock: () => sellerLock });
 
   async function warpTo(nowMs: number): Promise<void> {
     clockRef.ms = nowMs;
@@ -85,7 +87,7 @@ function setupSwap(node: BitcoindHandle, config: BtcRailConfig, buyer: Party, se
     await node.mine(n);
   }
 
-  return { clockRef, clock, venue, noteStore, buyerFlow, sellerFlow, buyerRail, sellerRail, warpTo, mineBlocks };
+  return { clockRef, clock, venue, noteStore, buyerFlow, sellerFlow, sellerLock, buyerRail, sellerRail, warpTo, mineBlocks };
 }
 
 type Swap = ReturnType<typeof setupSwap>;
@@ -270,7 +272,7 @@ describe("Group G — Bitcoin client-flow fixes that need a real bitcoind wallet
       await h.sellerFlow.claimLegA(lockA.hashLock);
 
       const secret = await h.buyerFlow.learnSecret();
-      expect(secret).toBe((h.sellerFlow as unknown as { hashLock: { preimage: string } }).hashLock.preimage);
+      expect(secret).toBe(h.sellerLock.preimage);
     }, 120_000);
   });
 

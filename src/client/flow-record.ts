@@ -223,6 +223,8 @@ export interface SellerFlowState {
   lockedLegBContract?: string;
   frozenLegAAccounts?: RailAccountsJson;
   frozenLegARailRef?: string;
+  /** This party's own proven account (or pubkey) line: the address, and the exact text posted (the Buyer's twin). */
+  ownAccountLine?: { address: string; text: string };
   /** True from just before the first leg A claim is sent, on any rail. */
   claimAttempted: boolean;
   /** Solana: every claim signature signed and not yet resolved (recorded before simulate/send). */
@@ -425,8 +427,15 @@ export function withLedgerLanded<T extends FlowRecord>(record: T, kind: LedgerKi
 
 /** A record that is safe to put in a log or an error message: the preimage is replaced. */
 export function redactFlowRecord(record: FlowRecord): Record<string, unknown> {
-  const copy = cloneFlowRecord(record) as unknown as Record<string, unknown>;
-  if ("preimage" in copy) copy.preimage = "[redacted]";
+  const copy = cloneFlowRecord(record) as unknown as Record<string, unknown> & { ledger: LedgerEntry[] };
+  if ("preimage" in copy && typeof copy.preimage === "string") {
+    const secretHex = copy.preimage.replace(/^0x/, "");
+    // The Seller's reveal frame carries the preimage in its text: that entry is masked too.
+    for (const entry of copy.ledger) {
+      if (secretHex !== "" && entry.text.includes(secretHex)) entry.text = "[redacted]";
+    }
+    copy.preimage = "[redacted]";
+  }
   return copy;
 }
 
@@ -706,7 +715,7 @@ class Reader {
 const COMMON_REQUIRED = ["v", "role", "swapId", "did", "railId", "caip2", "createdAtMs", "updatedAtMs", "revision", "frames", "ledger"] as const;
 const COMMON_OPTIONAL = ["contractA", "contractB", "lockTimeMs", "legB"] as const;
 const SELLER_REQUIRED = ["preimage", "statement", "claimAttempted", "claimRecords", "neverLandedClaims", "claimOutcome", "revealPosted", "receiptPosted", "legBRefund"] as const;
-const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "publicClaimSignature"] as const;
+const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature"] as const;
 const BUYER_REQUIRED = ["legBVerified", "lock", "legBClaimAttempted", "legBClaimed", "refund", "refundNotes"] as const;
 const BUYER_OPTIONAL = ["ownAccountLine"] as const;
 
@@ -816,6 +825,15 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
   const refundObject = r.object(o.legBRefund, `${path}.legBRefund`, ["attempted", "done", "framesPosted"]);
   const frozenLegAAccounts = r.optional(o, "frozenLegAAccounts", (v, p) => r.accounts(v, p), path);
   const frozenLegARailRef = r.optional(o, "frozenLegARailRef", (v, p) => r.string(v, p), path);
+  const ownAccountLine = r.optional(
+    o,
+    "ownAccountLine",
+    (v, p) => {
+      const l = r.object(v, p, ["address", "text"]);
+      return { address: r.string(l.address, `${p}.address`), text: r.line(l.text, `${p}.text`) };
+    },
+    path,
+  );
   return {
     ...common,
     role: "seller",
@@ -825,6 +843,7 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
     ...(lockedLegBContract === undefined ? {} : { lockedLegBContract }),
     ...(frozenLegAAccounts === undefined ? {} : { frozenLegAAccounts }),
     ...(frozenLegARailRef === undefined ? {} : { frozenLegARailRef }),
+    ...(ownAccountLine === undefined ? {} : { ownAccountLine }),
     claimAttempted,
     claimRecords,
     ...(publicClaimSignature === undefined ? {} : { publicClaimSignature }),
