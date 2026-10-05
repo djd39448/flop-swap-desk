@@ -8,9 +8,10 @@
 
 import { dealRoom, generateHashLock, MemoryNoteStore, PaperRail, tryDecodeFrame, type HashLock, type TranscriptRecord } from "@flop-labs/tclk";
 
-import { BuyerFlow } from "../../src/client/buyer.js";
+import { BuyerFlow, type BuyerFlowOptions } from "../../src/client/buyer.js";
+import type { FlowStore } from "../../src/client/flow-store.js";
 import { createSolCounterRail } from "../../src/client/sol-rail.js";
-import { SellerFlow } from "../../src/client/seller.js";
+import { SellerFlow, type SellerFlowOptions } from "../../src/client/seller.js";
 import { MemoryVenue } from "../../src/client/venue.js";
 import { swapId as computeSwapId } from "../../src/profile.js";
 import { InMemorySolSigner } from "../../src/rails/sol-signer-memory.js";
@@ -44,6 +45,9 @@ export interface SolHarnessOptions {
   /** P8: the secret the Seller mints (the flow keeps its secret in a `#private` field, so a test that needs to know it
    *  injects it). Default: a fresh random lock, returned as `sellerLock`. */
   sellerLock?: HashLock;
+  /** P8: give the flows a store (crash-resume tests). Absent: the flows run exactly as before. */
+  buyerStore?: FlowStore;
+  sellerStore?: FlowStore;
 }
 
 export function solHarness(options: SolHarnessOptions = {}) {
@@ -71,9 +75,17 @@ export function solHarness(options: SolHarnessOptions = {}) {
   const buyerRail = createSolCounterRail({ ...railOptions, rpc: node.rpc(), signer: buyerWallet });
   const sellerRail = createSolCounterRail({ ...railOptions, rpc: node.rpc(), signer: sellerWallet });
 
-  const buyerFlow = new BuyerFlow({ identity: buyer, venue, paperRail: new PaperRail(noteStore, clock), rail: buyerRail, clock });
+  const buyerOptions: BuyerFlowOptions = {
+    identity: buyer,
+    venue,
+    paperRail: new PaperRail(noteStore, clock),
+    rail: buyerRail,
+    clock,
+    ...(options.buyerStore === undefined ? {} : { store: options.buyerStore }),
+  };
+  const buyerFlow = new BuyerFlow(buyerOptions);
   const sellerLock = options.sellerLock ?? generateHashLock();
-  const sellerFlow = new SellerFlow({
+  const sellerOptions: SellerFlowOptions = {
     identity: seller,
     venue,
     paperRail: new PaperRail(noteStore, clock),
@@ -81,8 +93,10 @@ export function solHarness(options: SolHarnessOptions = {}) {
     clock,
     mintHashLock: () => sellerLock,
     ...(options.revealPostTimeoutMs === undefined ? {} : { revealPostTimeoutMs: options.revealPostTimeoutMs }),
-  });
-  return { node, buyer, seller, buyerWallet, sellerWallet, buyerRail, sellerRail, venue, noteStore, clockRef, clock, setTime, buyerFlow, sellerFlow, sellerLock };
+    ...(options.sellerStore === undefined ? {} : { store: options.sellerStore }),
+  };
+  const sellerFlow = new SellerFlow(sellerOptions);
+  return { node, buyer, seller, buyerWallet, sellerWallet, buyerRail, sellerRail, venue, noteStore, clockRef, clock, setTime, buyerFlow, sellerFlow, sellerLock, buyerOptions, sellerOptions };
 }
 
 export type SolHarness = ReturnType<typeof solHarness>;
