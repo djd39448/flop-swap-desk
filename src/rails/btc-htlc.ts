@@ -268,7 +268,7 @@ function validateTerms(terms: BtcHtlcTerms): void {
 export class BtcBroadcastRefusedError extends Error {
   readonly reason: string;
   constructor(reason: string | undefined) {
-    super(`btc-htlc: refusing to broadcast — testmempoolaccept rejected it (${reason ?? "no reason given"})`);
+    super(`btc-htlc: refusing to broadcast \u2014 testmempoolaccept rejected it (${reason ?? "no reason given"})`);
     this.name = "BtcBroadcastRefusedError";
     this.reason = reason ?? "no reason given";
   }
@@ -688,7 +688,7 @@ export class BtcHtlcRail {
       throw new Error("btc-htlc: the recorded funding rawTx does not decode as a transaction");
     }
     if (decodedTxid !== refTxid) {
-      throw new Error("btc-htlc: the recorded funding rawTx does not hash to the ref's txid — refusing to broadcast it");
+      throw new Error("btc-htlc: the recorded funding rawTx does not hash to the ref's txid, refusing to broadcast it");
     }
     await this.assertPinnedChain();
     const before = this.rpc.exchanges().length;

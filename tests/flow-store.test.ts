@@ -6,10 +6,10 @@
 // than an empty answer (rule 6), the key grammar, nothing written outside the directory, and the file mode where
 // the platform has one.
 
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, promises as fsp, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   FileFlowStore,
@@ -201,6 +201,30 @@ describe("FileFlowStore", () => {
     // after the rename only the final file exists
     for (const stage of seen.slice(2)) expect(stage.files).toEqual([final]);
     expect(readdirSync(dir)).toEqual([final]);
+  });
+
+  it("fsyncs the temp file BEFORE the rename, and the directory AFTER it (the directory not on Windows, which cannot)", async () => {
+    const probe = await fsp.open(join(root, "probe"), "w");
+    const proto = Object.getPrototypeOf(probe) as { sync: (this: unknown) => Promise<void> };
+    await probe.close();
+    const realSync = proto.sync;
+    const realRename = fsp.rename.bind(fsp);
+    const order: string[] = [];
+    const syncSpy = vi.spyOn(proto, "sync").mockImplementation(function (this: unknown) {
+      order.push("fsync");
+      return realSync.call(this);
+    });
+    const renameSpy = vi.spyOn(fsp, "rename").mockImplementation(async (from, to) => {
+      order.push("rename");
+      return realRename(from, to);
+    });
+    try {
+      await new FileFlowStore(join(root, "flows")).save(KEY_BUYER, bytes("x"));
+    } finally {
+      syncSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+    expect(order).toEqual(process.platform === "win32" ? ["fsync", "rename"] : ["fsync", "rename", "fsync"]);
   });
 
   it.skipIf(process.platform === "win32")("fsyncs the directory after the rename (not on Windows, which cannot)", async () => {

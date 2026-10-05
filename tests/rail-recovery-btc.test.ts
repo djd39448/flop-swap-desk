@@ -309,7 +309,7 @@ describe("BtcHtlcRail.rebroadcastFunding", () => {
     const error = await rail.rebroadcastFunding(REF, FUNDING_HEX).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(BtcBroadcastRefusedError);
     expect((error as BtcBroadcastRefusedError).reason).toBe("bad-txns-inputs-missingorspent");
-    expect((error as Error).message).toBe("btc-htlc: refusing to broadcast — testmempoolaccept rejected it (bad-txns-inputs-missingorspent)");
+    expect((error as Error).message).toBe("btc-htlc: refusing to broadcast \u2014 testmempoolaccept rejected it (bad-txns-inputs-missingorspent)");
   });
 });
 
