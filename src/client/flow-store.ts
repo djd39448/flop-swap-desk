@@ -40,6 +40,9 @@ export const FLOW_KEY_PATTERN = /^(buyer|seller):(0x[0-9a-f]{64})$/;
 /** The file-name form of a key, `<role>-<swapId>.json`. */
 const FILE_NAME_PATTERN = /^(buyer|seller)-(0x[0-9a-f]{64})\.json$/;
 
+/** The format tag alone, to tell "a format this build does not know" from "not one of our files at all". */
+const FORMAT_PATTERN = /^flop-flow-store\/([0-9]+) /;
+
 /** The first line of a `FileFlowStore` file: format tag, payload sha256, payload length. */
 const HEADER_PATTERN = /^flop-flow-store\/1 sha256=([0-9a-f]{64}) length=([0-9]+)\n/;
 
@@ -283,7 +286,12 @@ export class FileFlowStore implements FlowStore {
     }
     const newline = file.indexOf(0x0a);
     if (newline < 0) throw new FlowStoreCorruptError(key, "no header line");
-    const header = HEADER_PATTERN.exec(file.subarray(0, newline + 1).toString("latin1"));
+    const headerLine = file.subarray(0, newline + 1).toString("latin1");
+    const formatVersion = FORMAT_PATTERN.exec(headerLine);
+    if (formatVersion !== null && formatVersion[1] !== "1") {
+      throw new FlowStoreCorruptError(key, `unknown store format version ${formatVersion[1]}, this build reads version 1 only`);
+    }
+    const header = HEADER_PATTERN.exec(headerLine);
     if (header === null) throw new FlowStoreCorruptError(key, "unrecognised header");
     const payload = file.subarray(newline + 1);
     const length = Number(header[2]);

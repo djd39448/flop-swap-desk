@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { FlowRecordVersionError, loadFlowRecord, saveFlowRecord } from "../src/client/flow-record.js";
 import {
   FileFlowStore,
   FlowStoreCorruptError,
@@ -21,6 +22,7 @@ import {
   parseFlowKey,
   type FileSaveStep,
 } from "../src/client/flow-store.js";
+import { sampleBuyerRecord } from "./helpers/flow-record-samples.js";
 
 const SWAP_A = `0x${"ab".repeat(32)}`;
 const SWAP_B = `0x${"cd".repeat(32)}`;
@@ -320,6 +322,28 @@ describe("FileFlowStore", () => {
       const swapped = Buffer.concat([file.subarray(0, newline + 1), Buffer.from('{"v":1,"hello":"WORLD"}')]); // same length
       writeFileSync(filePath(dir), swapped);
       await expect(store.load(KEY_BUYER)).rejects.toThrow(FlowStoreCorruptError);
+    });
+
+    it("an unknown store format version in the header is refused by name, never read", async () => {
+      const { dir, store } = await seeded();
+      const file = readFileSync(filePath(dir));
+      writeFileSync(filePath(dir), Buffer.concat([Buffer.from(file.toString("latin1").replace("flop-flow-store/1 ", "flop-flow-store/2 "), "latin1")]));
+      const error = await store.load(KEY_BUYER).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(FlowStoreCorruptError);
+      expect((error as FlowStoreCorruptError).reason).toMatch(/unknown store format version 2/);
+    });
+
+    it("an unknown RECORD version stored through a healthy store is refused when decoded, not read as empty", async () => {
+      const dir = join(root, "flows");
+      const store = new FileFlowStore(dir);
+      const record = sampleBuyerRecord();
+      await saveFlowRecord(store, record);
+      expect(await loadFlowRecord(store, "buyer", record.swapId)).toEqual(record);
+      // the next release writes version 2 records: this build must refuse one that arrives through a valid store file
+      const written = new TextDecoder().decode((await store.load(`buyer:${record.swapId}`))!);
+      expect(written.startsWith('{"v":1,')).toBe(true);
+      await store.save(`buyer:${record.swapId}`, new TextEncoder().encode(written.replace('{"v":1,', '{"v":2,')));
+      await expect(loadFlowRecord(store, "buyer", record.swapId)).rejects.toThrow(FlowRecordVersionError);
     });
 
     it("carries the key and a reason on the error", async () => {
