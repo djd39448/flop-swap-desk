@@ -390,9 +390,13 @@ export class SellerFlow {
     const journal = this.#journal;
     if (journal === undefined) return "acceptLegA";
     if (!(journal.isLanded("accept-a") && journal.isLanded("offer-b"))) return "acceptLegA";
-    if (!journal.isLanded("account-a")) return "postAccountLineA";
     if (this.legBRefundAttempted || this.legBRefundDone) return journal.isLanded("receipt-refund-b") ? "done" : "refundLegB";
-    if (this.lockedLegBContract === undefined || !journal.isLanded("lock-b")) return "lockLegB";
+    // A leg B lock that was started is finished first (its recover path), whatever else is still open.
+    const lockStarted = this.attemptedAcceptB !== undefined;
+    const lockFinished = this.lockedLegBContract !== undefined && journal.isLanded("lock-b");
+    if (lockStarted && !lockFinished) return "lockLegB";
+    if (!journal.isLanded("account-a")) return "postAccountLineA";
+    if (!lockFinished) return "lockLegB";
     if (journal.isLanded("receipt-a")) return "done";
     return "claimLegA";
   }
@@ -684,7 +688,7 @@ export class SellerFlow {
         asset: classification.context.wantAsset,
         lock: "hash",
         // The declared want-rail (e.g. "flop-htlc") plus "paper" (tclk's own rehearsal rail,
-        // which is what this build actually settles leg B on — there is no FLOP chain adapter
+        // which is what this build actually settles leg B on - there is no FLOP chain adapter
         // yet): `checkOrientation` requires the want-rail be offered, and the `lock` frame this
         // flow posts (`lockLegB`) declares `rail: "paper"`, which the tclk state machine only
         // accepts when the offer itself lists it (same convention as the 2026-09-18 rehearsal
@@ -814,7 +818,7 @@ export class SellerFlow {
   }
 
   /** Post this Seller's own leg-A account/key line (D-08) into leg A's deal room, as the payee
-   *  — required before the Buyer may lock (SPEC §3, §6).
+   *  - required before the Buyer may lock (SPEC section 3, section 6).
    *
    *  P8-RESUME-SPEC.md rules 1 and 3: with a store, the proven line is built ONCE and its exact text saved before it
    *  is posted; a repeat (or a resumed call) re-posts only that text, only when the room lacks it, and never once leg
@@ -824,7 +828,7 @@ export class SellerFlow {
     const { offerA, acceptA } = this.requireAcceptedA();
     const journal = this.#journal;
     if (journal === undefined) {
-      // P7: a proven line — the chain key signs a message binding this DID and this leg's contract.
+      // P7: a proven line - the chain key signs a message binding this DID and this leg's contract.
       const line = await this.rail.proveAccountLine({
         address,
         did: this.identity.did,
