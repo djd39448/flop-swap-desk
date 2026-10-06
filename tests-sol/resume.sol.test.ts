@@ -47,6 +47,7 @@ import { SolHtlcRail, type SolSigner } from "../src/rails/sol-htlc.js";
 import { SolRpc } from "../src/rails/sol-rpc.js";
 import { offerAcceptLockTerms } from "../src/swap.js";
 import { identity, type Identity } from "../tests/helpers/identity.js";
+import { sellerKeyOf } from "../tests/helpers/seller-key.js";
 import { assertSavesClean, countingFetch, lossyFetch, RecordingStore, swapProblems, type CountingFetch, type Outcome } from "../tests/helpers/live-resume.js";
 import { startSolValidator, type SolParty, type SolValidatorHandle } from "./helpers/validator.js";
 
@@ -207,7 +208,8 @@ describe("Resume on a real solana-test-validator: a send landed, its reply was l
   async function readRecord(store: RecordingStore, role: "buyer", swapId: string): Promise<BuyerFlowRecord>;
   async function readRecord(store: RecordingStore, role: "seller", swapId: string): Promise<SellerFlowRecord>;
   async function readRecord(store: RecordingStore, role: "buyer" | "seller", swapId: string): Promise<BuyerFlowRecord | SellerFlowRecord> {
-    const key = flowKey(role, swapId);
+    // A Seller record is keyed by leg A's contract id (R1-14), not by the swap id: find it through the store's listing.
+    const key = role === "seller" ? await sellerKeyOf(store) : flowKey(role, swapId);
     const bytes = await store.load(key);
     if (bytes === null) throw new Error(`test: the ${role} has no stored record`);
     const record = decodeFlowRecord(bytes, key);
