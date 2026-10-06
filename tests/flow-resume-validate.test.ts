@@ -158,6 +158,15 @@ describe("resume fails closed on bad state (rule 6)", () => {
   });
 });
 
+describe("a flow with a store needs a swap id the record can be stored under", () => {
+  it("a Buyer bid with a swap id that is not 0x + 64 hex is refused before anything is posted", async () => {
+    const r = rig();
+    await expect(r.buyer.bid({ ...bidParams(r), swapId: "not-a-swap-id" })).rejects.toThrow(/0x \+ 64 lowercase hex/);
+    expect((await r.h.venue.read("tclk-offers")).length).toBe(0);
+    expect(await r.buyerStore.list()).toEqual([]);
+  });
+});
+
 describe("a new flow never overwrites a stored swap", () => {
   it("bid and acceptLegA over an existing record are refused (resume is the way back in), and nothing is posted", async () => {
     const r = rig();

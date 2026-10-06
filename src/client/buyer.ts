@@ -85,7 +85,7 @@ import {
 } from "@flop-labs/tclk";
 
 import { checkSwapDeadlines } from "../deadlines.js";
-import { checkLegBMatchesWant, checkOrientation, classifySwapOffer, legAContext } from "../profile.js";
+import { checkLegBMatchesWant, checkOrientation, classifySwapOffer, isSwapId, legAContext } from "../profile.js";
 import { encodeFrameWith, makeOfferWith } from "../rails/custom-frames.js";
 import { SOL_RAIL_ID } from "../rails/custom-rails.js";
 import type { Exchange } from "../rails/rpc-capture.js";
@@ -130,6 +130,8 @@ import {
 } from "./flow-resume.js";
 import { FlowStoreCorruptError, type FlowStore } from "./flow-store.js";
 import { chainClockProblem } from "./policy.js";
+
+export type { BuyerNextStep } from "./flow-resume.js";
 import type { Signer, Venue } from "./venue.js";
 
 export interface BuyerFlowOptions {
@@ -574,6 +576,7 @@ export class BuyerFlow {
   private async bidPersisted(offerA: OfferFrame, swapId: string): Promise<OfferFrame> {
     const store = this.store;
     if (store === undefined) throw new Error("buyer: no store"); // unreachable: the caller checked
+    if (!isSwapId(swapId)) throw new Error("buyer: a flow with a store needs a swapId of the form 0x + 64 lowercase hex (the record is stored under it)");
     const text = encodeFrameWith(offerA, this.rail.railRegistry);
     if (this.#journal === undefined) {
       let initial: BuyerFlowRecord = {

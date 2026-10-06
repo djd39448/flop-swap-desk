@@ -143,6 +143,8 @@ import {
 } from "./flow-resume.js";
 import { FlowStoreCorruptError, type FlowStore } from "./flow-store.js";
 import { chainClockProblem } from "./policy.js";
+
+export type { SellerNextStep } from "./flow-resume.js";
 import type { Signer, Venue } from "./venue.js";
 
 export interface SellerFlowOptions {
