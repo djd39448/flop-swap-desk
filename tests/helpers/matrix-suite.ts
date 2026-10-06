@@ -7,7 +7,9 @@
 import { describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../../src/client/buyer.js";
-import { FlowRecordStaleError, FlowStoreLockedError, FlowStoreWriteFailedError } from "../../src/client/flow-store.js";
+import { FlowRecordExistsError, FlowRecordStaleError, FlowStoreLockedError, FlowStoreWriteFailedError } from "../../src/client/flow-store.js";
+import { OFFER_ROOM, tryDecodeFrame } from "@flop-labs/tclk";
+import { SellerFlow } from "../../src/client/seller.js";
 import {
   MODES,
   NEVER_LOCKED,
@@ -16,6 +18,7 @@ import {
   SETTLE,
   finishStalled,
   inspectRun,
+  readSwap,
   resumeRole,
   runScript,
   STEPS,
@@ -203,6 +206,7 @@ async function buyerSavesPerStep(factory: WorldFactory, script: readonly Step[])
  * Buyer is resumed (a new flow) and the swap runs to its end.
  */
 export async function describeStickyFault(world: string, factory: WorldFactory): Promise<void> {
+  await describeSellerStickyFault(world, factory);
   const plans: Array<{ title: string; script: readonly Step[]; expected: Expected; steps: Step[] }> = [
     { title: "the swap settles", script: SETTLE, expected: "settled", steps: [STEPS.bid, STEPS.acceptLegB, STEPS.verify, STEPS.buyerLine, STEPS.lockLegA, STEPS.learnAndClaimB] },
     { title: "the Seller never reveals", script: REFUND_BOTH, expected: "refunded-both", steps: [STEPS.refundLegA] },
@@ -262,6 +266,7 @@ export async function describeStickyFault(world: string, factory: WorldFactory):
  * store (`FlowRecordStaleError`, or `FlowStoreLockedError` for a file store); the swap then finishes through the winner.
  */
 export async function describeTwoInstances(world: string, factory: WorldFactory, options: { alsoRefusedBy?: RegExp } = {}): Promise<void> {
+  await describeTwoSellerInstances(world, factory);
   const lockIndex = SETTLE.indexOf(STEPS.lockLegA);
   describe(`${world}: two Buyer instances on one store both lock leg A (R1-02)`, () => {
     for (const order of ["in turn", "at once"] as const) {
@@ -290,6 +295,120 @@ export async function describeTwoInstances(world: string, factory: WorldFactory,
             if (order === "at once") expect(refusedByStore, "two calls at once reach the store together: the store refuses the loser").toBe(true);
             expect(w.counts().locks).toBe(1);
             c.buyer = results[0]?.ok === true ? first : second;
+            c.history.push(second);
+            return { handled: true };
+          },
+        });
+        const findings = await inspectRun(run, "settled");
+        expect(findings.problems).toEqual([]);
+        expect(findings.counts.locks).toBe(1);
+      });
+    }
+  });
+}
+
+// --- review round 1: the Seller's side of the sticky fault and of two live instances --------------------------------------------------------
+
+/** The saves each step of `script` makes on the Seller's store, by step index (a step that is not the Seller's, or saves nothing, is 0). */
+async function sellerSavesPerStep(factory: WorldFactory, script: readonly Step[]): Promise<number[]> {
+  const starts: number[] = [];
+  const run = await runScript(factory, script, [], {
+    beforeStep: async (index, _step, c) => {
+      starts[index] = c.w.stores.seller.saveCount;
+    },
+  });
+  const end = run.world.stores.seller.saveCount;
+  return script.map((_step, index) => (index === script.length - 1 ? end : (starts[index + 1] ?? end)) - (starts[index] ?? 0));
+}
+
+/**
+ * The Seller's twin of `describeStickyFault` (R1-03): for each Seller step and each of its saves k, every save from the k-th on is refused
+ * (the fault never heals); the step fails with a `FlowStoreWriteFailedError`; the same step is called twice more in the SAME process and
+ * refuses both times with no outward action and nothing built or sent; then the fault is cleared, the Seller is resumed (a new flow) and
+ * the swap runs to its end. A Seller that never saved anything (the first save of `acceptLegA` refused) is simply started again.
+ */
+export async function describeSellerStickyFault(world: string, factory: WorldFactory): Promise<void> {
+  const plans: Array<{ title: string; script: readonly Step[]; expected: Expected; steps: Step[] }> = [
+    { title: "the swap settles", script: SETTLE, expected: "settled", steps: [STEPS.acceptLegA, STEPS.sellerLine, STEPS.lockLegB, STEPS.claimLegA] },
+    { title: "the Seller never gets its claim in: leg B is refunded", script: REFUND_BOTH, expected: "refunded-both", steps: [STEPS.refundLegB] },
+  ];
+  for (const plan of plans) {
+    const saves = await sellerSavesPerStep(factory, plan.script);
+    describe(`${world}: ${plan.title}; a Seller store fault that never heals (R1-03)`, () => {
+      for (const step of plan.steps) {
+        const index = plan.script.indexOf(step);
+        for (let k = 1; k <= (saves[index] ?? 0); k += 1) {
+          it(`${step.name}, from its save ${k} of ${saves[index]}: the step fails, two retries in the same process refuse and do nothing, the restart finishes`, async () => {
+            const run = await runScript(factory, plan.script, [], {
+              beforeStep: async (at, current, c) => {
+                if (at !== index) return;
+                const w = c.w;
+                const store = w.stores.seller;
+                const start = store.saveCount;
+                store.failSaveWhen((n) => (n >= start + k ? "reject" : undefined));
+                const first = await settle(current.run(c));
+                expect(first.ok, "the step must fail once its save is refused").toBe(false);
+                expect(!first.ok && first.error, "the first failure").toBeInstanceOf(FlowStoreWriteFailedError);
+                const before = { actions: w.ctl.actions.length, counts: w.counts() };
+                for (let retry = 1; retry <= 2; retry += 1) {
+                  const again = await settle(current.run(c));
+                  expect(again.ok, `retry ${retry} must refuse`).toBe(false);
+                  expect(!again.ok && again.error, `retry ${retry}`).toBeInstanceOf(FlowStoreWriteFailedError);
+                }
+                expect(w.ctl.actions.length, "no outward action by a retry").toBe(before.actions);
+                expect(w.counts(), "nothing built or sent by a retry").toEqual(before.counts);
+                store.clearFaults();
+                w.ctl.attachStore(store, "seller");
+                if (current === STEPS.acceptLegA && k === 1) {
+                  // nothing was ever saved, so there is nothing to resume: the runner starts the swap again with a new flow
+                  w.ctl.restart("seller");
+                  c.seller = new SellerFlow(w.sellerOptions());
+                  c.history.push(c.seller);
+                  return { next: "acceptLegA" };
+                }
+                return { next: await resumeRole(c, "seller") };
+              },
+            });
+            const findings = await inspectRun(run, plan.expected);
+            expect(findings.problems).toEqual([]);
+            expect(run.deaths).toBe(0);
+          });
+        }
+      }
+    });
+  }
+}
+
+/**
+ * Two live Seller instances on one store (a supervisor that believes the first died, or a runner that starts a second flow while a hung call is
+ * still running) both call `acceptLegA` for the same offer, in turn and at once (R1-02, review round 1): exactly ONE accept A is posted, exactly
+ * one call wins, and the loser is refused with `FlowRecordExistsError` before it posts anything; the swap then finishes through the winner.
+ */
+export async function describeTwoSellerInstances(world: string, factory: WorldFactory): Promise<void> {
+  const acceptIndex = SETTLE.indexOf(STEPS.acceptLegA);
+  describe(`${world}: two Seller instances on one store both accept leg A (R1-02)`, () => {
+    for (const order of ["in turn", "at once"] as const) {
+      it(`${order}: one accept A, one winner, the loser is refused with FlowRecordExistsError, and the swap settles`, async () => {
+        const run = await runScript(factory, SETTLE, [], {
+          beforeStep: async (at, _step, c) => {
+            if (at !== acceptIndex) return;
+            const w = c.w;
+            const offerA = (await readSwap(w)).offerA;
+            if (offerA === undefined) throw new Error("matrix runner: offer A is not in the venue yet");
+            const first = c.seller;
+            const second = new SellerFlow(w.sellerOptions()); // same epoch: both are alive
+            const call = (flow: SellerFlow) => flow.acceptLegA(offerA, w.legB, w.lockTimeMs);
+            const results = order === "in turn" ? [await settle(call(first)), await settle(call(second))] : await Promise.all([settle(call(first)), settle(call(second))]);
+            const winners = results.filter((result) => result.ok);
+            const losers = results.filter((result) => !result.ok);
+            expect(winners).toHaveLength(1);
+            expect(losers).toHaveLength(1);
+            const refusal = !losers[0]?.ok ? losers[0]?.error : undefined;
+            expect(refusal, `the loser's error: ${refusal instanceof Error ? `${refusal.name}: ${refusal.message.slice(0, 200)}` : String(refusal)}`).toBeInstanceOf(FlowRecordExistsError);
+            const accepts = (await w.venue.read(OFFER_ROOM)).filter((record) => tryDecodeFrame(record.line)?.type === "accept" && record.sender === w.dids.seller);
+            expect(accepts, "exactly one accept A was posted").toHaveLength(1);
+            expect(await w.stores.seller.list(), "one Seller record").toHaveLength(1);
+            c.seller = results[0]?.ok === true ? first : second;
             c.history.push(second);
             return { handled: true };
           },

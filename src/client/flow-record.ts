@@ -257,6 +257,10 @@ export interface SellerFlowState {
   ownAccountLine?: { address: string; text: string };
   /** True from just before the first leg A claim is sent, on any rail. */
   claimAttempted: boolean;
+  /** R1-13: where the chain was when `claimAttempted` was saved (EVM and Bitcoin only, the rails whose `findClaimedPreimage` scans blocks): a
+   *  claim lands after it, so a resumed `claimLegA` looks for its own claim from here instead of from genesis. Saved in the same save as
+   *  `claimAttempted`, before the first send. */
+  claimFromBlock?: BlockMarkerJson;
   /** Solana: every claim signature signed and not yet resolved (recorded before simulate/send). */
   claimRecords: RailClaimRecord[];
   publicClaimSignature?: string;
@@ -815,7 +819,7 @@ const COMMON_REQUIRED = ["v", "role", "swapId", "did", "railId", "caip2", "deplo
 const COMMON_OPTIONAL = ["contractB", "lockTimeMs", "legB"] as const;
 // A Seller record is keyed by contract A (R1-14), so it has one from birth; a Buyer learns it with accept A.
 const SELLER_REQUIRED = ["contractA", "preimage", "statement", "claimAttempted", "claimRecords", "neverLandedClaims", "claimOutcome", "revealPosted", "receiptPosted", "legBRefund"] as const;
-const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature"] as const;
+const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature", "claimFromBlock"] as const;
 const BUYER_REQUIRED = ["legBVerified", "lock", "legBClaimAttempted", "legBClaimed", "refund", "refundNotes"] as const;
 const BUYER_OPTIONAL = ["contractA", "ownAccountLine", "legBClaimAdopted"] as const;
 
@@ -941,6 +945,8 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
   if (claimOutcome !== "none" && claimOutcome !== "landed" && claimOutcome !== "failed-public") r.fail(`${path}.claimOutcome`, 'must be "none", "landed" or "failed-public"');
   const claimAttempted = r.bool(o.claimAttempted, `${path}.claimAttempted`);
   if (claimOutcome !== "none" && !claimAttempted) r.fail(`${path}.claimOutcome`, "a claim outcome needs claimAttempted");
+  const claimFromBlock = r.optional(o, "claimFromBlock", (v, p) => r.marker(v, p), path);
+  if (claimFromBlock !== undefined && !claimAttempted) r.fail(`${path}.claimFromBlock`, "is saved with claimAttempted and needs it");
   if (claimOutcome === "failed-public" && publicClaimSignature === undefined) r.fail(`${path}.publicClaimSignature`, "is required for a failed-public claim: it is the proof the secret is public");
   const refundObject = r.object(o.legBRefund, `${path}.legBRefund`, ["attempted", "done", "framesPosted"]);
   const frozenLegAAccounts = r.optional(o, "frozenLegAAccounts", (v, p) => r.accounts(v, p), path);
@@ -966,6 +972,7 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
     ...(frozenLegARailRef === undefined ? {} : { frozenLegARailRef }),
     ...(ownAccountLine === undefined ? {} : { ownAccountLine }),
     claimAttempted,
+    ...(claimFromBlock === undefined ? {} : { claimFromBlock }),
     claimRecords,
     ...(publicClaimSignature === undefined ? {} : { publicClaimSignature }),
     neverLandedClaims: r.int(o.neverLandedClaims, `${path}.neverLandedClaims`),

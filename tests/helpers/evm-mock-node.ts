@@ -91,6 +91,13 @@ export class EvmMockNode {
   blockNumber = 5n;
   /** When true `eth_getLogs` answers nothing (an evidence lookup that finds no event although the transaction mined). */
   hideLogs = false;
+  /** A public provider's cap (R1-13): `eth_getLogs` over more than this many blocks (from `fromBlock` to the latest block) is refused with
+   *  an error, as a range-capped RPC does. `undefined` = no cap. */
+  maxLogSpan: bigint | undefined;
+  /** When true every `eth_getLogs` is refused with an error (a provider that is down for log queries). */
+  refuseLogs = false;
+  /** Every `fromBlock` an `eth_getLogs` was asked for, in order (a test reads where a scan started). */
+  readonly logQueries: bigint[] = [];
   /** See `SendHook`. */
   hook: SendHook | undefined;
   private readonly logs: StoredLog[] = [];
@@ -186,8 +193,16 @@ export class EvmMockNode {
           },
         };
       }
-      case "eth_getLogs":
-        return { result: this.getLogs(params[0] as { topics?: Array<string | null>; fromBlock?: string; toBlock?: string }) };
+      case "eth_getLogs": {
+        const filter = params[0] as { topics?: Array<string | null>; fromBlock?: string; toBlock?: string };
+        const from = filter.fromBlock !== undefined && filter.fromBlock.startsWith("0x") ? BigInt(filter.fromBlock) : 0n;
+        this.logQueries.push(from);
+        if (this.refuseLogs) return { error: { code: -32000, message: "mock evm node: eth_getLogs refused (test)" } };
+        if (this.maxLogSpan !== undefined && this.blockNumber - from > this.maxLogSpan) {
+          return { error: { code: -32602, message: `mock evm node: query exceeds the block range limit of ${this.maxLogSpan} (test)` } };
+        }
+        return { result: this.getLogs(filter) };
+      }
       case "eth_call":
         return this.call(params[0] as { to?: string; data?: string });
       case "eth_sendTransaction":

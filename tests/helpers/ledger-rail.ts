@@ -108,6 +108,8 @@ export class LedgerChain {
    *  Buyer knows and not yet a claim anyone can read). */
   hideSpends = false;
   height = 100;
+  /** The `fromMarker` of every `findClaimedPreimage` call (R1-13: a resumed Seller must scan from the marker it saved, never from genesis). */
+  readonly scanFrom: unknown[] = [];
   private serial = 0;
 
   constructor(readonly nowMs: () => number) {}
@@ -438,8 +440,9 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     };
   }
 
-  async findClaimedPreimage(ref: string): Promise<string | null> {
+  async findClaimedPreimage(ref: string, fromMarker?: RailBlockMarker): Promise<string | null> {
     this.options.hooks.alive();
+    this.chain.scanFrom.push(fromMarker);
     const output = this.chain.outputs.get(ref);
     return output?.status === "claimed" && output.preimage !== undefined ? output.preimage : null;
   }

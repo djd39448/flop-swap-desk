@@ -119,11 +119,13 @@ import { SOL_CLAIM_LANDING_MARGIN_MS, SolClaimFailedError, SolNotLandedError, So
 import type { Exchange } from "../rails/rpc-capture.js";
 import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
 import { offerAcceptLockTerms } from "../swap.js";
-import { belowMinLockable, type ConnectedCounterAssetRail, type CounterAssetRail, type RailAccounts, type RailClaimRecord, type RailWriteEvidence } from "./counter-rail.js";
+import { belowMinLockable, type ConnectedCounterAssetRail, type CounterAssetRail, type RailAccounts, type RailBlockMarker, type RailClaimRecord, type RailWriteEvidence } from "./counter-rail.js";
 import {
   FlowRecordConflictError,
   FlowRecordMismatchError,
   checkRecordIdentity,
+  markerFromJson,
+  markerToJson,
   newSellerRecord,
   railDeploymentId,
   withLedgerIntent,
@@ -142,7 +144,7 @@ import {
   type JournalDeps,
   type SellerNextStep,
 } from "./flow-resume.js";
-import { FlowStoreCorruptError, type FlowStore } from "./flow-store.js";
+import { FlowStoreCorruptError, FlowStoreWriteFailedError, type FlowStore } from "./flow-store.js";
 import { chainClockProblem } from "./policy.js";
 
 export type { SellerNextStep } from "./flow-resume.js";
@@ -317,11 +319,20 @@ export class SellerFlow {
   /** P8: true from just before the first leg A claim is sent, on any rail (stored; `claimLegA` then asks the chain
    *  whether that claim landed before it ever signs another). */
   private claimAttempted = false;
+  /** R1-13: where the chain was when the first claim was about to be sent (EVM and Bitcoin, with a store): a resumed `claimLegA` looks for
+   *  its own claim from here, never from genesis (a public RPC refuses or drowns in a scan from block 0). */
+  private claimFromBlock?: RailBlockMarker;
   private claimOutcome: "none" | "landed" | "failed-public" = "none";
   private legBRefundAttempted = false;
   private legBRefundDone = false;
   /** P8: a same-process double call of `acceptLegA` is refused while one is in flight (store mode only). */
   private acceptLegAPending = false;
+  /** R1-16: set synchronously at the start of `postAccountLineA`, `claimLegA` and `refundLegB` and cleared when the call ends, the
+   *  same re-entry pattern `lockLegB` and `acceptLegA` use: two overlapping calls of one step can never both reach the venue or
+   *  the rail (two account lines for two addresses, two claim signatures, two refunds of leg B). */
+  private accountLinePending = false;
+  private claimPending = false;
+  private legBRefundPending = false;
   private lockedLegBContract?: string;
   /** P22-P24-EVM-FIXES-R3.md E2: the accept `lockLegB` is about to call `paperRail.lock` for,
    *  recorded *before* that call runs and never cleared afterward, success or failure — see
@@ -534,6 +545,7 @@ export class SellerFlow {
       this.frozenLegARailRef = record.frozenLegARailRef;
     }
     this.claimAttempted = record.claimAttempted;
+    if (record.claimFromBlock !== undefined) this.claimFromBlock = markerFromJson(record.claimFromBlock);
     this.claimRecords = record.claimRecords.map((entry) => ({ ...entry }));
     if (record.publicClaimSignature !== undefined) this.publicClaimSignature = record.publicClaimSignature;
     this.neverLandedClaims = record.neverLandedClaims;
@@ -552,6 +564,7 @@ export class SellerFlow {
       ...(this.frozenLegAAccounts === undefined ? {} : { frozenLegAAccounts: accountsToJson(this.frozenLegAAccounts) }),
       ...(this.frozenLegARailRef === undefined ? {} : { frozenLegARailRef: this.frozenLegARailRef }),
       claimAttempted: this.claimAttempted,
+      ...(this.claimFromBlock === undefined ? {} : { claimFromBlock: markerToJson(this.claimFromBlock) }),
       claimRecords: this.claimRecords.map((entry) => ({ ...entry })),
       ...(this.publicClaimSignature === undefined ? {} : { publicClaimSignature: this.publicClaimSignature }),
       neverLandedClaims: this.neverLandedClaims,
@@ -565,6 +578,17 @@ export class SellerFlow {
   /** Saves the record now (the live state laid over it). A no-op without a store. */
   private async persist(): Promise<void> {
     await this.#journal?.update((r) => r);
+  }
+
+  /**
+   * R1-03: every public step starts here. A flow whose save was refused (the store refused it, the disk failed, a second
+   * instance saved first) holds latches in memory that the store never saw: a claim attempt, a leg B lock intent, a refund
+   * intent. Acting on them again could send a claim whose attempt the record does not show (after a restart the Seller would
+   * then find its own claim landed and "refuse for ever", or sign a second one), so such a flow is treated as a crashed one:
+   * every step throws `FlowStoreWriteFailedError` until the runner drops it and builds a new one with `resume()`.
+   */
+  private usable(): void {
+    this.#journal?.assertUsable();
   }
 
   private requireAcceptedA(): { offerA: OfferFrame; acceptA: AcceptFrame } {
@@ -592,6 +616,7 @@ export class SellerFlow {
    * against the same clock, never trusting the other to have done the arithmetic right.
    */
   async acceptLegA(offerA: OfferFrame, legB: LegBDeadlines, lockTimeMs: number): Promise<AcceptLegAResult> {
+    this.usable(); // R1-03
     if (this.offerA !== undefined) {
       if (this.store === undefined) throw new Error("seller: leg A already accepted for this flow");
       // P8: confirmed already (this process, or rebuilt from the record): the recorded result, nothing posted again.
@@ -679,20 +704,16 @@ export class SellerFlow {
     const storedKey = stored === undefined ? "" : `seller:${stored.contractA}`;
     const storedAccept = stored === undefined ? undefined : acceptFromSlot(storedKey, "acceptA", stored.frames.acceptA);
     const storedOfferB = stored === undefined ? undefined : offerFromSlot(storedKey, "offerB", stored.frames.offerB);
-    let hashLock: HashLock;
-    let acceptA: AcceptFrame;
+    let reused: { hashLock: HashLock; acceptA: AcceptFrame } | undefined;
     let offerB: OfferFrame;
     if (stored !== undefined && storedAccept !== undefined && storedOfferB !== undefined) {
       if (stored.frames.offerA?.text !== encodeFrameWith(offerA, this.rail.railRegistry)) {
         throw new FlowRecordConflictError("seller: a different leg A offer than the one this swap's saved accept answers (a party never posts a second, different frame)");
       }
-      hashLock = { preimage: stored.preimage, hash: stored.statement };
-      acceptA = storedAccept;
+      reused = { hashLock: { preimage: stored.preimage, hash: stored.statement }, acceptA: storedAccept };
       offerB = storedOfferB;
     } else {
-      hashLock = this.mintHashLock();
-      if (!verifyHashPreimage(hashLock.hash, hashLock.preimage)) throw new Error("seller: the minted hash lock's preimage does not open its statement");
-      acceptA = makeAccept(offerA, { from: this.identity.did, statement: hashLock.hash });
+      // Leg B's offer names no statement, so it is built (and its deadlines checked) before the secret is minted.
       offerB = makeOffer({
         from: this.identity.did,
         role: "payer",
@@ -723,8 +744,9 @@ export class SellerFlow {
       );
     }
 
-    if (this.store !== undefined) return this.acceptLegAPersisted(offerA, classification.swapId, legB, lockTimeMs, hashLock, acceptA, offerB);
+    if (this.store !== undefined) return this.acceptLegAPersisted(offerA, classification.swapId, legB, lockTimeMs, offerB, reused);
 
+    const { hashLock, acceptA } = this.mintAccept(offerA);
     const acceptARecord = await this.venue.post("tclk-offers", encodeFrame(acceptA), this.identity);
     const offerBRecord = await this.venue.post("tclk-offers", encodeFrame(offerB), this.identity);
 
@@ -749,6 +771,13 @@ export class SellerFlow {
     return { acceptA, acceptARecord, offerB, offerBRecord };
   }
 
+  /** Mints the swap secret and the accept A frame that names its statement. The secret never leaves this flow. */
+  private mintAccept(offerA: OfferFrame): { hashLock: HashLock; acceptA: AcceptFrame } {
+    const hashLock = this.mintHashLock();
+    if (!verifyHashPreimage(hashLock.hash, hashLock.preimage)) throw new Error("seller: the minted hash lock's preimage does not open its statement");
+    return { hashLock, acceptA: makeAccept(offerA, { from: this.identity.did, statement: hashLock.hash }) };
+  }
+
   /** P4-BTC-FIXES.md G1/G8: find the authenticated `tclk-offers` record for the offer named
    *  `offerId` — the Buyer's own original, signed post, never re-derived from the bare frame a
    *  caller handed `acceptLegA`. `null` when no such authenticated record exists (never thrown:
@@ -770,47 +799,70 @@ export class SellerFlow {
    * text of accept A and offer B, the deadlines) is saved BEFORE the first post, because accept A makes the statement
    * public; then each frame is posted once as exactly that text, or adopted when the room already holds it (a
    * resumed call after a crash between the two posts). Nothing is assigned to the flow until both landed.
+   *
+   * R1-02: the secret is minted INSIDE `FlowJournal.beginSeller`, after it found no Seller record for this offer, so a
+   * second `acceptLegA` of the same offer on this store refuses with `FlowRecordExistsError` before it mints or posts
+   * anything (and names the stored record's key, which is what `resume` takes). `reused` is the stored accept and secret
+   * of a call that already began (this flow retrying, or a resumed flow).
    */
   private async acceptLegAPersisted(
     offerA: OfferFrame,
     swapId: string,
     legB: LegBDeadlines,
     lockTimeMs: number,
-    hashLock: HashLock,
-    acceptA: AcceptFrame,
     offerB: OfferFrame,
+    reused: { hashLock: HashLock; acceptA: AcceptFrame } | undefined,
   ): Promise<AcceptLegAResult> {
     const store = this.store;
     if (store === undefined) throw new Error("seller: no store"); // unreachable: the caller checked
-    const acceptAText = encodeFrame(acceptA);
     const offerBText = encodeFrame(offerB);
+    let hashLock: HashLock;
+    let acceptA: AcceptFrame;
     if (this.#journal === undefined) {
-      let initial: SellerFlowRecord = {
-        ...newSellerRecord({
-          swapId,
-          did: this.identity.did,
-          railId: this.rail.railId,
-          caip2: this.rail.caip2,
-          deploymentId: railDeploymentId(this.rail),
-          nowMs: this.clock(),
-          contractA: acceptA.contract, // R1-14: the record's key, known before accept A is posted
-          preimage: hashLock.preimage,
-          statement: hashLock.hash,
-        }),
-        frames: { offerA: { text: encodeFrameWith(offerA, this.rail.railRegistry) }, acceptA: { text: acceptAText }, offerB: { text: offerBText } },
-        lockTimeMs,
-        legB: { claimByMs: legB.claimByMs, refundAfterMs: legB.refundAfterMs, expiresMs: legB.expiresMs },
-      };
-      initial = withLedgerIntent(initial, { kind: "accept-a", room: OFFER_ROOM, text: acceptAText });
-      initial = withLedgerIntent(initial, { kind: "offer-b", room: OFFER_ROOM, text: offerBText });
+      let minted: { hashLock: HashLock; acceptA: AcceptFrame } | undefined;
       // Rule 1: the secret and the exact frames are durable BEFORE accept A is posted (the statement is public from that post).
-      const journal = await FlowJournal.begin(this.journalDeps(store), initial);
+      const journal = await FlowJournal.beginSeller(this.journalDeps(store), encodeFrameWith(offerA, this.rail.railRegistry), () => {
+        const made = this.mintAccept(offerA);
+        minted = made;
+        const acceptAText = encodeFrame(made.acceptA);
+        let initial: SellerFlowRecord = {
+          ...newSellerRecord({
+            swapId,
+            did: this.identity.did,
+            railId: this.rail.railId,
+            caip2: this.rail.caip2,
+            deploymentId: railDeploymentId(this.rail),
+            nowMs: this.clock(),
+            contractA: made.acceptA.contract, // R1-14: the record's key, known before accept A is posted
+            preimage: made.hashLock.preimage,
+            statement: made.hashLock.hash,
+          }),
+          frames: { offerA: { text: encodeFrameWith(offerA, this.rail.railRegistry) }, acceptA: { text: acceptAText }, offerB: { text: offerBText } },
+          lockTimeMs,
+          legB: { claimByMs: legB.claimByMs, refundAfterMs: legB.refundAfterMs, expiresMs: legB.expiresMs },
+        };
+        initial = withLedgerIntent(initial, { kind: "accept-a", room: OFFER_ROOM, text: acceptAText });
+        initial = withLedgerIntent(initial, { kind: "offer-b", room: OFFER_ROOM, text: offerBText });
+        return initial;
+      });
       journal.setProjector((next) => this.project(next));
       this.#journal = journal;
+      if (minted === undefined) throw new Error("seller: no secret was minted"); // unreachable: begin ran the factory
+      ({ hashLock, acceptA } = minted);
+    } else {
+      if (reused === undefined) throw new Error("seller: a flow with a journal has no saved accept A"); // unreachable: the journal's first record holds it
+      ({ hashLock, acceptA } = reused);
     }
     const journal = this.#journal;
     this.#hashLock = hashLock;
-    const acceptARecord = await journal.ensurePosted({ kind: "accept-a", room: OFFER_ROOM, text: acceptAText, slot: "acceptA" });
+    // R1-12: an accept A the ledger shows as landed is DONE: its signed record is the stored one and it does not go through
+    // `ensurePosted` again (the offers room is a short ring: a read can miss a line that did land, and the line is never
+    // posted twice). Only an offer B that has not landed is run through it.
+    const storedAcceptA = journal.isLanded("accept-a") ? journal.record.frames.acceptA?.record : undefined;
+    const acceptARecord =
+      storedAcceptA !== undefined
+        ? recordFromJson(storedAcceptA)
+        : await journal.ensurePosted({ kind: "accept-a", room: OFFER_ROOM, text: encodeFrame(acceptA), slot: "acceptA" });
     const offerBRecord = await journal.ensurePosted({ kind: "offer-b", room: OFFER_ROOM, text: offerBText, slot: "offerB" });
 
     // G1/G8, as in the unstored path: the Buyer's own signed offer record, best effort.
@@ -838,6 +890,17 @@ export class SellerFlow {
    *  A's lock frame is in the room (a line after it would not count). A different address than the saved one is
    *  refused: a party never posts a second, different account line. */
   async postAccountLineA(address: string): Promise<TranscriptRecord> {
+    this.usable(); // R1-03
+    if (this.accountLinePending) throw new Error("seller: refusing to post the account line - another postAccountLineA call is already in flight (R1-16)");
+    this.accountLinePending = true;
+    try {
+      return await this.postAccountLineAUnlatched(address);
+    } finally {
+      this.accountLinePending = false;
+    }
+  }
+
+  private async postAccountLineAUnlatched(address: string): Promise<TranscriptRecord> {
     const { offerA, acceptA } = this.requireAcceptedA();
     const journal = this.#journal;
     if (journal === undefined) {
@@ -871,11 +934,30 @@ export class SellerFlow {
       room: dealRoom(acceptA.contract),
       text,
       guard: (roomRecords) => {
-        const lockPosted = roomRecords.some((candidate) => verifyTranscriptRecord(candidate).ok && tryDecodeFrame(candidate.line)?.type === "lock");
-        if (lockPosted) {
+        if (this.acceptedLockPosted(roomRecords)) {
           throw new FlowRecordConflictError("seller: refusing to post the account line - leg A's lock frame is already in the room, so the line would not count (rule 3)");
         }
       },
+    });
+  }
+
+  /**
+   * R1-11: whether leg A's deal room already holds the lock frame that tclk's machine ACCEPTED for contract A, the only one after which
+   * an account line no longer counts. Anyone can post a self-signed `lock` frame there (accept A is public, so is the room), and the
+   * machine rejects it ("only the payer locks"): counting any such frame let a stranger stall every swap for free. The machine decides
+   * (`foldAcceptedLock`, as `claimLegA` does). Without the signed offer A record (it can roll off the offers ring before the Seller
+   * captures it) the fallback counts only an authenticated lock frame for contract A whose record was signed by offer A's sender (the
+   * payer) and whose own `from` is that sender.
+   */
+  private acceptedLockPosted(roomRecords: readonly TranscriptRecord[]): boolean {
+    if (this.offerARecord !== undefined && this.acceptARecord !== undefined) {
+      return foldAcceptedLock(this.offerARecord, this.acceptARecord, roomRecords) !== null;
+    }
+    const { offerA, acceptA } = this.requireAcceptedA();
+    return roomRecords.some((record) => {
+      if (!verifyTranscriptRecord(record).ok) return false;
+      const frame = tryDecodeFrame(record.line);
+      return frame !== null && frame.type === "lock" && frame.contract === acceptA.contract && record.sender === offerA.from && frame.from === record.sender;
     });
   }
 
@@ -912,6 +994,7 @@ export class SellerFlow {
    * way to learn the truth about that one attempt; this method itself never retries.
    */
   async lockLegB(acceptBRecord: TranscriptRecord): Promise<TranscriptRecord> {
+    this.usable(); // R1-03
     // P8: with a store, an attempt that was saved without an outcome is not refused but RECOVERED (below); a
     // same-process double call is still refused while one is in flight.
     if ((this.attemptedAcceptB !== undefined && this.#journal === undefined) || this.legBLockPending) {
@@ -1025,6 +1108,7 @@ export class SellerFlow {
    * lock (nothing to reconcile).
    */
   async reconcileLegB(): Promise<{ locked: boolean }> {
+    this.usable(); // R1-03
     if (this.attemptedAcceptB === undefined) {
       throw new Error("seller: nothing to reconcile — leg B lock was never attempted (E2)");
     }
@@ -1065,6 +1149,20 @@ export class SellerFlow {
     hashLockHex: string,
     options?: { skipReveal?: boolean },
   ): Promise<{ evidence: RailWriteEvidence; reveal?: TranscriptRecord; receipt: TranscriptRecord; neverLandedClaims?: number }> {
+    this.usable(); // R1-03
+    if (this.claimPending) throw new Error("seller: refusing to claim leg A - another claimLegA call is already in flight (R1-16)");
+    this.claimPending = true;
+    try {
+      return await this.claimLegAUnlatched(hashLockHex, options);
+    } finally {
+      this.claimPending = false;
+    }
+  }
+
+  private async claimLegAUnlatched(
+    hashLockHex: string,
+    options?: { skipReveal?: boolean },
+  ): Promise<{ evidence: RailWriteEvidence; reveal?: TranscriptRecord; receipt: TranscriptRecord; neverLandedClaims?: number }> {
     const { offerA, acceptA } = this.requireAcceptedA();
     if (this.#hashLock === undefined) throw new Error("seller: no secret minted for this flow");
     if (hashLockHex !== this.#hashLock.hash) {
@@ -1072,6 +1170,15 @@ export class SellerFlow {
     }
 
     const termsA = offerAcceptLockTerms(offerA, acceptA);
+
+    // R1-13: a claim the record shows as LANDED (the rail's `claim` returned, and that was saved) is not searched for again: nothing is read
+    // from the chain, and only the frames that are still missing are posted (each once, as the saved text, or adopted).
+    if (this.#journal !== undefined && this.claimOutcome === "landed" && this.frozenLegAAccounts !== undefined && this.frozenLegARailRef !== undefined) {
+      const railRef = this.frozenLegARailRef;
+      const reveal = options?.skipReveal === true ? undefined : await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, "claim already landed (recorded)");
+      const receipt = await this.postReceiptLatched(acceptA.contract, railRef);
+      return { evidence: { ref: railRef, raw: [] }, ...(reveal === undefined ? {} : { reveal }), receipt, ...this.neverLandedField() };
+    }
 
     // P4-BTC-FIXES.md G1: once this leg's lock has verified, its resolved accounts and railRef
     // are frozen permanently — a later call (only reachable when an earlier one threw before
@@ -1196,7 +1303,7 @@ export class SellerFlow {
     // Solana keep their finality rule below.
     const lookedUpOnChain = this.#journal !== undefined && this.claimAttempted && this.rail.railId !== NEAR_RAIL_ID && !isSol;
     if (this.rail.railId === NEAR_RAIL_ID || isSol || lookedUpOnChain) {
-      const priorPreimage = isSol && this.publicClaimSignature !== undefined ? this.#hashLock.preimage : await connected.findClaimedPreimage(railRef);
+      const priorPreimage = isSol && this.publicClaimSignature !== undefined ? this.#hashLock.preimage : await connected.findClaimedPreimage(railRef, this.claimFromBlock);
       const revealedIsOwn = priorPreimage !== null && priorPreimage === this.#hashLock.preimage;
 
       if (revealedIsOwn) {
@@ -1304,6 +1411,9 @@ export class SellerFlow {
     // P8 (rule 1): from here a claim may reach the network. The flag, with the frozen accounts and ref, is durable
     // BEFORE the first send on any rail (a Solana claim signature follows through `onSigned`, below).
     if (!this.claimAttempted) {
+      // R1-13: the block marker is taken BEFORE the first send and saved in the same save as the attempt, so a claim that lands after it is
+      // found by a scan that starts here. Only the rails whose scan walks blocks need one (EVM, Bitcoin); a flow without a store is not resumed.
+      if (this.#journal !== undefined && this.rail.railId !== NEAR_RAIL_ID && !isSol) this.claimFromBlock = await connected.currentBlockMarker();
       this.claimAttempted = true;
       await this.persist();
     }
@@ -1315,7 +1425,9 @@ export class SellerFlow {
               ...(this.neverLandedClaims > 0 ? { priorityFeeAttempt: this.neverLandedClaims } : {}),
               // P8: awaited by the rail BEFORE anything is simulated or sent, so the signature is durable first.
               onSigned: async (record: RailClaimRecord): Promise<void> => {
-                this.claimRecords.push(record);
+                // R1-09: a signature is recorded once. The stored list refuses a repeated signature (and is capped), so a record
+                // pushed twice would make every later save fail before the claim could be resolved.
+                if (!this.claimRecords.some((known) => known.signature === record.signature)) this.claimRecords.push(record);
                 await this.persist();
               },
               onNotBroadcast: async (record: RailClaimRecord): Promise<void> => {
@@ -1508,6 +1620,10 @@ export class SellerFlow {
         this.revealPosted = { key, record };
         return record;
       } catch (error) {
+        // R1-03: a refused SAVE is not a post that failed: this flow is a crashed one (the journal refuses every later write), so another
+        // attempt is pointless and `RevealNotPostedError`'s "retry claimLegA" would be wrong advice. The typed store error says what to do:
+        // drop the flow and `resume()`, which posts the frames that are still missing.
+        if (error instanceof FlowStoreWriteFailedError) throw error;
         last = error;
         // S2-4: an attempt that timed out may still have landed; adopt it instead of posting a second reveal.
         if (isSolRail) {
@@ -1578,6 +1694,17 @@ export class SellerFlow {
    *  this and would throw; this check exists so the error names the rule from this class's own
    *  vocabulary, not the rail's). */
   async refundLegB(): Promise<{ refund: TranscriptRecord; receipt: TranscriptRecord }> {
+    this.usable(); // R1-03
+    if (this.legBRefundPending) throw new Error("seller: refusing to refund leg B - another refundLegB call is already in flight (R1-16)");
+    this.legBRefundPending = true;
+    try {
+      return await this.refundLegBUnlatched();
+    } finally {
+      this.legBRefundPending = false;
+    }
+  }
+
+  private async refundLegBUnlatched(): Promise<{ refund: TranscriptRecord; receipt: TranscriptRecord }> {
     if (this.offerB === undefined || this.acceptA === undefined) {
       throw new Error("seller: leg B has not been opened yet");
     }

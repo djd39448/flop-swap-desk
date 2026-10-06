@@ -126,6 +126,7 @@ export function sampleSellerRecord(): SellerFlowRecord {
     frozenLegAAccounts: { payer: "BuyerWallet11111111111111111111111111111111", payee: "SellerWallet1111111111111111111111111111111" },
     frozenLegARailRef: `${SAMPLE_STATEMENT}:BuyerWallet11111111111111111111111111111111`,
     claimAttempted: true,
+    claimFromBlock: { kind: "bigint", value: "1234" }, // R1-13
     claimRecords: [
       { signature: "sig-one", blockhash: "hash-one", lastValidBlockHeight: 5_082, signedSlot: 5_031 },
       { signature: "sig-two", blockhash: "hash-two", lastValidBlockHeight: 5_300 },

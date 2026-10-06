@@ -25,11 +25,12 @@ import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
 import { InMemoryNearSigner } from "../src/rails/near-signer-memory.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { InMemorySolSigner } from "../src/rails/sol-signer-memory.js";
-import { Controller, PREFIX, type Ctx } from "./helpers/crash-matrix.js";
+import { Controller, PREFIX, STEPS, type Ctx } from "./helpers/crash-matrix.js";
 import { EvmMockNode } from "./helpers/evm-mock-node.js";
 import { evmWorld } from "./helpers/matrix-worlds.js";
 import { HTLC_CODE_HASH, nearConfig } from "./helpers/near-stateful-rpc.js";
 import { evmSigner } from "./helpers/proven-lines.js";
+import { sellerKeyOf } from "./helpers/seller-key.js";
 import { StatefulSolNode } from "./helpers/sol-stateful-chain.js";
 
 /** A transport that must never be used: constructing a rail, and reading its deployment id, makes no network call. */
@@ -196,5 +197,33 @@ describe("the flows pin it (R1-05): a resume against a redeployed EVM contract i
     expect(resumed.next).toBe("lockLegA");
     await resumed.flow.lockLegA();
     expect(w.counts().locks).toBe(1);
+  });
+});
+
+describe("the Seller pins it too (R1-05): a resume against a redeployed EVM contract is refused", () => {
+  it("the record names the deployment it was created on, and a Seller rail on another contract is a FlowRecordMismatchError: nothing is claimed on deployment 2", async () => {
+    const ctl = new Controller();
+    const w = evmWorld(ctl);
+    const buyer = new BuyerFlow(w.buyerOptions());
+    const seller = new SellerFlow(w.sellerOptions());
+    const c: Ctx = { w, buyer, seller, history: [buyer, seller] };
+    for (const step of [...PREFIX, STEPS.lockLegA]) await step.run(c);
+    const key = await sellerKeyOf(w.stores.seller);
+    const contractA = key.slice("seller:".length);
+    const stored = await w.stores.seller.load(key);
+    expect(decodeFlowRecord(stored as Uint8Array, key).deploymentId).toBe(railDeploymentId(w.sellerOptions().rail));
+
+    ctl.restart("seller");
+    const node2 = new EvmMockNode(() => w.clockRef.ms, address("matrix-evm-rail-v2"), address("matrix-evm-usdc"), [evmSigner(0x411), evmSigner(0x412)]);
+    const rail2 = createEvmCounterRail({ config: node2.config(), rpc: node2.rpc(), account: w.addresses.seller as Address, clock: () => w.clockRef.ms });
+    const refusal = await SellerFlow.resume({ ...w.sellerOptions(), rail: rail2, store: w.stores.seller, contractA, swapId: w.swapId }).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(FlowRecordMismatchError);
+    expect((refusal as FlowRecordMismatchError).field).toBe("deploymentId");
+    expect(node2.count("claim")).toBe(0);
+    // against the right deployment the same record resumes and claims where the lock is
+    const resumed = await SellerFlow.resume({ ...w.sellerOptions(), store: w.stores.seller, contractA, swapId: w.swapId });
+    expect(resumed.next).toBe("claimLegA");
+    await resumed.flow.claimLegA(resumed.flow.statement!);
+    expect(w.counts().claims).toBe(1);
   });
 });

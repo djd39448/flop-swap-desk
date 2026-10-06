@@ -46,6 +46,7 @@ import {
   type LedgerEntry,
   type LedgerKind,
   type RailAccountsJson,
+  type SellerFlowRecord,
   type SwapFrames,
   type TranscriptRecordJson,
 } from "./flow-record.js";
@@ -266,18 +267,27 @@ export class FlowJournal<R extends FlowRecord> {
    *  record for that offer (the same exact offer A text), as the swap-id key used to (a new flow never starts a swap
    *  over). A different Buyer's offer with a copied swap id is a different offer and is not refused (R1-14). */
   static async begin<T extends FlowRecord>(deps: JournalDeps, initial: T): Promise<FlowJournal<T>> {
-    const journal = new FlowJournal<T>(deps, initial, null);
     const offerAText = initial.role === "seller" ? initial.frames.offerA?.text : undefined;
-    if (offerAText === undefined) {
-      await journal.run(() => initial, true);
-      return journal;
-    }
-    await serialisedPerStore(deps.store, async () => {
+    if (offerAText !== undefined) return FlowJournal.beginSeller(deps, offerAText, () => initial as unknown as SellerFlowRecord) as unknown as Promise<FlowJournal<T>>;
+    const journal = new FlowJournal<T>(deps, initial, null);
+    await journal.run(() => initial, true);
+    return journal;
+  }
+
+  /** `begin` for a Seller's record, with the record BUILT only once the store is known to hold no Seller record for the offer
+   *  whose exact text is `offerAText`: `build` is where the Seller mints its secret, so a second `acceptLegA` of one offer
+   *  (two processes, or two calls at once on one store object) is refused with `FlowRecordExistsError` BEFORE anything is
+   *  minted or posted (R1-02, review round 1). The scan and the create run one after the other per store object; two
+   *  processes on one store are fenced by the store's own per-key compare-and-swap only (the README says one process per swap). */
+  static async beginSeller(deps: JournalDeps, offerAText: string, build: () => SellerFlowRecord): Promise<FlowJournal<SellerFlowRecord>> {
+    return serialisedPerStore(deps.store, async () => {
       const existing = await findStoredSellerOffer(deps.store, offerAText);
       if (existing !== null) throw new FlowRecordExistsError(existing);
+      const initial = build();
+      const journal = new FlowJournal<SellerFlowRecord>(deps, initial, null);
       await journal.run(() => initial, true);
+      return journal;
     });
-    return journal;
   }
 
   /** The journal of an existing swap, from its stored record. `id` is the swap id for a Buyer and leg A's contract id

@@ -74,59 +74,65 @@ function evmAddress(tag: string): Address {
   return getAddress(`0x${Buffer.from(tag, "utf8").toString("hex").padEnd(40, "0").slice(0, 40)}`);
 }
 
-export const evmWorld: WorldFactory = (ctl): World => {
-  const buyerKey = evmSigner(0x411);
-  const sellerKey = evmSigner(0x412);
-  const legA = { claimByMs: T0 + 60 * 60_000, refundAfterMs: T0 + 90 * 60_000, expiresMs: T0 + 30 * 60_000 };
-  const legB = { claimByMs: T0 + 120 * 60_000, refundAfterMs: T0 + 180 * 60_000, expiresMs: T0 + 40 * 60_000 };
-  const clockRef = { ms: T0 };
-  const clock = (): number => clockRef.ms;
-  const node = new EvmMockNode(clock, evmAddress("matrix-evm-rail"), evmAddress("matrix-evm-usdc"), [buyerKey, sellerKey]);
-  const venue = new MemoryVenue(clock);
-  const noteStore = new MemoryNoteStore();
-  const base = common(ctl, clockRef, venue, noteStore);
-  const dids = { buyer: ident(0x21).did, seller: ident(0x22).did };
-  const hashLock = generateHashLock();
-  const roleOf = (from: Address): Role => (from.toLowerCase() === buyerKey.address.toLowerCase() ? "buyer" : "seller");
-  // The chain's sends are the actions; they are cut inside the node, so the approve/lock pair of a lock is two boundaries.
-  node.hook = {
-    begin: (fn, from) => ctl.begin(roleOf(from), ctl.epochOf(roleOf(from)), "chain", `chain:${fn}`),
-    end: (token) => ctl.end(token as Parameters<Controller["end"]>[0]),
-  };
-  const options = (role: Role) => {
-    const epoch = ctl.epochOf(role);
-    const key = role === "buyer" ? buyerKey : sellerKey;
+/** The EVM world; `configure` reaches the mock node before any flow runs (a knob to turn, a chain to advance). */
+export const evmWorldWith =
+  (configure?: (node: EvmMockNode) => void): WorldFactory =>
+  (ctl): World => {
+    const buyerKey = evmSigner(0x411);
+    const sellerKey = evmSigner(0x412);
+    const legA = { claimByMs: T0 + 60 * 60_000, refundAfterMs: T0 + 90 * 60_000, expiresMs: T0 + 30 * 60_000 };
+    const legB = { claimByMs: T0 + 120 * 60_000, refundAfterMs: T0 + 180 * 60_000, expiresMs: T0 + 40 * 60_000 };
+    const clockRef = { ms: T0 };
+    const clock = (): number => clockRef.ms;
+    const node = new EvmMockNode(clock, evmAddress("matrix-evm-rail"), evmAddress("matrix-evm-usdc"), [buyerKey, sellerKey]);
+    configure?.(node);
+    const venue = new MemoryVenue(clock);
+    const noteStore = new MemoryNoteStore();
+    const base = common(ctl, clockRef, venue, noteStore);
+    const dids = { buyer: ident(0x21).did, seller: ident(0x22).did };
+    const hashLock = generateHashLock();
+    const roleOf = (from: Address): Role => (from.toLowerCase() === buyerKey.address.toLowerCase() ? "buyer" : "seller");
+    // The chain's sends are the actions; they are cut inside the node, so the approve/lock pair of a lock is two boundaries.
+    node.hook = {
+      begin: (fn, from) => ctl.begin(roleOf(from), ctl.epochOf(roleOf(from)), "chain", `chain:${fn}`),
+      end: (token) => ctl.end(token as Parameters<Controller["end"]>[0]),
+    };
+    const options = (role: Role) => {
+      const epoch = ctl.epochOf(role);
+      const key = role === "buyer" ? buyerKey : sellerKey;
+      return {
+        identity: role === "buyer" ? ident(0x21) : ident(0x22),
+        venue: wrapVenue(venue, ctl, role, epoch),
+        paperRail: wrapPaper(new PaperRail(noteStore, clock), ctl, role, epoch),
+        rail: createEvmCounterRail({ config: node.config(), rpc: node.rpc(), account: key.address, clock }),
+        clock,
+        store: base.stores[role],
+      };
+    };
     return {
-      identity: role === "buyer" ? ident(0x21) : ident(0x22),
-      venue: wrapVenue(venue, ctl, role, epoch),
-      paperRail: wrapPaper(new PaperRail(noteStore, clock), ctl, role, epoch),
-      rail: createEvmCounterRail({ config: node.config(), rpc: node.rpc(), account: key.address, clock }),
-      clock,
-      store: base.stores[role],
+      name: "evm",
+      ...base,
+      setTime: (ms) => {
+        clockRef.ms = ms;
+      },
+      paper: new PaperRail(noteStore, clock),
+      dids,
+      swapId: computeSwapId(dids.buyer, "00000001"),
+      bidParams: { swapId: computeSwapId(dids.buyer, "00000001"), wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc", amount: "1000000", asset: "USDC", ...legA },
+      legB,
+      lockTimeMs: T0,
+      addresses: { buyer: buyerKey.address, seller: sellerKey.address },
+      hashLock,
+      keySeeds: [seedOfTag(0x21), seedOfTag(0x22), evmKeySeed(0x411), evmKeySeed(0x412)],
+      refundAt: { legA: legA.refundAfterMs, legB: legB.refundAfterMs },
+      buyerOptions: () => ({ ...options("buyer") }),
+      sellerOptions: () => ({ ...options("seller"), mintHashLock: () => hashLock }),
+      counts: (): ChainCounts => ({ locks: node.count("lock"), claims: node.count("claim"), refunds: node.count("refund"), refundBuilds: node.count("refund") }),
+      settlePending: async () => false, // the EVM rail answers a missing row as never-landed; it is never pending
     };
   };
-  return {
-    name: "evm",
-    ...base,
-    setTime: (ms) => {
-      clockRef.ms = ms;
-    },
-    paper: new PaperRail(noteStore, clock),
-    dids,
-    swapId: computeSwapId(dids.buyer, "00000001"),
-    bidParams: { swapId: computeSwapId(dids.buyer, "00000001"), wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc", amount: "1000000", asset: "USDC", ...legA },
-    legB,
-    lockTimeMs: T0,
-    addresses: { buyer: buyerKey.address, seller: sellerKey.address },
-    hashLock,
-    keySeeds: [seedOfTag(0x21), seedOfTag(0x22), evmKeySeed(0x411), evmKeySeed(0x412)],
-    refundAt: { legA: legA.refundAfterMs, legB: legB.refundAfterMs },
-    buyerOptions: () => ({ ...options("buyer") }),
-    sellerOptions: () => ({ ...options("seller"), mintHashLock: () => hashLock }),
-    counts: (): ChainCounts => ({ locks: node.count("lock"), claims: node.count("claim"), refunds: node.count("refund"), refundBuilds: node.count("refund") }),
-    settlePending: async () => false, // the EVM rail answers a missing row as never-landed; it is never pending
-  };
-};
+
+export const evmWorld: WorldFactory = evmWorldWith();
 
 // --- sol ----------------------------------------------------------------------------------------------------------------
 
