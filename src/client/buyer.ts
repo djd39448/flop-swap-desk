@@ -144,6 +144,7 @@ import {
   recordFromJson,
   recordToJson,
   slotRecord,
+  SwapExpiredError,
   type BuyerNextStep,
   type JournalDeps,
 } from "./flow-resume.js";
@@ -374,7 +375,14 @@ export class BuyerFlow {
   private nextStep(): BuyerNextStep {
     const journal = this.#journal;
     if (journal === undefined || !journal.isLanded("offer-a")) return "bid";
-    if (!journal.isLanded("accept-b")) return "acceptLegB";
+    if (!journal.isLanded("accept-b")) {
+      // R2-06: a pairing that was saved and whose accept B never landed before leg B's offer expired can no longer be completed:
+      // `acceptLegB` would refuse it for ever. Nothing is at stake (leg A is locked only after accept B landed), so the swap is
+      // abandoned, not "acceptLegB" for ever. Derived from the record and the clock alone; an unsaved pairing names no offer B.
+      const legB = journal.record.legB;
+      if (legB !== undefined && this.clock() >= legB.expiresMs) return "abandoned";
+      return "acceptLegB";
+    }
     if (this.refundAttempted) {
       if (journal.isLanded("receipt-refund-a")) return "done";
       // R1-15: the refund lost the race to a claim: `refundLegA` only throws its routing error from here on, and the way on is
@@ -785,6 +793,12 @@ export class BuyerFlow {
     if (acceptAFrame.ref !== this.offerA.id) {
       throw new Error("buyer: refusing to accept — the leg A accept does not reference this flow's own offer");
     }
+    // R2-06: tclk's machine rejects an accept timestamped at or after the offer's `expiresMs` ("offer has expired"), so an accept A like
+    // that never folded into leg A's transcript: the swap it would pair with never existed for the venue. Leg B is never locked before
+    // this step, so refusing is always safe. The record's own timestamp decides (not the clock): a valid accept stays valid.
+    if (acceptARecord.timestampMs >= this.offerA.expiresMs) {
+      throw new SwapExpiredError(this.offerA.id, this.offerA.expiresMs, `accept A is timestamped ${acceptARecord.timestampMs}, at or after the offer's expiry`);
+    }
     const expectedContractA = contractId(this.offerA, {
       from: acceptAFrame.from,
       ref: acceptAFrame.ref,
@@ -830,6 +844,7 @@ export class BuyerFlow {
 
     if (this.store !== undefined) return this.acceptLegBPersisted(offerBRecord, acceptARecord, acceptAFrame, offerB, lockTimeMs);
 
+    this.checkAcceptBNotExpired(offerB); // R2-06
     const acceptB = makeAccept(offerB, { from: this.identity.did, statement: acceptAFrame.statement });
     const acceptBRecord = await this.venue.post("tclk-offers", encodeFrame(acceptB), this.identity);
 
@@ -837,6 +852,15 @@ export class BuyerFlow {
     this.acceptA = acceptAFrame;
     this.acceptB = acceptB;
     return { acceptB, acceptBRecord };
+  }
+
+  /** R2-06: refuses to post accept B at or after leg B's offer's `expiresMs` by the flow clock: tclk's machine rejects it ("offer has
+   *  expired"), so it would never fold, while the Seller (who locked leg B on the strength of the offer) and this Buyer went on to
+   *  lock and claim real value on a swap the venue never accepted. Nothing is posted or saved; leg A is never locked before accept B. */
+  private checkAcceptBNotExpired(offerB: OfferFrame): void {
+    if (this.clock() >= offerB.expiresMs) {
+      throw new SwapExpiredError(offerB.id, offerB.expiresMs, "accept B can no longer be posted");
+    }
   }
 
   /**
@@ -863,6 +887,7 @@ export class BuyerFlow {
       }
       acceptB = storedAcceptB;
     } else {
+      this.checkAcceptBNotExpired(offerB); // R2-06: nothing is saved for a pairing that can no longer be completed
       acceptB = makeAccept(offerB, { from: this.identity.did, statement: acceptAFrame.statement });
       const chosen = acceptB;
       await journal.update((r) => ({
@@ -879,7 +904,15 @@ export class BuyerFlow {
         },
       }));
     }
-    const acceptBRecord = await journal.ensurePosted({ kind: "accept-b", room: OFFER_ROOM, text: encodeFrame(acceptB), slot: "acceptB" });
+    // R2-06: the guard runs only when accept B has to be POSTED (a copy already in the room is adopted first): a saved accept B that
+    // never landed is not posted once leg B's offer has expired.
+    const acceptBRecord = await journal.ensurePosted({
+      kind: "accept-b",
+      room: OFFER_ROOM,
+      text: encodeFrame(acceptB),
+      slot: "acceptB",
+      guard: () => this.checkAcceptBNotExpired(offerB),
+    });
     this.offerB = offerB;
     this.acceptA = acceptAFrame;
     this.acceptB = acceptB;
