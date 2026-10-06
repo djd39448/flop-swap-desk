@@ -20,10 +20,14 @@
 //     is broken; a lock held by a live one is a typed `FlowStoreLockedError` and is never broken silently. A lock
 //     that names THIS process's own pid and is not one this process holds (a predecessor that died inside a save
 //     and a restart under the same pid, the normal case for node as pid 1 in a container, R2-01) is a leftover too
-//     and is broken: the process-wide set of held lock bodies tells the two apart. The file
+//     and is broken: the process-wide set of held lock bodies tells the two apart. The set is per process, not per
+//     thread: one thread per store directory (the README says so). The file
 //     carries a one-line header with the payload's length and sha256, so a truncated or corrupted file is a
 //     `FlowStoreCorruptError` on `load`, never an empty answer (the watcher's `state.json` habit of resetting on a
-//     bad read is deliberately NOT copied).
+//     bad read is deliberately NOT copied). A store also names its storage (`scopeId`: the resolved directory) and
+//     offers one store-wide exclusive section (`exclusive("seller-begin")`, a fixed `seller-begin.lock` taken with
+//     the same lock code), so that two accepts of one offer, which a per-key compare-and-swap cannot tell apart
+//     (their keys differ), are one critical section across store objects and processes (R2-04).
 //
 // Keys are `buyer:<swapId>` and `seller:<contractA>`: the part after the colon is `0x` + 64 lowercase hex in both
 // cases (the swap id of `src/profile.ts` for a Buyer; leg A's tclk contract id for a Seller, review round 1 R1-14: a
@@ -34,7 +38,8 @@
 //
 // File names: the key's `:` is not a legal character in a Windows file name (it opens an NTFS alternate data
 // stream), so a key is stored as `<role>-<id>.json`; `list()` maps the names back to keys. Lock and temp files
-// (`<role>-<id>.lock`, `<role>-<id>.json.tmp-<pid>-<random>`) never match that pattern, so `list()` never shows them.
+// (`<role>-<id>.lock`, `seller-begin.lock`, `<role>-<id>.json.tmp-<pid>-<random>`) never match that pattern, so
+// `list()` never shows them.
 //
 // This directory is secret-grade, exactly like a key file: the Seller's record holds the swap preimage.
 
