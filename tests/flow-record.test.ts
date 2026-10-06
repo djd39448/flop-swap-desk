@@ -739,6 +739,68 @@ describe("R1-18: a Buyer never holds the secret, not even in a ledger entry", ()
   });
 });
 
+describe("R2-14: no string of a Buyer record may hold the secret that opens its own lock.hashLock", () => {
+  const SECRET_HEX = SAMPLE_PREIMAGE.slice(2);
+  const revealText = `tclk1 {"type":"reveal","from":"${SAMPLE_BUYER.did}","contract":"${SAMPLE_CONTRACT_B}","ref":"${SAMPLE_CONTRACT_B}","secret":"${SAMPLE_PREIMAGE}"}`;
+  type Plant = [label: string, plant: (record: Record<string, unknown>) => void, path: RegExp];
+  const at = (record: Record<string, unknown>, ...path: string[]): Record<string, unknown> => path.reduce((o, k) => o[k] as Record<string, unknown>, record);
+  const roomB = dealRoom(SAMPLE_CONTRACT_B);
+  const plants: Plant[] = [
+    ["the reveal text in a receipt-b ledger entry", (r) => void (r.ledger as unknown[]).push({ kind: "receipt-b", room: roomB, text: revealText }), /record\.ledger\[5\]\.text/],
+    ["the bare 0x preimage in a receipt-b ledger entry", (r) => void (r.ledger as unknown[]).push({ kind: "receipt-b", room: roomB, text: `claimed with ${SAMPLE_PREIMAGE}` }), /record\.ledger\[5\]\.text/],
+    ["the preimage in a refundNotes entry (with 0x)", (r) => void (r.refundNotes as unknown[]).push(`note with ${SAMPLE_PREIMAGE}`), /record\.refundNotes\[\d+\]/],
+    ["the preimage in a refundNotes entry (without 0x)", (r) => void (r.refundNotes as unknown[]).push(`note with ${SECRET_HEX} inside`), /record\.refundNotes\[\d+\]/],
+    ["the preimage in upper case", (r) => void (r.refundNotes as unknown[]).push(SECRET_HEX.toUpperCase()), /record\.refundNotes\[\d+\]/],
+    ["the preimage in the own account line's text", (r) => void (at(r, "ownAccountLine").text = `acct ${SECRET_HEX}`), /record\.ownAccountLine\.text/],
+    ["the preimage in a frame slot's text", (r) => void ((at(r, "frames", "acceptB").text = `tclk1 {"x":"${SECRET_HEX}"}`), (at(r, "frames", "acceptB", "record").line = `tclk1 {"x":"${SECRET_HEX}"}`)), /record\.frames\.acceptB\.text/],
+    ["the preimage in a lock evidence raw entry", (r) => void ((at(r, "lock", "evidence").raw as unknown[])[0] = `{"revealed":"${SAMPLE_PREIMAGE}"}`), /record\.lock\.evidence\.raw\[0\]/],
+  ];
+
+  it.each(plants)("%s is refused when encoded (FlowRecordInvalidError) and when decoded (FlowStoreCorruptError), naming the path and never the secret", (_label, plant, path) => {
+    const record = plain(sampleBuyerRecord());
+    plant(record);
+    const encoded = (() => {
+      try {
+        encodeFlowRecord(record as unknown as FlowRecord);
+        return undefined;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(encoded).toBeInstanceOf(FlowRecordInvalidError);
+    expect((encoded as Error).message).toMatch(path);
+    expect((encoded as Error).message.toLowerCase()).not.toContain(SECRET_HEX);
+    const decoded = (() => {
+      try {
+        decodeFlowRecord(envelope(record), `buyer:${SAMPLE_SWAP_ID}`);
+        return undefined;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(decoded).toBeInstanceOf(FlowStoreCorruptError);
+    expect((decoded as Error).message).toMatch(path);
+    expect((decoded as Error).message.toLowerCase()).not.toContain(SECRET_HEX);
+  });
+
+  it("controls: the sample as it is, other 64-hex strings (ids, txids, digests), and a record whose lock has no hashLock yet are all accepted", () => {
+    const sample = sampleBuyerRecord();
+    expect(decodeFlowRecord(encodeFlowRecord(sample), recordKey(sample))).toEqual(sample); // full of 64-hex strings, none of them the secret
+    const other = plain(sample);
+    (other.refundNotes as unknown[]).push(`0x${"3c".repeat(32)}`, "ab".repeat(32), `sha256:${"3c".repeat(32)}`);
+    expect(() => encodeFlowRecord(other as unknown as FlowRecord)).not.toThrow();
+    // before the lock names a statement there is nothing to compare against
+    const early = plain(sample);
+    delete at(early, "lock").hashLock;
+    (early.refundNotes as unknown[]).push(SAMPLE_PREIMAGE);
+    expect(() => encodeFlowRecord(early as unknown as FlowRecord)).not.toThrow();
+  });
+
+  it("the Seller's record keeps the preimage (it is the one place that holds it)", () => {
+    expect(text(encodeFlowRecord(sampleSellerRecord()))).toContain(SECRET_HEX);
+  });
+});
+
 describe("R1-12 (record part): a landed mark can carry the signed record", () => {
   const roomA = dealRoom(SAMPLE_CONTRACT_A);
   const recordFor = (line: string) => ({ room: roomA, seq: 5, timestampMs: 1_700_000_000_500, sender: SAMPLE_BUYER.did, nonce: "10005", signature: "sig-5", line });

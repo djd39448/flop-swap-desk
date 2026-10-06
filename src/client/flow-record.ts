@@ -644,6 +644,8 @@ const HEX_EVEN = /^([0-9a-f]{2})+$/;
 const DID = /^did:key:z[1-9A-HJ-NP-Za-km-z]+$/;
 const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 const DIGITS = /^[0-9]+$/;
+/** A run of exactly 64 hex digits, not part of a longer one (R2-14). */
+const HEX64_RUN = /(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])/g;
 const MAX_TEXT = 8192;
 
 /** Parse, don't validate: turns an untrusted JSON value into the typed record or throws `FlowStoreCorruptError` naming
@@ -698,6 +700,31 @@ class Reader {
     if (!Array.isArray(value)) this.fail(path, "must be an array");
     if (value.length > max) this.fail(path, "has too many entries");
     return value;
+  }
+
+  /**
+   * R2-14 (rule 5, defence in depth): refuses a value, anywhere inside `value`, that holds the swap secret. A string
+   * holds it when it contains a run of exactly 64 hex digits (with or without a `0x` before it, in either case) that
+   * opens `hashLock`, the statement the Buyer's own lock names. Only the PATH of the first such string is reported, never
+   * the string. The decoder already refuses a preimage field and a reveal-b entry that is not a digest; this is the net
+   * under the strings it cannot know the purpose of (a receipt-b text, a refund note, an account line, a frame slot).
+   */
+  noPreimageOf(hashLock: string, value: unknown, path: string): void {
+    if (typeof value === "string") {
+      for (const run of value.matchAll(HEX64_RUN)) {
+        if (verifyHashPreimage(hashLock, `0x${run[0].toLowerCase()}`)) {
+          this.fail(path, "holds the swap secret (a 64-hex run that opens lock.hashLock): a Buyer's record never holds it");
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item, i) => this.noPreimageOf(hashLock, item, `${path}[${i}]`));
+      return;
+    }
+    if (value !== null && typeof value === "object") {
+      for (const [name, item] of Object.entries(value)) this.noPreimageOf(hashLock, item, `${path}.${name}`);
+    }
   }
 
   nullableString(value: unknown, path: string): string | null {
@@ -1046,7 +1073,7 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
   if (legBClaimAdopted !== undefined && !legBClaimAttempted) r.fail(`${path}.legBClaimAdopted`, "needs legBClaimAttempted");
   if (legBClaimAdopted !== undefined && legBClaimed) r.fail(`${path}.legBClaimAdopted`, "a leg B claim is this flow's own or adopted, never both");
 
-  return {
+  const record: BuyerFlowRecord = {
     ...common,
     role: "buyer",
     legBVerified: r.bool(o.legBVerified, `${path}.legBVerified`),
@@ -1072,6 +1099,9 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
     },
     refundNotes: r.array(o.refundNotes, `${path}.refundNotes`, 64).map((item, i) => r.string(item, `${path}.refundNotes[${i}]`, { max: 1024 })),
   };
+  // R2-14: once the statement is known (the lock names it), no string of the Buyer's record may hold the secret that opens it.
+  if (hashLock !== undefined) r.noPreimageOf(hashLock, record, path);
+  return record;
 }
 
 /** Runs the reader over a record the caller just built, so a bad one never leaves the helper that made it. A failure is
