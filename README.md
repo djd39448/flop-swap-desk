@@ -969,8 +969,13 @@ Only what the tests prove is claimed; the rest is written down.
   A refund carries the two budget instructions. The price is the 75th percentile of recent fees over the
   claim's writable accounts (floor 1,000, cap 1,000,000 micro-lamports per unit), doubled for each earlier
   claim of the flow that never landed (at most 10 doublings, never above the cap). The priority fee is therefore
-  bounded: at most 1,000,000 micro-lamports x 50,000 compute units = 50 lamports per claim (15 per refund at
-  15,000 units), on top of the 5,000-lamport base fee and the payee account's rent. The Seller then keeps claiming up to the landing bound (not the
+  bounded: price x limit, at most 1,000,000 micro-lamports x 120,000 compute units = 120,000 lamports
+  (0.00012 SOL) per claim (60,000 lamports per refund at its 60,000-unit limit), and 120 lamports (60 per refund)
+  at the 1,000 floor, on top of the 5,000-lamport base fee and the payee account's rent. The limits are that high
+  because the program derives the vault address at run time on every claim and refund, at 1,500 compute units per
+  bump attempt and a number of attempts that depends on the escrow (the measured base plus 1,500 per attempt; 120,000
+  and 60,000 cover thirty-plus attempts); storing the vault bump in the escrow is on the Solana-leg backlog.
+  The Seller then keeps claiming up to the landing bound (not the
   5-minute policy margin) and reports `neverLandedClaims` / `SolClaimStarvedError` ("secret broadcast but not
   landed, possibly seen"). Known limit: write-lock starvation on a busy cluster; the fee policy mitigates it,
   nothing guarantees inclusion. A starved claim leaves the secret possibly seen: leg B is then exposed (claimable by

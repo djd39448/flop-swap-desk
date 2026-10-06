@@ -101,16 +101,33 @@ export const SOL_CLAIM_LANDING_MARGIN_MS = SOL_BLOCKHASH_VALIDITY_BLOCKS * SOL_S
  *  max(reported, processed block height + this), so a node that under-reports cannot shorten the bound. */
 export const SOL_LAST_VALID_HEIGHT_CLAMP_BLOCKS = SOL_BLOCKHASH_VALIDITY_BLOCKS + 1;
 
-/** R3-2: the compute-unit limit every claim carries. MEASURED on the local validator (Agave 4.3.0): 12,982 units
- *  for a claim into an existing token account, 22,061 to 29,561 when the claim creates the account (two runs; the account creation varies); refund 7,258
- *  (tests-sol/sol-htlc.sol.test.ts asserts the measured use stays under these limits) with headroom. A limit far above use would make the priority fee (price x limit) cost more
- *  than needed. */
-export const SOL_CLAIM_COMPUTE_UNIT_LIMIT = 50_000;
-/** A refund (no token-account creation) is smaller. */
-export const SOL_REFUND_COMPUTE_UNIT_LIMIT = 15_000;
+/** R3-17 (root cause of R3-2's spread): the compute-unit limit every claim carries. MEASURED on the local validator
+ *  (Agave 4.3.0): 12,982 units for a claim into an existing token account, 22,061 to 29,561 when the claim creates
+ *  the payee's account, 7,258 to 10,258 for a refund (tests-sol/sol-htlc.sol.test.ts asserts the measured use stays
+ *  at or under these limits).
+ *
+ *  ROOT CAUSE of the spread: the program's check_vault_key calls find_program_address at run time on every claim and
+ *  every refund (contracts-sol/htlc/src/lib.rs), and the associated-token program does the same when a claim creates
+ *  the payee's account. Each bump attempt costs 1,500 compute units and the number of attempts depends on the escrow
+ *  key (roughly one chance in two per extra attempt), so the cost is fixed for one escrow but differs between
+ *  escrows in 1,500-unit steps: the suite measured the same refund at 7,258, 8,758 and 10,258 across runs. The old
+ *  refund limit of 15,000 left 14,700 after the two ComputeBudget instructions and failed (ComputationalBudgetExceeded
+ *  in simulation) for an escrow needing six or more attempts, deterministically for that escrow: every retry
+ *  simulates the same bytes.
+ *
+ *  FORMULA: use = measured base + 1,500 per bump attempt. 120,000 (claim) and 60,000 (refund) cover thirty-plus
+ *  attempts, below one chance in a billion.
+ *
+ *  FEE COST: the priority fee is price x limit, so the larger limits cost at most 120 lamports at the 1,000
+ *  micro-lamport floor and 0.00012 SOL (120,000 lamports) at the 1,000,000 micro-lamport cap per claim, and half of
+ *  that per refund; a high limit is not a cost worry. The program-side fix (store the vault bump in the escrow and
+ *  derive the vault with create_program_address, at constant cost) is on the Solana-leg backlog, not in this client. */
+export const SOL_CLAIM_COMPUTE_UNIT_LIMIT = 120_000;
+/** A refund (no token-account creation) has a smaller base; see the claim limit's comment for the formula and fee. */
+export const SOL_REFUND_COMPUTE_UNIT_LIMIT = 60_000;
 /** R3-2 priority-fee policy, micro-lamports per compute unit: the 75th percentile of the recent fees paid over the
  *  writable accounts, never below the floor, doubled for each earlier claim that never landed, never above the cap
- *  (the cap bounds the cost: 30k units x 1,000,000 micro-lamports = 30,000 lamports). */
+ *  (the cap bounds the cost: 120,000 units x 1,000,000 micro-lamports = 120,000 lamports). */
 export const SOL_PRIORITY_FEE_FLOOR_MICRO_LAMPORTS = 1_000n;
 export const SOL_PRIORITY_FEE_CAP_MICRO_LAMPORTS = 1_000_000n;
 /** The most doublings applied (further never-landed claims reuse the highest price). */
