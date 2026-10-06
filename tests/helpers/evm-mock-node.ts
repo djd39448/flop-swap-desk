@@ -71,6 +71,13 @@ export interface AppliedSend {
   hashLock?: Hex;
 }
 
+/** P8 matrix: a seam around every send the node applies. `begin` runs before the effect (it may throw: the process died right
+ *  before the send) and `end` right after it (the effect happened). A send the node refuses with an error reaches neither. */
+export interface SendHook {
+  begin(fn: SendKind, from: Address): unknown;
+  end(token: unknown): void;
+}
+
 export interface EvmSignerLike {
   address: Address;
   signPersonal(message: string): string;
@@ -84,6 +91,8 @@ export class EvmMockNode {
   blockNumber = 5n;
   /** When true `eth_getLogs` answers nothing (an evidence lookup that finds no event although the transaction mined). */
   hideLogs = false;
+  /** See `SendHook`. */
+  hook: SendHook | undefined;
   private readonly logs: StoredLog[] = [];
   private readonly receipts = new Map<string, { blockNumber: bigint; to: Address; from: Address }>();
   private txCounter = 0;
@@ -260,6 +269,7 @@ export class EvmMockNode {
       fn = decoded.functionName as SendKind;
     }
     if (this.rejectNext.delete(fn)) return { error: { code: -32000, message: `mock evm node: ${fn} not accepted (test)` } };
+    const hookToken = this.hook?.begin(fn, from);
 
     const txHash = `0x${(++this.txCounter).toString(16).padStart(64, "0")}` as Hex;
     const blockNumber = this.mine();
@@ -288,6 +298,7 @@ export class EvmMockNode {
     }
     this.receipts.set(txHash, { blockNumber, to: tx.to, from });
     this.sends.push({ fn, from, ...(hashLock === undefined ? {} : { hashLock }) });
+    this.hook?.end(hookToken);
     if (this.loseNext.delete(fn)) return { error: { code: -32000, message: `mock evm node: connection reset after ${fn} (test)` } };
     return { result: txHash };
   }
