@@ -77,3 +77,45 @@ export async function describeMatrix(world: string, factory: WorldFactory, optio
     });
   }
 }
+
+/** How many outward actions after the first death are tried as the place of a second one (the recovery itself, not the rest of the swap). */
+const RECOVERY_CUTS = 4;
+
+/**
+ * A process that dies again while it is recovering: for each chain action of the settle script, the first death either comes right before
+ * the action (the recovery has to send it, or find out it was sent) or right after it with the next store write refused (the action
+ * happened, its record did not); each of the next few outward actions of the run is then cut as well, before it and after it with the next
+ * store write refused. The swap must still end exactly as if nothing had happened.
+ */
+export async function describeDoubleCrash(world: string, factory: WorldFactory, options: MatrixOptions = {}): Promise<void> {
+  const reference = await runScript(factory, SETTLE, []);
+  const firsts = reference.world.ctl.actions.filter((action) => action.kind === "chain");
+  describe(`${world}: the swap settles, and the recovery is cut too`, () => {
+    for (const first of firsts) {
+      for (const firstMode of ["before", "after-store-fail"] as const) {
+        if (options.stalls?.(first, firstMode) !== undefined) continue; // that cut stops the swap; the matrix above has it
+        it(`#${first.n} ${first.what} / ${firstMode}; then each of the next ${RECOVERY_CUTS} outward actions is cut as well`, async () => {
+          const probe = await runScript(factory, SETTLE, [{ n: first.n, mode: firstMode }]);
+          const doomed = new Set(probe.world.ctl.doomed.map((action) => action.n));
+          const seconds = probe.world.ctl.actions.filter((action) => action.n > first.n && action.kind !== "signed" && !doomed.has(action.n)).slice(0, RECOVERY_CUTS);
+          expect(seconds.length).toBeGreaterThan(0);
+          for (const second of seconds) {
+            for (const mode of ["before", "after-store-fail"] as const) {
+              const run = await runScript(factory, SETTLE, [
+                { n: first.n, mode: firstMode },
+                { n: second.n, mode },
+              ]);
+              expect(run.world.ctl.fired.map((fired) => fired.n).sort((a, b) => a - b), `${second.what} / ${mode}`).toEqual([first.n, second.n]);
+              const stalls = options.stalls?.(second, mode);
+              expect(run.stalled).toBe(stalls);
+              if (stalls === "lock-pending") await finishStalled(run);
+              const findings = await inspectRun(run, stalls === "lock-pending" ? "never-locked" : stalls === "refund-pending" ? "refund-stuck" : "settled");
+              expect(findings.problems, `${second.what} / ${mode}`).toEqual([]);
+              expect(run.world.ctl.unsaved).toEqual([]);
+            }
+          }
+        });
+      }
+    }
+  });
+}

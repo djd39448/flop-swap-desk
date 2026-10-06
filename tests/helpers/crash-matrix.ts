@@ -84,6 +84,8 @@ export class Controller {
   private readonly gaps: Array<{ role: Role; after: Action; next: Action }> = [];
   /** Roles that died, in order. */
   readonly kills: Array<{ role: Role; at: Action | undefined }> = [];
+  /** Actions that were reached but never ran because the role was already doomed by a refused store write (they are not cut points). */
+  readonly doomed: Action[] = [];
   private readonly targets: readonly Target[];
   private count = 0;
   private readonly dead: Record<Role, boolean> = { buyer: false, seller: false };
@@ -131,6 +133,7 @@ export class Controller {
     const pending = this.armed[role];
     if (pending !== undefined) {
       this.armed[role] = undefined;
+      this.doomed.push(action);
       this.fired.push({ ...pending.target, role, what: pending.after.what });
       this.kill(role);
       throw new ProcessDied(`before ${what} (the store write after ${pending.after.what} never came)`);

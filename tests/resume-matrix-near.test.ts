@@ -12,10 +12,11 @@
 //     in the escrow, not lost); the Seller still takes leg B back.
 // Both are open issues of the rail's nonce proof, reported rather than fixed here.
 
-import { describeMatrix } from "./helpers/matrix-suite.js";
+import { describeDoubleCrash, describeMatrix } from "./helpers/matrix-suite.js";
 import { nearWorld } from "./helpers/matrix-worlds.js";
 
-await describeMatrix("near", nearWorld, {
-  stalls: (action, mode) =>
-    action.what === "chain:commitLock" && mode === "before" ? "lock-pending" : action.what === "chain:refund.signed" ? "refund-pending" : undefined,
-});
+const nearStalls = (action: { what: string }, mode: string) =>
+  action.what === "chain:commitLock" && mode === "before" ? ("lock-pending" as const) : action.what === "chain:refund.signed" ? ("refund-pending" as const) : undefined;
+
+await describeMatrix("near", nearWorld, { stalls: nearStalls });
+await describeDoubleCrash("near", nearWorld, { stalls: nearStalls });

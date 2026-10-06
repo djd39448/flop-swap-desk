@@ -87,6 +87,21 @@ describe("rule 2: a signed transaction that may still land is never answered by 
     expect(r.h.node.sent.claim).toBe(1);
   });
 
+  it("Solana (S2-1): a resumed Buyer claims leg B only once leg A reads Claimed; before that nothing is saved or written, after it the claim goes through", async () => {
+    const r = rig();
+    const p = await toLocked(r);
+    await restartBuyer(r);
+    await expect(r.buyer.claimLegB(r.h.sellerLock.preimage)).rejects.toThrow(/S2-1/); // the secret is known, leg A is still locked
+    expect((await buyerRecord(r)).legBClaimAttempted).toBe(false);
+    const note = new PaperRail(r.h.noteStore, r.h.clock);
+    expect((await note.read(p.contractB))?.status).toBe("locked");
+
+    await r.seller.claimLegA(p.accepted.acceptA.statement);
+    await restartBuyer(r);
+    await r.buyer.claimLegB(await r.buyer.learnSecret());
+    expect((await note.read(p.contractB))?.status).toBe("claimed");
+  });
+
   it("a fresh lock built after a proven never-landed must be the SAME lock: a different outpoint is refused and nothing is sent", async () => {
     const factory = ledgerWorldWith("btc", (chain) => void (chain.provesNeverLanded = true));
     const reference = await runScript(factory, SETTLE, []);
