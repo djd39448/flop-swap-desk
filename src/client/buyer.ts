@@ -381,6 +381,10 @@ export class BuyerFlow {
     }
     if (!this.legBVerified) return "verifyLegBLocked";
     if (!journal.isLanded("account-a")) return "postAccountLineA";
+    // R2-02: a claim of leg A seen on chain (refundLegA routed to it before a refund attempt was saved), or this flow's own claim of leg
+    // B, wins over the F1b refund route below: the way on is learnSecret then claimLegB, and `done` once leg B's receipt landed. An
+    // ADOPTED-only leg B note is not a reason to leave the refund doorway (R1-06), so `legBClaimAdopted` is deliberately not read here.
+    if (this.refundClaimSeen || this.legBClaimed) return this.legBDone() ? "done" : "learnSecret";
     if (this.lockEvidence === undefined || !this.lockFramePosted) {
       // R1-01 (variant F1b): a lock that was attempted and is not recognised yet is read by `lockLegA`, which finds it landed
       // whatever the clock says. Once leg A's refund time has come, though, the way out of a landed lock is `refundLegA`
