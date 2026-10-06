@@ -116,7 +116,8 @@
 //    posted; tclk's machine rejects such an accept, so leg B would settle on a swap the venue never accepted). Only while no lock attempt is saved: an
 //    attempt that was saved is recovered whatever the stamp of its accept B, because recognising a lock that may have landed is not a new action.
 //  - R3-08: the EVM claim-marker margin is 256 blocks (the Base Sepolia safe head was measured up to 91 blocks behind the tip), under the public
-//    endpoint's 500-block `eth_getLogs` window.
+//    endpoint's 500-block `eth_getLogs` window. Since P9-3 the resumed scan itself is chunked to that window (newest range first, at most 100
+//    calls), so neither the margin nor the delay of a resume is bounded by it any more.
 //
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
 // B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a;
@@ -309,8 +310,9 @@ export const CLAIM_MARKER_REORG_MARGIN_BTC = 6;
  *  samples) to trail the unsafe tip by 8 to 91 blocks (median 56, p90 79), so the earlier 64 sat inside that lag and a claim re-included below
  *  the tip by an unsafe-head reorg could fall under the saved marker (the resumed Seller would then never find its own claim, never post its
  *  reveal and receipt: liveness only, the Buyer still learns the secret from its own older scan). 256 leaves headroom over the measured lag and
- *  stays under the public endpoint's 500-block `eth_getLogs` window (a prompt resume scans about this margin plus the blocks mined since the
- *  claim). Anvil, the only EVM chain of the test suites, is unaffected. The Bitcoin margin and the Buyer's lock marker are unchanged. */
+ *  stays under the public endpoint's 500-block `eth_getLogs` window, so a prompt resume is one call (about this margin plus the blocks mined
+ *  since the claim); since P9-3 a later resume is split into window-sized calls instead of being refused. Anvil, the only EVM chain of the
+ *  test suites, is unaffected. The Bitcoin margin and the Buyer's lock marker are unchanged. */
 export const CLAIM_MARKER_REORG_MARGIN_EVM = 256;
 
 /** R2-13: `marker` (the chain tip read before the first claim send) minus the reorg margin of its kind (a bigint is an EVM block number, a number a

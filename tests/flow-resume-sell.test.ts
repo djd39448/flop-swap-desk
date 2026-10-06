@@ -11,6 +11,8 @@
 //   R1-11  only the lock frame tclk's machine accepted for contract A stops the Seller's account line, never a stranger's
 //   R1-13  a resumed claim is looked for from the block marker saved with the attempt (never from genesis), and a claim recorded as landed
 //          is not searched for at all
+//   P9-3   that scan is chunked to the endpoint's 500-block `eth_getLogs` window (newest range first, 100 calls at most), so a resume of any
+//          delay finds its claim on a capped endpoint; past the bound it fails with a typed error, never with "no claim"
 //
 // The flows are the real ones, with stores, over the EVM mock node, the Solana node and the Bitcoin ledger fake of the crash matrix.
 
@@ -23,6 +25,7 @@ import { decodeFlowRecord, FlowRecordConflictError, FlowRecordMismatchError, mar
 import { FlowNotFoundError } from "../src/client/flow-resume.js";
 import { FlowRecordExistsError, FlowStoreFaultError, FlowStoreWriteFailedError } from "../src/client/flow-store.js";
 import { CLAIM_MARKER_REORG_MARGIN_BTC, CLAIM_MARKER_REORG_MARGIN_EVM, SellerFlow, RevealNotPostedError } from "../src/client/seller.js";
+import { EvmLogScanBoundError, MAX_LOG_SCAN_CHUNKS } from "../src/rails/evm-htlc.js";
 import { PREFIX, STEPS, readSwap } from "./helpers/crash-matrix.js";
 import { identity } from "./helpers/identity.js";
 import type { EvmMockNode } from "./helpers/evm-mock-node.js";
@@ -404,6 +407,129 @@ describe("R1-13 (EVM): a resumed claim is looked for from the saved block marker
     expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(1);
     expect(await framesOfType(s, dealRoom(contractA), "receipt")).toBe(1);
     expect(s.w.counts().claims).toBe(1);
+  });
+});
+
+describe("P9-3 (EVM): the resumed claim scan is chunked, so the resume delay is no longer bounded by the 500-block window", () => {
+  /** Base Sepolia (84532): the default `maxLogRange` of 500 is in force, and the node refuses any `eth_getLogs` over 500 blocks (both ends counted). */
+  const sepolia = (node: EvmMockNode): void => {
+    node.chainId = 84532;
+    node.blockNumber = 1000n;
+    node.maxLogSpan = 500n;
+  };
+
+  /** The Seller sends its claim and dies; the chain moves on by `late` blocks while the process is down. `resume()` brings the Seller back (not yet run). */
+  async function diedAfterClaim(late: bigint, prepare: (node: EvmMockNode) => void = sepolia) {
+    let node: EvmMockNode | undefined;
+    const s = await started(evmWorldWith((n) => ((node = n), prepare(n))));
+    const statement = s.c.seller.statement!;
+    await resumedSeller(s, (o) => ({ rail: crashRail(o.rail, { after: ["claim"] }) }));
+    await expect(s.c.seller.claimLegA(statement)).rejects.toBeInstanceOf(ProcessDied);
+    expect(s.w.counts().claims).toBe(1);
+    const marker = markerFromJson((await sellerRecordOf(s.w)).claimFromBlock!) as bigint;
+    const rawTip = node!.blockNumber - 1n; // the tip the attempt saw (the claim's send then mined the next block)
+    node!.blockNumber += late; // the process stays down while the chain moves on
+    return { s, node: node!, statement, marker, rawTip, resume: () => resumedSeller(s) };
+  }
+
+  /** `[from, tip]` as the newest-first ranges of at most `size` blocks (both ends counted). */
+  function newestFirst(from: bigint, tip: bigint, size: bigint): Array<{ from: bigint; to: bigint }> {
+    const out: Array<{ from: bigint; to: bigint }> = [];
+    let hi = tip;
+    while (hi >= from) {
+      const lo = hi - size + 1n > from ? hi - size + 1n : from;
+      out.push({ from: lo, to: hi });
+      hi = lo - 1n;
+    }
+    return out;
+  }
+
+  // The claim sits at the tip the attempt saw plus one block; the saved marker is 256 blocks below that tip. A resume `late` blocks after
+  // the send scans [marker, tip + late]: the newest range holds the claim while late < 500 (one call), then each further 500 blocks of
+  // delay costs one more call. Unchunked, every one of these is one call over 557 blocks or more, which the endpoint refuses.
+  it.each([
+    [300n, 1],
+    [600n, 2],
+    [1000n, 3],
+  ])(
+    "a resume %i blocks late finds its claim in %i getLogs calls on a 500-block endpoint: reveal and receipt are posted, nothing is claimed twice",
+    async (late, calls) => {
+      const { s, node, statement, marker, rawTip, resume } = await diedAfterClaim(late);
+      const before = node.logRanges.length;
+      const back = await resume();
+      expect(back.next).toBe("claimLegA");
+      const result = await back.flow.claimLegA(statement); // unchunked, the one call over about 560 or 1,260 blocks is refused by the endpoint
+      expect(result.receipt).toBeDefined();
+      expect(s.w.counts().claims, "nothing is claimed twice").toBe(1);
+      const { contractA } = await contractsOf(s.w);
+      expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(1);
+      expect(await framesOfType(s, dealRoom(contractA), "receipt")).toBe(1);
+
+      const scan = node.logRanges.slice(before).map(({ from, to }) => ({ from, to }));
+      const claimBlock = rawTip + 1n;
+      const planned = newestFirst(marker, node.blockNumber, 500n);
+      const upToTheClaim = planned.slice(0, planned.findIndex((range) => range.from <= claimBlock && claimBlock <= range.to) + 1);
+      expect(planned.at(-1)?.from, "the planned scan still reaches the saved marker (the window is not shrunk)").toBe(marker);
+      expect(scan, "newest range first, stopping at the range that holds the claim").toEqual(upToTheClaim);
+      expect(scan).toHaveLength(calls);
+      expect(node.logRanges.slice(before).every((range) => !range.latest && range.to - range.from + 1n <= 500n)).toBe(true);
+    },
+  );
+
+  it("the marker is still the tip minus 256 (the chunked scan does not shrink the reorg margin)", async () => {
+    const { marker, rawTip } = await diedAfterClaim(0n);
+    expect(marker).toBe(rawTip - BigInt(CLAIM_MARKER_REORG_MARGIN_EVM));
+  });
+
+  it("a claim a reorg re-included 200 blocks below the tip it was sent at is found by a resume 600 blocks late", async () => {
+    const { s, node, statement, rawTip, resume } = await diedAfterClaim(600n);
+    node.reorgLog("Claimed", statement, rawTip - 200n);
+    const back = await resume();
+    const result = await back.flow.claimLegA(statement);
+    expect(result.receipt).toBeDefined();
+    expect(s.w.counts().claims).toBe(1);
+    const { contractA } = await contractsOf(s.w);
+    expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(1);
+  });
+
+  it("on anvil an explicit maxLogRange of 500 does the same (the field works on any pin)", async () => {
+    const { s, node, statement, resume } = await diedAfterClaim(1000n, (n) => {
+      n.blockNumber = 1000n;
+      n.maxLogSpan = 500n;
+      n.configExtras = { maxLogRange: 500 };
+    });
+    const before = node.logRanges.length;
+    const back = await resume();
+    await back.flow.claimLegA(statement);
+    expect(node.logRanges.length - before).toBe(3);
+    expect(s.w.counts().claims).toBe(1);
+  });
+
+  it("without chunking (anvil default, a capped endpoint) the same resume is refused before anything is posted: the pre-P9-3 failure, kept as the anchor", async () => {
+    const { s, statement, resume } = await diedAfterClaim(1000n, (n) => {
+      n.blockNumber = 1000n;
+      n.maxLogSpan = 500n;
+    });
+    const back = await resume();
+    await expect(back.flow.claimLegA(statement)).rejects.toThrow(/block range limit/);
+    expect(s.w.counts().claims).toBe(1);
+    const { contractA } = await contractsOf(s.w);
+    expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(0);
+  });
+
+  it("a resume further behind than the bound (more than 100 calls) fails with the typed error: it never reads 'no claim', sends nothing and posts nothing", async () => {
+    const { s, node, statement, marker, resume } = await diedAfterClaim(BigInt(MAX_LOG_SCAN_CHUNKS) * 500n + 10_000n);
+    const before = node.logRanges.length;
+    const back = await resume();
+    const error = (await back.flow.claimLegA(statement).catch((caught: unknown) => caught)) as EvmLogScanBoundError;
+    expect(error).toBeInstanceOf(EvmLogScanBoundError);
+    expect(error.fromBlock).toBe(marker);
+    expect(error.unreadFrom).toBe(marker);
+    expect(node.logRanges.length - before, "100 newest ranges were read before the error").toBe(MAX_LOG_SCAN_CHUNKS);
+    expect(s.w.counts().claims, "no second claim was sent").toBe(1);
+    const { contractA } = await contractsOf(s.w);
+    expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(0);
+    expect(await framesOfType(s, dealRoom(contractA), "receipt")).toBe(0);
   });
 });
 

@@ -27,12 +27,13 @@ import {
   validateEvmRailConfig,
   type EvmRailConfig,
 } from "../src/rails/evm-htlc.js";
-import { CapturingRpc, verifiedExchangeBytes } from "../src/rails/rpc-capture.js";
+import { verifiedExchangeBytes, type CapturingRpc } from "../src/rails/rpc-capture.js";
 import type { AddressBook } from "../src/vendor/evm-hash-rail.js";
 import { Controller, PREFIX, type Ctx } from "./helpers/crash-matrix.js";
 import { EvmMockNode } from "./helpers/evm-mock-node.js";
 import { evmWorldWith } from "./helpers/matrix-worlds.js";
 import { evmSigner } from "./helpers/proven-lines.js";
+import { scriptedRpc } from "./helpers/scripted-rpc.js";
 
 const T0 = 1_700_000_000_000;
 const NOW = (): number => T0;
@@ -74,24 +75,6 @@ function connectBuyer(node: EvmMockNode, config: EvmRailConfig = node.config()):
   return EvmHtlcRail.connect({ config, rpc: node.rpc(), account: BUYER.address, addressBook: ADDRESS_BOOK, clock: NOW });
 }
 
-/** Scripted JSON-RPC answers, recording every method called. A method with no handler is an error, so a stray call shows. */
-function scripted(handlers: Record<string, (params: readonly unknown[]) => { result?: unknown; error?: { code: number; message: string } }>): {
-  rpc: CapturingRpc;
-  calls: Array<{ method: string; params: readonly unknown[] }>;
-} {
-  const calls: Array<{ method: string; params: readonly unknown[] }> = [];
-  const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as { id: number; method: string; params: readonly unknown[] };
-    calls.push({ method: body.method, params: body.params });
-    const handler = handlers[body.method];
-    const response = handler === undefined ? { error: { code: -32601, message: `unexpected ${body.method}` } } : handler(body.params);
-    const text = JSON.stringify(response.error !== undefined ? { jsonrpc: "2.0", id: body.id, error: response.error } : { jsonrpc: "2.0", id: body.id, result: response.result });
-    const bytes = new TextEncoder().encode(text);
-    return { text: async () => text, arrayBuffer: async () => bytes.buffer } as Response;
-  }) as typeof fetch;
-  return { rpc: new CapturingRpc({ endpoint: "http://mock-evm", fetch: fetchImpl }), calls };
-}
-
 const sepoliaConfig = (hash?: string): unknown => ({
   pin: BASE_SEPOLIA_PIN,
   endpoint: "http://mock-evm",
@@ -110,7 +93,7 @@ describe("P9-2 config: a Base Sepolia config must carry contractCodeHash, an anv
   });
 
   it("connect() refuses that config before any network call", async () => {
-    const { rpc, calls } = scripted({});
+    const { rpc, calls } = scriptedRpc({});
     await expect(EvmHtlcRail.connect({ config: sepoliaConfig() as EvmRailConfig, rpc, account: BUYER.address, addressBook: ADDRESS_BOOK, clock: NOW })).rejects.toThrow(
       /refusing to connect.*must carry contractCodeHash/,
     );
@@ -154,7 +137,7 @@ describe("P9-2 connect(): the contract's code is read and must hash to the pin",
     const node = newNode();
     const hash = keccak256(node.contractCode);
     for (const written of [hash, hash.toUpperCase().replace("0X", "0x")] as Hex[]) {
-      const { rpc, calls } = scripted({
+      const { rpc, calls } = scriptedRpc({
         eth_chainId: () => ({ result: "0x7a69" }),
         eth_getCode: () => ({ result: node.contractCode }),
       });
@@ -193,7 +176,7 @@ describe("P9-2 connect(): the contract's code is read and must hash to the pin",
   });
 
   it.each([["not hex at all"], ["0x123"], ["0xzz"], [""]])("an answer that is not whole hex bytes (%j) is refused as malformed", async (answer) => {
-    const { rpc } = scripted({ eth_chainId: () => ({ result: "0x7a69" }), eth_getCode: () => ({ result: answer }) });
+    const { rpc } = scriptedRpc({ eth_chainId: () => ({ result: "0x7a69" }), eth_getCode: () => ({ result: answer }) });
     const config = { ...newNode().config(), contractCodeHash: WRONG_HASH };
     const error = (await EvmHtlcRail.connect({ config, rpc, account: BUYER.address, addressBook: ADDRESS_BOOK, clock: NOW }).catch((caught: unknown) => caught)) as EvmContractCodeError;
     expect(error).toBeInstanceOf(EvmContractCodeError);
@@ -201,7 +184,7 @@ describe("P9-2 connect(): the contract's code is read and must hash to the pin",
   });
 
   it("a node that answers an error to eth_getCode refuses the connect too (never trusted unread)", async () => {
-    const { rpc } = scripted({ eth_chainId: () => ({ result: "0x7a69" }), eth_getCode: () => ({ error: { code: -32000, message: "no code for you" } }) });
+    const { rpc } = scriptedRpc({ eth_chainId: () => ({ result: "0x7a69" }), eth_getCode: () => ({ error: { code: -32000, message: "no code for you" } }) });
     const config = { ...newNode().config(), contractCodeHash: WRONG_HASH };
     await expect(EvmHtlcRail.connect({ config, rpc, account: BUYER.address, addressBook: ADDRESS_BOOK, clock: NOW })).rejects.toThrow(/no code for you/);
   });
@@ -214,7 +197,7 @@ describe("P9-2 connect(): the contract's code is read and must hash to the pin",
   });
 
   it("an anvil config without the field never reads the code (the existing configs behave exactly as before)", async () => {
-    const { rpc, calls } = scripted({ eth_chainId: () => ({ result: "0x7a69" }) });
+    const { rpc, calls } = scriptedRpc({ eth_chainId: () => ({ result: "0x7a69" }) });
     const config = newNode().config();
     expect(config.contractCodeHash).toBeUndefined();
     await EvmHtlcRail.connect({ config, rpc, account: BUYER.address, addressBook: ADDRESS_BOOK, clock: NOW });
@@ -392,7 +375,7 @@ describe("P9-2 evidence: the capture reads the code and fails closed when it is 
   it("an eth_getCode answered with an error is refused", async () => {
     const node = newNode();
     const { terms, config } = await lockedAndCaptured(node);
-    const { rpc } = scripted({
+    const { rpc } = scriptedRpc({
       eth_chainId: () => ({ result: "0x7a69" }),
       eth_getCode: () => ({ error: { code: -32000, message: "boom" } }),
     });

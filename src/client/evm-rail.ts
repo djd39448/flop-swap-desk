@@ -199,6 +199,8 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
     return this.rail.verifyLockFinal(terms, ref, accounts as EvmAccounts);
   }
 
+  /** P9-3: chunked to the config's `maxLogRange` (500 on Base Sepolia), newest range first, at most `MAX_LOG_SCAN_CHUNKS` calls, a typed
+   *  `EvmLogScanBoundError` past that; this is the scan of the resumed Seller's own claim and of the Buyer's secret discovery alike. */
   async findClaimedPreimage(ref: string, fromMarker?: RailBlockMarker): Promise<string | null> {
     const fromBlock = typeof fromMarker === "bigint" ? fromMarker : 0n;
     return this.rail.findClaimedPreimage(ref as Hex, fromBlock);

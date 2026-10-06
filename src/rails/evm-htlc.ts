@@ -530,6 +530,15 @@ interface LogRange {
   to: bigint | "latest";
 }
 
+/** `planLogScan`'s answer: the calls to make (newest first), the tip they were cut from (absent when unlimited), the older part that did
+ *  not fit in `MAX_LOG_SCAN_CHUNKS` calls (absent when everything is covered) and the range limit in force. */
+interface LogScanPlan {
+  ranges: LogRange[];
+  tip: bigint | undefined;
+  unread: { from: bigint; to: bigint } | undefined;
+  limit: number | undefined;
+}
+
 /** Shared by the wrapped public client (which records a timeout) and the rail (which reads it back after a vendored write
  *  has re-wrapped the error as `tclk: ...`). One write runs at a time on one rail handle. */
 interface ReceiptWatch {
@@ -984,16 +993,25 @@ export class EvmHtlcRail {
    *  exchange log length this write's own caller (`lock`/`claim`/`refund`) snapshotted right
    *  before it started, so `raw` below can be sliced to exactly this write's own exchanges. */
   private async captureWriteEvidence(event: WriteEventName, hashLock: Hex, fromBlock: bigint, before: number): Promise<WriteEvidence> {
-    const logs = await this.publicClient.getLogs({
-      address: this.config.contract,
-      event: WRITE_EVENT_ABI[event],
-      args: { hashLock },
-      fromBlock,
-      toBlock: "latest",
-    });
+    // P9-3: the lookup is paged to the endpoint's range cap like every scan, and an answer needs every page: exactly one log across
+    // them all. A range that cannot be covered inside the bound is refused up front (a part read would prove nothing about "one").
+    const plan = await this.planLogScan(fromBlock);
+    if (plan.unread !== undefined) throw this.logScanBoundError(fromBlock, plan);
+    const logs = [];
+    for (const range of [...plan.ranges].reverse()) {
+      logs.push(
+        ...(await this.publicClient.getLogs({
+          address: this.config.contract,
+          event: WRITE_EVENT_ABI[event],
+          args: { hashLock },
+          fromBlock: range.from,
+          toBlock: range.to,
+        })),
+      );
+    }
     if (logs.length !== 1) {
       throw new Error(
-        `evm-htlc: expected exactly one ${event} log for ${hashLock} in blocks [${fromBlock}, latest], found ${logs.length}`,
+        `evm-htlc: expected exactly one ${event} log for ${hashLock} in blocks [${fromBlock}, ${plan.tip ?? "latest"}], found ${logs.length}`,
       );
     }
     const [log] = logs;
@@ -1086,17 +1104,58 @@ export class EvmHtlcRail {
    *  never trusts the log's shape alone. How the Buyer learns `s` when the Seller claims on
    *  chain before (or without) posting its reveal frame. */
   async findClaimedPreimage(hashLock: Hex, fromBlock: bigint): Promise<Hex | null> {
-    const logs = await this.publicClient.getLogs({
-      address: this.config.contract,
-      event: CLAIMED_EVENT,
-      args: { hashLock },
-      fromBlock,
-      toBlock: "latest",
-    });
-    for (const log of logs) {
-      const preimage = log.args.preimage;
-      if (preimage !== undefined && verifyHashPreimage(hashLock, preimage)) return preimage;
+    // P9-3: `[fromBlock, tip]` is read in ranges of at most the endpoint's cap, NEWEST range first (a claim is most likely a recent
+    // one, so the usual answer costs one call). A preimage found in any range is returned whatever lies below it. A range left
+    // unread when the bound runs out is never reported as "no claim": the typed error says the scan is incomplete.
+    const plan = await this.planLogScan(fromBlock);
+    for (const range of plan.ranges) {
+      const logs = await this.publicClient.getLogs({
+        address: this.config.contract,
+        event: CLAIMED_EVENT,
+        args: { hashLock },
+        fromBlock: range.from,
+        toBlock: range.to,
+      });
+      for (const log of logs) {
+        const preimage = log.args.preimage;
+        if (preimage !== undefined && verifyHashPreimage(hashLock, preimage)) return preimage;
+      }
     }
+    if (plan.unread !== undefined) throw this.logScanBoundError(fromBlock, plan);
     return null;
+  }
+
+  /**
+   * P9-3 (rule 3): the `eth_getLogs` ranges that cover `[fromBlock, tip]`, newest first. With no limit in force (anvil's default) it is
+   * the one range `[fromBlock, "latest"]` as before and no tip is read. With a limit, the tip is read once, fresh (`eth_blockNumber`
+   * through the capturing transport, never viem's cached block number), and the span is cut into ranges of at most `maxLogRange`
+   * blocks (both ends counted, so a 500-block range is `to - from + 1 = 500`), at most `MAX_LOG_SCAN_CHUNKS` of them; whatever
+   * older part does not fit is returned as `unread`, for the caller to refuse or report, never silently dropped. A start above the tip
+   * has no range at all.
+   */
+  private async planLogScan(fromBlock: bigint): Promise<LogScanPlan> {
+    const limit = effectiveMaxLogRange(this.config);
+    if (limit === undefined) return { ranges: [{ from: fromBlock, to: "latest" }], tip: undefined, unread: undefined, limit: undefined };
+    const raw = await this.rpc.request({ method: "eth_blockNumber", params: [] });
+    if (typeof raw !== "string" || !/^0x[0-9a-fA-F]+$/.test(raw)) {
+      throw new Error("evm-htlc: eth_blockNumber returned something that is not a hex number, so a log scan cannot be planned");
+    }
+    const tip = BigInt(raw);
+    const width = BigInt(limit);
+    const ranges: LogRange[] = [];
+    let high = tip;
+    while (high >= fromBlock && ranges.length < MAX_LOG_SCAN_CHUNKS) {
+      const low = high - width + 1n > fromBlock ? high - width + 1n : fromBlock;
+      ranges.push({ from: low, to: high });
+      high = low - 1n;
+    }
+    return { ranges, tip, unread: high >= fromBlock ? { from: fromBlock, to: high } : undefined, limit };
+  }
+
+  private logScanBoundError(fromBlock: bigint, plan: LogScanPlan): EvmLogScanBoundError {
+    if (plan.unread === undefined || plan.tip === undefined || plan.limit === undefined) {
+      throw new Error("evm-htlc: internal error: a log scan bound error without a bounded plan");
+    }
+    return new EvmLogScanBoundError(fromBlock, plan.tip, plan.unread.from, plan.unread.to, plan.limit, MAX_LOG_SCAN_CHUNKS);
   }
 }
