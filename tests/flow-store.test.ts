@@ -640,6 +640,208 @@ describe("FileFlowStore", () => {
       });
     });
 
+    describe("R3-04: assertHeld reads the lock with the retrying reader", () => {
+      const eperm = (): Error => Object.assign(new Error("EPERM: operation not permitted (a scanner holds the file)"), { code: "EPERM" });
+      /** Makes every lock-file read for which `fails(n)` is true throw EPERM; `n` counts the lock reads from 1 after this call. */
+      const failLockReads = (fails: (read: number) => boolean): { restore: () => void; reads: () => number } => {
+        const original = fsp.readFile;
+        let lockReads = 0;
+        const spy = vi.spyOn(fsp, "readFile").mockImplementation((async (path: unknown, options?: unknown) => {
+          if (String(path).endsWith(".lock")) {
+            lockReads += 1;
+            if (fails(lockReads)) throw eperm();
+          }
+          return (original as (p: unknown, o?: unknown) => Promise<unknown>).call(fsp, path, options);
+        }) as typeof fsp.readFile);
+        return { restore: () => spy.mockRestore(), reads: () => lockReads };
+      };
+
+      it("one transient EPERM on assertHeld's read does not fail a save that holds its own lock: the save resolves and stores the new value", async () => {
+        const dir = join(root, "flows");
+        const store = new FileFlowStore(dir, { lockWaitMs: 100 });
+        await store.save(KEY_BUYER, bytes("v1"), null);
+        const fault = failLockReads((read) => read === 1); // read 1 is assertHeld's (an update: the create of the lock succeeds at once)
+        try {
+          await store.save(KEY_BUYER, bytes("v2"), digestOf("v1"));
+        } finally {
+          fault.restore();
+        }
+        expect(fault.reads()).toBeGreaterThanOrEqual(3); // assertHeld's read was retried, then release read
+        expect(text(await store.load(KEY_BUYER))).toBe("v2");
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+      });
+
+      it("a lock file that stays unreadable refuses the save with its own wording (never 'another instance'), renames nothing, and the next save goes through", async () => {
+        const dir = join(root, "flows");
+        const store = new FileFlowStore(dir, { lockWaitMs: 100 });
+        await store.save(KEY_BUYER, bytes("v1"), null);
+        const fault = failLockReads(() => true); // every lock read fails: assertHeld's and release's
+        let error: unknown;
+        try {
+          error = await store.save(KEY_BUYER, bytes("v2"), digestOf("v1")).catch((e: unknown) => e);
+        } finally {
+          fault.restore();
+        }
+        expect(error).toBeInstanceOf(FlowStoreLockedError);
+        expect((error as FlowStoreLockedError).reason).toBe("unreadable");
+        expect((error as FlowStoreLockedError).holderPid).toBeUndefined();
+        expect((error as FlowStoreLockedError).lockPath).toBe(lockFile(dir));
+        expect((error as Error).message).toContain("the lock file could not be read");
+        expect((error as Error).message).toContain("nothing was renamed");
+        expect((error as Error).message).not.toContain("another instance");
+        expect(text(await store.load(KEY_BUYER))).toBe("v1"); // nothing was renamed
+        expect(readdirSync(dir).filter((name) => name.includes(".tmp-"))).toEqual([]);
+        // no other writer exists: the lock this process could not read is its own leftover and the next save breaks it
+        await store.save(KEY_BUYER, bytes("v2"), digestOf("v1"));
+        expect(text(await store.load(KEY_BUYER))).toBe("v2");
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+      });
+
+      it("a lock file that is gone, or replaced by another body, keeps the 'removed or replaced' refusal", async () => {
+        for (const replace of [(dir: string) => rmSync(lockFile(dir), { force: true }), (dir: string) => writeFileSync(lockFile(dir), lockBody(deadPid()))]) {
+          const dir = join(root, `lost-${readdirSync(root).length}`);
+          await new FileFlowStore(dir).save(KEY_BUYER, bytes("old"), null);
+          const store = new FileFlowStore(dir, {
+            lockWaitMs: 0,
+            onStep: (step) => {
+              if (step === "file-synced") replace(dir);
+            },
+          });
+          const error = await store.save(KEY_BUYER, bytes("new"), digestOf("old")).catch((e: unknown) => e);
+          expect(error).toBeInstanceOf(FlowStoreLockedError);
+          expect((error as FlowStoreLockedError).reason).toBe("lost");
+          expect((error as Error).message).toContain("removed or replaced");
+          expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("old");
+        }
+      });
+    });
+
+    describe("R3-05: the wording of a lock refusal names the way out", () => {
+      const eperm = (): Error => Object.assign(new Error("EPERM: operation not permitted (a handle without delete sharing)"), { code: "EPERM" });
+      /** Makes every remove of a `.lock` file fail with EPERM. */
+      const failLockRemoves = (): { restore: () => void } => {
+        const original = fsp.rm;
+        const spy = vi.spyOn(fsp, "rm").mockImplementation((async (path: unknown, options?: unknown) => {
+          if (String(path).endsWith(".lock")) throw eperm();
+          return (original as (p: unknown, o?: unknown) => Promise<unknown>).call(fsp, path, options);
+        }) as typeof fsp.rm);
+        return { restore: () => spy.mockRestore() };
+      };
+
+      it("an own-pid leftover that cannot be removed says a stale lock file naming the pid could not be removed and names the file, not 'same process' and not 'another instance'", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        writeFileSync(lockFile(dir), lockBody(process.pid)); // a predecessor with this pid died inside a save
+        const fault = failLockRemoves();
+        let error: unknown;
+        try {
+          error = await new FileFlowStore(dir, { lockWaitMs: 100 }).save(KEY_BUYER, bytes("x"), null).catch((e: unknown) => e);
+        } finally {
+          fault.restore();
+        }
+        expect(error).toBeInstanceOf(FlowStoreLockedError);
+        expect((error as FlowStoreLockedError).reason).toBe("stale");
+        expect((error as FlowStoreLockedError).holderPid).toBe(process.pid);
+        expect((error as Error).message).toContain(`a stale lock file naming pid ${process.pid} could not be removed: remove ${lockFile(dir)}`);
+        expect((error as Error).message).not.toContain("same process");
+        expect((error as Error).message).not.toContain("another instance");
+        expect(await new FileFlowStore(dir).load(KEY_BUYER)).toBeNull(); // nothing was written
+        // the way out the message names works: with the file removed (here: the fault is gone) the save goes through
+        await new FileFlowStore(dir, { lockWaitMs: 100 }).save(KEY_BUYER, bytes("x"), null);
+        expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("x");
+      });
+
+      it("a dead pid's leftover that cannot be removed says the same, and the begin section's leftover too", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        const dead = deadPid();
+        writeFileSync(lockFile(dir), lockBody(dead));
+        writeFileSync(join(dir, "seller-begin.lock"), lockBody(dead));
+        const fault = failLockRemoves();
+        let keyError: unknown;
+        let sectionError: unknown;
+        try {
+          keyError = await new FileFlowStore(dir, { lockWaitMs: 100 }).save(KEY_BUYER, bytes("x"), null).catch((e: unknown) => e);
+          sectionError = await new FileFlowStore(dir, { lockWaitMs: 100 }).exclusive("seller-begin", async () => "ran").catch((e: unknown) => e);
+        } finally {
+          fault.restore();
+        }
+        expect((keyError as Error).message).toContain(`a stale lock file naming pid ${dead} could not be removed: remove ${lockFile(dir)}`);
+        expect((sectionError as Error).message).toContain(`a stale lock file naming pid ${dead} could not be removed: remove ${join(dir, "seller-begin.lock")}`);
+        for (const error of [keyError, sectionError]) {
+          expect(error).toBeInstanceOf(FlowStoreLockedError);
+          expect((error as FlowStoreLockedError).reason).toBe("stale");
+          expect((error as Error).message).not.toContain("another instance");
+          expect((error as Error).message).not.toContain("owns this swap");
+        }
+      });
+
+      it("a live foreign pid still says another instance owns the swap, and adds that a reused pid looks live and the named file may be removed by hand", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        const other = livePid();
+        try {
+          writeFileSync(lockFile(dir), lockBody(other.pid));
+          const error = await new FileFlowStore(dir, { lockWaitMs: 0 }).save(KEY_BUYER, bytes("x"), null).catch((e: unknown) => e);
+          expect((error as FlowStoreLockedError).reason).toBe("held");
+          expect((error as Error).message).toContain("another instance owns this swap");
+          expect((error as Error).message).toContain("A pid reused by an unrelated process looks live");
+          expect((error as Error).message).toContain(`remove ${lockFile(dir)} by hand`);
+        } finally {
+          other.stop();
+        }
+      });
+
+      it("a live lock of this very process adds no 'remove it by hand' advice", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        const link = join(root, "link");
+        symlinkSync(dir, link, "junction");
+        let refusal: unknown;
+        await new FileFlowStore(dir, {
+          onStep: async (step) => {
+            if (step !== "tmp-written") return;
+            refusal = await new FileFlowStore(link, { lockWaitMs: 0 }).save(KEY_BUYER, bytes("intruder"), null).catch((e: unknown) => e);
+          },
+        }).save(KEY_BUYER, bytes("holder"), null);
+        expect((refusal as Error).message).toContain("this same process");
+        expect((refusal as Error).message).not.toContain("by hand");
+      });
+
+      it("a begin section held by a live foreign process says another Seller begin is running, never 'owns this swap', and names the file for a reused pid", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        const other = livePid();
+        try {
+          writeFileSync(join(dir, "seller-begin.lock"), lockBody(other.pid));
+          const error = await new FileFlowStore(dir, { lockWaitMs: 0 }).exclusive("seller-begin", async () => "ran").catch((e: unknown) => e);
+          expect(error).toBeInstanceOf(FlowStoreLockedError);
+          expect((error as FlowStoreLockedError).holderPid).toBe(other.pid);
+          expect((error as Error).message).toContain(`another Seller begin is running (pid ${other.pid})`);
+          expect((error as Error).message).not.toContain("owns this swap");
+          expect((error as Error).message).not.toContain("another instance");
+          expect((error as Error).message).toContain(`remove ${join(dir, "seller-begin.lock")} by hand`);
+        } finally {
+          other.stop();
+        }
+      });
+
+      it("a begin section held by this very process says so, without 'owns this swap' and without 'by hand'", async () => {
+        const dir = join(root, "flows");
+        const link = join(root, "link");
+        mkdirSync(dir);
+        symlinkSync(dir, link, "junction"); // another spelling, so the in-process queue does not serialise the two
+        let refusal: unknown;
+        await new FileFlowStore(dir).exclusive("seller-begin", async () => {
+          refusal = await new FileFlowStore(link, { lockWaitMs: 0 }).exclusive("seller-begin", async () => "ran").catch((e: unknown) => e);
+        });
+        expect(refusal).toBeInstanceOf(FlowStoreLockedError);
+        expect((refusal as Error).message).toContain(`another Seller begin is running (pid ${process.pid}) in this same process`);
+        expect((refusal as Error).message).not.toContain("owns this swap");
+        expect((refusal as Error).message).not.toContain("by hand");
+      });
+    });
+
     it("another key's lock does not block this key", async () => {
       const dir = join(root, "flows");
       mkdirSync(dir);

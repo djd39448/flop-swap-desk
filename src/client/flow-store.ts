@@ -150,26 +150,61 @@ export class FlowRecordExistsError extends FlowStoreWriteFailedError {
   }
 }
 
+/** Why a `FlowStoreLockedError` refused. `held`: a live holder owns the lock (or the lock could not be taken at all).
+ *  `stale`: the lock file is a leftover (its process is gone, or it names this process's pid without this process
+ *  holding it) and could not be removed (R3-05). `lost`: the save's own lock file was removed or replaced while the
+ *  save held it. `unreadable`: the save's own lock file could not be read when the save checked it (R3-04). */
+export type FlowStoreLockReason = "held" | "stale" | "lost" | "unreadable";
+
 /** Another LIVE process holds the key's lock file (or the lock could not be taken): that process owns the swap. The
  *  lock is never broken silently. A lock left by a process that is gone is broken automatically, and so is one that
  *  names this very process's pid without this process holding it (R2-01); if the pid was reused by an unrelated
- *  process, an operator removes the named file. The message never says "another instance" for this process's own
- *  pid: the only own-pid lock that is not broken is one a save of THIS process is holding right now. */
+ *  process, an operator removes the named file, and the message says so. The message never says "another instance"
+ *  for this process's own pid: the only own-pid lock that is not broken is one a save of THIS process is holding
+ *  right now. A leftover that cannot be removed has its own reason and wording (`stale`: remove the named file), and
+ *  so does a save whose own lock file could not be read (`unreadable`); neither names another instance (R3-04,
+ *  R3-05). A refusal of the store-wide Seller begin section says "another Seller begin is running", not "owns this
+ *  swap". */
 export class FlowStoreLockedError extends FlowStoreWriteFailedError {
   readonly lockPath: string;
   /** The pid the lock file names, when it could be read. */
   readonly holderPid: number | undefined;
-  constructor(key: string, lockPath: string, holderPid: number | undefined, detail?: string) {
-    const own = holderPid !== undefined && holderPid === process.pid;
-    super(
-      key,
-      `flow store: "${key}" is locked by ${holderPid === undefined ? "another writer" : own ? `a save in this same process (pid ${holderPid})` : `process ${holderPid}`} (${lockPath})` +
-        `${detail === undefined ? "" : `: ${detail}`}; ${own ? "" : "another instance owns this swap, "}nothing was written`,
-    );
+  /** Why the lock refused (see `FlowStoreLockReason`). Default `held`. */
+  readonly reason: FlowStoreLockReason;
+  constructor(key: string, lockPath: string, holderPid: number | undefined, detail?: string, reason: FlowStoreLockReason = "held") {
+    super(key, lockedMessage(key, lockPath, holderPid, detail, reason));
     this.name = "FlowStoreLockedError";
     this.lockPath = lockPath;
     this.holderPid = holderPid;
+    this.reason = reason;
   }
+}
+
+function lockedMessage(key: string, lockPath: string, holderPid: number | undefined, detail: string | undefined, reason: FlowStoreLockReason): string {
+  if (reason === "stale") {
+    return (
+      `flow store: "${key}": a stale lock file${holderPid === undefined ? "" : ` naming pid ${holderPid}`} could not be removed: ` +
+      `remove ${lockPath}; nothing was written`
+    );
+  }
+  if (reason === "unreadable") return `flow store: "${key}": the lock file could not be read (${lockPath}); nothing was renamed`;
+  const own = holderPid !== undefined && holderPid === process.pid;
+  const extra = detail === undefined ? "" : `: ${detail}`;
+  // A live foreign pid may be a pid an unrelated process now has (a reboot, a recycled pid): the way out is the file.
+  const reused = holderPid !== undefined && !own && reason === "held";
+  if (!FLOW_KEY_PATTERN.test(key)) {
+    // A store-wide section (`seller-begin`), not a record: there is no swap to own.
+    if (holderPid === undefined) return `flow store: "${key}" is locked by another writer (${lockPath})${extra}; nothing was written`;
+    return (
+      `flow store: another Seller begin is running (pid ${holderPid})${own ? " in this same process" : ""} (${lockPath})${extra}; nothing was written` +
+      `${reused ? `. A pid reused by an unrelated process looks live: if no Seller begin is running, remove ${lockPath} by hand` : ""}`
+    );
+  }
+  return (
+    `flow store: "${key}" is locked by ${holderPid === undefined ? "another writer" : own ? `a save in this same process (pid ${holderPid})` : `process ${holderPid}`} (${lockPath})` +
+    `${extra}; ${own ? "" : "another instance owns this swap, "}nothing was written` +
+    `${reused ? `. A pid reused by an unrelated process looks live: if no instance of this swap is running, remove ${lockPath} by hand` : ""}`
+  );
 }
 
 /** The failure a `MemoryFlowStore` injects on purpose (never thrown by a real store). */
@@ -733,7 +768,9 @@ export class FileFlowStore implements FlowStore {
           const stale = holder.pid === undefined ? unparsed === holder.raw : holder.pid === process.pid ? !held.has(holder.raw) : !processAlive(holder.pid);
           if (stale) {
             breaks += 1;
-            if (breaks > 5) throw new FlowStoreLockedError(key, lockPath, holder.pid, "a stale lock file could not be removed");
+            // R3-05: a leftover that cannot be removed is not "a save in this same process" and not "another instance":
+            // it names the file a person removes.
+            if (breaks > 5) throw new FlowStoreLockedError(key, lockPath, holder.pid, undefined, "stale");
             await this.breakLock(lockPath, holder.raw);
             unparsed = undefined;
             continue;
@@ -754,9 +791,13 @@ export class FileFlowStore implements FlowStore {
   private heldLock(key: string, lockPath: string, body: string, held: Set<string>): HeldLock {
     return {
       assertHeld: async () => {
-        const now = await readLockFile(lockPath).catch(() => null);
+        // R3-04: the reader release uses, which retries a transient EPERM, EBUSY or EACCES (a scanner or indexer holding
+        // the file between the fsync and the rename). `readLockFile` answers `null` to those, which would be read here as
+        // "removed or replaced" and fail a save that owns its lock.
+        const now = await readLockFileRetrying(lockPath);
+        if (now === undefined) throw new FlowStoreLockedError(key, lockPath, undefined, undefined, "unreadable");
         if (now === null || now.raw !== body) {
-          throw new FlowStoreLockedError(key, lockPath, now?.pid, "the lock file was removed or replaced while this save held it; nothing was renamed");
+          throw new FlowStoreLockedError(key, lockPath, now?.pid, "the lock file was removed or replaced while this save held it; nothing was renamed", "lost");
         }
       },
       release: async () => {

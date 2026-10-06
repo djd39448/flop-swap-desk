@@ -109,6 +109,8 @@ describe("R2-04: the begin section across processes", () => {
       const error = await seller(new FileFlowStore(dir, { lockWaitMs: 0 })).acceptLegA(offerA, s.w.legB, s.w.lockTimeMs).catch((e: unknown) => e);
       expect(error).toBeInstanceOf(FlowStoreLockedError);
       expect((error as FlowStoreLockedError).holderPid).toBe(other.pid);
+      expect((error as Error).message).toContain(`another Seller begin is running (pid ${other.pid})`); // R3-05: not "another instance owns this swap"
+      expect((error as Error).message).not.toContain("owns this swap");
       expect(await sellerFrames(s)).toEqual({ accepts: 0, offers: 0 }); // nothing posted
       expect(sellerFiles(dir)).toEqual([]); // nothing stored: the secret was never minted
     } finally {
@@ -152,6 +154,8 @@ describe("R2-04: the begin section across processes", () => {
       const error = await seller(new FileFlowStore(dir, { lockWaitMs: 0 })).acceptLegA(offerA, s.w.legB, s.w.lockTimeMs).catch((e: unknown) => e);
       expect(error).toBeInstanceOf(FlowStoreLockedError);
       expect((error as FlowStoreLockedError).holderPid).toBe(child.pid);
+      expect((error as Error).message).toContain(`another Seller begin is running (pid ${child.pid})`); // R3-05
+      expect((error as Error).message).not.toContain("owns this swap");
       expect(await sellerFrames(s)).toEqual({ accepts: 0, offers: 0 });
       expect(sellerFiles(dir)).toEqual([]);
       // the child dies inside the section (a crash during a begin): its lock names a dead pid and is broken
