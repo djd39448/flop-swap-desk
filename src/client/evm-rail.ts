@@ -10,6 +10,7 @@
 // Design source: flop-contrib/handoff/P4-BTC-SPEC.md §7a.
 
 import { isAddressEqual, type Address, type Hex } from "viem";
+import type { LocalAccount } from "viem/accounts";
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
 import { accountProofMessage, formatAccountLine, resolveAccounts } from "../rails/account-line.js";
@@ -36,9 +37,19 @@ export interface EvmCounterRailOptions {
   config: EvmRailConfig;
   /** The transport every read and write goes through — also this rail's `CaptureSink`. */
   rpc: CapturingRpc;
-  /** This party's own EVM address. A JSON-RPC account: no private key anywhere (D-10). */
-  account: Address;
+  /**
+   * This party's own EVM account: an `Address` (a JSON-RPC account: the node holds the key and signs over RPC, anvil's
+   * unlocked accounts) or a viem `LocalAccount` (P9-1: loaded from a key file by `loadEvmLocalAccount`; viem signs locally,
+   * every write goes out as `eth_sendRawTransaction` and the account proof is `account.signMessage`). No private key
+   * is held, stored or printed by this module either way (D-10); only the address is ever shown.
+   */
+  account: Address | LocalAccount;
   clock: () => number;
+}
+
+/** The address of either kind of account. */
+function addressOf(account: Address | LocalAccount): Address {
+  return typeof account === "string" ? account : account.address;
 }
 
 /**
@@ -63,33 +74,43 @@ function addressBookFor(terms: LockTerms, accounts: RailAccounts, ownAccount: Ad
 class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
   private readonly rail: EvmHtlcRail;
   private readonly rpc: CapturingRpc;
+  /** This party's address, whichever kind of account it has. */
   private readonly account: Address;
+  /** Set only for a local account: the object that signs the account proof (never a key, never printed). */
+  private readonly local: LocalAccount | undefined;
   private readonly caip2: string;
   /** G3: `prepareLock`'s own recorded intent — EVM's write ref (the hashLock) is already known
    *  before any write happens at all (P22-P24-EVM-FIXES-R3.md E3), so preparing needs no network
    *  call of its own; `commitLock` consumes this and does the real approve+lock. */
   private prepared: { terms: LockTerms; feeBps: number } | undefined;
 
-  constructor(rail: EvmHtlcRail, rpc: CapturingRpc, account: Address, caip2: string) {
+  constructor(rail: EvmHtlcRail, rpc: CapturingRpc, account: Address | LocalAccount, caip2: string) {
     this.rail = rail;
     this.rpc = rpc;
-    this.account = account;
+    this.account = addressOf(account);
+    this.local = typeof account === "string" ? undefined : account;
     this.caip2 = caip2;
   }
 
-  /** P7: EIP-191 `personal_sign` by this party's own JSON-RPC account: the node holds the key and
-   *  signs over RPC, this code never sees one (D-10). The signature is re-verified locally (the
-   *  same `eip191` verifier a resolver uses) before it is returned, so a node that signs with the
-   *  wrong account or returns garbage is refused here, not discovered at resolution. */
+  /** P7: EIP-191 by this party's own account. A JSON-RPC account: `personal_sign` over RPC, the node holds the key and
+   *  signs, this code never sees one (D-10). A local account (P9-1): `account.signMessage` signs in this process (the
+   *  same EIP-191 message hash; no `personal_sign` call goes out). Either way the signature is re-verified locally
+   *  (the same `eip191` verifier a resolver uses) before it is returned, so a signer that signs with the wrong account
+   *  or returns garbage is refused here, not discovered at resolution. */
   async signAccountProof(message: string): Promise<AccountProof> {
     const own = `${this.caip2}:${this.account.toLowerCase()}`;
     if (!message.endsWith(`|${own}`)) {
       throw new Error("evm-rail: refusing to sign an account proof for a message that does not name this handle's own account");
     }
-    const hex = `0x${Buffer.from(message, "utf8").toString("hex")}`;
-    const signed = await this.rpc.request({ method: "personal_sign", params: [hex, this.account] });
+    let signed: unknown;
+    if (this.local !== undefined) {
+      signed = await this.local.signMessage({ message });
+    } else {
+      const hex = `0x${Buffer.from(message, "utf8").toString("hex")}`;
+      signed = await this.rpc.request({ method: "personal_sign", params: [hex, this.account] });
+    }
     if (typeof signed !== "string" || !/^0x[0-9a-fA-F]{130}$/.test(signed)) {
-      throw new Error("evm-rail: personal_sign did not return a 65-byte signature");
+      throw new Error(`evm-rail: ${this.local !== undefined ? "the local account's signMessage" : "personal_sign"} did not return a 65-byte signature`);
     }
     const bytes = Buffer.from(signed.slice(2), "hex");
     // Some nodes return v as 0/1; EIP-191 tooling (and the verifier) use 27/28.
@@ -102,7 +123,13 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
       subject: this.account.toLowerCase(),
       proof,
     });
-    if (!ok) throw new Error("evm-rail: the node's personal_sign signature does not verify for this account");
+    if (!ok) {
+      throw new Error(
+        this.local !== undefined
+          ? "evm-rail: the local account's signature does not verify for this account"
+          : "evm-rail: the node's personal_sign signature does not verify for this account",
+      );
+    }
     return proof;
   }
 
@@ -135,9 +162,13 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
     return this.rail.claim(ref as Hex, secret as Hex, notAfterMs);
   }
 
-  /** P8: `evm-htlc` takes the recorder options for interface symmetry and never calls them: the node signs and sends
-   *  in one JSON-RPC call, so there is no signed refund to hand over before the send. A repeated refund after a crash
-   *  is recognised from the lock's own state (`verifyLockFinal` reads `refunded`), not from a handle. */
+  /** P8: `evm-htlc` takes the recorder options for interface symmetry and never calls them: with a JSON-RPC account the
+   *  node signs and sends in one call, and with a local account (P9-1) the transaction is signed and broadcast inside
+   *  viem's `sendTransaction`, which returns only the hash once the node has it, so there is no signed refund to hand
+   *  over before the send either way (and `LockRecovery` has no EVM shape: the P8 record format is unchanged). The P8
+   *  order holds for a local account exactly as for a JSON-RPC one: the flow persists its intent first, then calls
+   *  this. A repeated refund after a crash is recognised from the lock's own state (`verifyLockFinal` reads
+   *  `refunded`), not from a handle. */
   async refund(ref: string, _options?: RailRefundOptions): Promise<RailWriteEvidence> {
     return this.rail.refund(ref as Hex);
   }
@@ -246,7 +277,7 @@ class EvmCounterRail implements CounterAssetRail {
   }
 
   async connect(terms: LockTerms, accounts: RailAccounts): Promise<ConnectedCounterAssetRail> {
-    const addressBook = addressBookFor(terms, accounts, this.options.account);
+    const addressBook = addressBookFor(terms, accounts, addressOf(this.options.account));
     const rail = await EvmHtlcRail.connect({
       config: this.options.config,
       rpc: this.options.rpc,

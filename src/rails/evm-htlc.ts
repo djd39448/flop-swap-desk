@@ -4,12 +4,15 @@
 // never edited) and adds what a real deployment needs that the vendored binding doesn't try
 // to be — a chain pin with an allow list (anvil-local, base-sepolia), byte-exact write evidence, and a fail-closed
 // finalized-view read shared with the offline replay (src/rails/evm-evidence.ts). Every write
-// goes through a viem `WalletClient` built on a plain address (`createWalletClient({ account:
-// <address>, transport })`, a JSON-RPC account): no private key, mnemonic or seed for any EVM
-// account exists anywhere in this build (D-10). `connect()` refuses to even start against a
-// mainnet chain id, pinned or actually connected to, and refuses to configure Base mainnet
-// USDC in the asset book (D-09) — this is the local, keyless build; a real key on Base Sepolia
-// is Dave's own G1 step, loaded from env, never printed, and not built here.
+// goes through a viem `WalletClient` built on the party's account, which is one of two things:
+// a plain address (`createWalletClient({ account: <address>, transport })`, a JSON-RPC account:
+// the node holds the key and signs over RPC, anvil's unlocked accounts) or a viem `LocalAccount`
+// (P9-1: viem signs locally and every write goes out as `eth_sendRawTransaction`; the account
+// comes from `loadEvmLocalAccount` in src/client/evm-key-file.ts, the one place a key file is
+// read, and nothing in this file ever sees, stores or prints a key). No private key, mnemonic
+// or seed for any EVM account exists anywhere in this repo (D-10). `connect()` refuses to even
+// start against a mainnet chain id, pinned or actually connected to, and refuses to configure
+// Base mainnet USDC in the asset book (D-09).
 //
 // P22-P24-EVM-FIXES-R3.md E4/E5: `claim()` now takes a `notAfterMs` bound (enforced against
 // fresh `pending`-block time right before it broadcasts) and no longer hands the real preimage
@@ -25,7 +28,9 @@ import {
   createWalletClient,
   custom,
   hexToNumber,
+  isAddress,
   isAddressEqual,
+  WaitForTransactionReceiptTimeoutError,
   type Address,
   type Account,
   type Chain,
@@ -34,6 +39,7 @@ import {
   type Transport,
   type WalletClient,
 } from "viem";
+import type { LocalAccount } from "viem/accounts";
 import type { LockTerms } from "@flop-labs/tclk";
 import { verifyHashPreimage } from "@flop-labs/tclk";
 
@@ -59,7 +65,21 @@ export interface EvmRailConfig {
   endpoint: string;
   contract: Address;
   assets: Record<string, Address>;
+  /**
+   * P9-1: how long (ms) any one receipt wait (approve, lock, claim, refund) may poll before it gives up with an
+   * `EvmReceiptTimeoutError`. Omitted: viem's own default, `VIEM_RECEIPT_TIMEOUT_MS` (180 s). A slower public chain
+   * raises it; it never makes a write safer or less safe (the transaction is already broadcast when the wait starts),
+   * it only decides how long this process waits before reporting "no receipt yet". A positive integer, at most
+   * `MAX_RECEIPT_TIMEOUT_MS`.
+   */
+  receiptTimeoutMs?: number;
 }
+
+/** viem 2.56.8's default for `waitForTransactionReceipt`'s `timeout` (180 s); what an omitted `receiptTimeoutMs` means. */
+export const VIEM_RECEIPT_TIMEOUT_MS = 180_000;
+
+/** An upper bound on a configured `receiptTimeoutMs`: one day. A larger number is a typo for something else. */
+export const MAX_RECEIPT_TIMEOUT_MS = 86_400_000;
 
 export const BASE_SEPOLIA_PIN: EvmChainPin = {
   chainId: 84532,
@@ -212,6 +232,16 @@ export function evmRailConfigShapeReason(value: unknown): string | null {
   for (const [asset, address] of Object.entries(v.assets as Record<string, unknown>)) {
     if (typeof address !== "string" || !HEX_ADDRESS.test(address)) {
       return `evm rail config: assets["${asset}"] must be a 0x-address`;
+    }
+  }
+  if (v.receiptTimeoutMs !== undefined) {
+    if (
+      typeof v.receiptTimeoutMs !== "number" ||
+      !Number.isInteger(v.receiptTimeoutMs) ||
+      v.receiptTimeoutMs <= 0 ||
+      v.receiptTimeoutMs > MAX_RECEIPT_TIMEOUT_MS
+    ) {
+      return `evm rail config: receiptTimeoutMs must be a positive integer of at most ${MAX_RECEIPT_TIMEOUT_MS}`;
     }
   }
   return null;
@@ -375,13 +405,72 @@ export interface EvmLockRecord {
   refundAfterMs: bigint;
 }
 
+/**
+ * P9-1: a receipt wait gave up (`EvmRailConfig.receiptTimeoutMs`, else viem's 180 s). The transaction named by `hash`
+ * WAS broadcast (the node accepted it and returned the hash) and may still be mined; this error says only that this
+ * process stopped waiting. It is what `approve`, `lock`, `claim` and `refund` throw when the wait times out (never a hang,
+ * never the vendored rail's `tclk: Timed out ...` text), so a caller can tell "sent, outcome unknown" from "refused".
+ * The right next step is to read the chain (`readLock`, `verifyLockFinal`, `findClaimedPreimage`) before sending anything
+ * again; the P8 recover paths do exactly that.
+ */
+export class EvmReceiptTimeoutError extends Error {
+  readonly hash: Hex;
+  readonly timeoutMs: number;
+  constructor(hash: Hex, timeoutMs: number) {
+    super(
+      `evm-htlc: no receipt for transaction ${hash} within ${timeoutMs} ms; it was broadcast and may still be mined, ` +
+        "so read the chain before sending anything again",
+    );
+    this.name = "EvmReceiptTimeoutError";
+    this.hash = hash;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/** Shared by the wrapped public client (which records a timeout) and the rail (which reads it back after a vendored write
+ *  has re-wrapped the error as `tclk: ...`). One write runs at a time on one rail handle. */
+interface ReceiptWatch {
+  timeout: EvmReceiptTimeoutError | undefined;
+}
+
+/** The viem `waitForTransactionReceipt` parameters, without naming a chain. */
+type ReceiptWaitParameters = Parameters<PublicClient["waitForTransactionReceipt"]>[0];
+
+/**
+ * P9-1: returns `client` with its `waitForTransactionReceipt` replaced, so that EVERY receipt wait in this build (the
+ * vendored rail's own, which cannot be edited, and `approve`'s) uses `receiptTimeoutMs` when one is configured (viem's own
+ * default otherwise) and turns viem's timeout into `EvmReceiptTimeoutError`. The error is also recorded in `watch`, because
+ * the vendored rail re-wraps whatever it catches as a plain `tclk: ...` Error.
+ */
+function withReceiptTimeout(client: PublicClient, receiptTimeoutMs: number | undefined, watch: ReceiptWatch): PublicClient {
+  const extended = client.extend(() => ({
+    async waitForTransactionReceipt(parameters: ReceiptWaitParameters) {
+      const withTimeout = parameters.timeout === undefined && receiptTimeoutMs !== undefined ? { ...parameters, timeout: receiptTimeoutMs } : parameters;
+      try {
+        return await client.waitForTransactionReceipt(withTimeout);
+      } catch (error) {
+        if (error instanceof WaitForTransactionReceiptTimeoutError) {
+          const typed = new EvmReceiptTimeoutError(parameters.hash, withTimeout.timeout ?? VIEM_RECEIPT_TIMEOUT_MS);
+          watch.timeout = typed;
+          throw typed;
+        }
+        throw error;
+      }
+    },
+  }));
+  return extended as unknown as PublicClient;
+}
+
 export interface EvmHtlcRailOptions {
   config: EvmRailConfig;
   /** The transport every read and write goes through — also this rail's `CaptureSink`. */
   rpc: CapturingRpc;
-  /** This party's own EVM address. A JSON-RPC account: `createWalletClient({ account, ... })`
-   *  never holds or asks for a private key (D-10). */
-  account: Address;
+  /** This party's own EVM account, one of two things. An `Address` is a JSON-RPC account (`createWalletClient({ account,
+   *  ... })` holds no key: the node answers `eth_sendTransaction`; anvil's unlocked accounts). A viem `LocalAccount`
+   *  (P9-1, from `loadEvmLocalAccount`) signs locally: viem fills nonce, gas and fees through the same `rpc`
+   *  (`eth_getTransactionCount`, `eth_estimateGas`, the fee reads; public data) and every write goes out as
+   *  `eth_sendRawTransaction`, never `eth_sendTransaction`. This module never reads, stores or prints a key. */
+  account: Address | LocalAccount;
   /** Resolves a counterparty's tclk DID to its EVM address for the vendored rail's write path
    *  (`lock()` needs the payee's address). Populated from `src/rails/account-line.ts`'s
    *  `resolveAccounts` in the client, out of this Stage's scope. */
@@ -401,6 +490,7 @@ export class EvmHtlcRail {
   private readonly walletClient: WalletClient<Transport, Chain, Account>;
   private readonly rail: EvmHashRail;
   private readonly clock: () => number;
+  private readonly receiptWatch: ReceiptWatch;
 
   private constructor(
     config: EvmRailConfig,
@@ -409,6 +499,7 @@ export class EvmHtlcRail {
     walletClient: WalletClient<Transport, Chain, Account>,
     rail: EvmHashRail,
     clock: () => number,
+    receiptWatch: ReceiptWatch,
   ) {
     this.config = config;
     this.rpc = rpc;
@@ -416,6 +507,7 @@ export class EvmHtlcRail {
     this.walletClient = walletClient;
     this.rail = rail;
     this.clock = clock;
+    this.receiptWatch = receiptWatch;
   }
 
   /**
@@ -447,7 +539,22 @@ export class EvmHtlcRail {
     // inclusion margin; with retries off, every request is one attempt bounded by the
     // CapturingRpc timeout, and every attempt is a single captured exchange.
     const transport = custom(options.rpc, { retryCount: 0 });
-    const publicClient = createPublicClient({ chain, transport });
+    if (typeof options.account !== "string") {
+      // A LocalAccount (P9-1). Anything else (a smart account, a half-built object) is refused before a client is built.
+      const local = options.account as { type?: unknown; address?: unknown; signTransaction?: unknown } | null;
+      if (
+        local === null ||
+        typeof local !== "object" ||
+        local.type !== "local" ||
+        typeof local.address !== "string" ||
+        !isAddress(local.address, { strict: false }) ||
+        typeof local.signTransaction !== "function"
+      ) {
+        throw new Error("evm-htlc: refusing to connect: account must be an address or a local account");
+      }
+    }
+    const receiptWatch: ReceiptWatch = { timeout: undefined };
+    const publicClient = withReceiptTimeout(createPublicClient({ chain, transport }), options.config.receiptTimeoutMs, receiptWatch);
     const walletClient = createWalletClient({ account: options.account, chain, transport });
 
     const liveChainIdHex = (await options.rpc.request({ method: "eth_chainId", params: [] })) as Hex;
@@ -477,7 +584,20 @@ export class EvmHtlcRail {
     // see (a write's `WriteEvidence.raw` must hold only that write's own exchanges).
     options.rpc.drain();
 
-    return new EvmHtlcRail(options.config, options.rpc, publicClient, walletClient, rail, options.clock ?? Date.now);
+    return new EvmHtlcRail(options.config, options.rpc, publicClient, walletClient, rail, options.clock ?? Date.now, receiptWatch);
+  }
+
+  /** Runs one write through the vendored rail, which re-wraps every failure as `tclk: <reason>`: a receipt timeout recorded
+   *  by the wrapped public client during this call is thrown back as the typed `EvmReceiptTimeoutError`. */
+  private async viaVendoredRail(write: () => Promise<unknown>): Promise<void> {
+    this.receiptWatch.timeout = undefined;
+    try {
+      await write();
+    } catch (error) {
+      const timeout = this.receiptWatch.timeout;
+      if (timeout !== undefined) throw timeout;
+      throw error;
+    }
   }
 
   private resolveAsset(asset: string): Address {
@@ -551,7 +671,7 @@ export class EvmHtlcRail {
     this.rpc.setIdNamespace(`write-lock:${terms.statement}:${this.clock()}`);
     try {
       const fromBlock = await this.publicClient.getBlockNumber();
-      await this.rail.lock(terms);
+      await this.viaVendoredRail(() => this.rail.lock(terms));
       return await this.captureWriteEvidence("Locked", terms.statement as Hex, fromBlock, before);
     } finally {
       this.rpc.setIdNamespace(undefined);
@@ -589,12 +709,20 @@ export class EvmHtlcRail {
     this.rpc.setIdNamespace(`write-claim:${hashLock}:${this.clock()}`);
     try {
       const fromBlock = await this.publicClient.getBlockNumber();
-      // Main-loop review 2026-09-28: the deadline guard is the last read before the claim
-      // transaction itself (only viem's own chain-id assertion and eth_sendTransaction follow,
-      // each a single attempt with retries off), so no slow read can run between the guard
-      // passing and the preimage going out.
+      // Main-loop review 2026-09-28: the deadline guard is the last read this method makes
+      // before the claim transaction itself, so no slow read of ours can run between the guard
+      // passing and the preimage going out. What follows is viem's own, each call a single
+      // attempt with retries off and bounded by the CapturingRpc timeout: with a JSON-RPC
+      // account, its chain-id assertion and `eth_sendTransaction`; with a local account (P9-1),
+      // `eth_getTransactionCount`, `eth_getBlockByNumber`, a fee read and `eth_estimateGas` (on a
+      // client's first write viem first tries one `eth_fillTransaction` instead, where the node has
+      // it), then `eth_sendRawTransaction`. The estimate and the fill carry the real preimage in
+      // their calldata, as the broadcast does a moment later: the endpoint is trusted with it
+      // either way, and nothing carries it before this guard (tests/evm-local-signer.test.ts pins
+      // that). That is a handful of calls, not an unbounded wait, and the policy's
+      // claimInclusionMarginMs is sized to cover it.
       await this.assertBeforeNotAfterMsOrThrow(notAfterMs);
-      await this.rail.claim(hashLock, secret);
+      await this.viaVendoredRail(() => this.rail.claim(hashLock, secret));
       return await this.captureWriteEvidence("Claimed", hashLock, fromBlock, before);
     } finally {
       this.rpc.setIdNamespace(undefined);
@@ -721,7 +849,7 @@ export class EvmHtlcRail {
     this.rpc.setIdNamespace(`write-refund:${hashLock}:${this.clock()}`);
     try {
       const fromBlock = await this.publicClient.getBlockNumber();
-      await this.rail.refund(hashLock);
+      await this.viaVendoredRail(() => this.rail.refund(hashLock));
       return await this.captureWriteEvidence("Refunded", hashLock, fromBlock, before);
     } finally {
       this.rpc.setIdNamespace(undefined);
