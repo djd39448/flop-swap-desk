@@ -334,7 +334,7 @@ describe("FileFlowStore", () => {
     });
     await store.save(KEY_BUYER, bytes("payload"), null);
     const final = `buyer-${SWAP_A}.json`;
-    const lock = `${final}.lock`;
+    const lock = `buyer-${SWAP_A}.lock`;
     const expectedSteps: FileSaveStep[] = process.platform === "win32" ? ["tmp-written", "file-synced", "renamed", "target-synced"] : ["tmp-written", "file-synced", "renamed", "dir-synced"];
     expect(seen.map((s) => s.step)).toEqual(expectedSteps);
     // every stage runs inside the critical section: the lock file is there
@@ -355,7 +355,7 @@ describe("FileFlowStore", () => {
     let body = "";
     const store = new FileFlowStore(dir, {
       onStep: (step) => {
-        if (step === "tmp-written") body = readFileSync(join(dir, `buyer-${SWAP_A}.json.lock`), "utf8");
+        if (step === "tmp-written") body = readFileSync(join(dir, `buyer-${SWAP_A}.lock`), "utf8");
       },
     });
     await store.save(KEY_BUYER, bytes("x"), null);
@@ -474,7 +474,7 @@ describe("FileFlowStore", () => {
   });
 
   describe("the per-key lock file (R1-02)", () => {
-    const lockFile = (dir: string): string => join(dir, `buyer-${SWAP_A}.json.lock`);
+    const lockFile = (dir: string): string => join(dir, `buyer-${SWAP_A}.lock`);
 
     it("a lock left by a dead process is broken and the save goes through", async () => {
       const dir = join(root, "flows");
@@ -499,7 +499,7 @@ describe("FileFlowStore", () => {
         expect((error as FlowStoreLockedError).message).toContain(String(holder.pid));
         expect(readFileSync(lockFile(dir), "utf8")).toBe(lockBody(holder.pid)); // untouched
         expect(await new FileFlowStore(dir).load(KEY_BUYER)).toBeNull(); // nothing written
-        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json.lock`]);
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.lock`]);
       } finally {
         holder.stop();
       }
@@ -535,7 +535,7 @@ describe("FileFlowStore", () => {
       mkdirSync(dir);
       const holder = livePid();
       try {
-        writeFileSync(join(dir, `buyer-${SWAP_B}.json.lock`), lockBody(holder.pid));
+        writeFileSync(join(dir, `buyer-${SWAP_B}.lock`), lockBody(holder.pid));
         await new FileFlowStore(dir, { lockWaitMs: 0 }).save(KEY_BUYER, bytes("x"), null);
         expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("x");
       } finally {

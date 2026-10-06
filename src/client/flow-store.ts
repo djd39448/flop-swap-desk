@@ -14,7 +14,7 @@
 //     one in two ways (the write is refused, or the write commits and the call still throws), which is how the
 //     crash matrix cuts a flow "after the action, before the store confirmed it".
 //   - `FileFlowStore`: one file per key under a runner-owned directory. Every save runs inside a per-key critical
-//     section held by an exclusive lock file (`<name>.json.lock`, created with O_EXCL, carrying the holder's pid):
+//     section held by an exclusive lock file (`<role>-<id>.lock`, created with O_EXCL, carrying the holder's pid):
 //     compare, remove this key's stale temp files, write a temp file, fsync it, rename it over the record, then
 //     fsync the directory (POSIX) or the renamed file (Windows, best effort). A lock left behind by a dead process
 //     is broken; a lock held by a live one is a typed `FlowStoreLockedError` and is never broken silently. The file
@@ -31,7 +31,7 @@
 //
 // File names: the key's `:` is not a legal character in a Windows file name (it opens an NTFS alternate data
 // stream), so a key is stored as `<role>-<id>.json`; `list()` maps the names back to keys. Lock and temp files
-// (`<name>.lock`, `<name>.tmp-<pid>-<random>`) never match that pattern, so `list()` never shows them.
+// (`<role>-<id>.lock`, `<role>-<id>.json.tmp-<pid>-<random>`) never match that pattern, so `list()` never shows them.
 //
 // This directory is secret-grade, exactly like a key file: the Seller's record holds the swap preimage.
 
@@ -505,7 +505,7 @@ export class FileFlowStore implements FlowStore {
     checkExpected(key, expected);
     const path = this.pathFor(key); // grammar + containment are checked before anything is queued or touched
     const payload = Uint8Array.from(bytes);
-    const lockPath = this.underDir(`${relative(this.dir, path)}.lock`);
+    const lockPath = this.underDir(`${relative(this.dir, path).replace(/\.json$/, "")}.lock`); // <role>-<id>.lock
     await withProcessMutex(lockPath, async () => {
       await fsp.mkdir(this.dir, { recursive: true, mode: 0o700 });
       const lock = await this.acquireLock(key, lockPath);

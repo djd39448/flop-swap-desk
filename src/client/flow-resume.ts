@@ -298,8 +298,8 @@ export class FlowJournal<R extends FlowRecord> {
     return this.failure !== undefined;
   }
 
-  /** The error of the first refused save (the error itself for a typed store refusal, else a `FlowStoreWriteFailedError`
-   *  wrapping it), or `undefined` while the journal is healthy. */
+  /** The error of the first refused save (always a `FlowStoreWriteFailedError`: the store's own refusal, or one wrapping
+   *  the disk error or the invalid record), or `undefined` while the journal is healthy. */
   get failureError(): Error | undefined {
     return this.failure;
   }
@@ -372,11 +372,13 @@ export class FlowJournal<R extends FlowRecord> {
     this.digest = flowDigest(bytes);
   }
 
-  /** Marks the journal failed (the first failure is kept) and throws the typed error for it: a store refusal and an
-   *  invalid record are thrown as they are, anything else (a disk error) is wrapped in `FlowStoreWriteFailedError`. */
+  /** Marks the journal failed (the first failure is kept) and throws `FlowStoreWriteFailedError` for it. The store's own
+   *  refusals (stale, exists, locked, an injected fault) ARE that class and are thrown as they are, so a caller can still
+   *  tell them apart; anything else (a disk error, a record that would not encode) is wrapped, with the real failure as
+   *  its `cause` and in its message. */
   private fail(error: unknown): never {
     const typed =
-      error instanceof FlowStoreWriteFailedError || error instanceof FlowRecordInvalidError
+      error instanceof FlowStoreWriteFailedError
         ? error
         : new FlowStoreWriteFailedError(this.key, `flow store: saving "${this.key}" failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     this.failure ??= typed;

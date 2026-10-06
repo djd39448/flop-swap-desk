@@ -252,15 +252,18 @@ describe("R1-03: a refused save fails the journal; nothing is adopted before it 
     expect(journal.failed).toBe(true);
   });
 
-  it("a record that would not encode (R1-09) is FlowRecordInvalidError, not a corrupt record; the journal is failed and the store untouched", async () => {
+  it("a record that would not encode (R1-09) fails the journal as FlowStoreWriteFailedError with FlowRecordInvalidError (not a corrupt record) as its cause; the store is untouched", async () => {
     const store = new MemoryFlowStore();
     const r = rig(store);
     const journal = await FlowJournal.begin(r.deps, buyerRecord());
     const before = flowDigest(bytesOfSync(await store.load(BUYER_KEY)));
     const tooMany = Array.from({ length: 65 }, (_, i) => `note ${i}`);
     const error = await journal.update((record) => ({ ...(record as BuyerFlowRecord), refundNotes: tooMany })).catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(FlowRecordInvalidError);
-    expect((error as FlowRecordInvalidError).reason).toMatch(/refundNotes/);
+    expect(error).toBeInstanceOf(FlowStoreWriteFailedError);
+    expect((error as FlowStoreWriteFailedError).cause).toBeInstanceOf(FlowRecordInvalidError);
+    expect(((error as FlowStoreWriteFailedError).cause as FlowRecordInvalidError).reason).toMatch(/refundNotes/);
+    expect((error as FlowStoreWriteFailedError).message).toMatch(/refundNotes/); // the real failure is named, not hidden behind the wrapper
+    expect(journal.failureError).toBe(error);
     expect(journal.failed).toBe(true);
     expect(flowDigest(bytesOfSync(await store.load(BUYER_KEY)))).toBe(before);
     await refused(journal.update((record) => record)); // the flow that wanted to persist state the store cannot hold is stopped
