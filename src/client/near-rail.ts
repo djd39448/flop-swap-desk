@@ -13,9 +13,13 @@
 //
 // D-N6: `resendRefundIfDropped` is deliberately OMITTED here — NEAR has no mempool a
 // transaction can silently drop out of the way Bitcoin's fee-market mempool does (a NEAR
-// `send_tx` either executes and is recorded, or the RPC call itself fails); there is nothing
-// for a "resend the identical bytes" path to fix that `NearHtlcRail.recoverByTxHash` (a lost
-// REPLY, not a lost transaction) doesn't already cover. `checkPendingClaim` IS implemented
+// `send_tx` either executes and is recorded, or the RPC call itself fails); a lost REPLY is
+// covered by `NearHtlcRail.recoverByTxHash`. What that cannot cover is a transaction that was
+// signed and saved and NEVER SENT (the process died first): the node does not know it and
+// nothing moves the access key's nonce, so it could not be proven dead (review round 1,
+// R1-10). `resendLock` / `resendRefund` close that: they send the IDENTICAL persisted bytes once
+// (one hash, one nonce, so it can never move funds twice), and the node's own `Expired` or
+// invalid-nonce answer is the proof. `recoverLock` / `recoverRefund` only read. `checkPendingClaim` IS implemented
 // (D-N6): NEAR's own `Claiming` state already carries the preimage the moment `claim()` is
 // called, so a caller building a refund can cheaply learn "someone else already claimed" before
 // ever broadcasting one — the same purpose `BuyerFlow.refundLegA` already uses this for on the
@@ -354,7 +358,9 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
   // D-N6: `resendRefundIfDropped` is deliberately not implemented — see this file's own header
   // comment. NEAR has no mempool-drop concept for a refund to be resent against; a caller
   // recovering from a lost RPC reply after a genuine send uses `NearHtlcRail.recoverByTxHash`
-  // (by the write's own recorded `txHash`), never a resend of different bytes.
+  // (by the write's own recorded `txHash`), never a resend of different bytes. The one re-send this
+  // rail offers is `resendRefund` (above): the IDENTICAL recorded bytes, for a refund that may
+  // never have reached the node.
 
   /** D-N6: the Buyer's own cheap pending-claim check, reused for `checkPendingClaim` exactly as
    *  `NearHtlcRail` itself documents (`Claiming` already carries the preimage the moment

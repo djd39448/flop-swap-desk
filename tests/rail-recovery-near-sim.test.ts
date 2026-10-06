@@ -273,6 +273,29 @@ describe("R1-10: a signed refund or lock that was never sent", () => {
   });
 });
 
+describe("R1-08 (what the flow relies on): a refund that landed and failed is a typed error, never a stall and never never-landed", () => {
+  it("the payout failed (storage not registered): the refund's own send throws NearRefundFailedError, and so does every later recoverRefund of its handle; the read sends nothing", async () => {
+    const w = world();
+    await lockLanded(w);
+    w.node.nowMs = REFUND_AFTER_MS + 1;
+    w.node.unregisterStorage(BUYER_ACCOUNT);
+    let recovery: LockRecovery | undefined;
+    await expect((await w.connectBuyer()).refund(REF, { onSigned: (r) => void (recovery = r) })).rejects.toMatchObject({ name: "NearRefundFailedError" });
+    if (recovery?.chain !== "near") throw new Error("test: onSigned was not called with a near handle");
+    expect(row(w)?.status).toBe("Locked"); // the contract put the lock back
+    const received = w.node.sendTxReceived;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect((await w.freshBuyer()).recoverRefund?.(REF, recovery)).rejects.toMatchObject({ name: "NearRefundFailedError" });
+    }
+    expect(w.node.sendTxReceived).toBe(received);
+    // once the storage is registered, a FRESH refund (the flow's next step) is one more transaction and it lands
+    w.node.registerStorage(BUYER_ACCOUNT);
+    await (await w.freshBuyer()).refund(REF);
+    expect(w.node.refundSendTxCalls).toBe(2);
+    expect(row(w)?.status).toBe("Refunded");
+  });
+});
+
 describe("R1-19: never-landed for a lock waits for the receipt (three blocks past the nonce)", () => {
   /** The Buyer's lock that landed with its reply lost, while the node hides the transaction and creates the row late. */
   async function landedButRowLate(w: World): Promise<PreparedLock> {
