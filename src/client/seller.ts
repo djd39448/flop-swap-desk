@@ -356,6 +356,11 @@ export class SellerFlow {
    *  bytes). Paper-rail writes (`lockLegB`, `refundLegB`) never touch leg A's rail, so nothing
    *  is added for them. */
   private readonly writeExchanges: Exchange[] = [];
+  /** R1-22: the exchanges of claim attempts that FAILED. A failed claim published the secret on chain (the claim's instruction data), and
+   *  the node answers later reads of it (`getTransaction`, a NEAR `tx_status`, a Bitcoin `getrawtransaction`) with the signed
+   *  transaction, secret and all. They name no `WriteEvidence` (a failed claim has none), and a bundle persists exchange RESPONSES, so they
+   *  are held out of `exchanges` until the reveal frame is posted: a bundle written before then must not hold the preimage (rule 5). */
+  private heldClaimExchanges: Exchange[] = [];
 
   constructor(options: SellerFlowOptions) {
     this.identity = options.identity;
@@ -368,7 +373,8 @@ export class SellerFlow {
     this.mintHashLock = options.mintHashLock ?? generateHashLock;
   }
 
-  /** B5: every leg-A write this flow has made so far, in call order. */
+  /** B5: every leg-A write this flow has made so far, in call order. R1-22: the exchanges of FAILED claim attempts join this list only
+   *  once the reveal frame is posted, so a bundle written from it earlier never holds the preimage. */
   get exchanges(): readonly Exchange[] {
     return this.writeExchanges;
   }
@@ -1451,7 +1457,7 @@ export class SellerFlow {
         await this.persist();
         break;
       } catch (error) {
-        this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+        this.heldClaimExchanges.push(...connected.exchanges.slice(before)); // B5, held until the reveal (R1-22)
         // R3-2: a claim that was broadcast and never landed (starved). The secret may have been seen; count it (the
         // next claim is priced higher) and sign again while the rail's landing bound still allows it. The bound ends
         // the effort with the starved error below, never a silent drop.
@@ -1618,6 +1624,7 @@ export class SellerFlow {
             ? await this.postBounded(dealRoom(contract), line)
             : await this.venue.post(dealRoom(contract), line, this.identity);
         this.revealPosted = { key, record };
+        this.releaseHeldClaimExchanges();
         return record;
       } catch (error) {
         // R1-03: a refused SAVE is not a post that failed: this flow is a crashed one (the journal refuses every later write), so another
@@ -1633,12 +1640,20 @@ export class SellerFlow {
               await journal.adopt({ kind: "reveal-a", room: dealRoom(contract), text: adopted.line }, adopted);
             }
             this.revealPosted = { key, record: adopted };
+            this.releaseHeldClaimExchanges();
             return adopted;
           }
         }
       }
     }
     throw new RevealNotPostedError(refundAfterMs, last, detail);
+  }
+
+  /** R1-22: the secret is public by design from the moment the reveal frame is posted, so the held exchanges of failed claims (response
+   *  bytes a replay may read) join `exchanges` then. */
+  private releaseHeldClaimExchanges(): void {
+    this.writeExchanges.push(...this.heldClaimExchanges);
+    this.heldClaimExchanges = [];
   }
 
   /** S2-4: one venue call bounded by `revealPostTimeoutMs` (a real timer): a stalled venue rejects instead of hanging. */
