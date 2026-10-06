@@ -468,8 +468,9 @@ export interface EvmHtlcRailOptions {
   /** This party's own EVM account, one of two things. An `Address` is a JSON-RPC account (`createWalletClient({ account,
    *  ... })` holds no key: the node answers `eth_sendTransaction`; anvil's unlocked accounts). A viem `LocalAccount`
    *  (P9-1, from `loadEvmLocalAccount`) signs locally: viem fills nonce, gas and fees through the same `rpc`
-   *  (`eth_getTransactionCount`, `eth_estimateGas`, the fee reads; public data) and every write goes out as
-   *  `eth_sendRawTransaction`, never `eth_sendTransaction`. This module never reads, stores or prints a key. */
+   *  (one `eth_fillTransaction` where the node answers it, else `eth_getTransactionCount`, `eth_estimateGas` and the
+   *  fee reads; all public data) and every write goes out as `eth_sendRawTransaction`, never `eth_sendTransaction`.
+   *  This module never reads, stores or prints a key. */
   account: Address | LocalAccount;
   /** Resolves a counterparty's tclk DID to its EVM address for the vendored rail's write path
    *  (`lock()` needs the payee's address). Populated from `src/rails/account-line.ts`'s
