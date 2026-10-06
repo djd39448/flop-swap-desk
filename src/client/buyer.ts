@@ -63,6 +63,17 @@
 // when the room lacks it. Without a store the flow behaves exactly as before and cannot be resumed. The Buyer's
 // record never holds the swap secret; `toJSON` and `util.inspect` show public data only.
 //
+// Review round 1 (P8-FIXES-R1.md), what a runner can rely on:
+//  - R1-03: a save the store refused (or refused as stale, R1-02: another instance saved first) makes this flow a crashed one: every
+//    public step throws `FlowStoreWriteFailedError` until the runner drops it and calls `resume()`. Nothing the failed instance latched
+//    in memory (a prepared lock, a refund handle) is ever acted on.
+//  - R1-01: a resumed `lockLegA` reads the chain BEFORE any guard. A lock that landed is recorded and announced whatever the clock
+//    says (rule 4's guards gate every NEW lock action only: a fresh lock, the re-send of saved bytes); `next` names `refundLegA` once
+//    leg A's refund time has come and a lock was attempted but not recognised yet.
+//  - R1-08 / R1-15: a recorded refund that landed and failed is resolved (one fresh refund follows); a refund that lost the race to a
+//    claim saves that fact, so `next` says `learnSecret`. R1-09: a refund note is recorded once. R1-16: overlapping calls of one step
+//    are refused.
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
 // P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3; P4-BTC-SPEC.md §7a;
 // P6-SOL-SPEC.md sections 3-5; P8-RESUME-SPEC.md.
