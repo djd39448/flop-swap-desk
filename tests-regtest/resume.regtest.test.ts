@@ -10,11 +10,13 @@
 // the test reads the exact bytes of every `sendrawtransaction` it made and the number of wallet signing calls (zero).
 //
 //   1  crash between `prepareLock` and `commitLock`: the funding rawTx is in the record, the node never saw it. The restart's
-//      `recoverLock` re-broadcasts the recorded bytes (the node then holds exactly the recorded txid), posts the lock frame once.
+//      `recoverLock` only READS (the node does not know the txid, so it answers unknown); `lockLegA` then re-sends the recorded bytes
+//      with `resendLock`, after the flow's own guards (the node then holds exactly the recorded txid), and posts the lock frame once.
 //   1b the funding broadcast landed and its reply was lost: the node already knows the recorded txid, so the restart sends nothing.
 //   2  the refund broadcast landed and its reply was lost, then the refund fell out of the node's mempool (a real eviction, a node
-//      with `-mempoolexpiry=1`): the restart's `recoverRefund` re-sends the recorded refund bytes while the funding output is
-//      unspent, never signs a second refund; mined, the swap refunds.
+//      with `-mempoolexpiry=1`): the restart's `recoverRefund` only READS; `refundLegA` then re-sends the recorded refund bytes
+//      with `resendRefund`, after the flow's own guards and while the funding output is unspent, and never signs a second refund;
+//      mined, the swap refunds.
 //   2b the refund was signed and recorded and the process died before sending it: same recovery, no eviction needed.
 // `npm run test:regtest` only; `npm test` never spawns bitcoind.
 

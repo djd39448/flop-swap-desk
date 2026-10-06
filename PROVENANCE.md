@@ -321,36 +321,38 @@ skip, and a retry of `claimLegA` posts only the frame still missing); `fromNearS
 comments at the two `refundedFold` call sites in `src/swap.ts` now describe the V4 rule. All
 first-party, covered by `tests/client-flows-near-rpc.test.ts` and `tests/near-signer-memory.test.ts`.
 
-## First-party crash-resume files (P8-RESUME-SPEC.md, P8-FIXES-R1.md) - unaudited, testnet-only
+## First-party crash-resume files (P8-RESUME-SPEC.md, P8-FIXES-R1.md, P8-FIXES-R2.md) - unaudited, testnet-only
 
 Not vendored: original to this repo, written for the crash-resume stage (`handoff/P8-RESUME-SPEC.md`, amended by the
-review round 1 fix list `handoff/P8-FIXES-R1.md`). Listed per that spec's own instruction, not because anything below
-reuses outside code. **First-party, unaudited, testnet-only**: none of it has been reviewed for a real deployment, no
-deployment this repo drives carries mainnet value, and the store directory a real run writes holds the Seller's swap
-secret (the README's "Resume" section says how to treat it). No dependency was added, and `vendor/tclk`,
-`src/vendor/evm-hash-rail.ts`, `contracts/`, `contracts-near/`, `contracts-sol/`, `docs/`, `fixtures/`, `package.json`
-and `package-lock.json` are byte-identical to `main` at `766a40a`. Nothing on the wire changed, so `docs/PROFILE.md`
-is unchanged, and no fixture was added or recaptured.
+review round 1 and round 2 fix lists `handoff/P8-FIXES-R1.md` and `handoff/P8-FIXES-R2.md`). Listed per that spec's own
+instruction, not because anything below reuses outside code. **First-party, unaudited, testnet-only**: none of it has
+been reviewed for a real deployment, no deployment this repo drives carries mainnet value, and the store directory a
+real run writes holds the Seller's swap secret (the README's "Resume" section says how to treat it). No dependency was
+added, and `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/`, `contracts-near/`, `contracts-sol/`, `docs/`,
+`fixtures/`, `package.json` and `package-lock.json` are byte-identical to `main` at `766a40a`. Nothing on the wire
+changed, so `docs/PROFILE.md` is unchanged, and no fixture was added or recaptured.
 
-- `src/client/flow-store.ts` - the `FlowStore` interface (a compare-and-swap `save`), `MemoryFlowStore` (with fault
-  injection for tests) and `FileFlowStore` (one checksummed file per swap, a per-key exclusive lock file, temp file,
-  fsync and rename).
+- `src/client/flow-store.ts` - the `FlowStore` interface (a compare-and-swap `save`, plus the optional `scopeId` and
+  `exclusive` section the Seller's begin uses), `MemoryFlowStore` (with fault injection for tests) and `FileFlowStore`
+  (one checksummed file per swap, a per-key exclusive lock file and a store-wide `seller-begin.lock`, temp file, fsync
+  and rename).
 - `src/client/flow-record.ts` - the versioned, strictly validated, checksummed swap record (`v: 1`) for both roles, the
   frame ledger, the record key (`buyer:<swapId>`, `seller:<contractA>`) and the identity pins (DID, rail, chain,
   deployment, contracts).
 - `src/client/flow-resume.ts` - `FlowJournal` (the single-writer, durable-before-adopted handle on one record), the
-  typed errors and the `next`-step names.
+  typed errors (`SwapExpiredError` among them) and the `next`-step names (`abandoned` among them).
 - Extended first-party files: `src/client/buyer.ts` and `seller.ts` (the `store` option, `resume`, the recover paths);
   `src/client/counter-rail.ts` and the four adapters `evm-rail.ts`, `btc-rail.ts`, `near-rail.ts` and `sol-rail.ts`
-  (recovery handles, the read-only `recoverLock` and `recoverRefund`, `resendLock` and `resendRefund`, `deploymentId`);
+  (recovery handles, the read-only `recoverLock` and `recoverRefund`, `resendLock` and `resendRefund`, `deploymentId`, and
+  the optional `settleDelay` that `near-rail.ts` and `sol-rail.ts` implement);
   `src/rails/btc-htlc.ts`, `near-htlc.ts`, `near-borsh.ts`, `sol-htlc.ts` and `evm-htlc.ts` (the reads and the re-send
   of identical bytes those use).
 - Hermetic tests: `tests/flow-store.test.ts`, `flow-record.test.ts`, `flow-journal.test.ts`, `flow-resume-*.test.ts`,
   `resume-rules.test.ts`, `resume-secrets.test.ts` (the preimage and key-material scan of every save),
   `resume-matrix-{evm,btc,near,nearfake,sol}.test.ts` (the crash matrix), `rail-recovery-{evm,btc,near,near-sim,sol}.test.ts`,
   `deployment-id.test.ts`, `bundle-leak.test.ts`, and their helpers `tests/helpers/{crash-matrix,evm-mock-node,
-  flow-record-samples,ledger-rail,live-resume,matrix-suite,matrix-worlds,near-stateful-rpc,resume-flows,resume-sol-rig,
-  resume-world,secret-scan,seller-key}.ts`.
+  flow-record-samples,ledger-rail,live-resume,matrix-suite,matrix-worlds,near-stateful-rpc,near-swap-rig,resume-flows,
+  resume-sol-rig,resume-world,secret-scan,seller-key}.ts`.
 - Live tests (each spawns its own throwaway local node and never touches a public network):
   `tests-anvil/resume.anvil.test.ts`, `tests-regtest/resume.regtest.test.ts`, `tests-near/resume.near.test.ts` and
   `tests-sol/resume.sol.test.ts`.
