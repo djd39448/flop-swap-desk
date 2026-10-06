@@ -318,6 +318,8 @@ describe("the closed schema: every field type, every unknown field", () => {
     ["a refund recovery on a refund that was never attempted", (r) => void (at(r, "refund").attempted = false)],
     ["legBClaimed without legBClaimAttempted", (r) => void ((r.legBClaimed = true), (r.legBClaimAttempted = false))],
     ["refundNotes that are not strings", (r) => void (r.refundNotes = [1])],
+    ["a refund.claimSeen of false (R1-15: it is true or absent)", (r) => void (at(r, "refund").claimSeen = false)],
+    ["a refund.claimSeen that is not a boolean (R1-15)", (r) => void (at(r, "refund").claimSeen = "yes")],
     ["an account line missing its text", (r) => void delete at(r, "ownAccountLine").text],
   ];
 

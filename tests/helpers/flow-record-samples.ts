@@ -81,6 +81,7 @@ export function sampleBuyerRecord(): BuyerFlowRecord {
       recovery: { chain: "btc", txid: "cd".repeat(32), rawTx: "02000000000102cafebabe" },
       evidence: { ref: `${"ab".repeat(32)}:1`, raw: [], txid: "cd".repeat(32), blockHeight: 205, blockHash: "ee".repeat(32), rawTx: "02000000000102cafebabe" },
       framesPosted: false,
+      claimSeen: true, // R1-15
     },
     refundNotes: ["leg B's paper note reads claimed but is not a proven claim: ignored (R4-1)"],
   };

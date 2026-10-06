@@ -17,8 +17,9 @@ import type { CounterAssetRail } from "../src/client/counter-rail.js";
 import { decodeFlowRecord, type BuyerFlowRecord } from "../src/client/flow-record.js";
 import { flowKey } from "../src/client/flow-store.js";
 import { SellerFlow } from "../src/client/seller.js";
-import { Controller, PREFIX, STEPS, readSwap, type Ctx, type World, type WorldFactory } from "./helpers/crash-matrix.js";
-import { ledgerWorldWith, solWorld } from "./helpers/matrix-worlds.js";
+import { Controller, PREFIX, STEPS, readSwap, runScript, type Ctx, type World, type WorldFactory } from "./helpers/crash-matrix.js";
+import { evmWorld, ledgerWorldWith, solWorld } from "./helpers/matrix-worlds.js";
+import type { LedgerChain } from "./helpers/ledger-rail.js";
 
 async function started(factory: WorldFactory, steps = [...PREFIX, STEPS.lockLegA]): Promise<{ ctl: Controller; w: World; c: Ctx }> {
   const ctl = new Controller();
@@ -146,5 +147,67 @@ describe("R1-16: overlapping calls of one Buyer step in one process are refused 
     const view = await readSwap(s.w);
     expect((await s.w.paper.read(view.acceptB!.contract))?.status).toBe("claimed");
     expect((await buyerRecordOf(s.w)).legBClaimed).toBe(true);
+  });
+});
+
+describe("R1-15: a refund that lost the race to a claim persists that fact, so next says learnSecret (not refundLegA for ever)", () => {
+  /** The number of the outward action `what` in a reference run of `steps`. */
+  async function actionNumber(factory: WorldFactory, steps: Parameters<typeof runScript>[1], what: string): Promise<number> {
+    const reference = await runScript(factory, steps, []);
+    const action = reference.world.ctl.actions.find((candidate) => candidate.what === what);
+    if (action === undefined) throw new Error(`no outward action ${what} in the reference run`);
+    return action.n;
+  }
+
+  it("Bitcoin: the refund is signed and saved, the Seller's claim wins; refundLegA routes, then next is learnSecret, learnSecret returns the secret, claimLegB succeeds, next is done", async () => {
+    const factory = (chain: { current?: LedgerChain }): WorldFactory => ledgerWorldWith("btc", (c) => void (chain.current = c));
+    const script = [...PREFIX, STEPS.lockLegA, STEPS.legARefundTime, STEPS.refundLegA];
+    const n = await actionNumber(factory({}), script, "chain:refund.send");
+    const chain: { current?: LedgerChain } = {};
+    const ctl = new Controller([{ n, mode: "before" }]);
+    const w = factory(chain)(ctl);
+    ctl.attachStore(w.stores.buyer, "buyer");
+    ctl.attachStore(w.stores.seller, "seller");
+    const buyer = new BuyerFlow(w.buyerOptions());
+    const seller = new SellerFlow(w.sellerOptions());
+    const c: Ctx = { w, buyer, seller, history: [buyer, seller] };
+    for (const step of [...PREFIX, STEPS.lockLegA, STEPS.legARefundTime]) await step.run(c);
+    await buyer.refundLegA().catch(() => undefined);
+    expect(ctl.isDead("buyer")).toBe(true); // signed and saved, never sent
+    expect(w.counts().refunds).toBe(0);
+    // the Seller's claim wins the race (Bitcoin has no claim deadline)
+    for (const output of chain.current!.outputs.values()) {
+      output.status = "claimed";
+      output.preimage = w.hashLock.preimage;
+    }
+
+    const next = async (): Promise<string> => {
+      ctl.restart("buyer");
+      const resumed = await BuyerFlow.resume({ ...w.buyerOptions(), store: w.stores.buyer, swapId: w.swapId });
+      c.buyer = resumed.flow;
+      return resumed.next;
+    };
+    expect(await next()).toBe("refundLegA"); // the refund was attempted and nothing says otherwise yet
+    await expect(c.buyer.refundLegA()).rejects.toThrow(/learnSecret/); // the routing error, and the fact is saved
+    expect((await buyerRecordOf(w)).refund.claimSeen).toBe(true);
+    expect(await next()).toBe("learnSecret"); // before: refundLegA for ever
+    const secret = await c.buyer.learnSecret();
+    expect(secret).toBe(w.hashLock.preimage);
+    await c.buyer.claimLegB(secret);
+    expect(await next()).toBe("done");
+    expect(w.counts().refunds).toBe(0);
+  });
+
+  it("EVM: a refund the contract refuses because the lock was claimed is routed to learnSecret on the FIRST call (every rail, not only Solana), and next follows", async () => {
+    const s = await started(evmWorld, [...PREFIX, STEPS.lockLegA, STEPS.claimLegA]);
+    s.w.setTime(s.w.refundAt.legA);
+    await expect(s.c.buyer.refundLegA()).rejects.toThrow(/learnSecret/); // before: the contract's raw refusal
+    expect((await buyerRecordOf(s.w)).refund.claimSeen).toBe(true);
+    s.ctl.restart("buyer");
+    const resumed = await BuyerFlow.resume({ ...s.w.buyerOptions(), store: s.w.stores.buyer, swapId: s.w.swapId });
+    expect(resumed.next).toBe("learnSecret");
+    s.w.setTime(s.w.refundAt.legA + 60_000); // leg B's window is longer than leg A's: the secret can still be used
+    await resumed.flow.claimLegB(await resumed.flow.learnSecret());
+    expect(s.w.counts().refunds).toBe(0);
   });
 });

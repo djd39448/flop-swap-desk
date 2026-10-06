@@ -291,6 +291,9 @@ export interface BuyerFlowState {
     recovery?: LockRecovery;
     evidence?: WriteEvidenceJson;
     framesPosted: boolean;
+    /** R1-15: set once `refundLegA` found leg A claimed (the refund lost the race to a claim) and routed the Buyer to
+     *  `learnSecret`: from then on `next` says `learnSecret`, not `refundLegA` for ever. */
+    claimSeen?: true;
   };
   refundNotes: string[];
 }
@@ -998,7 +1001,16 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
   const attempted = r.bool(lockObject.attempted, `${path}.lock.attempted`);
   if (!attempted && (prepared !== undefined || evidence !== undefined)) r.fail(`${path}.lock.attempted`, "must be true once a lock was prepared or has evidence");
 
-  const refundObject = r.object(o.refund, `${path}.refund`, ["attempted", "framesPosted"], ["recovery", "evidence"]);
+  const refundObject = r.object(o.refund, `${path}.refund`, ["attempted", "framesPosted"], ["recovery", "evidence", "claimSeen"]);
+  const refundClaimSeen = r.optional(
+    refundObject,
+    "claimSeen",
+    (v, p) => {
+      if (r.bool(v, p) !== true) r.fail(p, "must be true when present");
+      return true as const;
+    },
+    `${path}.refund`,
+  );
   const refundRecovery = r.optional(refundObject, "recovery", (v, p) => r.recovery(v, p), `${path}.refund`);
   const refundEvidence = r.optional(refundObject, "evidence", (v, p) => r.evidence(v, p), `${path}.refund`);
   const refundAttempted = r.bool(refundObject.attempted, `${path}.refund.attempted`);
@@ -1029,6 +1041,7 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
       ...(refundRecovery === undefined ? {} : { recovery: refundRecovery }),
       ...(refundEvidence === undefined ? {} : { evidence: refundEvidence }),
       framesPosted: r.bool(refundObject.framesPosted, `${path}.refund.framesPosted`),
+      ...(refundClaimSeen === undefined ? {} : { claimSeen: refundClaimSeen }),
     },
     refundNotes: r.array(o.refundNotes, `${path}.refundNotes`, 64).map((item, i) => r.string(item, `${path}.refundNotes[${i}]`, { max: 1024 })),
   };

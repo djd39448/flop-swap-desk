@@ -88,7 +88,9 @@ import { checkSwapDeadlines } from "../deadlines.js";
 import { checkLegBMatchesWant, checkOrientation, classifySwapOffer, isSwapId, legAContext } from "../profile.js";
 import { encodeFrameWith, makeOfferWith } from "../rails/custom-frames.js";
 import { SOL_RAIL_ID } from "../rails/custom-rails.js";
+import { NearRefundFailedError, NearTxFailedError } from "../rails/near-htlc.js";
 import type { Exchange } from "../rails/rpc-capture.js";
+import { SolRefundFailedError } from "../rails/sol-htlc.js";
 import { offerAcceptLockTerms } from "../swap.js";
 import {
   RailRecoveryRefusedError,
@@ -198,6 +200,16 @@ export class LockPendingError extends Error {
   }
 }
 
+/** R1-10: what a refund that was signed and saved but is not seen on chain yet says. It may never have been sent (the process may
+ *  have died between signing and sending), which is why this is not "broadcast". */
+const REFUND_UNCONFIRMED =
+  "buyer: refund signed but not yet confirmed; it may never have been sent; call refundLegA() again later (G7)";
+
+/** R1-08: a typed error that says the recorded refund transaction LANDED and FAILED on chain (it can never land again). */
+function isLandedAndFailedRefund(error: unknown): boolean {
+  return error instanceof NearRefundFailedError || error instanceof NearTxFailedError || error instanceof SolRefundFailedError;
+}
+
 /**
  * One Buyer's view of one swap. Call order (SPEC §6): `bid` → `acceptLegB` →
  * `verifyLegBLocked` → `postAccountLineA` → `lockLegA` → (`learnSecret` → `claimLegB`) |
@@ -265,6 +277,8 @@ export class BuyerFlow {
    *  from the moment the rail signed it until the refund is confirmed. */
   private legBClaimAttempted = false;
   private refundAttempted = false;
+  /** R1-15: `refundLegA` found leg A claimed (the refund lost the race to a claim) and routed the Buyer to `learnSecret`. */
+  private refundClaimSeen = false;
   /** R1-16: set synchronously at the start of `postAccountLineA`, `claimLegB` and `refundLegA` and cleared when the call ends,
    *  the same re-entry pattern `lockLegA` and `acceptLegB` use: two overlapping calls of one step can never both reach the
    *  rail or the venue (two refund builds, two account lines for two addresses, two claims). */
@@ -339,7 +353,13 @@ export class BuyerFlow {
     const journal = this.#journal;
     if (journal === undefined || !journal.isLanded("offer-a")) return "bid";
     if (!journal.isLanded("accept-b")) return "acceptLegB";
-    if (this.refundAttempted) return journal.isLanded("receipt-refund-a") ? "done" : "refundLegA";
+    if (this.refundAttempted) {
+      if (journal.isLanded("receipt-refund-a")) return "done";
+      // R1-15: the refund lost the race to a claim: `refundLegA` only throws its routing error from here on, and the way on is
+      // learnSecret then claimLegB (after which leg B's receipt makes the swap done), not refundLegA for ever.
+      if (this.refundClaimSeen) return this.legBClaimed && journal.isLanded("receipt-b") ? "done" : "learnSecret";
+      return "refundLegA";
+    }
     if (!this.legBVerified) return "verifyLegBLocked";
     if (!journal.isLanded("account-a")) return "postAccountLineA";
     if (this.lockEvidence === undefined || !this.lockFramePosted) {
@@ -483,6 +503,7 @@ export class BuyerFlow {
     this.legBClaimAttempted = record.legBClaimAttempted;
     this.legBClaimed = record.legBClaimed;
     this.refundAttempted = record.refund.attempted;
+    this.refundClaimSeen = record.refund.claimSeen === true;
     if (record.refund.recovery !== undefined) this.refundRecovery = record.refund.recovery;
     if (record.refund.evidence !== undefined) this.legARefundEvidence = evidenceFromJson(record.refund.evidence);
     this.legARefundFramesPosted = record.refund.framesPosted || ledgerLanded(record, "receipt-refund-a");
@@ -512,6 +533,7 @@ export class BuyerFlow {
         ...(this.refundRecovery === undefined ? {} : { recovery: this.refundRecovery }),
         ...(this.legARefundEvidence === undefined ? {} : { evidence: evidenceToJson(this.legARefundEvidence) }),
         framesPosted: this.legARefundFramesPosted || ledgerLanded(r, "receipt-refund-a"),
+        ...(this.refundClaimSeen ? { claimSeen: true as const } : {}),
       },
       refundNotes: [...this.refundNotes],
     };
@@ -520,6 +542,19 @@ export class BuyerFlow {
   /** Saves the record now (the live state laid over it). A no-op without a store. */
   private async persist(): Promise<void> {
     await this.#journal?.update((r) => r);
+  }
+
+  /**
+   * R1-15: `refundLegA` found leg A claimed (the refund lost the race to a claim, or a claim is pending): the Buyer is routed to
+   * `learnSecret` then `claimLegB`, and that fact is saved first, so after a restart `next` says learnSecret instead of
+   * `refundLegA` for ever (a runner driven only by `next` would loop on this error and miss leg B).
+   */
+  private async routeToClaim(message: string): Promise<never> {
+    if (this.#journal !== undefined && !this.refundClaimSeen) {
+      this.refundClaimSeen = true;
+      await this.persist();
+    }
+    throw new Error(message);
   }
 
   /**
@@ -1428,7 +1463,7 @@ export class BuyerFlow {
     if (connected.checkPendingClaim !== undefined) {
       const pendingSecret = await connected.checkPendingClaim(railRef, this.lockedFromBlock);
       if (pendingSecret !== null) {
-        throw new Error(
+        return this.routeToClaim(
           "buyer: refusing to refund leg A — the lock has been claimed (on chain or already broadcast); " +
             "call learnSecret() then claimLegB() instead of refundLegA() (K2)",
         );
@@ -1500,10 +1535,10 @@ export class BuyerFlow {
         const priorEvidence = await connected.verifyLockFinal(termsA, railRef, this.lockedAccounts);
         if (priorEvidence.rail?.status === "refunded" && priorEvidence.rail.final) {
           this.legARefundEvidence = { ref: railRef, raw: [] };
-        } else if (this.rail.railId === SOL_RAIL_ID && priorEvidence.rail?.status === "claimed") {
-          // R3-8: the refund failed because the escrow was claimed in the finality-lag window (the claim was not final
-          // when the pre-check ran): route to the claim path instead of surfacing the refund's own refusal.
-          throw new Error(
+        } else if (priorEvidence.rail?.status === "claimed") {
+          // R3-8 (Solana) and R1-15 (every rail): the refund failed because the lock was claimed (in the finality-lag window,
+          // or by a claim the pre-check could not see yet): route to the claim path instead of surfacing the refund's own refusal.
+          return this.routeToClaim(
             "buyer: refusing to refund leg A - the lock was claimed (seen after the refund failed); " +
               "call learnSecret() then claimLegB() instead of refundLegA() (R3-8)",
           );
@@ -1523,13 +1558,13 @@ export class BuyerFlow {
 
     const evidence = await connected.verifyLockFinal(termsA, railRef, this.lockedAccounts);
     if (evidence.rail?.status === "claimed") {
-      throw new Error(
+      return this.routeToClaim(
         "buyer: refusing to report leg A refunded — the lock was claimed instead (the refund lost the race to a claim); " +
           "call learnSecret() then claimLegB() instead of refundLegA() (G7)",
       );
     }
     if (evidence.rail === undefined || evidence.rail.status !== "refunded" || !evidence.rail.final) {
-      throw new Error("buyer: refund broadcast but not yet confirmed; call refundLegA() again once it confirms (G7)");
+      throw new Error(REFUND_UNCONFIRMED);
     }
 
     if (!this.legARefundFramesPosted) {
@@ -1554,14 +1589,17 @@ export class BuyerFlow {
   }
 
   /**
-   * P8-RESUME-SPEC.md "Buyer refund A" (rules 1 and 2): a refund that was attempted without a known outcome. The
-   * chain decides, never an assumption: with the refund's recorded handle the rail says what became of THAT refund
-   * (Bitcoin re-sends the identical saved bytes when they dropped and the funding output is still unspent; it never
-   * builds a second); the lock itself is then read. Refunded and final: the evidence is recorded and only the frames
-   * remain. Claimed instead: the Buyer is routed to `learnSecret`. A refund still pending is awaited (`refundLegA`
-   * says so and sends nothing). Only a refund the rail proves can no longer land (NEAR, Solana), or one that never
-   * got a handle (nothing was signed before the crash; EVM keeps no handle and a repeat is refused by the contract),
-   * leaves the way open for exactly one fresh refund, which the caller then builds with the same recorder.
+   * P8-RESUME-SPEC.md "Buyer refund A" (rules 1 and 2): a refund that was attempted without a known outcome. The chain
+   * decides, never an assumption: with the refund's recorded handle the rail READS what became of THAT refund (R1-01 part 2:
+   * `recoverRefund` never sends); when the node does not know it (`unknown`: Bitcoin while the funding output is unspent, NEAR
+   * while it reads Locked) the identical recorded bytes are sent once with `resendRefund`, never a second refund built. The
+   * rule-4 guards of a refund (leg A's refund time, the leg B claim latches, the pending-claim read) all ran at the top of
+   * `refundLegA`, on this very call, before this one is reached. The lock itself is then read. Refunded and final: the
+   * evidence is recorded and only the frames remain. Claimed instead: the Buyer is routed to `learnSecret`. A refund still
+   * pending is awaited (`refundLegA` says so and sends nothing). Only a refund the rail proves can no longer land (NEAR,
+   * Solana), one that LANDED AND FAILED (R1-08), or one that never got a handle (nothing was signed before the crash; EVM
+   * keeps no handle and a repeat is refused by the contract) leaves the way open for exactly one fresh refund, which the
+   * caller then builds with the same recorder.
    */
   private async recoverRefundA(
     connected: ConnectedCounterAssetRail,
@@ -1570,12 +1608,18 @@ export class BuyerFlow {
   ): Promise<void> {
     if (this.lockedAccounts === undefined) throw new Error("buyer: refusing to refund leg A - leg A accounts were never resolved (G1)");
     const handle = this.refundRecovery;
-    let outcome: LockRecoveryOutcome | undefined;
+    let outcome: LockRecoveryOutcome | "landed-failed" | undefined;
     if (handle !== undefined && connected.recoverRefund !== undefined) {
-      outcome = await connected.recoverRefund(railRef, handle);
-      // R1-01 (part 2): `recoverRefund` only READS; an `unknown` answer is settled by sending the identical recorded bytes
-      // once more (the rail re-reads first and sends only while the refund can still land), as it used to do inside.
-      if (outcome === "unknown" && connected.resendRefund !== undefined) outcome = await connected.resendRefund(railRef, handle);
+      try {
+        outcome = await connected.recoverRefund(railRef, handle);
+        if (outcome === "unknown" && connected.resendRefund !== undefined) outcome = await connected.resendRefund(railRef, handle);
+      } catch (error) {
+        // R1-08: the recorded refund LANDED and FAILED on chain (a NEAR payout that failed and put the lock back to Locked, a
+        // transaction that failed, a Solana refund that failed). A transaction that landed can never land again, so it is
+        // resolved; the lock itself says what follows. Any other error (a transport failure, a refused handle) is not an outcome.
+        if (!isLandedAndFailedRefund(error)) throw error;
+        outcome = "landed-failed";
+      }
     }
     const observed = await connected.verifyLockFinal(termsA, railRef, this.lockedAccounts);
     if (observed.rail?.status === "refunded" && observed.rail.final) {
@@ -1588,22 +1632,25 @@ export class BuyerFlow {
       return;
     }
     if (observed.rail?.status === "claimed") {
-      throw new Error(
+      return this.routeToClaim(
         "buyer: refusing to report leg A refunded - the lock was claimed instead (the refund lost the race to a claim); " +
           "call learnSecret() then claimLegB() instead of refundLegA() (G7)",
       );
     }
-    if (outcome === "pending" || outcome === "landed" || outcome === "unknown") {
-      throw new Error("buyer: refund broadcast but not yet confirmed; call refundLegA() again once it confirms (G7)");
-    }
-    if (handle?.chain === "btc") {
+    if (outcome === "landed-failed") {
+      // Locked and final: nothing was paid and nobody claimed; the failed refund's handle is cleared and ONE fresh refund follows.
+      // Anything else (a transitional state, an evidence reader that withholds its answer) is not decided: ask again later.
+      if (observed.rail?.status !== "locked" || !observed.rail.final) throw new Error(REFUND_UNCONFIRMED);
+    } else if (outcome === "pending" || outcome === "landed" || outcome === "unknown") {
+      throw new Error(REFUND_UNCONFIRMED);
+    } else if (handle?.chain === "btc") {
       // never-landed on Bitcoin: the funding output is spent by another transaction. A second refund cannot spend it.
       throw new Error(
         "buyer: the recorded Bitcoin refund can no longer land (the funding output is spent by another transaction); " +
           "a second refund is not built - call learnSecret() then claimLegB() if it was claimed (K2, rule 2)",
       );
     }
-    this.refundRecovery = undefined; // proven never to land, or never signed: one fresh refund follows
+    this.refundRecovery = undefined; // proven never to land, landed and failed, or never signed: one fresh refund follows
     await this.persist();
   }
 }
