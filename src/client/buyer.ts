@@ -991,17 +991,17 @@ export class BuyerFlow {
     const fromBlock = await connected.currentBlockMarker();
 
     // G3 (client half of H2): build (and, for a rail that needs one, sign) the lock transaction
-    // WITHOUT broadcasting it yet — `prepared.ref` is already fully determined at this point (a
+    // WITHOUT broadcasting it yet - `prepared.ref` is already fully determined at this point (a
     // Bitcoin outpoint hashes the prepared transaction's own bytes; an EVM ref is simply the
     // hashLock, already known regardless).
     const prepared = await connected.prepareLock(termsA, 0);
 
     // P22-P24-EVM-FIXES-R3.md E3 + P4-BTC-FIXES.md G1/G3: record everything `refundLegA`/
-    // `learnSecret` will ever need BEFORE this flow ever risks a broadcast — the hash lock
+    // `learnSecret` will ever need BEFORE this flow ever risks a broadcast - the hash lock
     // (always known in advance), the resolved accounts (G1: frozen here, permanently, so a
     // pubkey/account line posted after this point can neither add to nor conflict with what this
     // flow already committed to acting on), and the rail's own write ref (G3: already known from
-    // `prepared`, not from whatever `commitLock` eventually returns — a failed evidence capture
+    // `prepared`, not from whatever `commitLock` eventually returns - a failed evidence capture
     // or a failed lock-frame post, or even a flaky read on the broadcast's own response, must
     // never leave this flow believing leg A was "never locked" when the write may already have
     // reached the network).
@@ -1011,7 +1011,7 @@ export class BuyerFlow {
     this.lockedAccounts = accounts;
     this.lockedRailRef = prepared.ref;
 
-    // G2: from this point on this flow can no longer be sure a retry would not double-fund —
+    // G2: from this point on this flow can no longer be sure a retry would not double-fund -
     // latch it permanently, right before the one call that might actually reach the network.
     this.legALockAttempted = true;
     this.preparedLock = prepared;
@@ -1028,7 +1028,7 @@ export class BuyerFlow {
 
     // P4-BTC-FIXES-R3.md K5: posting the lock frame is broken out into its own idempotent method
     // (`announceLockA`) so `reconcileLockA` can re-post it later if THIS post itself is what fails
-    // (or is lost) — a genuinely-funded outpoint must never stay invisible to tclk's own machine
+    // (or is lost) - a genuinely-funded outpoint must never stay invisible to tclk's own machine
     // just because the one frame that would have announced it never landed.
     await this.announceLockA(acceptA.contract, writeEvidence.ref);
 

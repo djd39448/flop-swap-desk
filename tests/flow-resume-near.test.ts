@@ -204,3 +204,26 @@ describe("R1-10 (NEAR): a refund signed and saved but never sent", () => {
     expect(h.node.getLockRow(p.statement.slice(2))?.status).toBe("Locked");
   });
 });
+
+describe("R1-01 (NEAR): a lock signed and never sent is re-sent only after the guards", () => {
+  it("outside the guard window the saved bytes are NOT sent and the call refuses; inside it the identical bytes go out once", async () => {
+    const h = harness();
+    await toLines(h);
+    const dying = await restart(h, { rail: crashRail(h.buyerRail(), { before: ["commitLock"] }) });
+    await expect(dying.flow.lockLegA()).rejects.toBeInstanceOf(ProcessDied); // signed and saved, never sent
+    expect(h.node.sendTxReceived).toBe(0);
+
+    h.setTime(legA.refundAfterMs - 1); // far outside the lock-time guard
+    const late = await restart(h);
+    expect(late.next).toBe("lockLegA");
+    await expect(late.flow.lockLegA()).rejects.toThrow(/deadlines are no longer safe at lock time/);
+    expect(h.node.sendTxReceived).toBe(0); // the identical bytes were not re-sent: that would be a new lock action
+    expect(h.node.lockSendTxCalls).toBe(0);
+
+    h.setTime(lockTimeMs); // back inside the window, the same record recovers: the identical bytes, once
+    const inWindow = await restart(h);
+    await inWindow.flow.lockLegA();
+    expect(h.node.lockSendTxCalls).toBe(1);
+    expect(h.node.sendTxReceived).toBe(1);
+  });
+});
