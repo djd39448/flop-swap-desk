@@ -356,9 +356,10 @@ describe("R1-11: a stranger's lock frame in leg A's deal room never blocks the S
 
 describe("R1-13 (EVM): a resumed claim is looked for from the saved block marker, never from genesis", () => {
   const chainAdvanced = (node: EvmMockNode): void => {
-    node.blockNumber = 500n; // the chain is far past block 0 when the lock lands
-    // a public RPC that refuses a scan over more than 100 blocks (R2-13: the saved marker sits CLAIM_MARKER_REORG_MARGIN_EVM blocks below the tip)
-    node.maxLogSpan = 100n;
+    node.blockNumber = 1000n; // the chain is far past block 0 when the lock lands
+    // a public RPC that refuses a scan over more than 500 blocks, like Base Sepolia's public endpoint (R2-13, R3-08: the saved marker sits
+    // CLAIM_MARKER_REORG_MARGIN_EVM = 256 blocks below the tip, so the resumed scan is about 257 blocks: inside the window; from block 0 it is not)
+    node.maxLogSpan = 500n;
   };
 
   it("the claim was sent and the process died: the resumed claimLegA scans from the marker and posts the reveal and the receipt", async () => {
@@ -373,7 +374,7 @@ describe("R1-13 (EVM): a resumed claim is looked for from the saved block marker
     expect(saved.claimFromBlock, "the marker is saved with the attempt, before the first send").toBeDefined();
     // the tip read before the claim send, minus the reorg margin (R2-13); the claim's own send then mined one block
     expect(markerFromJson(saved.claimFromBlock!)).toBe(node!.blockNumber - 1n - BigInt(CLAIM_MARKER_REORG_MARGIN_EVM));
-    expect(markerFromJson(saved.claimFromBlock!)).toBeGreaterThan(400n);
+    expect(markerFromJson(saved.claimFromBlock!)).toBeGreaterThan(700n);
 
     const back = await resumedSeller(s);
     const result = await back.flow.claimLegA(statement); // before the fix: the scan started at block 0 and the capped RPC refused it
@@ -382,7 +383,7 @@ describe("R1-13 (EVM): a resumed claim is looked for from the saved block marker
     const { contractA } = await contractsOf(s.w);
     expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(1);
     expect(await framesOfType(s, dealRoom(contractA), "receipt")).toBe(1);
-    expect(Math.min(...node!.logQueries.slice(-1).map(Number))).toBeGreaterThan(400);
+    expect(Math.min(...node!.logQueries.slice(-1).map(Number))).toBeGreaterThan(700);
   });
 
   it("a claim the record shows as landed is not searched for at all: with every log query refused the missing frames are still posted", async () => {

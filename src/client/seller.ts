@@ -105,8 +105,8 @@
 //  - R2-11, R2-12: the exchange lists are ES `#private` fields (a claim the node refused before it reached the chain leaves the secret out of
 //    `Object.entries(flow)` and `util.inspect(flow, { customInspect: false })`), and a later claim attempt's held exchanges are released with
 //    the already-posted reveal.
-//  - R2-13: the block marker saved with the claim attempt is the tip minus a reorg margin (6 on Bitcoin, 64 on EVM, floored at 0), so a claim a
-//    reorg mines below the tip is still inside the resumed scan.
+//  - R2-13: the block marker saved with the claim attempt is the tip minus a reorg margin (6 on Bitcoin, 256 on EVM since R3-08, floored at 0), so a
+//    claim a reorg mines below the tip is still inside the resumed scan.
 //
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
 // B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a;
@@ -295,9 +295,13 @@ export const SELLER_OFFER_EXPIRY_MARGIN_MS = 5_000;
  *  sent; a reorg that branches below it can mine the claim into a block under that height, and a resumed scan that starts AT the marker would never
  *  see the Seller's own landed claim (its reveal and receipt would not be posted, and a new claim is refused: the input is spent). */
 export const CLAIM_MARKER_REORG_MARGIN_BTC = 6;
-/** R2-13: the same on EVM (blocks, bigint arithmetic). The scan is one `eth_getLogs` over this many blocks more, which a range-capped public RPC
- *  still answers. */
-export const CLAIM_MARKER_REORG_MARGIN_EVM = 64;
+/** R2-13, R3-08: the same on EVM (blocks, bigint arithmetic). 256 since review round 3: the Base Sepolia safe head was measured on 2026-10-06 (92
+ *  samples) to trail the unsafe tip by 8 to 91 blocks (median 56, p90 79), so the earlier 64 sat inside that lag and a claim re-included below
+ *  the tip by an unsafe-head reorg could fall under the saved marker (the resumed Seller would then never find its own claim, never post its
+ *  reveal and receipt: liveness only, the Buyer still learns the secret from its own older scan). 256 leaves headroom over the measured lag and
+ *  stays under the public endpoint's 500-block `eth_getLogs` window, so the resumed scan (marker to tip) is still one answerable request.
+ *  Anvil, the only EVM chain of the test suites, is unaffected. The Bitcoin margin and the Buyer's lock marker are unchanged. */
+export const CLAIM_MARKER_REORG_MARGIN_EVM = 256;
 
 /** R2-13: `marker` (the chain tip read before the first claim send) minus the reorg margin of its kind (a bigint is an EVM block number, a number a
  *  Bitcoin height), floored at 0. A value that is not a marker this build can save is returned as it is, so the save refuses it (R2-09). */

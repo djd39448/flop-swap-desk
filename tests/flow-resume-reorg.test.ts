@@ -4,7 +4,8 @@
 // block marker saved with the attempt (the chain tip when the first claim was about to be sent) instead of from genesis. A reorg that branches
 // BELOW that tip can mine the claim into a block under the marker: the bounded scan starting at the marker never sees the Seller's own landed claim, its
 // reveal and receipt are never posted, and a new claim is refused (the output is spent). The marker is therefore saved as the tip minus
-// CLAIM_MARKER_REORG_MARGIN_BTC (6) on Bitcoin or CLAIM_MARKER_REORG_MARGIN_EVM (64) on EVM, floored at 0 (bigint arithmetic on EVM).
+// CLAIM_MARKER_REORG_MARGIN_BTC (6) on Bitcoin or CLAIM_MARKER_REORG_MARGIN_EVM on EVM (64 at first, 256 since R3-08: the Base Sepolia safe head
+// was measured 8 to 91 blocks behind the tip), floored at 0 (bigint arithmetic on EVM).
 //
 // Each world cuts the Seller right after the claim's send (the claim is on chain, its outcome unsaved), simulates the reorg (the claim now sits one block
 // below the raw marker), and resumes: claimLegA must find the claim, post the reveal and the receipt, and send nothing.
@@ -76,7 +77,7 @@ describe("R2-13 (EVM): a claim a reorg mined below the raw marker is still found
   async function cutOnEvm(): Promise<{ w: World; statement: string; node: EvmMockNode; rawMarker: bigint }> {
     let node: EvmMockNode | undefined;
     const factory = evmWorldWith((n) => {
-      n.blockNumber = 1000n; // far past the margin: the saved marker is the tip minus 64, not the floor
+      n.blockNumber = 1000n; // far past the margin: the saved marker is the tip minus the margin, not the floor
       node = n;
     });
     const { w, statement } = await cutAfterClaimSend(factory, "chain:claim");
@@ -90,15 +91,31 @@ describe("R2-13 (EVM): a claim a reorg mined below the raw marker is still found
     await expectFoundAndFinished(w, statement);
   });
 
-  it("the boundary: a claim at exactly rawMarker - 64 is found", async () => {
+  it("the boundary: a claim at exactly rawMarker - the margin is found", async () => {
     const { w, statement, node, rawMarker } = await cutOnEvm();
     node.reorgLog("Claimed", statement, rawMarker - BigInt(CLAIM_MARKER_REORG_MARGIN_EVM));
     await expectFoundAndFinished(w, statement);
   });
 
-  it("the saved marker is the tip read before the send minus 64 (bigint arithmetic)", async () => {
+  it("the saved marker is the tip read before the send minus the margin (bigint arithmetic)", async () => {
     const { w, rawMarker } = await cutOnEvm();
-    expect(markerFromJson((await sellerRecordOf(w)).claimFromBlock!)).toBe(rawMarker - 64n);
+    expect(markerFromJson((await sellerRecordOf(w)).claimFromBlock!)).toBe(rawMarker - 256n);
+  });
+
+  // R3-08 (decision 6): the margin is 256, above the Base Sepolia safe-head lag measured on 2026-10-06 (92 samples, 8 to 91 blocks behind the
+  // tip, median 56, p90 79), so a claim an unsafe-head reorg re-includes far below the tip is still inside the resumed scan. With the margin
+  // back at 64 the saved marker sat at rawMarker - 64 and a claim 200 blocks down was never found: the resumed Seller read its own claim as
+  // "claimed by someone", refused to claim again, and never posted its reveal and receipt.
+  it("R3-08: a claim re-included 200 blocks below the tip saved with the claim attempt is found: reveal and receipt are posted, no second claim", async () => {
+    const { w, statement, node, rawMarker } = await cutOnEvm();
+    node.reorgLog("Claimed", statement, rawMarker - 200n);
+    await expectFoundAndFinished(w, statement);
+  });
+
+  it("R3-08: the margin is 256 and stays under the public endpoint's 500-block getLogs window", () => {
+    expect(CLAIM_MARKER_REORG_MARGIN_EVM).toBe(256);
+    expect(CLAIM_MARKER_REORG_MARGIN_EVM).toBeLessThan(500);
+    expect(CLAIM_MARKER_REORG_MARGIN_EVM, "above the measured safe-head lag maximum of 91 blocks").toBeGreaterThan(91);
   });
 
   it("near genesis the marker is floored at 0", async () => {
@@ -140,13 +157,14 @@ describe("R2-13 (Bitcoin ledger world): a claim a reorg mined below the raw mark
 describe("R2-13: claimMarkerWithReorgMargin", () => {
   it("subtracts the margin of the marker's kind and floors at 0; anything that is not a marker is left for the save to refuse", () => {
     expect(CLAIM_MARKER_REORG_MARGIN_BTC).toBe(6);
-    expect(CLAIM_MARKER_REORG_MARGIN_EVM).toBe(64);
-    expect(claimMarkerWithReorgMargin(1000n)).toBe(936n);
-    expect(claimMarkerWithReorgMargin(65n)).toBe(1n);
+    expect(CLAIM_MARKER_REORG_MARGIN_EVM).toBe(256);
+    expect(claimMarkerWithReorgMargin(1000n)).toBe(744n);
+    expect(claimMarkerWithReorgMargin(257n)).toBe(1n);
+    expect(claimMarkerWithReorgMargin(256n)).toBe(0n);
+    expect(claimMarkerWithReorgMargin(255n)).toBe(0n);
     expect(claimMarkerWithReorgMargin(64n)).toBe(0n);
-    expect(claimMarkerWithReorgMargin(63n)).toBe(0n);
     expect(claimMarkerWithReorgMargin(0n)).toBe(0n);
-    expect(claimMarkerWithReorgMargin(2n ** 80n)).toBe(2n ** 80n - 64n); // bigint arithmetic: no precision is lost
+    expect(claimMarkerWithReorgMargin(2n ** 80n)).toBe(2n ** 80n - 256n); // bigint arithmetic: no precision is lost
     expect(claimMarkerWithReorgMargin(700)).toBe(694);
     expect(claimMarkerWithReorgMargin(7)).toBe(1);
     expect(claimMarkerWithReorgMargin(6)).toBe(0);
