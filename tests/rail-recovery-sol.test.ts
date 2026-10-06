@@ -179,6 +179,51 @@ describe("Solana recoverLock", () => {
   });
 });
 
+describe("Solana recoverLock after the lock moved on (R1-04)", () => {
+  /** The Buyer's lock lands with its reply lost, before any lock frame exists. */
+  async function landedReplyLost() {
+    const h = solHarness();
+    const p = await pairWithLines(h);
+    const leg = legOf(h, p);
+    const { rail, prepared } = await prepare(h, leg);
+    h.node.dropNextSendReplyFor = "lock";
+    await expect(rail.commitLock()).rejects.toThrow(/connection reset/);
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Locked");
+    return { h, p, leg, prepared };
+  }
+
+  it("the Seller, which holds the secret, claims the escrow before the Buyer's resumed recovery: landed, never 'nothing was locked' (and the claim is not repeated or sent again)", async () => {
+    const { h, p, leg, prepared } = await landedReplyLost();
+    const seller = await h.sellerRail.connect(leg.terms, leg.accounts);
+    await seller.claim(prepared.ref, h.sellerLock.preimage, p.offerA.refundAfterMs - 10 * 60_000);
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Claimed");
+    await expect((await fresh(h, leg)).recoverLock(prepared)).resolves.toBe("landed");
+    expect(h.node.sent).toMatchObject({ lock: 1, claim: 1 }); // the recovery sent nothing
+  });
+
+  it("the lock was refunded after it landed (the Buyer's earlier process refunded it): landed too", async () => {
+    const { h, p, leg, prepared } = await landedReplyLost();
+    h.setTime(p.offerA.refundAfterMs + 60_000);
+    await (await fresh(h, leg)).refund(prepared.ref);
+    expect(h.node.escrow(p.statement, h.buyerWallet.publicKey)?.status).toBe("Refunded");
+    await expect((await fresh(h, leg)).recoverLock(prepared)).resolves.toBe("landed");
+    expect(h.node.sent).toMatchObject({ lock: 1, refund: 1 });
+  });
+
+  it("a lock transaction that FAILED is still 'nothing was locked' (SolLockRefusedError): only a transaction that executed counts as landed", async () => {
+    const h = solHarness();
+    const p = await pairWithLines(h);
+    const leg = legOf(h, p);
+    const { rail, prepared } = await prepare(h, leg);
+    h.node.midFlight = (kind) => {
+      if (kind === "lock") h.node.closeToken(h.buyerWallet.publicKeyBytes);
+    };
+    await expect(rail.commitLock()).rejects.toBeInstanceOf(SolLockRefusedError);
+    h.node.midFlight = undefined;
+    await expect((await fresh(h, leg)).recoverLock(prepared)).rejects.toBeInstanceOf(SolLockRefusedError);
+  });
+});
+
 // -- refund: record before send ----------------------------------------------------------------------------------------
 
 describe("Solana refund: onSigned / onNotBroadcast", () => {

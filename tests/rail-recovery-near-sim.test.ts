@@ -3,6 +3,8 @@
 // tests/rail-recovery-near-sim.test.ts: the NEAR rail's recovery against the stateful node (tests/helpers/near-stateful-rpc.ts), which
 // remembers every transaction, moves its blocks on demand and answers `send_tx` the way a real node does (`Expired`, invalid nonce).
 // Review round 1 (P8-FIXES-R1.md), at the rail level:
+//   - R1-04: a lock that landed and was then claimed (or is being claimed, or was refunded) is `landed` for a recovery, never
+//     `NearLockUnknownError` ("nothing was locked");
 //   - R1-10: a lock or refund that was signed, saved and never sent is `unknown` for the read; the identical bytes are sent once by
 //     `resendLock` / `resendRefund` and either land or, once the node calls them `Expired`, are `never-landed` (a fresh one may follow);
 //   - R1-19: a transaction whose nonce moved is only `never-landed` once the lock row was read three blocks later: the
@@ -17,7 +19,7 @@ import { describe, expect, it } from "vitest";
 import type { ConnectedCounterAssetRail, LockRecovery, PreparedLock } from "../src/client/counter-rail.js";
 import { createNearCounterRail } from "../src/client/near-rail.js";
 import { decodeSignedTransactionHeader } from "../src/rails/near-borsh.js";
-import { NEAR_RECEIPT_SETTLE_BLOCKS, NEAR_SETTLE_MAX_POLLS } from "../src/rails/near-htlc.js";
+import { NEAR_RECEIPT_SETTLE_BLOCKS, NEAR_SETTLE_MAX_POLLS, NearLockUnknownError } from "../src/rails/near-htlc.js";
 import { InMemoryNearSigner } from "../src/rails/near-signer-memory.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { BUYER_ACCOUNT, CONTRACT, HTLC_CODE_HASH, SELLER_ACCOUNT, StatefulNearRpc, USDC, fetchFor, nearConfig } from "./helpers/near-stateful-rpc.js";
@@ -133,6 +135,45 @@ async function refundSignedNeverSent(w: World): Promise<Extract<LockRecovery, { 
   expect(w.node.refundSendTxCalls).toBe(0);
   return recovery;
 }
+
+describe("R1-04: a lock that landed and was then claimed, refunded or is on its way is `landed` for a recovery", () => {
+  it("the Seller claims the lock before the Buyer's resumed recovery: landed, not NearLockUnknownError", async () => {
+    const w = world();
+    const prepared = await lockLanded(w);
+    const seller = await w.connectSeller();
+    await seller.claim(REF, `0x${PREIMAGE_HEX}`, CLAIM_BY_MS);
+    expect(row(w)?.status).toBe("Claimed");
+    const received = w.node.sendTxReceived;
+    await expect((await w.freshBuyer()).recoverLock(prepared)).resolves.toBe("landed");
+    expect(w.node.sendTxReceived).toBe(received); // a recovery sends nothing
+  });
+
+  it.each(["Claiming", "Refunding", "Refunded"] as const)("a lock the contract has moved on to %s is landed too (the node still holds the lock transaction)", async (status) => {
+    const w = world();
+    const prepared = await lockLanded(w);
+    (row(w) as { status: string }).status = status;
+    await expect((await w.freshBuyer()).recoverLock(prepared)).resolves.toBe("landed");
+  });
+
+  it("the node forgot the transaction and the lock is claimed: still landed (by the row)", async () => {
+    const w = world();
+    const prepared = await lockLanded(w);
+    const seller = await w.connectSeller();
+    await seller.claim(REF, `0x${PREIMAGE_HEX}`, CLAIM_BY_MS);
+    w.node.txStatusUnknown = true;
+    await expect((await w.freshBuyer()).recoverLock(prepared)).resolves.toBe("landed");
+  });
+
+  it("a fresh lock's own confirmation keeps its strict check: a row that is not Locked right after the send is NearLockUnknownError (the commit path is unchanged)", async () => {
+    const w = world();
+    const rail = await w.connectBuyer();
+    await rail.prepareLock(terms, 0);
+    w.cut.afterSend = () => {
+      (row(w) as { status: string }).status = "Claimed"; // claimed before the lock's own confirmation read
+    };
+    await expect(rail.commitLock()).rejects.toBeInstanceOf(NearLockUnknownError);
+  });
+});
 
 describe("R1-10: a signed refund or lock that was never sent", () => {
   it("the read says `unknown` and sends nothing; resendRefund sends the IDENTICAL bytes once and the refund lands", async () => {

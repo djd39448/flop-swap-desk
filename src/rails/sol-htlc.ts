@@ -934,8 +934,18 @@ export class SolHtlcRail {
     return null;
   }
 
-  /** The chain-confirmed check for one write, given the finalized status. Throws the kind's typed error. */
-  private async confirmWrite(record: SolPreparedRecord, status: SolSignatureStatus, raw: () => string[], claimPreimage?: string): Promise<SolWriteEvidence> {
+  /** The chain-confirmed check for one write, given the finalized status. Throws the kind's typed error.
+   *  `recovering` (R1-04): the status was reached through `recoverBySignature`, so the escrow may have moved on since the
+   *  transaction landed (a Seller that holds the secret can claim before the Buyer ever posts a lock frame): for a lock,
+   *  `Claimed` and `Refunded` then still mean the lock landed. A fresh send keeps the strict check (`Locked`, with the
+   *  vault holding the terms). */
+  private async confirmWrite(
+    record: SolPreparedRecord,
+    status: SolSignatureStatus,
+    raw: () => string[],
+    claimPreimage?: string,
+    recovering = false,
+  ): Promise<SolWriteEvidence> {
     const { kind, signature } = record;
     if (status.err !== null) {
       if (kind === "claim") {
@@ -954,6 +964,16 @@ export class SolHtlcRail {
       const terms = record.terms;
       if (terms === undefined) throw new Error("sol-htlc: internal - a lock record is missing its terms");
       if (view === null) throw new SolLockRefusedError(signature, null, raw(), "no escrow exists after the transaction");
+      if (recovering && view.status !== "Locked") {
+        // R1-04: a transaction that executed successfully made this escrow. The escrow under this ref (payer and hash lock are
+        // part of its address) belongs to this payer and hash lock, so it landed whatever it has become since; the vault is
+        // empty after a claim or a refund, and the terms are checked on the fields the account still carries by the evidence
+        // reader. "Nothing was locked" is never reported for it.
+        if (view.payer !== this.signer.publicKey || view.hashLock !== terms.hashLock) {
+          throw new SolLockRefusedError(signature, null, raw(), "the escrow under this ref is not this payer's lock for this hash lock");
+        }
+        return evidence;
+      }
       const vaultProblem = this.tokenAccountProblem(read.accounts[1] ?? null, this.mint, escrow);
       const vaultBalance = vaultProblem === null ? decodeTokenAccount((read.accounts[1] as SolAccountInfo).data).amount : null;
       const matches =
@@ -1313,12 +1333,12 @@ export class SolHtlcRail {
       if (height <= record.lastValidBlockHeight) throw new SolPendingError(record.signature, "no status yet and the blockhash has not expired");
       const found = await this.confirmNeverLanded(record.signature, record.signedSlot);
       if (found === null) return null;
-      return this.confirmWrite(record, found, raw);
+      return this.confirmWrite(record, found, raw, undefined, true);
     }
     if (status.confirmationStatus !== "finalized") {
       throw new SolPendingError(record.signature, `status ${String(status.confirmationStatus)}, not finalized yet`);
     }
-    return this.confirmWrite(record, status, raw);
+    return this.confirmWrite(record, status, raw, undefined, true);
   }
 
   // -- preimage discovery ---------------------------------------------------------------------------------

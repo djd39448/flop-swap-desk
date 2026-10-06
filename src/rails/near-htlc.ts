@@ -731,6 +731,7 @@ export class NearHtlcRail {
     prepared: { ref: string; txHash: string; kind: "lock" | "claim" | "refund"; lockTerms?: NearHtlcTerms | undefined },
     outcome: NearTxOutcome,
     before: number,
+    options: { recovering?: boolean } = {},
   ): Promise<NearWriteEvidence> {
     const raw = (): string[] => this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256);
 
@@ -775,6 +776,14 @@ export class NearHtlcRail {
         lockView = await this.getLock(prepared.ref);
       }
       if (lockView === null) throw new NearLockUnknownError(prepared.txHash, "no lock is visible at the final block, even after a re-read", raw());
+      // R1-04: a lock transaction found again by its hash (`recoverByTxHash`) may belong to a lock that has moved on since it
+      // landed (a Seller that holds the secret can claim before the Buyer ever posts a lock frame). The row under this ref
+      // belongs to this payer and hash lock (the ref names both), so a row in any state after `Locked` (Claiming, Claimed,
+      // Refunding, Refunded) means the lock landed: "unknown" is never reported for a transaction that executed. A fresh send
+      // (`commitLock`) keeps the strict check below.
+      if (options.recovering === true && lockView.status !== "Locked" && lockView.payer === this.signer.accountId) {
+        return { ...evidence, raw: raw() };
+      }
       const matches =
         lockView.status === "Locked" &&
         lockView.payer === this.signer.accountId &&
@@ -1129,7 +1138,7 @@ export class NearHtlcRail {
     // transaction itself (signer, receiver, method, args) rather than trusting the hash a caller
     // supplied -- then apply the same kind-specific post-checks (and typed errors) as a send.
     const write = this.classifyOwnWrite(outcome, txHash, senderAccountId, expectedRef, refParts);
-    return this.confirmWrite({ ref: expectedRef, txHash, kind: write.kind, lockTerms: write.lockTerms }, outcome, before);
+    return this.confirmWrite({ ref: expectedRef, txHash, kind: write.kind, lockTerms: write.lockTerms }, outcome, before, { recovering: true });
   }
 
   /** H10: proves `outcome`'s transaction is a write of THIS rail (this signer and key, this
