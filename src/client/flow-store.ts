@@ -187,7 +187,8 @@ export interface FlowStore {
    * are durable.
    */
   save(key: string, bytes: Uint8Array, expected: string | null): Promise<void>;
-  /** Every key with a saved value, sorted. */
+  /** Every key with a saved value, sorted: `buyer:<swapId>` for each Buyer record and `seller:<contractA>` (leg A's
+   *  tclk contract id, not the swap id: R1-14) for each Seller record. */
   list(): Promise<string[]>;
 }
 
