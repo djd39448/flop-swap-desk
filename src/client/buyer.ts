@@ -265,6 +265,12 @@ export class BuyerFlow {
    *  from the moment the rail signed it until the refund is confirmed. */
   private legBClaimAttempted = false;
   private refundAttempted = false;
+  /** R1-16: set synchronously at the start of `postAccountLineA`, `claimLegB` and `refundLegA` and cleared when the call ends,
+   *  the same re-entry pattern `lockLegA` and `acceptLegB` use: two overlapping calls of one step can never both reach the
+   *  rail or the venue (two refund builds, two account lines for two addresses, two claims). */
+  private accountLinePending = false;
+  private legBClaimPending = false;
+  private refundPending = false;
   private refundRecovery: LockRecovery | undefined = undefined;
   /** R4-1 / RR4-1: what `refundLegA` recorded about a leg-B paper note that read claimed — a proven claim ("the secret
    *  is public and leg B's paper note reads claimed") or one ignored as not proven. Never a reason to refuse. */
@@ -803,6 +809,16 @@ export class BuyerFlow {
    *  it to bind the lock's payer to this DID. */
   async postAccountLineA(address: string): Promise<TranscriptRecord> {
     this.usable();
+    if (this.accountLinePending) throw new Error("buyer: refusing to post the account line - another postAccountLineA call is already in flight (R1-16)");
+    this.accountLinePending = true;
+    try {
+      return await this.postAccountLineAUnlatched(address);
+    } finally {
+      this.accountLinePending = false;
+    }
+  }
+
+  private async postAccountLineAUnlatched(address: string): Promise<TranscriptRecord> {
     const { offerA, acceptA } = this.requirePaired();
     const journal = this.#journal;
     if (journal === undefined) {
@@ -1226,6 +1242,16 @@ export class BuyerFlow {
    *  the Buyer's own reveal on leg B, distinct from the Seller's reveal on leg A). */
   async claimLegB(secret: string): Promise<{ reveal: TranscriptRecord; receipt: TranscriptRecord }> {
     this.usable(); // R1-03
+    if (this.legBClaimPending) throw new Error("buyer: refusing to claim leg B - another claimLegB call is already in flight (R1-16)");
+    this.legBClaimPending = true;
+    try {
+      return await this.claimLegBUnlatched(secret);
+    } finally {
+      this.legBClaimPending = false;
+    }
+  }
+
+  private async claimLegBUnlatched(secret: string): Promise<{ reveal: TranscriptRecord; receipt: TranscriptRecord }> {
     const { offerB, acceptB } = this.requirePaired();
     const termsB = offerAcceptLockTerms(offerB, acceptB);
     if (!verifySecret(termsB.lock, termsB.statement, secret)) {
@@ -1305,6 +1331,16 @@ export class BuyerFlow {
    */
   async refundLegA(): Promise<RailWriteEvidence> {
     this.usable(); // R1-03
+    if (this.refundPending) throw new Error("buyer: refusing to refund leg A - another refundLegA call is already in flight (R1-16)");
+    this.refundPending = true;
+    try {
+      return await this.refundLegAUnlatched();
+    } finally {
+      this.refundPending = false;
+    }
+  }
+
+  private async refundLegAUnlatched(): Promise<RailWriteEvidence> {
     const { offerA, acceptA } = this.requirePaired();
     if (this.lockedHashLock === undefined) throw new Error("buyer: leg A was never locked, nothing to refund");
     if (this.clock() < offerA.refundAfterMs) {

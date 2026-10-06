@@ -246,7 +246,8 @@ export class FlowJournal<R extends FlowRecord> {
   /** The first refused save, once there was one: the journal is dead from then on (R1-03). */
   private failure: Error | undefined;
   private tail: Promise<void> = Promise.resolve();
-  private readonly inflight = new Map<LedgerKind, Promise<TranscriptRecord>>();
+  /** The attempt in flight for each kind, with the room and the ledger text it carries (R1-16). */
+  private readonly inflight = new Map<LedgerKind, { room: string; text: string; promise: Promise<TranscriptRecord> }>();
   private readonly deps: JournalDeps;
   private readonly key: string;
   private projector: ((record: R) => R) | undefined;
@@ -406,13 +407,23 @@ export class FlowJournal<R extends FlowRecord> {
    * or room makes this throw `FlowRecordConflictError` before anything is read or posted (a party never posts a
    * second, different frame). The landed `seq` and `nonce` are saved after the post. An entry the ledger already marks
    * as landed is never posted again and the room is not read: the stored record answers (R1-12). Two calls for the
-   * same kind that overlap share one attempt.
+   * same kind that overlap share one attempt, but only when they carry the SAME room and text: a second call for a kind whose
+   * attempt is in flight with another text is a `FlowRecordConflictError` (R1-16), never a silent share of the first call's
+   * answer (two overlapping calls would otherwise leave the record naming one text while the room holds another).
    */
   ensurePosted(spec: PostSpec): Promise<TranscriptRecord> {
     const running = this.inflight.get(spec.kind);
-    if (running !== undefined) return running;
+    const text = this.ledgerText(spec);
+    if (running !== undefined) {
+      if (running.room !== spec.room || running.text !== text) {
+        return Promise.reject(
+          new FlowRecordConflictError(`flow record: "${spec.kind}" is already being posted with another room or text; a party never posts a second, different frame (R1-16)`),
+        );
+      }
+      return running.promise;
+    }
     const attempt = this.postOnce(spec).finally(() => this.inflight.delete(spec.kind));
-    this.inflight.set(spec.kind, attempt);
+    this.inflight.set(spec.kind, { room: spec.room, text, promise: attempt });
     return attempt;
   }
 

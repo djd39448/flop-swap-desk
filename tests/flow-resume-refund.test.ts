@@ -18,7 +18,7 @@ import { decodeFlowRecord, type BuyerFlowRecord } from "../src/client/flow-recor
 import { flowKey } from "../src/client/flow-store.js";
 import { SellerFlow } from "../src/client/seller.js";
 import { Controller, PREFIX, STEPS, readSwap, type Ctx, type World, type WorldFactory } from "./helpers/crash-matrix.js";
-import { solWorld } from "./helpers/matrix-worlds.js";
+import { ledgerWorldWith, solWorld } from "./helpers/matrix-worlds.js";
 
 async function started(factory: WorldFactory, steps = [...PREFIX, STEPS.lockLegA]): Promise<{ ctl: Controller; w: World; c: Ctx }> {
   const ctl = new Controller();
@@ -111,5 +111,40 @@ describe("R1-09: the refund note of a claimed paper note is recorded once, so th
     await flow.refundLegA();
     expect(w.counts().refunds).toBe(1);
     expect((await buyerRecordOf(w)).refundNotes).toHaveLength(1);
+  });
+});
+
+describe("R1-16: overlapping calls of one Buyer step in one process are refused (in-flight flags)", () => {
+  it("two overlapping postAccountLineA calls for two addresses: the second is refused, only the first line is built and saved", async () => {
+    const s = await started(ledgerWorldWith("btc", () => undefined), PREFIX.slice(0, 6)); // everything up to verifyLegBLocked
+    const first = s.c.buyer.postAccountLineA(s.w.addresses.buyer);
+    const second = s.c.buyer.postAccountLineA(s.w.addresses.seller);
+    await expect(second).rejects.toThrow(/already in flight/);
+    await first;
+    expect((await buyerRecordOf(s.w)).ownAccountLine?.address).toBe(s.w.addresses.buyer);
+    await s.c.buyer.postAccountLineA(s.w.addresses.buyer); // a later call (nothing in flight) is the ordinary confirmed repeat
+  });
+
+  it("two overlapping refundLegA calls on Bitcoin: the second is refused and exactly ONE refund is built", async () => {
+    const s = await started(ledgerWorldWith("btc", () => undefined));
+    s.w.setTime(s.w.refundAt.legA);
+    const first = s.c.buyer.refundLegA();
+    const second = s.c.buyer.refundLegA();
+    await expect(second).rejects.toThrow(/already in flight/);
+    await first;
+    expect(s.w.counts().refundBuilds).toBe(1);
+    expect(s.w.counts().refunds).toBe(1);
+  });
+
+  it("two overlapping claimLegB calls: the second is refused, the first claims leg B and posts its frames once", async () => {
+    const s = await started(ledgerWorldWith("btc", () => undefined), [...PREFIX, STEPS.lockLegA, STEPS.claimLegA]);
+    const secret = await s.c.buyer.learnSecret();
+    const first = s.c.buyer.claimLegB(secret);
+    const second = s.c.buyer.claimLegB(secret);
+    await expect(second).rejects.toThrow(/already in flight/);
+    await first;
+    const view = await readSwap(s.w);
+    expect((await s.w.paper.read(view.acceptB!.contract))?.status).toBe("claimed");
+    expect((await buyerRecordOf(s.w)).legBClaimed).toBe(true);
   });
 });

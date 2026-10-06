@@ -508,6 +508,38 @@ describe("R1-12 (journal part): a line the ledger shows as landed is never poste
   });
 });
 
+describe("R1-16: overlapping ensurePosted calls for one kind", () => {
+  it("a second call carrying ANOTHER text while the first is in flight is FlowRecordConflictError; exactly one line is posted, the first's", async () => {
+    const r = rig(new MemoryFlowStore());
+    const journal = await FlowJournal.begin(r.deps, buyerRecord());
+    const first = journal.ensurePosted(specAccount);
+    const second = journal.ensurePosted({ ...specAccount, text: "acct a DIFFERENT line" });
+    await expect(second).rejects.toBeInstanceOf(FlowRecordConflictError);
+    const posted = await first;
+    expect(posted.line).toBe(ACCOUNT_TEXT);
+    expect((await linesIn(r, specAccount.room)).map((line) => line.line)).toEqual([ACCOUNT_TEXT]);
+    expect(journal.failed).toBe(false); // a refusal of the caller's own does not fail the journal
+  });
+
+  it("a second call for another ROOM with the same kind is refused the same way", async () => {
+    const r = rig(new MemoryFlowStore());
+    const journal = await FlowJournal.begin(r.deps, buyerRecord());
+    const first = journal.ensurePosted(specAccount);
+    const second = journal.ensurePosted({ ...specAccount, room: dealRoom(CONTRACT_B) });
+    await expect(second).rejects.toBeInstanceOf(FlowRecordConflictError);
+    await first;
+    expect(await linesIn(r, dealRoom(CONTRACT_B))).toHaveLength(0);
+  });
+
+  it("a second call with the SAME text shares the attempt: one post, the same answer", async () => {
+    const r = rig(new MemoryFlowStore());
+    const journal = await FlowJournal.begin(r.deps, buyerRecord());
+    const [a, b] = await Promise.all([journal.ensurePosted(specAccount), journal.ensurePosted(specAccount)]);
+    expect(b.seq).toBe(a.seq);
+    expect(await linesIn(r, specAccount.room)).toHaveLength(1);
+  });
+});
+
 /** `bytesOf` for the places that read it right after an await (keeps the lines short). */
 function bytesOfSync(value: Uint8Array | null): Uint8Array {
   return bytesOf(value);
