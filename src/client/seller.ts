@@ -416,6 +416,18 @@ export class SellerFlow {
     return record === undefined ? undefined : offerFromSlot(`seller:${record.contractA}`, "offerA", record.frames.offerA);
   }
 
+  /** R2-07: the Buyer's accept B as the record kept it (the signed venue record, checked against its slot as a resume checks it), once a
+   *  `lockLegB` saved it: public data. The offers room is a short ring, so by the time a resumed runner needs it again (`next` says
+   *  `lockLegB` after a lock that was started and not finished) the room may have rolled past it; `lockLegB(flow.recordedAcceptB)` and
+   *  `lockLegB()` both continue from this one. `undefined` before any lock was attempted. */
+  get recordedAcceptB(): TranscriptRecord | undefined {
+    const record = this.#journal?.record;
+    if (record === undefined) return undefined;
+    const key = `seller:${record.contractA}`;
+    const acceptB = acceptFromSlot(key, "acceptB", record.frames.acceptB);
+    return slotRecord(key, "acceptB", record.frames.acceptB, acceptB?.from ?? "");
+  }
+
   /** P8: public data only (rule 5). `JSON.stringify(flow)` sees nothing else. */
   toJSON(): { role: "seller"; swapId: string | undefined; did: string; railId: string; caip2: string; statement: string | undefined } {
     return { role: "seller", swapId: this.swapId, did: this.identity.did, railId: this.rail.railId, caip2: this.rail.caip2, statement: this.statement };
@@ -1052,9 +1064,14 @@ export class SellerFlow {
    * this flow free to believe leg B was never touched and try again, possibly under a different
    * contract, while the first attempt may have actually landed. `reconcileLegB()` is the only
    * way to learn the truth about that one attempt; this method itself never retries.
+   *
+   * R2-07: with no argument the call continues a lock that was already attempted, from the signed accept B the record saved with that
+   * attempt (`recordedAcceptB`): the offers room is a short ring and may no longer hold it. Every check below runs on it as on a record
+   * the runner passes. A flow whose lock was never attempted has no accept B of its own and needs the runner's.
    */
-  async lockLegB(acceptBRecord: TranscriptRecord): Promise<TranscriptRecord> {
+  async lockLegB(given?: TranscriptRecord): Promise<TranscriptRecord> {
     this.usable(); // R1-03
+    const acceptBRecord = given ?? this.savedAcceptBToContinue();
     // P8: with a store, an attempt that was saved without an outcome is not refused but RECOVERED (below); a
     // same-process double call is still refused while one is in flight.
     if ((this.attemptedAcceptB !== undefined && this.#journal === undefined) || this.legBLockPending) {
@@ -1118,6 +1135,17 @@ export class SellerFlow {
       // field's own comment and `reconcileLegB` below.
       this.legBLockPending = false;
     }
+  }
+
+  /** R2-07: the accept B a `lockLegB()` with no argument continues from: the one saved with the lock attempt. */
+  private savedAcceptBToContinue(): TranscriptRecord {
+    const saved = this.attemptedAcceptB === undefined ? undefined : this.recordedAcceptB;
+    if (saved === undefined) {
+      throw new Error(
+        "seller: lockLegB needs the Buyer's accept B record: pass the signed record accept B arrived as (with no argument it only continues a lock that was already attempted, from the record saved with that attempt) (R2-07)",
+      );
+    }
+    return saved;
   }
 
   /** The text of the `lock` frame this Seller posts for leg B (the paper rail, ref = the contract). */
