@@ -10,7 +10,7 @@
 // an error that names `claimLegA`; `next` says `claimLegA` (or `done` once the receipt of leg A is posted). Ported from the fund-safety
 // lens of review round 2 (FS2-2).
 
-import { PaperRail, encodePaperRecord, paperNote } from "@flop-labs/tclk";
+import { PaperRail, dealRoom, encodePaperRecord, paperNote, tryDecodeFrame } from "@flop-labs/tclk";
 import { describe, expect, it } from "vitest";
 
 import { decodeFlowRecord, encodeFlowRecord, type FlowRecord, type SellerFlowRecord } from "../src/client/flow-record.js";
@@ -81,6 +81,10 @@ describe("R2-03: a refund of leg B that leg B's claim refused routes the Seller 
     expect(r.node.getLockRow(r.statement.slice(2))?.status).toBe("Claimed");
     const done = await resume();
     expect(done.next).toBe("done");
+    // the frames of leg A, each once: the reveal the failed payout posted, and the receipt the paid retry posted
+    const room = await r.venue.read(dealRoom(contractA));
+    expect(room.filter((record) => tryDecodeFrame(record.line)?.type === "reveal")).toHaveLength(1);
+    expect(room.filter((record) => tryDecodeFrame(record.line)?.type === "receipt")).toHaveLength(1);
     // the swap never refunded leg B: the note is the Buyer's claim
     const noteB = await new PaperRail(r.noteStore, () => T0).read((await storedSeller(r.sellerStore)).lockedLegBContract ?? "");
     expect(noteB?.status).toBe("claimed");

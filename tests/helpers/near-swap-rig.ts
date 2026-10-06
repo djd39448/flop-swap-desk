@@ -59,6 +59,6 @@ export async function nearSwap() {
   await buyer.postAccountLineA(BUYER_ACCOUNT);
   setTime(lockTimeMs);
   await buyer.lockLegA();
-  return { node, noteStore, buyer, seller, buyerOptions, sellerOptions, sellerStore, swapId, setTime, statement: accepted.acceptA.statement };
+  return { node, venue, noteStore, buyer, seller, buyerOptions, sellerOptions, sellerStore, swapId, setTime, statement: accepted.acceptA.statement };
 }
 
