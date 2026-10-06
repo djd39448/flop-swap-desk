@@ -299,7 +299,7 @@ describe("Seller/Buyer client flows with LOCAL accounts against a real anvil nod
       acceptAContract: s.acceptA.contract,
       acceptBContract: s.acceptB.contract,
       noteStore: s.noteStore,
-      hashLock: lockA.hashLock,
+      hashLock: lockA.hashLock as Hex,
       nowMs: s.clock(),
       writes: [
         { leg: "a", step: "lock", rail: "evm-htlc", evidence: lockA.writeEvidence },
@@ -340,7 +340,7 @@ describe("Seller/Buyer client flows with LOCAL accounts against a real anvil nod
       acceptAContract: s.acceptA.contract,
       acceptBContract: s.acceptB.contract,
       noteStore: s.noteStore,
-      hashLock: lockA.hashLock,
+      hashLock: lockA.hashLock as Hex,
       nowMs: s.clock(),
       writes: [
         { leg: "a", step: "lock", rail: "evm-htlc", evidence: lockA.writeEvidence },

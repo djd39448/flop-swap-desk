@@ -47,6 +47,12 @@ const RAIL = getAddress(`0x${Buffer.from("p91-rail", "utf8").toString("hex").pad
 const TOKEN = getAddress(`0x${Buffer.from("p91-usdc", "utf8").toString("hex").padEnd(40, "0")}`);
 const FEE_READS = ["eth_maxPriorityFeePerGas", "eth_gasPrice", "eth_feeHistory"];
 
+/** A fresh hash lock with its preimage, typed as the hex strings viem wants (tclk types both as plain strings). */
+function newLock(): { hash: Hex; preimage: Hex } {
+  const lock = generateHashLock();
+  return { hash: lock.hash as Hex, preimage: lock.preimage as Hex };
+}
+
 function methodsOf(rpc: CapturingRpc): string[] {
   return rpc.exchanges().map((exchange) => exchange.method);
 }
@@ -95,14 +101,14 @@ describe("EvmHtlcRail with a LocalAccount: every write is eth_sendRawTransaction
     const buyerRail = await EvmHtlcRail.connect({ config: node.config(), rpc: buyerWire.rpc, account: buyer, addressBook: book, clock });
     const sellerRail = await EvmHtlcRail.connect({ config: node.config(), rpc: sellerWire.rpc, account: seller, addressBook: book, clock });
 
-    const lockHash = generateHashLock();
+    const lockHash = newLock();
     const approved = await buyerRail.approve("USDC", "1000000");
     expect(approved.raw.length).toBeGreaterThan(4); // the write's own exchanges: nonce, fee, gas, send, receipt poll
     const locked = await buyerRail.lock(termsFor(lockHash.hash), 0);
     expect(locked.event).toBe("Locked");
     await sellerRail.claim(lockHash.hash, lockHash.preimage, T0 + 80 * 60_000).then((evidence) => expect(evidence.event).toBe("Claimed"));
 
-    const refundHash = generateHashLock();
+    const refundHash = newLock();
     await buyerRail.approve("USDC", "1000000");
     await buyerRail.lock(termsFor(refundHash.hash), 0);
     node.rows.get(refundHash.hash.toLowerCase())!.refundAfterMs = BigInt(T0 - 1); // the chain is past this lock's refund window
@@ -156,7 +162,7 @@ describe("EvmHtlcRail with a LocalAccount: every write is eth_sendRawTransaction
     const book = bookFor(buyer.address, seller.address);
     const buyerRail = await EvmHtlcRail.connect({ config: node.config(), rpc: buyerWire.rpc, account: buyer, addressBook: book, clock });
     const sellerRail = await EvmHtlcRail.connect({ config: node.config(), rpc: sellerWire.rpc, account: seller, addressBook: book, clock });
-    const secret = generateHashLock();
+    const secret = newLock();
     await buyerRail.approve("USDC", "1000000");
     await buyerRail.lock(termsFor(secret.hash), 0);
     await sellerRail.claim(secret.hash, secret.preimage, T0 + 80 * 60_000);
@@ -215,7 +221,7 @@ describe("EvmHtlcRail with an Address: the old shape is unchanged", () => {
     const rpc = node.rpc();
     const payer = getAddress("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
     const rail = await EvmHtlcRail.connect({ config: node.config(), rpc, account: payer, addressBook: bookFor(payer, payer), clock });
-    const lockHash = generateHashLock();
+    const lockHash = newLock();
     await rail.approve("USDC", "1000000");
     await rail.lock(termsFor(lockHash.hash), 0);
     const methods = methodsOf(rpc);
@@ -255,7 +261,7 @@ describe("the account proof (EIP-191) signed by a local account", () => {
     const buyer = await makeLocalAccount();
     const wire = localSigningRpc(node);
     const rail = createEvmCounterRail({ config: node.config(), rpc: wire.rpc, account: buyer, clock });
-    const line = await rail.proveAccountLine({ address: buyer.address, did, contract, terms: termsFor(generateHashLock().hash) });
+    const line = await rail.proveAccountLine({ address: buyer.address, did, contract, terms: termsFor(newLock().hash) });
 
     expect(wire.calls).not.toContain("personal_sign");
     expect(methodsOf(wire.rpc)).not.toContain("personal_sign");
@@ -286,7 +292,7 @@ describe("the account proof (EIP-191) signed by a local account", () => {
     const sign = vi.fn(buyer.signMessage);
     const counting = { address: buyer.address, type: "local", source: "privateKey", publicKey: buyer.publicKey, signMessage: sign, signTransaction: buyer.signTransaction, signTypedData: buyer.signTypedData } as unknown as typeof buyer;
     const rail = createEvmCounterRail({ config: node.config(), rpc: wire.rpc, account: counting, clock });
-    await expect(rail.proveAccountLine({ address: other.address, did, contract, terms: termsFor(generateHashLock().hash) })).rejects.toThrow(
+    await expect(rail.proveAccountLine({ address: other.address, did, contract, terms: termsFor(newLock().hash) })).rejects.toThrow(
       /does not name this handle's own account/,
     );
     expect(sign).not.toHaveBeenCalled();
@@ -297,7 +303,7 @@ describe("the account proof (EIP-191) signed by a local account", () => {
     const seller = await makeLocalAccount();
     const wire = localSigningRpc(node);
     const rail = createEvmCounterRail({ config: node.config(), rpc: wire.rpc, account: seller, clock });
-    const line = await rail.proveAccountLine({ address: seller.address, did, contract, terms: termsFor(generateHashLock().hash) });
+    const line = await rail.proveAccountLine({ address: seller.address, did, contract, terms: termsFor(newLock().hash) });
     const parsed = parseAccountLine(line)!;
     expect(line).toBe(formatAccountLine({ railId: "evm-htlc", caip2: "eip155:31337", address: seller.address, proof: parsed.proof! }));
   });
@@ -345,7 +351,7 @@ describe("receiptTimeoutMs", () => {
     it(`${kind}: a lock whose receipt never comes is an EvmReceiptTimeoutError after receiptTimeoutMs, not a hang`, async () => {
       const { rail } = await stuckRail(150, kind);
       const started = Date.now();
-      const error = await rail.lock(termsFor(generateHashLock().hash), 0).then(
+      const error = await rail.lock(termsFor(newLock().hash), 0).then(
         () => undefined,
         (e: unknown) => e,
       );
@@ -372,7 +378,7 @@ describe("receiptTimeoutMs", () => {
       node.rows.set(hash.toLowerCase(), { payer: address, payee, token: TOKEN, amount: 1n, claimByMs: BigInt(T0 + 60 * 60_000), refundAfterMs: BigInt(refundAfterMs), status: 1 });
 
     // The chain never confirms OUR sends, but it can already hold locks: one open (to claim), one past its refund window.
-    const toClaim = generateHashLock();
+    const toClaim = newLock();
     open(toClaim.hash, T0 + 90 * 60_000);
     const claim = await rail.claim(toClaim.hash, toClaim.preimage, T0 + 80 * 60_000).then(
       () => undefined,
@@ -381,7 +387,7 @@ describe("receiptTimeoutMs", () => {
     expect(claim).toBeInstanceOf(EvmReceiptTimeoutError);
     expect(wire?.rawSends).toHaveLength(1); // it WAS sent: the timeout is "sent, outcome unknown"
 
-    const toRefund = generateHashLock();
+    const toRefund = newLock();
     open(toRefund.hash, T0 - 1);
     const refund = await rail.refund(toRefund.hash).then(
       () => undefined,
