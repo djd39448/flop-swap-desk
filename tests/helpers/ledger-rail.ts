@@ -147,6 +147,9 @@ export function createLedgerRail(options: LedgerRailOptions): CounterAssetRail {
 class LedgerRail implements CounterAssetRail {
   readonly railId: string;
   readonly caip2: string;
+  /** The value `railDeploymentId` derives for a rail that has none (`rail:<railId>`): the records these fakes write
+   *  carry it either way, so declaring it changes nothing but the type (`CounterAssetRail.deploymentId` is required). */
+  readonly deploymentId: string;
   readonly policy: RailLocalPolicy;
   readonly minLockableAmount: string;
   readonly assetId?: string;
@@ -154,6 +157,7 @@ class LedgerRail implements CounterAssetRail {
   constructor(private readonly options: LedgerRailOptions) {
     const btc = options.flavour === "btc";
     this.railId = btc ? "btc-htlc" : "near-htlc";
+    this.deploymentId = `rail:${this.railId}`;
     this.caip2 = btc ? "bip122:0f9188f13cb7b2c71f2a335e3a4fc328" : "near:sandbox-flop";
     this.policy = btc ? BTC_LOCAL_POLICY : NEAR_LOCAL_POLICY;
     this.minLockableAmount = btc ? BTC_MIN_LOCKABLE_SATS.toString() : NEAR_AMOUNT_FLOOR;

@@ -928,7 +928,8 @@ describe("FileFlowStore", () => {
       expect(new FileFlowStore(join(root, "flows", ".", "")).scopeId).toBe(new FileFlowStore(dir).scopeId); // the same directory, spelled another way
       expect(new FileFlowStore(join(root, "other")).scopeId).not.toBe(new FileFlowStore(dir).scopeId);
       expect(new FileFlowStore(dir).scopeId).toBe(process.platform === "win32" ? new FileFlowStore(dir).directory.toLowerCase() : new FileFlowStore(dir).directory);
-      expect(new MemoryFlowStore().scopeId).toBeUndefined();
+      const memory: FlowStore = new MemoryFlowStore(); // `scopeId` is on the interface, not on the class: a memory store is its own storage
+      expect(memory.scopeId).toBeUndefined();
     });
 
     it("runs the work, hands back its answer, and leaves no lock file behind; the lock is never listed and never a record", async () => {

@@ -70,11 +70,11 @@ export class StatefulSolNode {
   readonly createdByAta: string[] = [];
   /** Runs after the preflight and before execution. A test mutates the world here (move the clock, close an
    *  account) to make a transaction land and fail. Called for every kind; `kind` says which. */
-  midFlight?: (kind: Kind, tx: SolTransaction) => void;
+  midFlight?: ((kind: Kind, tx: SolTransaction) => void) | undefined;
   /** Make the reply of the next send of `kind` fail at the transport level AFTER the transaction executed. */
-  dropNextSendReplyFor?: Kind;
+  dropNextSendReplyFor?: Kind | undefined;
   /** Runs right after a transaction landed (executed and recorded), with whether it failed. */
-  afterLand?: (kind: Kind, failed: boolean) => void;
+  afterLand?: ((kind: Kind, failed: boolean) => void) | undefined;
 
   constructor() {
     this.world = makeWorld();
