@@ -11,8 +11,11 @@
 // swap now runs to its end like every other cut. The stall expectations are gone; the rail-level cases (accepted, `Expired`,
 // invalid nonce, transport failure) are in tests/rail-recovery-near.test.ts.
 
-import { describeDoubleCrash, describeMatrix } from "./helpers/matrix-suite.js";
+import { describeDoubleCrash, describeMatrix, describeStickyFault, describeTimePasses, describeTwoInstances } from "./helpers/matrix-suite.js";
 import { nearWorld } from "./helpers/matrix-worlds.js";
 
 await describeMatrix("near", nearWorld);
 await describeDoubleCrash("near", nearWorld);
+await describeTimePasses("near", nearWorld);
+await describeStickyFault("near", nearWorld);
+await describeTwoInstances("near", nearWorld);

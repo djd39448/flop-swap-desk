@@ -494,9 +494,19 @@ export async function resumeRole(c: Ctx, role: Role): Promise<string> {
   return resumed.next;
 }
 
+/** What a `beforeStep` hook may answer. `handled`: the hook did the whole step itself (the driver goes on to the next one). `next`: the
+ *  hook broke the run and rebuilt the flow of the role the step belongs to (a resume), and `next` is what that resume said (the driver
+ *  skips what `next` skips and then runs the step again, as after a death). Nothing: the step runs as usual. */
+export type StepVerdict = { handled: true } | { next: string } | void;
+
 export interface RunHooks {
+  /** Runs when a role died, BEFORE it is resumed: time may pass while a process is down (the clock a resume then reads is the later one). */
+  beforeResume?: (role: Role, w: World) => void | Promise<void>;
   /** Runs right after a dead role was resumed and before its crashed step runs again: the place for a third party to act on the chain. */
   afterResume?: (role: Role, next: string, w: World) => void | Promise<void>;
+  /** Runs before step `index`, the first time the driver reaches it (not again when the step is re-run after a death or a restart):
+   *  the place for a test that breaks the run in a way a process death does not (a sticky store fault, a second live instance). */
+  beforeStep?: (index: number, step: Step, c: Ctx) => Promise<StepVerdict>;
 }
 
 export async function runScript(factory: WorldFactory, script: readonly Step[], targets: readonly Target[], hooks: RunHooks = {}): Promise<RunResult> {
@@ -519,7 +529,19 @@ export async function runScript(factory: WorldFactory, script: readonly Step[], 
       i += 1;
       continue;
     }
-    if (result.stepAt[i] === undefined) result.stepAt[i] = ctl.actions.length;
+    if (result.stepAt[i] === undefined) {
+      result.stepAt[i] = ctl.actions.length;
+      const verdict = hooks.beforeStep === undefined ? undefined : await hooks.beforeStep(i, step, c);
+      if (verdict !== undefined && "handled" in verdict) {
+        i += 1;
+        continue;
+      }
+      if (verdict !== undefined && step.role !== null) {
+        result.nexts.push({ role: step.role, next: verdict.next, crashedAt: step.name });
+        skipBelow[step.role] = rankOf(script, step.role, verdict.next);
+        continue; // the same step again, unless `next` is past it
+      }
+    }
     let failure: unknown;
     let pendingRetries = 0;
     for (;;) {
@@ -540,6 +562,7 @@ export async function runScript(factory: WorldFactory, script: readonly Step[], 
       // The process died during this step (whatever the step then returned or threw). Nothing else happened since.
       result.deaths += 1;
       result.leaks.push(...(await secretLeaks(w)));
+      await hooks.beforeResume?.(step.role, w);
       const next = await resumeRole(c, step.role);
       await hooks.afterResume?.(step.role, next, w);
       result.nexts.push({ role: step.role, next, crashedAt: step.name });

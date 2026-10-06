@@ -4,7 +4,10 @@
 // See tests/helpers/crash-matrix.ts for what is cut, how, and what is counted afterwards.
 
 import { evmWorld } from "./helpers/matrix-worlds.js";
-import { describeDoubleCrash, describeMatrix } from "./helpers/matrix-suite.js";
+import { describeDoubleCrash, describeMatrix, describeStickyFault, describeTimePasses, describeTwoInstances } from "./helpers/matrix-suite.js";
 
 await describeMatrix("evm", evmWorld);
 await describeDoubleCrash("evm", evmWorld);
+await describeTimePasses("evm", evmWorld);
+await describeStickyFault("evm", evmWorld);
+await describeTwoInstances("evm", evmWorld);
