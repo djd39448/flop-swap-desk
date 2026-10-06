@@ -489,8 +489,9 @@ evidence reader both check it, see "Trust the contract by its code".)
 
 ### The config
 
-One JSON file; relative paths are relative to the file. `rails.evm` is exactly an `EvmRailConfig`: the same object goes into the
-bundle's `rails.json` and may be passed to `bin/watch.mjs --rails`. Every object is closed: a field the runner does not know is
+One JSON file; relative paths are relative to the file. `rails` has the shape of a rails file (`{ "evm": EvmRailConfig }`), and
+`rails.evm` is exactly an `EvmRailConfig`: it goes into the bundle's `rails.json` unchanged, and `bin/watch.mjs --rails` reads the
+same shape. Every object is closed: a field the runner does not know is
 refused by name (never by value), so a key pasted under a wrong name cannot ride into a log or a bundle.
 
 ```json

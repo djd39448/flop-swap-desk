@@ -512,6 +512,13 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(await chainFacts(warp, rig)).toEqual({ locked: 1, claimed: 0, refunded: 0, buyerTxs: 2, sellerTxs: 0 });
       expect(await exists(rig.outDir)).toBe(false);
 
+      // A run that was asked to stop after the lock stops there again when it is resumed: the Seller still does not claim.
+      const resumed = await run(rig, ["--resume"]);
+      expect(resumed.code).toBe(0);
+      expect(resumed.stdout).toContain("stopped after the lock, as asked");
+      expect(resumed.stdout).toContain("continuing swap");
+      expect(await chainFacts(warp, rig)).toEqual({ locked: 1, claimed: 0, refunded: 0, buyerTxs: 2, sellerTxs: 0 });
+
       const early = await run(rig, ["--refund"]);
       expect(early.code).toBe(5);
       expect(early.stdout).toContain("leg A is refundable from");
