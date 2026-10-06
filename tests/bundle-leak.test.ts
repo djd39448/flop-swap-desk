@@ -203,7 +203,10 @@ describe("R1-22: a bundle written after a FAILED Solana claim, before the reveal
     made.push(beforeReveal);
     await writeBundleOf(h, p, beforeReveal);
     expect((await scanBundle(beforeReveal, secret)).leaks).toEqual([]);
-    const heldBefore = h.sellerFlow.exchanges.length;
+    // the failed claim's own send is not among the exchanges a bundle is built from (it is held until the reveal)
+    const failedSignature = h.node.history.find((t) => t.kind === "claim" && t.err !== null)!.signature;
+    const sentFailed = (exchange: { method: string; responseBody: string }): boolean => exchange.method === "sendTransaction" && exchange.responseBody.includes(failedSignature);
+    expect(h.sellerFlow.exchanges.some(sentFailed)).toBe(false);
 
     // the payee re-creates its account; a while later the Seller claims again in public-secret mode and the reveal follows
     h.node.midFlight = undefined;
@@ -212,11 +215,7 @@ describe("R1-22: a bundle written after a FAILED Solana claim, before the reveal
     h.setTime(p.offerA.refundAfterMs - 60_000);
     await h.sellerFlow.claimLegA(p.statement);
     expect(framesIn(await h.venue.read(dealRoom(p.acceptA.contract)), "reveal")).toHaveLength(1);
-    const released = h.sellerFlow.exchanges.slice(heldBefore);
-    expect(
-      released.some((exchange) => holdsSecret(Buffer.from(exchange.responseBytes), secret) !== null),
-      "once the secret is revealed, the failed claim's read-back (response bytes) joins the exchanges a bundle persists",
-    ).toBe(true);
+    expect(h.sellerFlow.exchanges.some(sentFailed), "once the secret is revealed, the failed claim's own exchanges (response bytes) join the ones a bundle persists").toBe(true);
   });
 
   it("the scan itself finds the secret where it is: raw, as hex, and inside an encoded transaction string", () => {

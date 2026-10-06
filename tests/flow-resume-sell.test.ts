@@ -100,6 +100,32 @@ describe("R1-03: every public step of a Seller whose save was refused refuses, a
   });
 });
 
+describe("R1-03: the store failure is reported FIRST, whatever else is wrong with the call", () => {
+  it("a failed Seller answers with the store's error even to a call its own argument checks would refuse (the uniform entry rule)", async () => {
+    const s = await started(evmWorld);
+    const view = await readSwap(s.w);
+    refuseClaimAttemptSaves(s);
+    await expect(s.c.seller.claimLegA(s.c.seller.statement!)).rejects.toBeInstanceOf(FlowStoreFaultError); // the flow is failed now
+    const wrong: Array<[string, () => Promise<unknown>]> = [
+      ["postAccountLineA for another address than the saved one", () => s.c.seller.postAccountLineA("0x0000000000000000000000000000000000000001")],
+      ["lockLegB with a record that does not authenticate", () => s.c.seller.lockLegB({ ...view.acceptBRecord!, signature: "AAAA" })],
+      ["refundLegB before leg B's refund time", () => s.c.seller.refundLegB()],
+      ["claimLegA with a hash lock that is not this flow's own", () => s.c.seller.claimLegA(`0x${"11".repeat(32)}`)],
+    ];
+    for (const [name, run] of wrong) {
+      const error = await run().then(() => undefined, (e: unknown) => e);
+      expect(error, name).toBeInstanceOf(FlowStoreWriteFailedError);
+    }
+  });
+
+  it("reconcileLegB on a failed Seller that never tried a leg B lock reports the store failure, not 'nothing to reconcile'", async () => {
+    const s = await started(evmWorld, [STEPS.bid, STEPS.acceptLegA, STEPS.acceptLegB]);
+    s.w.stores.seller.failSaveWhen(() => "reject");
+    await expect(s.c.seller.postAccountLineA(s.w.addresses.seller)).rejects.toBeInstanceOf(FlowStoreFaultError); // the flow is failed now
+    await expect(s.c.seller.reconcileLegB()).rejects.toBeInstanceOf(FlowStoreWriteFailedError);
+  });
+});
+
 describe("R1-16: overlapping calls of one Seller step are refused", () => {
   it("two postAccountLineA calls for two addresses: one line is posted and the second call throws", async () => {
     const s = await started(evmWorld, BEFORE_LINES);
