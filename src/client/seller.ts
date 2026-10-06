@@ -92,6 +92,22 @@
 //    posted again. R1-13: a resumed claim is looked for from the block marker saved with the attempt (EVM, Bitcoin), and a claim recorded as
 //    landed is not searched for at all. R1-22: the exchanges of a FAILED claim join `exchanges` only once the reveal is posted.
 //
+// Review round 2 (P8-FIXES-R2.md), what a runner can rely on (the Seller's items; the store's and the Buyer's are in their own headers):
+//  - R2-03: a `refundLegB` that the paper rail refuses because leg B's note was claimed with this swap's secret (the Buyer took leg B) clears the
+//    refund latch, saves `legBClaimSeen` and throws an error that names `claimLegA`; `next` then says `claimLegA` (or `done` once the receipt of
+//    leg A is posted), never `refundLegB` for ever. A claimed note whose secret does not open this swap's statement is not that claim.
+//  - R2-06: `acceptLegA` refuses to post, or re-post, an accept A that has not landed once the flow's clock is within SELLER_OFFER_EXPIRY_MARGIN_MS of
+//    offer A's `expiresMs` (`SwapExpiredError`: nothing is minted, saved or posted; tclk's machine would reject the accept). An accept A that DID land
+//    (its mark lost) is still adopted. `next` says `abandoned` for an accept A that is not recorded as landed once the offer has expired: nothing is
+//    at stake (no lock on either leg, the statement never public), so there is nothing to call.
+//  - R2-07: `recordedAcceptB` returns the signed accept B the record saved with a lock attempt, and `lockLegB()` with no argument continues from it
+//    (the offers room is a short ring and may no longer hold it).
+//  - R2-11, R2-12: the exchange lists are ES `#private` fields (a claim the node refused before it reached the chain leaves the secret out of
+//    `Object.entries(flow)` and `util.inspect(flow, { customInspect: false })`), and a later claim attempt's held exchanges are released with
+//    the already-posted reveal.
+//  - R2-13: the block marker saved with the claim attempt is the tip minus a reorg margin (6 on Bitcoin, 64 on EVM, floored at 0), so a claim a
+//    reorg mines below the tip is still inside the resumed scan.
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
 // B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a;
 // P6-SOL-SPEC.md sections 3-5; P8-RESUME-SPEC.md.
@@ -466,7 +482,9 @@ export class SellerFlow {
   }
 
   /** P8: the next safe step by the stored record alone (no I/O). After leg B's `refundAfterMs` the runner may call
-   *  `refundLegB` where this says `claimLegA`. */
+   *  `refundLegB` where this says `claimLegA`, and a person can always call `claimLegA` and `refundLegB` whatever this says. R2-03: once leg B's
+   *  note was seen claimed with this swap's secret (`legBClaimSeen`) it says `claimLegA` (or `done`), not `refundLegB`. R2-06: `abandoned` when
+   *  accept A never landed and offer A has expired (nothing to call, nothing at stake). */
   private nextStep(): SellerNextStep {
     const journal = this.#journal;
     if (journal === undefined) return "acceptLegA";

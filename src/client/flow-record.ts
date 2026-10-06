@@ -259,7 +259,8 @@ export interface SellerFlowState {
   claimAttempted: boolean;
   /** R1-13: where the chain was when `claimAttempted` was saved (EVM and Bitcoin only, the rails whose `findClaimedPreimage` scans blocks): a
    *  claim lands after it, so a resumed `claimLegA` looks for its own claim from here instead of from genesis. Saved in the same save as
-   *  `claimAttempted`, before the first send. */
+   *  `claimAttempted`, before the first send. R2-13: the value is the tip when the attempt was saved MINUS a reorg margin (6 blocks on Bitcoin,
+   *  64 on EVM, floored at 0), so a claim a reorg mines below that tip is still inside the scan. */
   claimFromBlock?: BlockMarkerJson;
   /** Solana: every claim signature signed and not yet resolved (recorded before simulate/send). */
   claimRecords: RailClaimRecord[];
