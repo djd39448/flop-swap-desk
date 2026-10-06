@@ -374,7 +374,18 @@ written down instead of hidden.
   reaches the endpoint only after that guard, first in the gas estimate (or the fill), then in the broadcast
   (`tests/evm-local-signer.test.ts` pins both facts).
 - **The claim endpoint is trusted with the preimage** at the moment the claim is sent (see
-  above).
+  above). With a local account the gas estimate (or the fill) carries it a moment before the broadcast does.
+- **A local signer has no fee bumping and no replacement logic.** viem prices each transaction once, from the latest
+  block's base fee and the endpoint's priority-fee answer (or the node's own fill). A transaction priced under a
+  rising fee market can sit pending: the receipt wait ends with `EvmReceiptTimeoutError`, and because the next
+  transaction's nonce is the endpoint's `pending` count, a re-send queues behind the stuck one. A stuck lock or
+  refund is a liveness problem: the contract's own deadlines and its duplicate and status checks decide
+  everything, and nobody is paid twice. A stuck CLAIM is the one case with value at stake: its preimage is already
+  public in the mempool, so if it does not land before `refundAfterMs` the Buyer can claim leg B with it and refund
+  leg A. What bounds that is the claim-inclusion margin (`claimInclusionMarginMs`, 5 minutes in `EVM_LOCAL_POLICY`;
+  the Base Sepolia policy of P9-4 sets its own) and the claim's last deadline guard, which refuses to broadcast
+  inside the margin; nothing re-prices a claim that is already out. A person speeds a stuck transaction up (same
+  nonce, higher fee) from a wallet that holds the key file's key.
 - **A restart costs gas at most.** After a crash a repeated `approve`, `lock`, `claim` or `refund` is refused by the
   contract (a duplicate hash lock, a spent status), so a resumed EVM flow cannot lock or pay twice; the price of
   the repeat is gas (see "Resume").

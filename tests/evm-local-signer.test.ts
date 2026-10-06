@@ -454,8 +454,9 @@ describe("the real Buyer and Seller flows with both parties local", () => {
 
   /** Both parties built over one mock node, each with its own CapturingRpc and its own freshly generated local account, taken
    *  through the pairing, leg B's paper lock and both PROVEN account lines (the lines are signed by the local accounts). */
-  async function pairedSwap(withStore: boolean) {
+  async function pairedSwap(withStore: boolean, receiptTimeoutMs?: number) {
     const { node, clockRef, clock } = rig();
+    const config: EvmRailConfig = { ...node.config(), ...(receiptTimeoutMs === undefined ? {} : { receiptTimeoutMs }) };
     const { account: buyerAccount, leaks: buyerLeaks } = await makeLocalAccountWithScan();
     const { account: sellerAccount, leaks: sellerLeaks } = await makeLocalAccountWithScan();
     const buyerWire = localSigningRpc(node);
@@ -469,7 +470,7 @@ describe("the real Buyer and Seller flows with both parties local", () => {
       identity: buyerId,
       venue,
       paperRail: new PaperRail(noteStore, clock),
-      rail: createEvmCounterRail({ config: node.config(), rpc: buyerWire.rpc, account: buyerAccount, clock }),
+      rail: createEvmCounterRail({ config, rpc: buyerWire.rpc, account: buyerAccount, clock }),
       clock,
       ...(withStore ? { store: stores.buyer } : {}),
     });
@@ -477,7 +478,7 @@ describe("the real Buyer and Seller flows with both parties local", () => {
       identity: sellerId,
       venue,
       paperRail: new PaperRail(noteStore, clock),
-      rail: createEvmCounterRail({ config: node.config(), rpc: sellerWire.rpc, account: sellerAccount, clock }),
+      rail: createEvmCounterRail({ config, rpc: sellerWire.rpc, account: sellerAccount, clock }),
       clock,
       ...(withStore ? { store: stores.seller } : {}),
     });
@@ -565,6 +566,29 @@ describe("the real Buyer and Seller flows with both parties local", () => {
     expect(r.buyerWire.rawSends.at(-1)?.from).toBe(r.buyerAccount.address);
     expect(r.buyerWire.calls).not.toContain("eth_sendTransaction");
     expect(lockA.hashLock).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("a claim whose receipt never comes back is a typed timeout; a restarted Seller finds the claim on chain: one claim, no second signature, the swap settles", async () => {
+    const r = await pairedSwap(true, 150);
+    const lockA = await r.buyer.lockLegA();
+    r.sellerWire.holdReceipts = true; // the chain mines the claim but this endpoint never shows its receipt in time
+    await expect(r.seller.claimLegA(lockA.hashLock)).rejects.toBeInstanceOf(EvmReceiptTimeoutError);
+    expect(r.node.count("claim")).toBe(1); // it DID land: the timeout means "sent, outcome unknown", not "refused"
+    const sentBefore = r.sellerWire.rawSends.length;
+    r.sellerWire.holdReceipts = false;
+
+    // The Seller's process restarts: the fresh flow resumes from its store and reads the chain before it signs anything.
+    const resumed = await SellerFlow.resume({ ...r.sellerOptions(), store: r.stores.seller, swapId: r.swapId, contractA: r.acceptA.contract });
+    const claimed = await resumed.flow.claimLegA(lockA.hashLock);
+    expect(claimed.evidence.ref).toBe(lockA.hashLock); // recognised from the chain: the recovered evidence names the ref, not a transaction
+    expect(claimed.reveal).toBeDefined(); // and the frames the crashed process never posted are posted now
+    expect(claimed.receipt).toBeDefined();
+    expect(r.node.count("claim")).toBe(1);
+    expect(r.sellerWire.rawSends.length).toBe(sentBefore); // nothing new was signed or sent
+
+    const secret = await r.buyer.learnSecret();
+    expect(verifyHashPreimage(lockA.hashLock, secret)).toBe(true);
+    await r.buyer.claimLegB(secret);
   });
 
   it("a lost lock reply is recovered through the P8 path: the same one lock, no second signed lock, then the swap settles", async () => {
