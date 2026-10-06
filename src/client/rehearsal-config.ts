@@ -153,6 +153,21 @@ function resolvePath(base: string, value: unknown, path: string): string {
   return isAbsolute(text) ? resolve(text) : resolve(base, text);
 }
 
+/**
+ * A key-file field names a FILE. A person who pastes the key itself (or a mnemonic phrase) into it would otherwise see it printed back by the
+ * first message that names the path ("evm key file <path>: no such file"), so a value that looks like key material is refused here, by field
+ * name only, before any message could carry it.
+ */
+function refuseKeyLikePath(value: unknown, field: string): void {
+  if (typeof value !== "string") return;
+  const looksLikeKey = /[0-9a-fA-F]{64}/.test(value);
+  const words = value.trim().split(/\s+/);
+  const looksLikePhrase = words.length >= 12 && words.every((word) => /^[a-z]{3,8}$/.test(word));
+  if (looksLikeKey || looksLikePhrase) {
+    throw new RehearsalConfigError(`${field} looks like key material (a run of 64 hex digits, or a phrase of words) and not a path: it must name the FILE that holds the key, never the key itself`);
+  }
+}
+
 /** Rebuilds the EVM config from its known fields only, refusing any other field at every level. */
 function cleanEvmConfig(value: unknown): EvmRailConfig {
   const evm = requireObject(value, "rails.evm");
@@ -229,6 +244,8 @@ export function parseRehearsalConfig(value: unknown, baseDir: string, file = "")
   closed(rails, RAILS_FIELDS, "rails");
   const evm = cleanEvmConfig(rails.evm);
 
+  refuseKeyLikePath(top.buyerKeyFile, "buyerKeyFile");
+  refuseKeyLikePath(top.sellerKeyFile, "sellerKeyFile");
   const buyerKeyFile = resolvePath(baseDir, top.buyerKeyFile, "buyerKeyFile");
   const sellerKeyFile = resolvePath(baseDir, top.sellerKeyFile, "sellerKeyFile");
   const samePath = process.platform === "win32" ? buyerKeyFile.toLowerCase() === sellerKeyFile.toLowerCase() : buyerKeyFile === sellerKeyFile;

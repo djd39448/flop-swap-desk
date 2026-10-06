@@ -522,7 +522,7 @@ refused by name (never by value), so a key pasted under a wrong name cannot ride
 | `rails.evm.contractCodeHash` | required on 84532 (see above) |
 | `rails.evm.maxLogRange` | the endpoint's `eth_getLogs` cap in blocks (500 on the public endpoint; the default on 84532); the dry run probes it |
 | `rails.evm.receiptTimeoutMs` | how long one receipt wait lasts (default 180 s); a timeout is a typed error that says the transaction was sent and may still be mined, and `--resume` reads the chain before it sends anything |
-| `buyerKeyFile`, `sellerKeyFile` | the two key files, loaded by `loadEvmLocalAccount` (see "Key files"); they must be two different files |
+| `buyerKeyFile`, `sellerKeyFile` | the two key files, loaded by `loadEvmLocalAccount` (see "Key files"); they must be two different files, and a value that looks like key material (a run of 64 hex digits, a twelve-word phrase) is refused by field name before any message could print it |
 | `deadlines` | `"known-good"` (default, the set below) or `{ "legA": { "claimByMin", "refundAfterMin", "expiresMin" }, "legB": { ... } }` in whole minutes after the run's start; the dry run checks the rules with the numbers it is given |
 | `amount` | leg A's amount in the token's minimal units (USDC has 6 decimals: `"1000000"` is 1 USDC), a decimal integer string |
 | `out` | the bundle directory: absent or empty when the bundle is written |
@@ -590,7 +590,7 @@ for a refund, shows a row that only a claim or a log scan uses as a warning, so 
 
 | row | what it checks, and what to do when it fails |
 |---|---|
-| `endpoint` | the host only is shown, never the URL |
+| `endpoint` | the host only is shown, never the URL; `WARN` for plain `http` to a host that is not this machine (use `https`) |
 | `chain id` | `eth_chainId` equals the pin (84532). Another number: the URL is not Base Sepolia |
 | `escrow code` | the keccak of `eth_getCode(contract)` equals `contractCodeHash`. A mismatch or empty code: wrong address, or the deploy has not landed or the node is a block behind (retry) |
 | `finalized` | the `finalized` tag exists and how far it trails the head in blocks and seconds. No tag and no `fallbackConfirmations`: no lock would ever read final, so the Seller could never claim |

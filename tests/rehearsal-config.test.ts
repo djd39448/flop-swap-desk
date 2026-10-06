@@ -157,6 +157,25 @@ describe("parseRehearsalConfig", () => {
     expect(refusal(anvilConfig({ sellerKeyFile: 7 }))).toContain("sellerKeyFile must be a non-empty string");
   });
 
+  it("refuses a key file field that holds key material instead of a path, by field name, and never prints it", () => {
+    const key = `0x${"1f".repeat(32)}`;
+    const phrase = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    for (const [field, value] of [
+      ["buyerKeyFile", key],
+      ["sellerKeyFile", key.slice(2)],
+      ["buyerKeyFile", `keys/${key}.key`],
+      ["sellerKeyFile", phrase],
+    ] as const) {
+      const message = refusal(anvilConfig({ [field]: value }));
+      expect(message, field).toContain(`${field} looks like key material`);
+      expect(message, field).not.toContain(key.slice(2, 20));
+      expect(message, field).not.toContain("winner");
+    }
+    // An ordinary path with spaces and digits is a path.
+    expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: "C:/Program Files/keys/base-sepolia.buyer.key" }), BASE).buyerKeyFile).toContain("base-sepolia.buyer.key");
+    expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: "base keys here" }), BASE).buyerKeyFile).toContain("base keys here"); // a few plain words are a path; a phrase has twelve
+  });
+
   it("checks the amount, the asset and the FLOP amount", () => {
     expect(refusal(anvilConfig({ amount: "0" }))).toContain("amount must be a positive decimal integer string");
     expect(refusal(anvilConfig({ amount: "1.5" }))).toContain("amount must be a positive decimal integer string");

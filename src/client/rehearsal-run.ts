@@ -679,23 +679,40 @@ async function driveSettle(w: World): Promise<number> {
   });
 }
 
-/** Waits (or reports) until `refundAfterMs` is behind both the local clock and, when `chain` is set, the chain's head. */
-async function untilRefundTime(w: World, label: string, refundAfterMs: number, chain: boolean, wait: boolean): Promise<boolean> {
+export interface RefundWaitParams {
+  /** "leg A" or "leg B", for the log. */
+  label: string;
+  refundAfterMs: number;
+  /** The runner's clock. */
+  local: () => number;
+  /** The chain's head time in ms; absent for a leg that has no chain (leg B's paper note, judged by the local clock alone). */
+  head: (() => Promise<number>) | undefined;
+  /** Wait for the refund time (true), or report that it has not come and give up (false). */
+  wait: boolean;
+  /** The machine clock and a sleep (the log's cadence and the pause between looks). */
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  pollMs: number;
+  log: (line: string) => void;
+}
+
+/** Looks until `refundAfterMs` is behind the local clock and (when the leg has a chain) the chain's head. True once it is; false when it is not and `wait` is off. */
+export async function untilRefundTime(p: RefundWaitParams): Promise<boolean> {
   let lastLogMs = 0;
   for (;;) {
-    const local = w.clock();
-    const head = chain ? await latestBlockMs(w.rpc) : local;
-    if (refundTimeReached(local, head, refundAfterMs)) return true;
-    const remaining = Math.max(refundAfterMs - local, refundAfterMs - head);
-    if (!wait) {
-      w.log(`${label} is refundable from ${iso(refundAfterMs)}: the local clock reads ${iso(local)}${chain ? ` and the chain's head ${iso(head)}` : ""}; run --refund again after that (or add --wait to wait here)`);
+    const local = p.local();
+    const head = p.head === undefined ? local : await p.head();
+    if (refundTimeReached(local, head, p.refundAfterMs)) return true;
+    const remaining = Math.max(p.refundAfterMs - local, p.refundAfterMs - head);
+    if (!p.wait) {
+      p.log(`${p.label} is refundable from ${iso(p.refundAfterMs)}: the local clock reads ${iso(local)}${p.head === undefined ? "" : ` and the chain's head ${iso(head)}`}; run --refund again after that (or add --wait to wait here)`);
       return false;
     }
-    if (w.env.now() - lastLogMs >= 60_000) {
-      w.log(`waiting for ${label}'s refund time ${iso(refundAfterMs)} (${Math.ceil(remaining / 60_000)} min to go)`);
-      lastLogMs = w.env.now();
+    if (p.now() - lastLogMs >= 60_000) {
+      p.log(`waiting for ${p.label}'s refund time ${iso(p.refundAfterMs)} (${Math.ceil(remaining / 60_000)} min to go)`);
+      lastLogMs = p.now();
     }
-    await w.env.sleep(Math.min(Math.max(w.pollMs, 1_000), 30_000));
+    await p.sleep(Math.min(Math.max(p.pollMs, 1_000), 30_000));
   }
 }
 
@@ -728,7 +745,19 @@ async function driveRefund(w: World, wait: boolean): Promise<number> {
   const paired = await buyer.acceptLegB(accepted.offerBRecord, accepted.acceptARecord, run.lockTimeMs);
 
   log(`refunding swap ${run.swapId} (buyer next: ${buyerOpen.next}, seller next: ${sellerOpen.next})`);
-  if (!(await untilRefundTime(w, "leg A", run.deadlines.legA.refundAfterMs, true, wait))) return EXIT.notYet;
+  const waitFor = (label: string, refundAfterMs: number, chain: boolean): Promise<boolean> =>
+    untilRefundTime({
+      label,
+      refundAfterMs,
+      local: w.clock,
+      head: chain ? () => latestBlockMs(w.rpc) : undefined,
+      wait,
+      now: w.env.now,
+      sleep: w.env.sleep,
+      pollMs: w.pollMs,
+      log: w.log,
+    });
+  if (!(await waitFor("leg A", run.deadlines.legA.refundAfterMs, true))) return EXIT.notYet;
 
   let refundA: RailWriteEvidence | undefined;
   const refundStartedMs = w.env.now();
@@ -748,7 +777,7 @@ async function driveRefund(w: World, wait: boolean): Promise<number> {
   if (refundA === undefined) step("buyer", "refundLegA", "leg A was never locked: nothing to refund on chain");
   else step("buyer", "refundLegA", evidenceTx(refundA));
 
-  if (!(await untilRefundTime(w, "leg B", run.deadlines.legB.refundAfterMs, false, wait))) {
+  if (!(await waitFor("leg B", run.deadlines.legB.refundAfterMs, false))) {
     log("leg A is refunded; leg B (the paper note) is not refundable yet");
     return EXIT.notYet;
   }

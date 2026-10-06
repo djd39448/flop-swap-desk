@@ -167,7 +167,13 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     "info",
     `${evm.pin.name} (chain ${evm.pin.chainId}), testnet only, no fee (feeBps 0), leg A ${config.amount} minimal units of ${config.asset}, leg B ${config.flopAmount} FLOP on the paper rail (no value)`,
   );
-  add("endpoint", "ok", `host ${endpointHost(evm.endpoint)}; the URL itself is never printed, and it carries no credentials, query or fragment`);
+  const endpointUrl = new URL(evm.endpoint);
+  const loopback = endpointUrl.hostname === "localhost" || endpointUrl.hostname === "127.0.0.1" || endpointUrl.hostname === "[::1]";
+  if (endpointUrl.protocol === "http:" && !loopback) {
+    add("endpoint", "warn", `host ${endpointHost(evm.endpoint)} over plain http: what the runner sends (a claim carries the swap's secret) can be read on the way; use an https endpoint`);
+  } else {
+    add("endpoint", "ok", `host ${endpointHost(evm.endpoint)}; the URL itself is never printed, and it carries no credentials, query or fragment`);
+  }
   add("escrow", "info", `${evm.contract}; ${config.asset} token ${evm.assets[config.asset] ?? "?"}`);
 
   // -- the chain -------------------------------------------------------------------------------------------------------------------

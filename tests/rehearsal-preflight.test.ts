@@ -138,6 +138,22 @@ describe("a healthy chain (every needed check holds)", () => {
   });
 });
 
+describe("the endpoint", () => {
+  const withEndpoint = (endpoint: string): RehearsalConfig => config({ endpoint });
+
+  it("warns about plain http to a host that is not this machine (a claim carries the swap's secret), and not for https or loopback", async () => {
+    const plain = await preflight({}, withEndpoint("http://rpc.example.org:8545"));
+    expect(status(plain, "endpoint")).toBe("warn");
+    expect(row(plain, "endpoint").detail).toContain("over plain http");
+    expect(row(plain, "endpoint").detail).toContain("host rpc.example.org:8545");
+    expect(plain.report.ok).toBe(true); // a warning, not a failure
+    expect(status(await preflight({}, withEndpoint("https://rpc.example.org")), "endpoint")).toBe("ok");
+    expect(status(await preflight({}, withEndpoint("http://127.0.0.1:8545")), "endpoint")).toBe("ok");
+    expect(status(await preflight({}, withEndpoint("http://localhost:8545")), "endpoint")).toBe("ok");
+    expect(status(await preflight({}, withEndpoint("http://[::1]:8545")), "endpoint")).toBe("ok");
+  });
+});
+
 describe("the chain and the escrow", () => {
   it("fails on another chain id", async () => {
     const run = await preflight({ chainId: 1 });

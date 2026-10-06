@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { EXIT, FLOW_MESSAGE, parseRunRecord, refundTimeReached, runRehearsal, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { EXIT, FLOW_MESSAGE, parseRunRecord, refundTimeReached, runRehearsal, untilRefundTime, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
 import { loadOrCreateIdentity } from "../src/client/rehearsal-world.js";
 import { BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
 import { keyScanner } from "./helpers/evm-local.js";
@@ -374,6 +374,73 @@ describe("refundTimeReached", () => {
     expect(refundTimeReached(2_000, 999, 1_000)).toBe(false); // the clock is ahead of a chain that has not got there
     expect(refundTimeReached(999, 2_000, 1_000)).toBe(false); // the chain is ahead of a clock that has not got there
     expect(refundTimeReached(999, 999, 1_000)).toBe(false);
+  });
+});
+
+describe("untilRefundTime (--refund and --refund --wait)", () => {
+  /** A fake world: `t` is the machine clock and the runner's clock, `sleep` moves it, the chain's head trails it by `headLagMs`. */
+  function world(headLagMs: number | undefined) {
+    const state = { t: 1_000_000_000_000, sleeps: [] as number[], logs: [] as string[], headReads: 0 };
+    return {
+      state,
+      params: (refundAfterMs: number, wait: boolean) => ({
+        label: "leg A",
+        refundAfterMs,
+        local: () => state.t,
+        head: headLagMs === undefined ? undefined : async () => (state.headReads += 1, state.t - headLagMs),
+        wait,
+        now: () => state.t,
+        sleep: async (ms: number) => void (state.sleeps.push(ms), (state.t += ms)),
+        pollMs: 5_000,
+        log: (line: string) => void state.logs.push(line),
+      }),
+    };
+  }
+
+  it("without --wait, a refund time that has not come is reported once (false), with both clocks named, and nothing sleeps", async () => {
+    const w = world(5_000);
+    const reached = await untilRefundTime(w.params(w.state.t + 60_000, false));
+    expect(reached).toBe(false);
+    expect(w.state.sleeps).toEqual([]);
+    expect(w.state.logs).toHaveLength(1);
+    expect(w.state.logs[0]).toContain("leg A is refundable from");
+    expect(w.state.logs[0]).toContain("the local clock reads");
+    expect(w.state.logs[0]).toContain("the chain's head");
+    expect(w.state.logs[0]).toContain("add --wait");
+  });
+
+  it("is true at once when both clocks are past it", async () => {
+    const w = world(5_000);
+    expect(await untilRefundTime(w.params(w.state.t - 6_000, false))).toBe(true);
+    expect(w.state.logs).toEqual([]);
+  });
+
+  it("with --wait, sleeps until the chain's head (the slower clock) has passed it too, then is true", async () => {
+    const w = world(20_000); // the head trails the local clock by 20 s
+    const refundAfter = w.state.t + 30_000;
+    expect(await untilRefundTime(w.params(refundAfter, true))).toBe(true);
+    expect(w.state.t - 20_000).toBeGreaterThanOrEqual(refundAfter); // not before the head got there
+    expect(w.state.sleeps.length).toBeGreaterThan(1);
+    expect(w.state.sleeps.every((ms) => ms === 5_000)).toBe(true);
+    expect(w.state.logs.some((l) => l.includes("waiting for leg A's refund time"))).toBe(true);
+    expect(w.state.headReads).toBeGreaterThan(1);
+  });
+
+  it("says how long there is to go by the slower of the two clocks", async () => {
+    const w = world(10 * 60_000); // the head trails the local clock by 10 minutes
+    expect(await untilRefundTime(w.params(w.state.t + 5 * 60_000, true))).toBe(true);
+    expect(w.state.logs[0]).toContain("(15 min to go)"); // 5 minutes for the local clock, 15 for the head
+  });
+
+  it("a leg with no chain (leg B's paper note) is judged by the local clock alone and never reads a head", async () => {
+    const w = world(undefined);
+    const refundAfter = w.state.t + 12_000;
+    expect(await untilRefundTime(w.params(refundAfter, true))).toBe(true);
+    expect(w.state.t).toBeGreaterThanOrEqual(refundAfter);
+    expect(w.state.headReads).toBe(0);
+    const reported = world(undefined);
+    expect(await untilRefundTime(reported.params(reported.state.t + 1_000, false))).toBe(false);
+    expect(reported.state.logs[0]).not.toContain("the chain's head");
   });
 });
 
