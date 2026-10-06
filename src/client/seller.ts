@@ -143,6 +143,7 @@ import {
 } from "./flow-record.js";
 import {
   FlowJournal,
+  SwapExpiredError,
   acceptFromSlot,
   accountsFromJson,
   accountsToJson,
@@ -268,6 +269,11 @@ const SOL_REVEAL_POST_TIMEOUT_MS = 10_000;
  *  public (each retry is a fresh signed transaction; the rail proves the secret is public before it skips the
  *  deadline bounds, and refuses once chain time reaches `refund_after_ms`). */
 const SOL_PUBLIC_SECRET_RETRIES = 2;
+
+/** R2-06: how long before offer A's `expiresMs` (by the flow's clock) the Seller already treats the offer as expired for a NEW accept A post.
+ *  tclk's machine rejects an accept stamped at or after the offer's expiry, and the venue stamps the post when it arrives, a moment after
+ *  this flow looked at its own clock; the margin keeps a post that would land at the edge from being sent at all. */
+export const SELLER_OFFER_EXPIRY_MARGIN_MS = 5_000;
 
 /** The rails whose lock ref is `0x<hash lock>:<payer>` (payer-keyed locks): how each parses it. `undefined` for
  *  a rail with another ref shape. */
@@ -429,7 +435,14 @@ export class SellerFlow {
   private nextStep(): SellerNextStep {
     const journal = this.#journal;
     if (journal === undefined) return "acceptLegA";
-    if (!(journal.isLanded("accept-a") && journal.isLanded("offer-b"))) return "acceptLegA";
+    if (!(journal.isLanded("accept-a") && journal.isLanded("offer-b"))) {
+      // R2-06: an accept A that never landed before its offer expired can never be posted (acceptLegA refuses), and nothing is at stake: no
+      // lock exists on either leg and the statement was never public. `next` says so instead of acceptLegA for ever. It is derived from
+      // the record and the clock alone: an accept A that DID land and whose mark was lost is still adopted by acceptLegA (the guard is for
+      // posting only), which a runner that obeys `next` never calls.
+      const offerA = journal.isLanded("accept-a") ? undefined : this.recordedOfferA;
+      return offerA !== undefined && this.offerAExpired(offerA) ? "abandoned" : "acceptLegA";
+    }
     // R2-03: leg B's note was seen claimed with this swap's secret (the Buyer took leg B) when a refund was tried: the refund can never
     // happen, so the way on is the claim of leg A (on NEAR a revealed lock's claim retry works past the deadlines), then done.
     if (this.legBClaimSeen) return journal.isLanded("receipt-a") ? "done" : "claimLegA";
@@ -615,6 +628,16 @@ export class SellerFlow {
     this.#journal?.assertUsable();
   }
 
+  /** R2-06: offer A counts as expired for a NEW accept A post from `SELLER_OFFER_EXPIRY_MARGIN_MS` before its `expiresMs` (the flow's clock). */
+  private offerAExpired(offerA: OfferFrame): boolean {
+    return this.clock() + SELLER_OFFER_EXPIRY_MARGIN_MS >= offerA.expiresMs;
+  }
+
+  /** R2-06: refuses a post of accept A once offer A has expired: nothing is posted, minted or saved by the refusal. */
+  private refuseExpiredOffer(offerA: OfferFrame): void {
+    if (this.offerAExpired(offerA)) throw new SwapExpiredError(offerA.id, offerA.expiresMs, `flow clock ${this.clock()}, accept A cannot be posted`);
+  }
+
   private requireAcceptedA(): { offerA: OfferFrame; acceptA: AcceptFrame } {
     if (this.offerA === undefined || this.acceptA === undefined) {
       throw new Error("seller: leg A has not been accepted yet");
@@ -770,6 +793,7 @@ export class SellerFlow {
 
     if (this.store !== undefined) return this.acceptLegAPersisted(offerA, classification.swapId, legB, lockTimeMs, offerB, reused);
 
+    this.refuseExpiredOffer(offerA); // R2-06: before anything is minted
     const { hashLock, acceptA } = this.mintAccept(offerA);
     const acceptARecord = await this.venue.post("tclk-offers", encodeFrame(acceptA), this.identity);
     const offerBRecord = await this.venue.post("tclk-offers", encodeFrame(offerB), this.identity);
@@ -846,6 +870,9 @@ export class SellerFlow {
       let minted: { hashLock: HashLock; acceptA: AcceptFrame } | undefined;
       // Rule 1: the secret and the exact frames are durable BEFORE accept A is posted (the statement is public from that post).
       const journal = await FlowJournal.beginSeller(this.journalDeps(store), encodeFrameWith(offerA, this.rail.railRegistry), () => {
+        // R2-06: a NEW accept of an expired offer mints nothing and saves nothing (the scan already found no record for this offer, so a
+        // repeat of an earlier accept is still a FlowRecordExistsError naming the record to resume).
+        this.refuseExpiredOffer(offerA);
         const made = this.mintAccept(offerA);
         minted = made;
         const acceptAText = encodeFrame(made.acceptA);
@@ -886,7 +913,16 @@ export class SellerFlow {
     const acceptARecord =
       storedAcceptA !== undefined
         ? recordFromJson(storedAcceptA)
-        : await journal.ensurePosted({ kind: "accept-a", room: OFFER_ROOM, text: encodeFrame(acceptA), slot: "acceptA" });
+        : await journal.ensurePosted({
+            kind: "accept-a",
+            room: OFFER_ROOM,
+            text: encodeFrame(acceptA),
+            slot: "acceptA",
+            // R2-06: runs only when the line is NOT in the room and is about to be posted (an accept A that already landed, its mark lost,
+            // is adopted before this): a re-post of the saved text after the offer expired is refused, because tclk's machine would
+            // reject it and both flows would go on to lock and claim real value on a swap the venue never accepted.
+            guard: () => this.refuseExpiredOffer(offerA),
+          });
     const offerBRecord = await journal.ensurePosted({ kind: "offer-b", room: OFFER_ROOM, text: offerBText, slot: "offerB" });
 
     // G1/G8, as in the unstored path: the Buyer's own signed offer record, best effort.
