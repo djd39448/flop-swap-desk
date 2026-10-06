@@ -302,8 +302,11 @@ export class BuyerFlow {
    *  the same re-entry pattern `lockLegA` and `acceptLegB` use: two overlapping calls of one step can never both reach the
    *  rail or the venue (two refund builds, two account lines for two addresses, two claims). */
   private accountLinePending = false;
-  private legBClaimPending = false;
-  private refundPending = false;
+  /** R1-16, R2-10: ONE flag for `claimLegB` and `refundLegA`, so the two are mutually exclusive in one process. Each decides from the
+   *  other's outcome (the refund adopts or refuses by what leg B's note says, the claim bars the refund once it returned), so running
+   *  them at once could set both `legBClaimed` and `legBClaimAdopted`, a record that cannot be encoded: the journal would fail, possibly
+   *  after the refund of leg A was sent. The second call is refused as in flight. */
+  private legBSettlePending = false;
   private refundRecovery: LockRecovery | undefined = undefined;
   /** R4-1 / RR4-1: what `refundLegA` recorded about a leg-B paper note that read claimed — a proven claim ("the secret
    *  is public and leg B's paper note reads claimed") or one ignored as not proven. Never a reason to refuse. */
@@ -1378,12 +1381,12 @@ export class BuyerFlow {
    *  the Buyer's own reveal on leg B, distinct from the Seller's reveal on leg A). */
   async claimLegB(secret: string): Promise<{ reveal: TranscriptRecord; receipt: TranscriptRecord }> {
     this.usable(); // R1-03
-    if (this.legBClaimPending) throw new Error("buyer: refusing to claim leg B - another claimLegB call is already in flight (R1-16)");
-    this.legBClaimPending = true;
+    if (this.legBSettlePending) throw new Error("buyer: refusing to claim leg B - another claimLegB or refundLegA call is already in flight (R1-16, R2-10)");
+    this.legBSettlePending = true;
     try {
       return await this.claimLegBUnlatched(secret);
     } finally {
-      this.legBClaimPending = false;
+      this.legBSettlePending = false;
     }
   }
 
@@ -1541,12 +1544,12 @@ export class BuyerFlow {
    */
   async refundLegA(): Promise<RailWriteEvidence> {
     this.usable(); // R1-03
-    if (this.refundPending) throw new Error("buyer: refusing to refund leg A - another refundLegA call is already in flight (R1-16)");
-    this.refundPending = true;
+    if (this.legBSettlePending) throw new Error("buyer: refusing to refund leg A - another refundLegA or claimLegB call is already in flight (R1-16, R2-10)");
+    this.legBSettlePending = true;
     try {
       return await this.refundLegAUnlatched();
     } finally {
-      this.refundPending = false;
+      this.legBSettlePending = false;
     }
   }
 
