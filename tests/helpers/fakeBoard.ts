@@ -62,6 +62,11 @@ export function fakeBuildBoard({ offers, dealRooms }: BoardInput): Board {
       feeBps: null,
       legA: null,
       legB: null,
+      // The field `SwapView` requires (P9-7, types only). `null` is what `src/swap.ts` gives before a pair is formed and
+      // what this fake always has: it never disambiguates accepts, so it never forms a pair key. (It was absent before,
+      // which the watcher read as the state key `pair:undefined`. No test on this fake asserts a state key or a swaps.jsonl
+      // pairKey; its one multi-swap case asserts only which deal rooms are fetched.)
+      pairKey: null,
       evidence: {},
       // This fake never sets up rail evidence, so both legs are always "none" (H3) --
       // matches src/swap.ts's own settlementViewForLeg for the no-evidence case.

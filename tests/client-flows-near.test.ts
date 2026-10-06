@@ -57,6 +57,7 @@ import {
 import { NEAR_AMOUNT_FLOOR, NEAR_ASSET_ID } from "../src/rails/near-htlc.js";
 import type { Exchange } from "../src/rails/rpc-capture.js";
 import { swapId as computeSwapId } from "../src/profile.js";
+import { railBinding, type LockEvidence, type RailObservation } from "../src/types.js";
 import { identity, type Identity } from "./helpers/identity.js";
 
 const T0 = 1_700_000_000_000;
@@ -91,12 +92,22 @@ function unimplemented(name: string): never {
   throw new Error(`FakeCounterAssetRail: ${name} was not configured for this test (G9: hermetic — no rail call this test didn't script)`);
 }
 
+/** What a test scripts for `verifyLockFinal`: the lock verdict and, optionally, the observation's own fields. The fake's
+ *  `verifyLockFinal` completes the observation the way every real reader does (`railBinding`: rail, ref, contract and
+ *  terms copied from the lock evidence), so the flows see a full `RailEvidenceResult`; they read only `status`, `final`
+ *  and `finalizedRef` from it, so nothing a test asserts depends on the added fields (P9-7, types only). */
+interface ScriptedEvidence {
+  lock: LockEvidence;
+  rail?: Omit<RailObservation, "rail" | "ref" | "contract" | "terms">;
+}
+
 interface FakeRailScript {
   prepareLock?: () => Promise<PreparedLock>;
   /** P8: the interface now carries `recoverLock`; no existing scenario calls it (these flows do not resume yet). */
   recoverLock?: () => Promise<LockRecoveryOutcome>;
   commitLock?: () => Promise<RailWriteEvidence>;
-  claim?: (ref?: string) => Promise<RailWriteEvidence>;
+  /** The flows always pass the lock's ref (`ConnectedCounterAssetRail.claim`'s first parameter is required). */
+  claim?: (ref: string) => Promise<RailWriteEvidence>;
   refund?: () => Promise<RailWriteEvidence>;
   /** D-N6: near-htlc's real adapter never implements this (see near-rail.ts's own header
    *  comment) — a script that omits this leaves the field entirely absent on the connected
@@ -107,7 +118,7 @@ interface FakeRailScript {
    *  exercises it, since D-N6 means near-rail.ts never will.
    */
   resendRefundIfDropped?: () => Promise<RailWriteEvidence>;
-  verifyLockFinal?: () => Promise<RailEvidenceResult>;
+  verifyLockFinal?: () => Promise<ScriptedEvidence>;
   findClaimedPreimage?: () => Promise<string | null>;
   /** D-N6: near-htlc's real adapter DOES implement this (`NearHtlcRail.checkPendingClaim`, the
    *  same cheap `get_lock` read as `findClaimedPreimage` — NEAR has no mempool race to check
@@ -144,14 +155,16 @@ class FakeConnectedRail implements ConnectedCounterAssetRail {
   async commitLock(): Promise<RailWriteEvidence> {
     return (this.script.commitLock ?? (() => unimplemented("commitLock")))();
   }
-  async claim(ref?: string): Promise<RailWriteEvidence> {
+  async claim(ref: string): Promise<RailWriteEvidence> {
     return (this.script.claim ?? (() => unimplemented("claim")))(ref);
   }
   async refund(): Promise<RailWriteEvidence> {
     return (this.script.refund ?? (() => unimplemented("refund")))();
   }
   async verifyLockFinal(): Promise<RailEvidenceResult> {
-    return (this.script.verifyLockFinal ?? (() => unimplemented("verifyLockFinal")))();
+    const scripted = await (this.script.verifyLockFinal ?? (() => unimplemented("verifyLockFinal")))();
+    if (scripted.rail === undefined) return { lock: scripted.lock };
+    return { lock: scripted.lock, rail: { ...scripted.rail, ...railBinding(scripted.lock) } };
   }
   async findClaimedPreimage(): Promise<string | null> {
     return (this.script.findClaimedPreimage ?? (() => unimplemented("findClaimedPreimage")))();
@@ -170,10 +183,13 @@ class FakeConnectedRail implements ConnectedCounterAssetRail {
  *  sequence of writes/reads it needs. */
 class FakeCounterAssetRail implements CounterAssetRail {
   readonly railId = "near-htlc";
+  /** The value `railDeploymentId` derives for a rail that has none (`rail:<railId>`): the records these flows write carry
+   *  it either way, so declaring it changes nothing but the type (`CounterAssetRail.deploymentId` is required). */
+  readonly deploymentId = `rail:${this.railId}`;
   readonly caip2 = "near:near-sandbox-flop";
   readonly policy = NEAR_LOCAL_POLICY;
-  readonly minLockableAmount: string | undefined;
-  readonly assetId: string | undefined;
+  readonly minLockableAmount?: string;
+  readonly assetId?: string;
   connectCalls = 0;
 
   constructor(
@@ -181,8 +197,9 @@ class FakeCounterAssetRail implements CounterAssetRail {
     minLockableAmount?: string,
     assetId?: string,
   ) {
-    this.minLockableAmount = minLockableAmount;
-    this.assetId = assetId;
+    // exactOptionalPropertyTypes: an unset field stays unset (reads as `undefined`, as before).
+    if (minLockableAmount !== undefined) this.minLockableAmount = minLockableAmount;
+    if (assetId !== undefined) this.assetId = assetId;
   }
 
   formatAccountLine(address: string): string {

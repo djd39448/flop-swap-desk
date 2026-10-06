@@ -36,6 +36,7 @@ import type {
 import { BTC_MIN_LOCKABLE_SATS } from "../src/rails/btc-htlc.js";
 import type { Exchange } from "../src/rails/rpc-capture.js";
 import { swapId as computeSwapId } from "../src/profile.js";
+import { railBinding, type LockEvidence, type RailObservation } from "../src/types.js";
 import { identity, type Identity } from "./helpers/identity.js";
 
 const T0 = 1_700_000_000_000;
@@ -63,6 +64,15 @@ function unimplemented(name: string): never {
   throw new Error(`FakeCounterAssetRail: ${name} was not configured for this test (G9: hermetic — no rail call this test didn't script)`);
 }
 
+/** What a test scripts for `verifyLockFinal`: the lock verdict and, optionally, the observation's own fields. The fake's
+ *  `verifyLockFinal` completes the observation the way every real reader does (`railBinding`: rail, ref, contract and
+ *  terms copied from the lock evidence), so the flows see a full `RailEvidenceResult`; they read only `status`, `final`
+ *  and `finalizedRef` from it, so nothing a test asserts depends on the added fields (P9-7, types only). */
+interface ScriptedEvidence {
+  lock: LockEvidence;
+  rail?: Omit<RailObservation, "rail" | "ref" | "contract" | "terms">;
+}
+
 interface FakeRailScript {
   prepareLock?: () => Promise<PreparedLock>;
   /** P8: the interface now carries `recoverLock`; no existing scenario calls it (these flows do not resume yet). */
@@ -76,7 +86,7 @@ interface FakeRailScript {
    *  real adapter, so `BuyerFlow.refundLegA`'s own `connected.resendRefundIfDropped !== undefined`
    *  check sees the same thing it would against real EVM/Bitcoin adapters. */
   resendRefundIfDropped?: () => Promise<RailWriteEvidence>;
-  verifyLockFinal?: () => Promise<RailEvidenceResult>;
+  verifyLockFinal?: () => Promise<ScriptedEvidence>;
   findClaimedPreimage?: () => Promise<string | null>;
   /** K2: only set on a fake that wants to stand in for a rail implementing the OPTIONAL
    *  `checkPendingClaim` — a script that omits this leaves the field entirely absent on the
@@ -123,7 +133,9 @@ class FakeConnectedRail implements ConnectedCounterAssetRail {
     return (this.script.refund ?? (() => unimplemented("refund")))();
   }
   async verifyLockFinal(): Promise<RailEvidenceResult> {
-    return (this.script.verifyLockFinal ?? (() => unimplemented("verifyLockFinal")))();
+    const scripted = await (this.script.verifyLockFinal ?? (() => unimplemented("verifyLockFinal")))();
+    if (scripted.rail === undefined) return { lock: scripted.lock };
+    return { lock: scripted.lock, rail: { ...scripted.rail, ...railBinding(scripted.lock) } };
   }
   async findClaimedPreimage(): Promise<string | null> {
     return (this.script.findClaimedPreimage ?? (() => unimplemented("findClaimedPreimage")))();
@@ -141,10 +153,13 @@ class FakeConnectedRail implements ConnectedCounterAssetRail {
  *  `FakeRailScript` so a test can drive exactly the sequence of writes/reads it needs. */
 class FakeCounterAssetRail implements CounterAssetRail {
   readonly railId = "btc-htlc";
+  /** The value `railDeploymentId` derives for a rail that has none (`rail:<railId>`): the records these flows write carry
+   *  it either way, so declaring it changes nothing but the type (`CounterAssetRail.deploymentId` is required). */
+  readonly deploymentId = `rail:${this.railId}`;
   readonly caip2 = "bip122:0f9188f13cb7b2c71f2a335e3a4fc328";
   readonly policy = BTC_LOCAL_POLICY;
-  readonly minLockableAmount: string | undefined;
-  readonly assetId: string | undefined;
+  readonly minLockableAmount?: string;
+  readonly assetId?: string;
   connectCalls = 0;
 
   constructor(
@@ -152,8 +167,9 @@ class FakeCounterAssetRail implements CounterAssetRail {
     minLockableAmount?: string,
     assetId?: string,
   ) {
-    this.minLockableAmount = minLockableAmount;
-    this.assetId = assetId;
+    // exactOptionalPropertyTypes: an unset field stays unset (reads as `undefined`, as before).
+    if (minLockableAmount !== undefined) this.minLockableAmount = minLockableAmount;
+    if (assetId !== undefined) this.assetId = assetId;
   }
 
   formatAccountLine(pubkey: string): string {
