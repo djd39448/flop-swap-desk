@@ -70,6 +70,13 @@ export class FakeSolChain {
   firstAvailableBlock = 0;
   /** R3-2: what getRecentPrioritizationFees answers. */
   prioritizationFees: Array<{ slot: number; prioritizationFee: number }> = [];
+  /** R3-16: a lagging member of a load-balanced endpoint. While `lagUntilMs` is ahead of `finalizedTimeMs` (the injected `sleep` moves that clock),
+   *  the reads below answer as if the write that already landed had not reached this node yet: no status and no stored transaction for
+   *  `lagHides.signatures`, no account at `lagHides.keys`, no history entry naming them. Only what is READ lags: the program's own execution
+   *  (`StatefulSolNode.run`) uses the real accounts. `lagServed` counts the hidden answers given. */
+  lagUntilMs: number | undefined;
+  readonly lagHides: { signatures: Set<string>; keys: Set<string> } = { signatures: new Set(), keys: new Set() };
+  lagServed = 0;
   simulateErr: unknown = null;
   simulateLogs: string[] = [];
   /** Called with the decoded transaction when `sendTransaction` is answered. Default: a finalized success. */
@@ -101,6 +108,20 @@ export class FakeSolChain {
     return this.requests.filter((r) => r.method === method).length;
   }
 
+  /** R3-16: true while this node still lags (see `lagUntilMs`). */
+  lagging(): boolean {
+    return this.lagUntilMs !== undefined && this.finalizedTimeMs < this.lagUntilMs;
+  }
+
+  /** The account at `key` as this node serves it: hidden while it lags and the key is one the lag hides. */
+  private served(key: string): FakeAccount | undefined {
+    if (this.lagging() && this.lagHides.keys.has(key)) {
+      this.lagServed += 1;
+      return undefined;
+    }
+    return this.accounts.get(key);
+  }
+
   ctx(commitment?: string): { slot: number } {
     return { slot: commitment === "finalized" ? this.finalizedSlot : this.confirmedSlot };
   }
@@ -124,13 +145,13 @@ export class FakeSolChain {
       const cfg = p[1] as { commitment?: string; minContextSlot?: number };
       const ctx = c.ctx(cfg.commitment);
       if (cfg.minContextSlot !== undefined && cfg.minContextSlot > ctx.slot) throw new FakeRpcError(-32016, "Minimum context slot has not been reached", { contextSlot: ctx.slot });
-      return { context: ctx, value: c.wireAccount(c.accounts.get(p[0] as string)) };
+      return { context: ctx, value: c.wireAccount(c.served(p[0] as string)) };
     },
     getMultipleAccounts: (p, c) => {
       const cfg = p[1] as { commitment?: string; minContextSlot?: number };
       const ctx = c.ctx(cfg.commitment);
       if (cfg.minContextSlot !== undefined && cfg.minContextSlot > ctx.slot) throw new FakeRpcError(-32016, "Minimum context slot has not been reached", { contextSlot: ctx.slot });
-      return { context: ctx, value: (p[0] as string[]).map((k) => c.wireAccount(c.accounts.get(k))) };
+      return { context: ctx, value: (p[0] as string[]).map((k) => c.wireAccount(c.served(k))) };
     },
     simulateTransaction: (_p, c) => ({ context: c.ctx("confirmed"), value: { err: c.simulateErr, logs: c.simulateLogs, unitsConsumed: 1234 } }),
     sendTransaction: (p, c) => {
@@ -138,15 +159,28 @@ export class FakeSolChain {
       c.onSend(tx, c);
       return tx.signature;
     },
-    getSignatureStatuses: (p, c) => ({ context: c.ctx("confirmed"), value: (p[0] as string[]).map((s) => c.statuses.get(s) ?? null) }),
+    getSignatureStatuses: (p, c) => ({
+      context: c.ctx("confirmed"),
+      value: (p[0] as string[]).map((s) => {
+        if (c.lagging() && c.lagHides.signatures.has(s)) {
+          c.lagServed += 1;
+          return null;
+        }
+        return c.statuses.get(s) ?? null;
+      }),
+    }),
     getTransaction: (p, c) => {
       const t = c.transactions.get(p[0] as string);
       if (t === undefined) return null;
+      if (c.lagging() && c.lagHides.signatures.has(p[0] as string)) {
+        c.lagServed += 1;
+        return null;
+      }
       return { slot: t.slot, blockTime: t.blockTime, meta: { err: t.err }, transaction: [base64.encode(t.bytes), "base64"], version: "legacy" };
     },
     getSignaturesForAddress: (p, c) => {
       const cfg = p[1] as { limit?: number; before?: string };
-      let list = c.addressSignatures.get(p[0] as string) ?? [];
+      let list = c.lagging() && c.lagHides.keys.has(p[0] as string) ? [] : (c.addressSignatures.get(p[0] as string) ?? []);
       if (cfg.before !== undefined) {
         const i = list.findIndex((e) => e.signature === cfg.before);
         list = i < 0 ? [] : list.slice(i + 1);
