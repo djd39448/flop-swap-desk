@@ -17,7 +17,10 @@
 //     section held by an exclusive lock file (`<role>-<id>.lock`, created with O_EXCL, carrying the holder's pid):
 //     compare, remove this key's stale temp files, write a temp file, fsync it, rename it over the record, then
 //     fsync the directory (POSIX) or the renamed file (Windows, best effort). A lock left behind by a dead process
-//     is broken; a lock held by a live one is a typed `FlowStoreLockedError` and is never broken silently. The file
+//     is broken; a lock held by a live one is a typed `FlowStoreLockedError` and is never broken silently. A lock
+//     that names THIS process's own pid and is not one this process holds (a predecessor that died inside a save
+//     and a restart under the same pid, the normal case for node as pid 1 in a container, R2-01) is a leftover too
+//     and is broken: the process-wide set of held lock bodies tells the two apart. The file
 //     carries a one-line header with the payload's length and sha256, so a truncated or corrupted file is a
 //     `FlowStoreCorruptError` on `load`, never an empty answer (the watcher's `state.json` habit of resetting on a
 //     bad read is deliberately NOT copied).
@@ -143,17 +146,20 @@ export class FlowRecordExistsError extends FlowStoreWriteFailedError {
 }
 
 /** Another LIVE process holds the key's lock file (or the lock could not be taken): that process owns the swap. The
- *  lock is never broken silently. A lock left by a process that is gone is broken automatically; if the pid was
- *  reused by an unrelated process, an operator removes the named file. */
+ *  lock is never broken silently. A lock left by a process that is gone is broken automatically, and so is one that
+ *  names this very process's pid without this process holding it (R2-01); if the pid was reused by an unrelated
+ *  process, an operator removes the named file. The message never says "another instance" for this process's own
+ *  pid: the only own-pid lock that is not broken is one a save of THIS process is holding right now. */
 export class FlowStoreLockedError extends FlowStoreWriteFailedError {
   readonly lockPath: string;
   /** The pid the lock file names, when it could be read. */
   readonly holderPid: number | undefined;
   constructor(key: string, lockPath: string, holderPid: number | undefined, detail?: string) {
+    const own = holderPid !== undefined && holderPid === process.pid;
     super(
       key,
-      `flow store: "${key}" is locked by ${holderPid === undefined ? "another writer" : `process ${holderPid}`} (${lockPath})` +
-        `${detail === undefined ? "" : `: ${detail}`}; another instance owns this swap, nothing was written`,
+      `flow store: "${key}" is locked by ${holderPid === undefined ? "another writer" : own ? `a save in this same process (pid ${holderPid})` : `process ${holderPid}`} (${lockPath})` +
+        `${detail === undefined ? "" : `: ${detail}`}; ${own ? "" : "another instance owns this swap, "}nothing was written`,
     );
     this.name = "FlowStoreLockedError";
     this.lockPath = lockPath;
@@ -375,6 +381,24 @@ function processAlive(pid: number): boolean {
   }
 }
 
+/** The lock bodies (a pid line, then a token line) this process holds right now. A lock file that names this
+ *  process's own pid and whose body is NOT in here was left by a predecessor (killed inside a save and restarted under the same pid,
+ *  or a release that could not read or remove its file) and is stale (R2-01). Kept on `globalThis` under a
+ *  registered symbol so that two copies of this module in one process (a bundle and a source import, say) share it.
+ *  A body is added BEFORE its lock file is created (a reader that sees the file must find the body) and removed by
+ *  `release` whatever its outcome. */
+const HELD_LOCKS = Symbol.for("flop-swap-desk.flow-store.held-locks");
+
+function heldLockBodies(): Set<string> {
+  const registry = globalThis as unknown as Record<symbol, Set<string> | undefined>;
+  let held = registry[HELD_LOCKS];
+  if (held === undefined) {
+    held = new Set<string>();
+    registry[HELD_LOCKS] = held;
+  }
+  return held;
+}
+
 /** In-process serialisation by lock path, across every `FileFlowStore` instance of this process: the O_EXCL lock file
  *  fences other PROCESSES, this fences other callers here, so the loser of a race is compared against the winner's
  *  bytes (a clean `FlowRecordStaleError`) instead of being refused as locked. */
@@ -414,6 +438,46 @@ async function readLockFile(path: string): Promise<LockFileContent | null> {
   }
   const match = LOCK_BODY.exec(raw);
   return { raw, pid: match === null ? undefined : Number(match[1]) };
+}
+
+/** The codes a read or a remove of a lock file can fail with while a scanner or indexer briefly holds it (Windows). */
+const LOCK_IO_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+const LOCK_IO_ATTEMPTS = 6;
+
+/** R2-01: the lock file's content for `release`, retrying a transient EPERM, EBUSY or EACCES with a short backoff
+ *  (`readLockFile` answers `null` to those, which `acquire` reads as "gone, try again"). `null`: there is no file;
+ *  `undefined`: it could not be read at all. */
+async function readLockFileRetrying(path: string): Promise<LockFileContent | null | undefined> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const raw = await fsp.readFile(path, "utf8");
+      const match = LOCK_BODY.exec(raw);
+      return { raw, pid: match === null ? undefined : Number(match[1]) };
+    } catch (error) {
+      const code = errorCode(error);
+      if (code === "ENOENT") return null;
+      if (code === undefined || !LOCK_IO_RETRY_CODES.has(code) || attempt >= LOCK_IO_ATTEMPTS) return undefined;
+      await sleep(20 * attempt);
+    }
+  }
+}
+
+/** `release`'s work: removes the lock file if it still holds `body`, retrying a transient read or remove failure.
+ *  A file that cannot be read, or that holds something else, is left alone (it is not ours to remove, or it cannot be
+ *  shown to be); a remove that keeps failing is left behind for this process's next acquire to break (R2-01). */
+async function removeOwnLock(lockPath: string, body: string): Promise<void> {
+  const now = await readLockFileRetrying(lockPath);
+  if (now === null || now === undefined || now.raw !== body) return;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await fsp.rm(lockPath, { force: true });
+      return;
+    } catch (error) {
+      const code = errorCode(error);
+      if (code === undefined || !LOCK_IO_RETRY_CODES.has(code) || attempt >= LOCK_IO_ATTEMPTS) return;
+      await sleep(20 * attempt);
+    }
+  }
 }
 
 interface HeldLock {
@@ -589,38 +653,53 @@ export class FileFlowStore implements FlowStore {
 
   private async acquireLock(key: string, lockPath: string): Promise<HeldLock> {
     const body = `${process.pid}\n${randomBytes(8).toString("hex")}\n`;
-    let waited = 0;
-    let breaks = 0;
-    let vanished = 0;
-    let unparsed: string | undefined;
-    for (let iteration = 0; iteration < LOCK_MAX_ITERATIONS; iteration += 1) {
-      if (await this.tryCreateLock(lockPath, body)) return this.heldLock(key, lockPath, body);
-      const holder = await readLockFile(lockPath);
-      if (holder === null) {
-        vanished += 1;
-        if (vanished <= 3) continue; // it was released between the two calls: try again at once
-      } else {
-        // A lock body that does not parse is a creator that died between create and write (or one about to write):
-        // it is judged stale only when the same unparseable content is seen twice, one poll apart.
-        const stale = holder.pid === undefined ? unparsed === holder.raw : !processAlive(holder.pid);
-        if (stale) {
-          breaks += 1;
-          if (breaks > 5) throw new FlowStoreLockedError(key, lockPath, holder.pid, "a stale lock file could not be removed");
-          await this.breakLock(lockPath, holder.raw);
-          unparsed = undefined;
-          continue;
+    const held = heldLockBodies();
+    // R2-01: the body is registered BEFORE the file exists, so that no reader in this process can see our own
+    // file and mistake it for a predecessor's leftover. It stays registered only if the lock is taken.
+    held.add(body);
+    let acquired = false;
+    try {
+      let waited = 0;
+      let breaks = 0;
+      let vanished = 0;
+      let unparsed: string | undefined;
+      for (let iteration = 0; iteration < LOCK_MAX_ITERATIONS; iteration += 1) {
+        if (await this.tryCreateLock(lockPath, body)) {
+          acquired = true;
+          return this.heldLock(key, lockPath, body, held);
         }
-        unparsed = holder.pid === undefined ? holder.raw : undefined;
-        if (holder.pid !== undefined && waited >= this.lockWaitMs) throw new FlowStoreLockedError(key, lockPath, holder.pid);
+        const holder = await readLockFile(lockPath);
+        if (holder === null) {
+          vanished += 1;
+          if (vanished <= 3) continue; // it was released between the two calls: try again at once
+        } else {
+          // A lock body that does not parse is a creator that died between create and write (or one about to write):
+          // it is judged stale only when the same unparseable content is seen twice, one poll apart. A lock naming a
+          // pid that is gone is stale. So is one naming THIS process's own pid whose body this process does not hold
+          // (R2-01): the pid is "alive" only because it is us, and `withProcessMutex` plus the held set guarantee that
+          // no save of this process is inside that lock.
+          const stale = holder.pid === undefined ? unparsed === holder.raw : holder.pid === process.pid ? !held.has(holder.raw) : !processAlive(holder.pid);
+          if (stale) {
+            breaks += 1;
+            if (breaks > 5) throw new FlowStoreLockedError(key, lockPath, holder.pid, "a stale lock file could not be removed");
+            await this.breakLock(lockPath, holder.raw);
+            unparsed = undefined;
+            continue;
+          }
+          unparsed = holder.pid === undefined ? holder.raw : undefined;
+          if (holder.pid !== undefined && waited >= this.lockWaitMs) throw new FlowStoreLockedError(key, lockPath, holder.pid);
+        }
+        if (holder === null && waited >= this.lockWaitMs) throw new FlowStoreLockedError(key, lockPath, undefined, "the lock file could not be created or read");
+        await sleep(LOCK_POLL_MS);
+        waited += LOCK_POLL_MS;
       }
-      if (holder === null && waited >= this.lockWaitMs) throw new FlowStoreLockedError(key, lockPath, undefined, "the lock file could not be created or read");
-      await sleep(LOCK_POLL_MS);
-      waited += LOCK_POLL_MS;
+      throw new FlowStoreLockedError(key, lockPath, undefined, "gave up taking the lock");
+    } finally {
+      if (!acquired) held.delete(body);
     }
-    throw new FlowStoreLockedError(key, lockPath, undefined, "gave up taking the lock");
   }
 
-  private heldLock(key: string, lockPath: string, body: string): HeldLock {
+  private heldLock(key: string, lockPath: string, body: string, held: Set<string>): HeldLock {
     return {
       assertHeld: async () => {
         const now = await readLockFile(lockPath).catch(() => null);
@@ -629,9 +708,13 @@ export class FileFlowStore implements FlowStore {
         }
       },
       release: async () => {
-        const now = await readLockFile(lockPath).catch(() => null);
-        if (now === null || now.raw !== body) return; // not ours any more: leave whatever is there alone
-        await fsp.rm(lockPath, { force: true, maxRetries: 5, retryDelay: 20 }).catch(() => undefined);
+        try {
+          await removeOwnLock(lockPath, body);
+        } finally {
+          // R2-01: whatever happened to the file, this process no longer holds it. A file left behind names our pid
+          // with a body that is not in the set, so this process's next acquire breaks it.
+          held.delete(body);
+        }
       },
     };
   }

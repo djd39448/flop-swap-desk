@@ -10,7 +10,7 @@
 // durability steps after the rename (R1-20).
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, promises as fsp, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, promises as fsp, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -528,6 +528,115 @@ describe("FileFlowStore", () => {
       writeFileSync(lockFile(dir), "garbage that is not a pid");
       await new FileFlowStore(dir, { lockWaitMs: 0 }).save(KEY_BUYER, bytes("y"), digestOf("x"));
       expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("y");
+    });
+
+    describe("R2-01: a lock naming this process's own pid", () => {
+      const eperm = (): Error => Object.assign(new Error("EPERM: operation not permitted (a scanner holds the file)"), { code: "EPERM" });
+
+      it("one this process does not hold is a predecessor's leftover: it is broken, the save goes through and no lock remains", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        // a predecessor with the same pid (node as pid 1 in a container, a reused Windows pid) died inside a save
+        writeFileSync(lockFile(dir), lockBody(process.pid));
+        await new FileFlowStore(dir, { lockWaitMs: 100 }).save(KEY_BUYER, bytes("x"), null);
+        expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("x");
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+        // and again for an update, from yet another store object
+        writeFileSync(lockFile(dir), lockBody(process.pid));
+        await new FileFlowStore(dir, { lockWaitMs: 100 }).save(KEY_BUYER, bytes("y"), digestOf("x"));
+        expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("y");
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+      });
+
+      it("one this process DOES hold is live: another store object on the same directory is refused, the message does not say 'another instance', and the holder's save is untouched", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        const link = join(root, "link"); // the same directory under another spelling, so the in-process queue does not serialise the two
+        symlinkSync(dir, link, "junction");
+        let refusal: unknown;
+        const holder = new FileFlowStore(dir, {
+          onStep: async (step) => {
+            if (step !== "tmp-written") return;
+            refusal = await new FileFlowStore(link, { lockWaitMs: 0 }).save(KEY_BUYER, bytes("intruder"), null).catch((e: unknown) => e);
+          },
+        });
+        await holder.save(KEY_BUYER, bytes("holder"), null);
+        expect(refusal).toBeInstanceOf(FlowStoreLockedError);
+        expect((refusal as FlowStoreLockedError).holderPid).toBe(process.pid);
+        expect((refusal as FlowStoreLockedError).message).not.toContain("another instance");
+        expect((refusal as FlowStoreLockedError).message).toContain("this same process");
+        expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("holder");
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+      });
+
+      it("a lock held by ANOTHER live process still says another instance owns the swap", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        const other = livePid();
+        try {
+          writeFileSync(lockFile(dir), lockBody(other.pid));
+          const error = await new FileFlowStore(dir, { lockWaitMs: 0 }).save(KEY_BUYER, bytes("x"), null).catch((e: unknown) => e);
+          expect((error as FlowStoreLockedError).message).toContain("another instance owns this swap");
+        } finally {
+          other.stop();
+        }
+      });
+
+      it("one transient EPERM on release's read of the lock file does not leave this process's own lock behind: the next saves, from the same and from a new store object, go through", async () => {
+        const dir = join(root, "flows");
+        const store = new FileFlowStore(dir, { lockWaitMs: 100 });
+        await store.save(KEY_BUYER, bytes("v1"), null);
+        const original = fsp.readFile;
+        let lockReads = 0;
+        const spy = vi.spyOn(fsp, "readFile").mockImplementation((async (path: unknown, options?: unknown) => {
+          if (String(path).endsWith(".lock")) {
+            lockReads += 1;
+            if (lockReads === 2) throw eperm(); // read 1 is assertHeld's, read 2 is release's
+          }
+          return (original as (p: unknown, o?: unknown) => Promise<unknown>).call(fsp, path, options);
+        }) as typeof fsp.readFile);
+        try {
+          await store.save(KEY_BUYER, bytes("v2"), digestOf("v1"));
+        } finally {
+          spy.mockRestore();
+        }
+        expect(lockReads).toBeGreaterThanOrEqual(3); // the release read was retried
+        await store.save(KEY_BUYER, bytes("v3"), digestOf("v2"));
+        await new FileFlowStore(dir, { lockWaitMs: 100 }).save(KEY_BUYER, bytes("v4"), digestOf("v3"));
+        expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("v4");
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+      });
+
+      it("a lock file release could not read at all stays behind, and this process's next save, from the same and from a new store object, breaks it", async () => {
+        const dir = join(root, "flows");
+        const store = new FileFlowStore(dir, { lockWaitMs: 100 });
+        await store.save(KEY_BUYER, bytes("v1"), null);
+        const original = fsp.readFile;
+        const failReleaseReads = async (work: () => Promise<void>): Promise<void> => {
+          let lockReads = 0;
+          const spy = vi.spyOn(fsp, "readFile").mockImplementation((async (path: unknown, options?: unknown) => {
+            if (String(path).endsWith(".lock")) {
+              lockReads += 1;
+              if (lockReads >= 2) throw eperm(); // every read from release's first on
+            }
+            return (original as (p: unknown, o?: unknown) => Promise<unknown>).call(fsp, path, options);
+          }) as typeof fsp.readFile);
+          try {
+            await work();
+          } finally {
+            spy.mockRestore();
+          }
+        };
+        await failReleaseReads(() => store.save(KEY_BUYER, bytes("v2"), digestOf("v1")));
+        expect(readdirSync(dir).sort()).toEqual([`buyer-${SWAP_A}.json`, `buyer-${SWAP_A}.lock`]); // our own lock was left behind
+        await store.save(KEY_BUYER, bytes("v3"), digestOf("v2")); // the same store object
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+        await failReleaseReads(() => store.save(KEY_BUYER, bytes("v4"), digestOf("v3")));
+        expect(readdirSync(dir)).toContain(`buyer-${SWAP_A}.lock`);
+        await new FileFlowStore(dir, { lockWaitMs: 100 }).save(KEY_BUYER, bytes("v5"), digestOf("v4")); // a new store object
+        expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("v5");
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+      });
     });
 
     it("another key's lock does not block this key", async () => {
