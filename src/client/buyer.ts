@@ -1169,6 +1169,12 @@ export class BuyerFlow {
    */
   private async announceLockA(contract: string, ref: string): Promise<void> {
     if (this.lockFramePosted) return;
+    // R2-16: tclk's machine rejects a `lock` frame at or after the offer's `refundAfterMs` ("refund window is already open"), so a
+    // lock recognised that late is recorded but its frame is not posted: the frame would never fold into the swap, and a Seller's
+    // fallback reveal that came first would leave the fold reading `locked` for a claimed lock. `next` then names refundLegA (or
+    // learnSecret once a claim is seen), exactly as for a lock whose frame is not posted yet. Only with a store: without one this
+    // flow behaves as before.
+    if (this.#journal !== undefined && this.offerA !== undefined && this.clock() >= this.offerA.refundAfterMs) return;
     const line = encodeFrameWith({ type: "lock", from: this.identity.did, contract, rail: this.rail.railId, ref }, this.rail.railRegistry);
     if (this.#journal !== undefined) {
       // P8 (rules 1 and 3): the exact text is saved before the post; a lock frame already in the room is adopted.
@@ -1184,7 +1190,8 @@ export class BuyerFlow {
    * P8-RESUME-SPEC.md "Buyer lock A" (rules 1, 2 and 4), review round 1 R1-01: what a saved lock turned into. The chain is
    * READ FIRST, before any guard, because recognising a lock that already landed is not a new lock:
    *   - `landed`: the evidence is recorded and the lock frame is posted (once, as the saved text, or adopted), whatever the
-   *     clock says, whatever leg B's note says, whatever the chain clock says. The Seller's own claim guards decide what can
+   *     clock says, whatever leg B's note says, whatever the chain clock says; EXCEPT at or after leg A's refund time, when
+   *     the frame is not posted (R2-16: tclk's machine rejects it). The Seller's own claim guards decide what can
    *     still follow; the Buyer is then routed to `learnSecret` (a claim) or `refundLegA` (after the refund time).
    *   - `pending`: `LockPendingError`; nothing was signed and nothing is sent.
    *   - `unknown` (Bitcoin: the node does not know the funding; NEAR: not known, no row, nonce not past) and `never-landed`
@@ -1249,7 +1256,8 @@ export class BuyerFlow {
     return { hashLock, writeEvidence };
   }
 
-  /** The chain showed this flow's lock (R1-01: no guard applies): its evidence is recorded and its frame is posted. */
+  /** The chain showed this flow's lock (R1-01: no guard applies): its evidence is recorded and its frame is posted (R2-16: not at
+   *  or after leg A's refund time, see `announceLockA`). */
   private async recordLockLanded(prepared: PreparedLock, hashLock: string, contract: string): Promise<{ hashLock: string; writeEvidence: RailWriteEvidence }> {
     const writeEvidence: RailWriteEvidence = { ref: prepared.ref, raw: [], ...(prepared.recovery?.chain === "btc" ? { txid: prepared.recovery.txid } : {}) };
     this.lockEvidence = writeEvidence;

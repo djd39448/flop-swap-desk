@@ -389,9 +389,10 @@ describe("EVM resume R1-01: a lock that already landed is recognised whatever th
     const p = await lockLandedUnrecorded(r);
     r.clockRef.ms = legAWindow.refundAfterMs + 1;
     expect(await restartBuyer(r)).toBe("refundLegA"); // before the fix: lockLegA for ever, though refundLegA would work
-    await r.buyer.lockLegA(); // recognised and announced: no deadline guard applies to a lock that already landed
+    await r.buyer.lockLegA(); // recognised: no deadline guard applies to a lock that already landed
     expect([r.node.count("approve"), r.node.count("lock")]).toEqual([1, 1]);
-    expect(await framesOf(r, dealRoom(p.contractA), "lock")).toHaveLength(1);
+    // R2-16: but its lock frame is NOT posted at or after leg A's refund time: tclk's machine would reject it (tests/flow-resume-fold.test.ts)
+    expect(await framesOf(r, dealRoom(p.contractA), "lock")).toHaveLength(0);
     await r.buyer.refundLegA();
     expect(r.node.row(p.statement)?.status).toBe(3);
     expect(r.node.count("refund")).toBe(1);
