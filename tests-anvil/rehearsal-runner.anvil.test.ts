@@ -93,6 +93,9 @@ interface Rig {
 }
 
 interface RigOptions {
+  /** Pin finality to this many confirmations instead of anvil's `finalized` tag (which trails the head by two blocks): a finality that lags
+   *  longer than the receipt polling does, as a public chain's does, so the runner's waits are really needed. */
+  confirmations?: number;
   clock?: "chain";
   fundBuyerEth?: boolean;
   buyerTokens?: bigint;
@@ -125,7 +128,7 @@ async function makeRig(chain: Chain, options: RigOptions = {}): Promise<Rig> {
   const config = {
     rails: {
       evm: {
-        pin: ANVIL_LOCAL_PIN,
+        pin: options.confirmations === undefined ? ANVIL_LOCAL_PIN : { ...ANVIL_LOCAL_PIN, finality: { mode: "confirmations", confirmations: options.confirmations } },
         endpoint: chain.anvil.endpoint,
         contract: chain.contract,
         assets: { USDC: chain.token },
@@ -433,10 +436,26 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
     }, 180_000);
   });
 
+  describe("--yes on a chain whose finality lags", () => {
+    it("waits for the lock and for the claim to be final (8 confirmations, a block a second): settles, and says it waited", async () => {
+      const rig = await makeRig(main, { confirmations: 8 });
+      const result = await run(rig, ["--yes"]);
+      expect(result.stderr).toBe("");
+      expect(result.code).toBe(0);
+      expect(result.stdout).toMatch(/OK\s+finalized\s+8 confirmations/);
+      expect(result.stdout).toContain("waiting for the lock of leg A to be final");
+      expect(result.stdout).toContain("waiting for the claim of leg A to be final");
+      expect(result.stdout).toContain("audit: the bundle replays offline to settled");
+      expect(await chainFacts(main, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 });
+      await expectCleanAndReplays(rig, result, "settled");
+    }, 180_000);
+  });
+
   describe("a kill in the middle, then --resume", () => {
     it.each([
       ["after the lock landed", /step buyer\.lockLegA done/, { locked: 1, claimed: 0 }],
       ["after the claim landed", /step seller\.claimLegA done/, { locked: 1, claimed: 1 }],
+      ["after the Buyer claimed leg B", /step buyer\.claimLegB done/, { locked: 1, claimed: 1 }],
     ] as const)("%s: a fresh process finishes the swap, with one lock and one claim", async (_label, marker, atKill) => {
       const rig = await makeRig(main);
       const first = startRunner(rig, ["--yes"]);
@@ -519,6 +538,21 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(resume.code).toBe(4);
       expect(resume.stderr).toContain("there is nothing to resume");
       expect(await chainFacts(warp, rig)).toEqual({ locked: 1, claimed: 0, refunded: 1, buyerTxs: 3, sellerTxs: 0 });
+    }, 240_000);
+
+    it("a refund that is not final yet is waited for (8 confirmations): the run says so and ends refunded", async () => {
+      const rig = await makeRig(warp, { clock: "chain", confirmations: 8 });
+      const locked = await run(rig, ["--yes", "--stop-after", "lock"]);
+      expect(locked.code).toBe(0);
+      const { deadlines } = await readRun(rig);
+      await warpTo(deadlines.legB.refundAfterMs + 60_000);
+      const refunded = await run(rig, ["--refund"]);
+      expect(refunded.stderr).toBe("");
+      expect(refunded.code).toBe(0);
+      expect(refunded.stdout).toContain("the refund of leg A is not final yet; waiting for the finalized block to pass the current head");
+      expect(refunded.stdout).toContain("audit: the bundle replays offline to refunded");
+      expect(await chainFacts(warp, rig)).toEqual({ locked: 1, claimed: 0, refunded: 1, buyerTxs: 3, sellerTxs: 0 });
+      await expectCleanAndReplays(rig, { ...refunded, stdout: locked.stdout + refunded.stdout, stderr: locked.stderr + refunded.stderr }, "refunded");
     }, 240_000);
 
     it("a run killed before leg A was locked is refunded-b: leg B's paper note is refunded, nothing is locked on the chain", async () => {

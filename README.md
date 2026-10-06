@@ -574,8 +574,10 @@ DIDs and addresses), `buyer/` and `seller/` (each party's P8 flow records, and a
 the local venue: not a wallet, minted once from the system CSPRNG), `world/` (the venue's rooms and the paper notes), `runner.lock`
 (one runner per swap) and, once the bundle is written and replays, `outcome.json` (a repeat then only says how the run ended). **This
 directory is secret-grade** (the Seller's record holds the swap secret): see "The store and its directory" under "Resume" for what that
-means on Windows. One state directory is one swap; start a new one in a new directory. The bundle after a resume lacks the crashed
-process's RPC exchanges (see "Limits of resume"). The config, the key paths and the state directory path are printed; a key never is.
+means on Windows. One state directory is one swap; start a new one in a new directory. A Ctrl-C is a kill like any other: `--resume`
+continues. The bundle is written to a sibling `<out>.partial-...` directory and renamed to `out` once it is whole, so a kill while it is
+written leaves only that sibling (delete it) and `out` empty or absent. The bundle after a resume lacks the crashed process's RPC
+exchanges (see "Limits of resume"). The config, the key paths and the state directory path are printed; a key never is.
 
 Exit codes: 0 done (or a clean dry run); 2 bad arguments, config or state; 3 the pre-flight failed (nothing was sent); 4 a step refused
 (the first line of its reason is printed, with the endpoint removed); 5 not yet (a refund time has not come); 6 the bundle was written
