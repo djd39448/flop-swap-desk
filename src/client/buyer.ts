@@ -1369,11 +1369,13 @@ export class BuyerFlow {
           legBRecord.statement === termsB.statement &&
           legBRecord.refundAfterMs === termsB.refundAfterMs &&
           verifySecret(termsB.lock, termsB.statement, legBRecord.secret ?? "");
-        this.refundNotes.push(
-          proven
-            ? "leg B's paper note is a proven claim: the secret is public and leg B's paper note reads claimed; paper moves no value, so the refund of leg A goes ahead (RR4-1)"
-            : "leg B's paper note reads claimed but is not a proven claim (terms differ or its secret does not open the statement): ignored (R4-1)",
-        );
+        const note = proven
+          ? "leg B's paper note is a proven claim: the secret is public and leg B's paper note reads claimed; paper moves no value, so the refund of leg A goes ahead (RR4-1)"
+          : "leg B's paper note reads claimed but is not a proven claim (terms differ or its secret does not open the statement): ignored (R4-1)";
+        // R1-09: a note is recorded ONCE. This block runs on every call until the refund's evidence exists, and every failed
+        // attempt (an RPC outage, say) used to append the same text again; the stored list is capped, so after 64 attempts every
+        // save failed before the refund was signed, in this process and after a restart. The same text is never recorded twice.
+        if (!this.refundNotes.includes(note)) this.refundNotes.push(note);
       }
     }
 
