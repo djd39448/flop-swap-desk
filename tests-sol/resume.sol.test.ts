@@ -367,7 +367,7 @@ describe("Resume on a real solana-test-validator: a send landed, its reply was l
 
     // A new process: the recorded signature is resolved on chain, nothing is signed again.
     const restarted = w.sellerProc();
-    const resumed = await SellerFlow.resume({ ...restarted.options, swapId: p.swapId });
+    const resumed = await SellerFlow.resume({ ...restarted.options, swapId: p.swapId, contractA: p.acceptA.contract });
     expect(resumed.next).toBe("claimLegA");
     expect(resumed.flow.statement).toBe(p.statement);
     const claimed = await resumed.flow.claimLegA(p.statement);
@@ -381,7 +381,7 @@ describe("Resume on a real solana-test-validator: a send landed, its reply was l
     await resumed.flow.claimLegA(p.statement); // confirmed: the recorded frames, nothing posted again
     expect((await w.venue.read(roomA)).length).toBe(after.length);
     expect((await readRecord(w.sellerStore, "seller", p.swapId)).claimRecords).toHaveLength(0); // resolved: the record is dropped
-    expect((await SellerFlow.resume({ ...w.sellerProc().options, swapId: p.swapId })).next).toBe("done");
+    expect((await SellerFlow.resume({ ...w.sellerProc().options, swapId: p.swapId, contractA: p.acceptA.contract })).next).toBe("done");
 
     const secret = await buyerFlow.learnSecret();
     expect(secret).toBe(w.sellerLock.preimage);

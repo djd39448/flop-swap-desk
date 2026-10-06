@@ -24,24 +24,30 @@ import {
   type FlowRecord,
 } from "../src/client/flow-record.js";
 import { FlowNotFoundError, FlowRecordExistsError } from "../src/client/flow-resume.js";
-import { FileFlowStore, FlowStoreCorruptError, FlowStoreFaultError, flowKey } from "../src/client/flow-store.js";
+import { FileFlowStore, FlowStoreCorruptError, FlowStoreFaultError, flowDigest, flowKey } from "../src/client/flow-store.js";
 import { SellerFlow } from "../src/client/seller.js";
 import { ANVIL_LOCAL_PIN } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { bid, bidParams, framesOf, isFrame, legA, restartBuyer, restartSeller, rig, toLines, toLocked, toPaired, type Rig } from "./helpers/resume-sol-rig.js";
 import { BID, T0, framesIn, legBDeadlines, solHarness } from "./helpers/sol-flow-harness.js";
 import { resumeBuyer, resumeSeller } from "./helpers/resume-flows.js";
+import { plant, sellerKeyOf } from "./helpers/seller-key.js";
 import { swapId as computeSwapId } from "../src/profile.js";
 import { dealRoom } from "@flop-labs/tclk";
 
+/** The key a role's record is stored under: `buyer:<swapId>`, `seller:<contractA>` (R1-14). */
+async function keyOf(r: Rig, role: "buyer" | "seller"): Promise<string> {
+  return role === "buyer" ? flowKey("buyer", r.swapId) : sellerKeyOf(r.sellerStore);
+}
+
 /** Reads a stored record, lets `edit` change it, and stores the result again (valid shape, valid checksum). */
 async function tamper(r: Rig, role: "buyer" | "seller", edit: (record: Record<string, unknown>) => void): Promise<void> {
-  const key = flowKey(role, r.swapId);
+  const key = await keyOf(r, role);
   const store = role === "buyer" ? r.buyerStore : r.sellerStore;
   const record = decodeFlowRecord((await store.load(key))!, key);
   const plain = JSON.parse(JSON.stringify(record)) as Record<string, unknown>;
   edit(plain);
-  await store.save(key, encodeFlowRecord(plain as unknown as FlowRecord));
+  await plant(store, key, encodeFlowRecord(plain as unknown as FlowRecord));
 }
 
 /** An EVM rail that is never called (resume reads the store only): only its ids matter. */
@@ -74,7 +80,7 @@ describe("resume fails closed on bad state (rule 6)", () => {
     const bytes = (await r.buyerStore.load(key))!;
     const at = Math.floor(bytes.length / 2);
     bytes[at] = (bytes[at] ?? 0) ^ 0x01;
-    await r.buyerStore.save(key, bytes);
+    await plant(r.buyerStore, key, bytes);
     await expect(restartBuyer(r)).rejects.toBeInstanceOf(FlowStoreCorruptError);
     // starting the swap over on top of it is refused too (the record is there, even if unreadable)
     const fresh = new BuyerFlow(r.h.buyerOptions);
@@ -84,16 +90,16 @@ describe("resume fails closed on bad state (rule 6)", () => {
   it("a record from another version is a FlowRecordVersionError", async () => {
     const r = rig();
     await toPaired(r);
-    const key = flowKey("seller", r.swapId);
+    const key = await sellerKeyOf(r.sellerStore);
     const text = new TextDecoder().decode((await r.sellerStore.load(key))!).replace('{"v":1,', '{"v":2,');
-    await r.sellerStore.save(key, new TextEncoder().encode(text));
+    await plant(r.sellerStore, key, new TextEncoder().encode(text));
     await expect(restartSeller(r)).rejects.toBeInstanceOf(FlowRecordVersionError);
   });
 
   it("a record stored under the other role's key is a FlowRecordMismatchError", async () => {
     const r = rig();
     await toPaired(r);
-    await r.buyerStore.save(flowKey("buyer", r.swapId), (await r.sellerStore.load(flowKey("seller", r.swapId)))!);
+    await plant(r.buyerStore, flowKey("buyer", r.swapId), (await r.sellerStore.load(await sellerKeyOf(r.sellerStore)))!);
     const error = await restartBuyer(r).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(FlowRecordMismatchError);
     expect((error as FlowRecordMismatchError).field).toBe("role");
@@ -315,16 +321,21 @@ describe("with FileFlowStore: a swap runs and resumes from files on disk", () =>
     expect(finished.nexts).toEqual(["done", "done"]);
     expect(h.node.sent).toEqual({ lock: 1, claim: 1, refund: 0 });
 
-    expect(await readdir(buyerDir)).toEqual([`buyer-${swapId}.json`]); // no temp file left behind
-    expect(await readdir(sellerDir)).toEqual([`seller-${swapId}.json`]);
-    expect(await readFile(join(sellerDir, `seller-${swapId}.json`), "utf8")).toContain(h.sellerLock.preimage.slice(2));
+    // no temp file and no lock file left behind; the Seller's record is keyed by leg A's contract id (R1-14), not the swap id
+    const sellerKey = await sellerKeyOf(sellerStore);
+    const contractA = sellerKey.slice("seller:".length);
+    expect(contractA).toBe(accepted.acceptA.contract);
+    expect(await readdir(buyerDir)).toEqual([`buyer-${swapId}.json`]);
+    expect(await readdir(sellerDir)).toEqual([`seller-${contractA}.json`]);
+    expect(await readFile(join(sellerDir, `seller-${contractA}.json`), "utf8")).toContain(h.sellerLock.preimage.slice(2));
     expect(await readFile(join(buyerDir, `buyer-${swapId}.json`), "utf8")).not.toContain(h.sellerLock.preimage.slice(2));
     expect(await buyerStore.list()).toEqual([`buyer:${swapId}`]);
 
     // a truncated file is a corrupt record on resume, never an empty one
-    const file = join(sellerDir, `seller-${swapId}.json`);
+    const file = join(sellerDir, `seller-${contractA}.json`);
     const bytes = await readFile(file);
-    await new FileFlowStore(sellerDir).save(`seller:${swapId}`, bytes.subarray(0, 10)); // a valid save of nonsense: the record decoder refuses it
+    const stored = (await sellerStore.load(sellerKey))!;
+    await new FileFlowStore(sellerDir).save(sellerKey, bytes.subarray(0, 10), flowDigest(stored)); // a valid save of nonsense: the record decoder refuses it
     await expect(resumeSeller(h.sellerOptions, sellerStore, swapId)).rejects.toBeInstanceOf(FlowStoreCorruptError);
   });
 });

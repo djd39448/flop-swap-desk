@@ -40,6 +40,7 @@ import { BuyerFlow, LockPendingError, type BidParams, type BuyerFlowOptions } fr
 import type { ConnectedCounterAssetRail, CounterAssetRail, RailClaimOptions, RailRefundOptions } from "../../src/client/counter-rail.js";
 import { decodeFlowRecord } from "../../src/client/flow-record.js";
 import { MemoryFlowStore, flowKey, type MemoryFault } from "../../src/client/flow-store.js";
+import { sellerContractA, sellerKeyOf } from "./seller-key.js";
 import { SellerFlow, type LegBDeadlines, type SellerFlowOptions } from "../../src/client/seller.js";
 import type { MemoryVenue, Venue } from "../../src/client/venue.js";
 import { classifySwapOffer } from "../../src/profile.js";
@@ -487,7 +488,7 @@ export async function resumeRole(c: Ctx, role: Role): Promise<string> {
     c.history.push(resumed.flow);
     return resumed.next;
   }
-  const resumed = await SellerFlow.resume({ ...w.sellerOptions(), store: w.stores.seller, swapId: w.swapId });
+  const resumed = await SellerFlow.resume({ ...w.sellerOptions(), store: w.stores.seller, swapId: w.swapId, contractA: await sellerContractA(w.stores.seller) });
   c.seller = resumed.flow;
   c.history.push(resumed.flow);
   return resumed.next;
@@ -739,15 +740,17 @@ export async function inspectRun(r: RunResult, expected: Expected): Promise<Find
   // the stores: one record per role under its own key and nothing else; both flows resumed from them are at "done"; only the Seller's
   // record holds the secret
   expect("buyer store keys", await w.stores.buyer.list(), [flowKey("buyer", w.swapId)]);
-  expect("seller store keys", await w.stores.seller.list(), [flowKey("seller", w.swapId)]);
+  const sellerKey = await sellerKeyOf(w.stores.seller); // R1-14: a Seller record is keyed by leg A's contract id, not the swap id
+  expect("seller store keys", await w.stores.seller.list(), [sellerKey]);
+  expect("the Seller's key is its leg A contract", sellerKey, flowKey("seller", (await readSwap(w)).acceptA!.contract));
   const nextAfter = { buyer: "", seller: "" };
   nextAfter.buyer = (await BuyerFlow.resume({ ...w.buyerOptions(), store: w.stores.buyer, swapId: w.swapId })).next;
-  nextAfter.seller = (await SellerFlow.resume({ ...w.sellerOptions(), store: w.stores.seller, swapId: w.swapId })).next;
+  nextAfter.seller = (await SellerFlow.resume({ ...w.sellerOptions(), store: w.stores.seller, swapId: w.swapId, contractA: await sellerContractA(w.stores.seller) })).next;
   const wantNext =
     expected === "never-locked" ? { buyer: "lockLegA", seller: "done" } : expected === "refund-stuck" ? { buyer: "refundLegA", seller: "done" } : { buyer: "done", seller: "done" };
   expect("next after the run", nextAfter, wantNext);
 
-  const sellerRecord = decodeFlowRecord((await w.stores.seller.load(flowKey("seller", w.swapId)))!, flowKey("seller", w.swapId));
+  const sellerRecord = decodeFlowRecord((await w.stores.seller.load(sellerKey))!, sellerKey);
   if (sellerRecord.role !== "seller" || sellerRecord.preimage !== w.hashLock.preimage) problems.push("the Seller's record does not hold the secret");
   if (!storeTexts(w.stores.seller).some((text) => containsSecret(text, w.hashLock))) problems.push("the secret form check is blind: the Seller's own saves do not show it");
   storeTexts(w.stores.buyer).forEach((text, index) => {

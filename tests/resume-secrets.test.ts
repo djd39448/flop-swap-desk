@@ -19,7 +19,7 @@ import { encodeFlowRecord } from "../src/client/flow-record.js";
 import { FileFlowStore, flowKey } from "../src/client/flow-store.js";
 import { Controller, REFUND_BOTH, SETTLE, containsSecret, runScript } from "./helpers/crash-matrix.js";
 import { identity } from "./helpers/identity.js";
-import { SAMPLE_PREIMAGE, SAMPLE_SWAP_ID, sampleBuyerRecord, sampleRecords, sampleSellerRecord } from "./helpers/flow-record-samples.js";
+import { SAMPLE_CONTRACT_A, SAMPLE_PREIMAGE, SAMPLE_SWAP_ID, sampleBuyerRecord, sampleRecords, sampleSellerRecord } from "./helpers/flow-record-samples.js";
 import { WORLDS } from "./helpers/matrix-worlds.js";
 import { keyMaterialProblems, scanStores, seedForms } from "./helpers/secret-scan.js";
 
@@ -88,10 +88,10 @@ describe("the files a FileFlowStore writes", () => {
     const dir = await mkdtemp(join(tmpdir(), "p8-secrets-"));
     try {
       const store = new FileFlowStore(dir);
-      await store.save(flowKey("buyer", SAMPLE_SWAP_ID), encodeFlowRecord(sampleBuyerRecord()));
-      await store.save(flowKey("seller", SAMPLE_SWAP_ID), encodeFlowRecord(sampleSellerRecord()));
+      await store.save(flowKey("buyer", SAMPLE_SWAP_ID), encodeFlowRecord(sampleBuyerRecord()), null);
+      await store.save(flowKey("seller", SAMPLE_CONTRACT_A), encodeFlowRecord(sampleSellerRecord()), null); // a Seller is keyed by contract A (R1-14)
       const names = (await readdir(dir)).sort();
-      expect(names).toEqual([`buyer-${SAMPLE_SWAP_ID}.json`, `seller-${SAMPLE_SWAP_ID}.json`]); // no stray temp file
+      expect(names).toEqual([`buyer-${SAMPLE_SWAP_ID}.json`, `seller-${SAMPLE_CONTRACT_A}.json`]); // no stray temp file, no lock file
       for (const name of names) {
         const body = await readFile(join(dir, name), "utf8");
         expect(keyMaterialProblems(`${name}\n${body}`, name, [])).toEqual([]);

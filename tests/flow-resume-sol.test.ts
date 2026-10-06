@@ -16,7 +16,7 @@ import { describe, expect, it } from "vitest";
 
 import { LockPendingError } from "../src/client/buyer.js";
 import { FlowRecordConflictError, ledgerEntry } from "../src/client/flow-record.js";
-import { flowKey } from "../src/client/flow-store.js";
+import { sellerKeyOf } from "./helpers/seller-key.js";
 import { swapId as computeSwapId } from "../src/profile.js";
 import { encodeFrameWith } from "../src/rails/custom-frames.js";
 import { SOL_RAIL_ID } from "../src/rails/custom-rails.js";
@@ -263,15 +263,18 @@ describe("resume: account lines (rules 1 and 3)", () => {
     const room = dealRoom(p.contractA);
     const ownLines = async () => (await r.h.venue.read(room)).filter((rec) => rec.sender === r.h.buyer.did && isLine(rec.line));
     expect(await ownLines()).toHaveLength(1);
+    const original = (await ownLines())[0]!;
     await expect(r.buyer.postAccountLineA(r.h.buyerWallet.publicKey)).resolves.toBeDefined(); // present: adopted
     expect(await ownLines()).toHaveLength(1);
 
-    // the line has vanished from the room (a venue that lost it): re-posting it now would put it AFTER the lock frame
+    // the line has vanished from the room (a venue that lost it): re-posting it now would put it AFTER the lock frame. Its ledger entry
+    // says it LANDED, so it is never posted again, whatever the room shows (R1-12): the call returns the recorded line and posts nothing.
     const rooms = (r.h.venue as unknown as { rooms: Map<string, unknown[]> }).rooms;
     rooms.set(room, (rooms.get(room) as Array<{ line: string; sender: string }>).filter((rec) => !(rec.sender === r.h.buyer.did && isLine(rec.line))));
     expect(await ownLines()).toHaveLength(0);
     await restartBuyer(r);
-    await expect(r.buyer.postAccountLineA(r.h.buyerWallet.publicKey)).rejects.toBeInstanceOf(FlowRecordConflictError);
+    const recorded = await r.buyer.postAccountLineA(r.h.buyerWallet.publicKey);
+    expect(recorded).toMatchObject({ seq: original.seq, nonce: original.nonce, line: original.line, sender: original.sender });
     expect(await ownLines()).toHaveLength(0);
   });
 
@@ -703,7 +706,7 @@ describe("resume: the preimage stays private (rule 5)", () => {
     const secretHex = r.h.sellerLock.preimage.slice(2);
     for (const save of r.buyerStore.saves) expect(Buffer.from(save.bytes).toString("utf8")).not.toContain(secretHex);
     // the Seller's record is its one home
-    expect(Buffer.from((await r.sellerStore.load(flowKey("seller", r.swapId)))!).toString("utf8")).toContain(secretHex);
+    expect(Buffer.from((await r.sellerStore.load(await sellerKeyOf(r.sellerStore)))!).toString("utf8")).toContain(secretHex);
     for (const flow of [r.seller, r.buyer]) {
       expect(JSON.stringify(flow)).not.toContain(secretHex);
       expect(inspect(flow, { depth: Infinity, showHidden: true })).not.toContain(secretHex);

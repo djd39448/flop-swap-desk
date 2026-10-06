@@ -22,6 +22,7 @@ import { describe, expect, it } from "vitest";
 import { RailRecoveryRefusedError } from "../src/client/counter-rail.js";
 import { FlowRecordConflictError, FlowRecordMismatchError, decodeFlowRecord, encodeFlowRecord, type FlowRecord } from "../src/client/flow-record.js";
 import { flowKey } from "../src/client/flow-store.js";
+import { plant, sellerKeyOf } from "./helpers/seller-key.js";
 import { PREFIX, STEPS, SETTLE, readSwap, resumeRole, runScript } from "./helpers/crash-matrix.js";
 import { evmWorld, ledgerWorldWith } from "./helpers/matrix-worlds.js";
 import { ProcessDied, crashRail, failVenuePosts } from "./helpers/resume-flows.js";
@@ -31,12 +32,12 @@ import type { LedgerChain } from "./helpers/ledger-rail.js";
 
 /** Reads a stored record, lets `edit` change it, and stores the result again (valid shape, valid checksum). */
 async function tamper(r: Rig, role: "buyer" | "seller", edit: (record: Record<string, unknown>) => void): Promise<void> {
-  const key = flowKey(role, r.swapId);
+  const key = role === "buyer" ? flowKey("buyer", r.swapId) : await sellerKeyOf(r.sellerStore); // R1-14: seller:<contractA>
   const store = role === "buyer" ? r.buyerStore : r.sellerStore;
   const record = decodeFlowRecord((await store.load(key))!, key);
   const plain = JSON.parse(JSON.stringify(record)) as Record<string, unknown>;
   edit(plain);
-  await store.save(key, encodeFlowRecord(plain as unknown as FlowRecord));
+  await plant(store, key, encodeFlowRecord(plain as unknown as FlowRecord));
 }
 
 const sigOf = (params: unknown): string => base58.encode(Buffer.from(params as string, "base64").subarray(1, 65));

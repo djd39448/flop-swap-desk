@@ -9,6 +9,7 @@ import { tryDecodeFrame, type OfferFrame, type TranscriptRecord } from "@flop-la
 import type { BuyerFlow } from "../../src/client/buyer.js";
 import { decodeFlowRecord, type BuyerFlowRecord, type SellerFlowRecord } from "../../src/client/flow-record.js";
 import { MemoryFlowStore, flowKey } from "../../src/client/flow-store.js";
+import { sellerKeyOf } from "./seller-key.js";
 import type { SellerFlow } from "../../src/client/seller.js";
 import { swapId as computeSwapId } from "../../src/profile.js";
 import { resumeBuyer, resumeSeller } from "./resume-flows.js";
@@ -54,7 +55,7 @@ export async function buyerRecord(r: Rig): Promise<BuyerFlowRecord> {
   return decodeFlowRecord((await r.buyerStore.load(key))!, key) as BuyerFlowRecord;
 }
 export async function sellerRecord(r: Rig): Promise<SellerFlowRecord> {
-  const key = flowKey("seller", r.swapId);
+  const key = await sellerKeyOf(r.sellerStore); // R1-14: seller:<contractA>
   return decodeFlowRecord((await r.sellerStore.load(key))!, key) as SellerFlowRecord;
 }
 

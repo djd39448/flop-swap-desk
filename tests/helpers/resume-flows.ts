@@ -13,6 +13,7 @@ import type { ConnectedCounterAssetRail, CounterAssetRail } from "../../src/clie
 import type { FlowStore } from "../../src/client/flow-store.js";
 import { SellerFlow, type SellerFlowOptions } from "../../src/client/seller.js";
 import type { Venue } from "../../src/client/venue.js";
+import { sellerContractAOrAbsent } from "./seller-key.js";
 
 /** What a "crashed" call throws. */
 export class ProcessDied extends Error {
@@ -71,8 +72,10 @@ export async function resumeBuyer(options: BuyerFlowOptions, store: FlowStore, s
   return BuyerFlow.resume({ ...options, ...extra, store, swapId });
 }
 
+/** A Seller record is keyed by leg A's contract id (R1-14): found through the store's own listing (the one Seller record
+ *  in it), so a test that only knows the swap id still resumes; the swap id rides along as the cross-check. */
 export async function resumeSeller(options: SellerFlowOptions, store: FlowStore, swapId: string, extra: Partial<SellerFlowOptions> = {}) {
-  return SellerFlow.resume({ ...options, ...extra, store, swapId });
+  return SellerFlow.resume({ ...options, ...extra, store, swapId, contractA: await sellerContractAOrAbsent(store) });
 }
 
 /** A venue whose `post` throws for the next `count` lines that satisfy `match` (everything else passes through). */

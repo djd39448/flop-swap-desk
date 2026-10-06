@@ -125,6 +125,7 @@ import {
   FlowRecordMismatchError,
   checkRecordIdentity,
   newSellerRecord,
+  railDeploymentId,
   withLedgerIntent,
   type SellerFlowRecord,
 } from "./flow-record.js";
@@ -175,7 +176,7 @@ export interface SellerFlowOptions {
 /** `SellerFlow.resume` options: the constructor's, plus the store and the swap to continue. `contractA` /
  *  `contractB` are the runner's own knowledge of the two tclk contract ids, if it has any: a stored record that
  *  names another contract stops `resume` with `FlowRecordMismatchError`. */
-export type SellerResumeOptions = SellerFlowOptions & { store: FlowStore; swapId: string; contractA?: string; contractB?: string };
+export type SellerResumeOptions = SellerFlowOptions & { store: FlowStore; contractA: string; swapId?: string; contractB?: string };
 
 export interface AcceptLegAResult {
   acceptA: AcceptFrame;
@@ -376,7 +377,7 @@ export class SellerFlow {
    *  has it (the offers room is a short ring) can pass it to `acceptLegA` again. Public data. */
   get recordedOfferA(): OfferFrame | undefined {
     const record = this.#journal?.record;
-    return record === undefined ? undefined : offerFromSlot(`seller:${record.swapId}`, "offerA", record.frames.offerA);
+    return record === undefined ? undefined : offerFromSlot(`seller:${record.contractA}`, "offerA", record.frames.offerA);
   }
 
   /** P8: public data only (rule 5). `JSON.stringify(flow)` sees nothing else. */
@@ -426,16 +427,18 @@ export class SellerFlow {
   }
 
   private async restore(options: SellerResumeOptions): Promise<void> {
-    const journal = await FlowJournal.open(this.journalDeps(options.store), "seller", options.swapId);
+    // R1-14: a Seller record is keyed by leg A's contract id; the swap id, when the runner has it, is only a cross-check.
+    const journal = await FlowJournal.open(this.journalDeps(options.store), "seller", options.contractA);
     const record = journal.record;
     if (record.role !== "seller") throw new FlowRecordMismatchError("role", "seller", record.role);
     checkRecordIdentity(record, {
       role: "seller",
-      swapId: options.swapId,
+      ...(options.swapId === undefined ? {} : { swapId: options.swapId }),
       did: this.identity.did,
       railId: this.rail.railId,
       caip2: this.rail.caip2,
-      ...(options.contractA === undefined ? {} : { contractA: options.contractA }),
+      deploymentId: railDeploymentId(this.rail), // R1-05: a record never continues against another deployment
+      contractA: options.contractA,
       ...(options.contractB === undefined ? {} : { contractB: options.contractB }),
     });
     this.applyRecord(record);
@@ -447,7 +450,7 @@ export class SellerFlow {
   /** Rebuilds every latch from a stored record, after checking that its frames add up (the contract ids are recomputed,
    *  never trusted). */
   private applyRecord(record: SellerFlowRecord): void {
-    const key = `seller:${record.swapId}`;
+    const key = `seller:${record.contractA}`;
     const f = record.frames;
     const offerA = offerFromSlot(key, "offerA", f.offerA);
     const acceptA = acceptFromSlot(key, "acceptA", f.acceptA);
@@ -614,7 +617,7 @@ export class SellerFlow {
     }
     const acceptARecord = record.frames.acceptA?.record;
     const offerBRecord = record.frames.offerB?.record;
-    if (acceptARecord === undefined || offerBRecord === undefined) throw new FlowStoreCorruptError(`seller:${record.swapId}`, "accept A is recorded as done but its signed records are missing");
+    if (acceptARecord === undefined || offerBRecord === undefined) throw new FlowStoreCorruptError(`seller:${record.contractA}`, "accept A is recorded as done but its signed records are missing");
     return { acceptA: this.acceptA, acceptARecord: recordFromJson(acceptARecord), offerB: this.offerB, offerBRecord: recordFromJson(offerBRecord) };
   }
 
@@ -673,7 +676,7 @@ export class SellerFlow {
     // the secret minted for them. Those exact frames and that secret are reused: a second accept A with another
     // statement would strand the first one's preimage.
     const stored = this.#journal?.record;
-    const storedKey = stored === undefined ? "" : `seller:${stored.swapId}`;
+    const storedKey = stored === undefined ? "" : `seller:${stored.contractA}`;
     const storedAccept = stored === undefined ? undefined : acceptFromSlot(storedKey, "acceptA", stored.frames.acceptA);
     const storedOfferB = stored === undefined ? undefined : offerFromSlot(storedKey, "offerB", stored.frames.offerB);
     let hashLock: HashLock;
@@ -788,12 +791,13 @@ export class SellerFlow {
           did: this.identity.did,
           railId: this.rail.railId,
           caip2: this.rail.caip2,
+          deploymentId: railDeploymentId(this.rail),
           nowMs: this.clock(),
+          contractA: acceptA.contract, // R1-14: the record's key, known before accept A is posted
           preimage: hashLock.preimage,
           statement: hashLock.hash,
         }),
         frames: { offerA: { text: encodeFrameWith(offerA, this.rail.railRegistry) }, acceptA: { text: acceptAText }, offerB: { text: offerBText } },
-        contractA: acceptA.contract,
         lockTimeMs,
         legB: { claimByMs: legB.claimByMs, refundAfterMs: legB.refundAfterMs, expiresMs: legB.expiresMs },
       };

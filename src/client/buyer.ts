@@ -112,6 +112,7 @@ import {
   markerFromJson,
   markerToJson,
   newBuyerRecord,
+  railDeploymentId,
   withLedgerIntent,
   type BuyerFlowRecord,
 } from "./flow-record.js";
@@ -364,6 +365,7 @@ export class BuyerFlow {
       did: this.identity.did,
       railId: this.rail.railId,
       caip2: this.rail.caip2,
+      deploymentId: railDeploymentId(this.rail), // R1-05: a record never continues against another deployment
       ...(options.contractA === undefined ? {} : { contractA: options.contractA }),
       ...(options.contractB === undefined ? {} : { contractB: options.contractB }),
     });
@@ -580,7 +582,7 @@ export class BuyerFlow {
     const text = encodeFrameWith(offerA, this.rail.railRegistry);
     if (this.#journal === undefined) {
       let initial: BuyerFlowRecord = {
-        ...newBuyerRecord({ swapId, did: this.identity.did, railId: this.rail.railId, caip2: this.rail.caip2, nowMs: this.clock() }),
+        ...newBuyerRecord({ swapId, did: this.identity.did, railId: this.rail.railId, caip2: this.rail.caip2, deploymentId: railDeploymentId(this.rail), nowMs: this.clock() }),
         frames: { offerA: { text } },
       };
       initial = withLedgerIntent(initial, { kind: "offer-a", room: OFFER_ROOM, text });

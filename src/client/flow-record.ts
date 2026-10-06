@@ -13,9 +13,16 @@
 //   - `encodeFlowRecord` / `decodeFlowRecord`: the bytes are UTF-8 JSON `{"v":1,"sum":"<sha256>","record":{...}}`
 //     where `sum` is the sha256 of the record's canonical JSON. `decode` is STRICT: invalid JSON, a checksum that does
 //     not match, an unknown version, an unknown field, a wrong type, a preimage on a Buyer record or a preimage that
-//     does not open its statement are all typed errors, never an empty record (rule 6);
+//     does not open its statement are all typed errors, never an empty record (rule 6). A record the BUILDER side
+//     refuses (`encodeFlowRecord`, and every `new*Record` / `with*` helper) is a different error,
+//     `FlowRecordInvalidError`: `FlowStoreCorruptError` keeps one meaning, "the stored bytes failed their checksum or
+//     schema on load" (review round 1, R1-09);
 //   - pure helpers to build and update a record (`newBuyerRecord`, `newSellerRecord`, `withLedgerIntent`,
-//     `withLedgerLanded`, `bumped`) and to check it against the runner's objects (`checkRecordIdentity`).
+//     `withLedgerLanded`, `bumped`) and to check it against the runner's objects (`checkRecordIdentity`);
+//   - the record's KEY (`recordKey`): `buyer:<swapId>` for a Buyer, `seller:<contractA>` for a Seller (R1-14: the swap id
+//     is chosen by the Buyer and nobody can authenticate it, so a Seller record is keyed by leg A's contract id, which
+//     binds the signed offer and the Seller's own accept and is computable before accept A is posted). `decode` checks
+//     the key's id against the record it opened.
 //
 // The frame ledger is how "same bytes, once" (rule 3) works: a frame's exact text is written to the ledger BEFORE
 // `venue.post` (`withLedgerIntent`), and the record's `seq` and `nonce` are added once it landed
@@ -29,7 +36,7 @@ import { createHash } from "node:crypto";
 import { OFFER_ROOM, dealRoom, verifyHashPreimage } from "@flop-labs/tclk";
 
 import type { LockRecovery, RailBlockMarker, RailClaimRecord, RailWriteEvidence } from "./counter-rail.js";
-import { FlowStoreCorruptError, flowKey, parseFlowKey, type FlowRole, type FlowStore } from "./flow-store.js";
+import { FlowStoreCorruptError, flowDigest, flowKey, parseFlowKey, type FlowRole, type FlowStore } from "./flow-store.js";
 
 export const FLOW_RECORD_VERSION = 1 as const;
 
@@ -70,6 +77,21 @@ export class FlowRecordMismatchError extends FlowRecordError {
     this.field = field;
     this.expected = expected;
     this.actual = actual;
+  }
+}
+
+/** A record this build refuses to WRITE: it would not read back (a field of the wrong shape, a list over its cap, a
+ *  reveal-b entry that holds more than a digest, ...). Nothing was saved. Distinct from `FlowStoreCorruptError`, which
+ *  means "the stored bytes failed their checksum or schema on load" (R1-09): a healthy store is never called corrupt
+ *  because the flow tried to save something invalid. */
+export class FlowRecordInvalidError extends FlowRecordError {
+  readonly key: string;
+  readonly reason: string;
+  constructor(key: string, reason: string) {
+    super(`flow record: "${key}" is not a record this build may save: ${reason}`);
+    this.name = "FlowRecordInvalidError";
+    this.key = key;
+    this.reason = reason;
   }
 }
 
@@ -149,7 +171,10 @@ export interface LedgerEntry {
   kind: LedgerKind;
   room: string;
   text: string;
-  landed?: { seq: number; nonce: string | null };
+  /** `record` is the whole signed venue record, kept (R1-12) so a step that is already confirmed can hand back what the
+   *  venue holds without reading the room again. Absent for a kind whose frame slot holds the record, and ALWAYS absent
+   *  for a Buyer's `reveal-b` (its text is held as a digest only: the record's line would carry the secret). */
+  landed?: { seq: number; nonce: string | null; record?: TranscriptRecordJson };
 }
 
 /** `RailAccounts`, as plain data. */
@@ -198,6 +223,9 @@ export interface FlowRecordBase {
   /** The leg A rail's id and chain (CAIP-2), pinned against the runner's rail on resume. */
   railId: string;
   caip2: string;
+  /** The rail's deployment identity (R1-05): which contract, token, program or network the lock was sent to. Pinned
+   *  against the runner's rail on resume: a record written for one deployment never continues against another. */
+  deploymentId: string;
   createdAtMs: number;
   updatedAtMs: number;
   /** 1 on creation, +1 on every save: a stale or replayed record is recognisable. */
@@ -214,6 +242,8 @@ export interface FlowRecordBase {
 }
 
 export interface SellerFlowState {
+  /** Leg A's tclk contract id (`0x` + 64 hex): the record's key (`seller:<contractA>`), set from the record's birth. */
+  contractA: string;
   /** The swap's one secret: `0x` + 64 hex, sha256 of which is `statement`. Never logged, never in a frame before the reveal. */
   preimage: string;
   statement: string;
@@ -321,7 +351,15 @@ export interface NewRecordInit {
   did: string;
   railId: string;
   caip2: string;
+  /** The rail's deployment identity: see `railDeploymentId`. */
+  deploymentId: string;
   nowMs: number;
+}
+
+/** The deployment identity a record pins for `rail`: the rail's own `deploymentId` once its adapter exposes one (R1-05),
+ *  else a value derived from its rail id (which `railId` already pins, so nothing weaker than before is recorded). */
+export function railDeploymentId(rail: { railId: string; deploymentId?: string }): string {
+  return rail.deploymentId ?? `rail:${rail.railId}`;
 }
 
 function base(role: FlowRole, init: NewRecordInit): FlowRecordBase {
@@ -332,6 +370,7 @@ function base(role: FlowRole, init: NewRecordInit): FlowRecordBase {
     did: init.did,
     railId: init.railId,
     caip2: init.caip2,
+    deploymentId: init.deploymentId,
     createdAtMs: init.nowMs,
     updatedAtMs: init.nowMs,
     revision: 1,
@@ -354,10 +393,11 @@ export function newBuyerRecord(init: NewRecordInit): BuyerFlowRecord {
   return checked(record);
 }
 
-export function newSellerRecord(init: NewRecordInit & { preimage: string; statement: string }): SellerFlowRecord {
+export function newSellerRecord(init: NewRecordInit & { contractA: string; preimage: string; statement: string }): SellerFlowRecord {
   const record: SellerFlowRecord = {
     ...base("seller", init),
     role: "seller",
+    contractA: init.contractA,
     preimage: init.preimage,
     statement: init.statement,
     claimAttempted: false,
@@ -389,6 +429,11 @@ export function ledgerEntry(record: FlowRecord, kind: LedgerKind): LedgerEntry |
   return record.ledger.find((entry) => entry.kind === kind);
 }
 
+/** The key a record is stored under: `buyer:<swapId>` for a Buyer, `seller:<contractA>` for a Seller (R1-14). */
+export function recordKey(record: FlowRecord): string {
+  return record.role === "seller" ? flowKey("seller", record.contractA) : flowKey("buyer", record.swapId);
+}
+
 /**
  * Writes the INTENT to post `text` into `room` as `kind`, a copy of the record to persist BEFORE `venue.post`
  * (rule 1). The same kind with the same room and text is a no-op (resume re-announces the identical bytes, rule 3);
@@ -408,8 +453,9 @@ export function withLedgerIntent<T extends FlowRecord>(record: T, entry: { kind:
   return checked(copy);
 }
 
-/** A copy with the venue's `seq` and `nonce` added to the ledger entry of `kind` (idempotent for the same values). */
-export function withLedgerLanded<T extends FlowRecord>(record: T, kind: LedgerKind, landed: { seq: number; nonce: string | null }): T {
+/** A copy with the venue's `seq` and `nonce` (and, where the caller keeps it, the signed record) added to the ledger
+ *  entry of `kind` (idempotent for the same values; a different seq or nonce for a landed entry is a conflict). */
+export function withLedgerLanded<T extends FlowRecord>(record: T, kind: LedgerKind, landed: { seq: number; nonce: string | null; record?: TranscriptRecordJson }): T {
   const existing = ledgerEntry(record, kind);
   if (existing === undefined) throw new FlowRecordConflictError(`flow record: "${kind}" has no ledger entry to mark as landed`);
   if (existing.landed !== undefined) {
@@ -421,7 +467,7 @@ export function withLedgerLanded<T extends FlowRecord>(record: T, kind: LedgerKi
   const copy = cloneFlowRecord(record);
   const entry = ledgerEntry(copy, kind);
   if (entry === undefined) throw new FlowRecordConflictError("flow record: ledger entry vanished on copy"); // unreachable
-  entry.landed = { seq: landed.seq, nonce: landed.nonce };
+  entry.landed = { seq: landed.seq, nonce: landed.nonce, ...(landed.record === undefined ? {} : { record: landed.record }) };
   return checked(copy);
 }
 
@@ -430,20 +476,24 @@ export function redactFlowRecord(record: FlowRecord): Record<string, unknown> {
   const copy = cloneFlowRecord(record) as unknown as Record<string, unknown> & { ledger: LedgerEntry[] };
   if ("preimage" in copy && typeof copy.preimage === "string") {
     const secretHex = copy.preimage.replace(/^0x/, "");
-    // The Seller's reveal frame carries the preimage in its text: that entry is masked too.
+    // The Seller's reveal frame carries the preimage in its text (and in the signed record kept beside it): that entry
+    // is masked too.
     for (const entry of copy.ledger) {
       if (secretHex !== "" && entry.text.includes(secretHex)) entry.text = "[redacted]";
+      if (secretHex !== "" && entry.landed?.record !== undefined && entry.landed.record.line.includes(secretHex)) entry.landed.record.line = "[redacted]";
     }
     copy.preimage = "[redacted]";
   }
   return copy;
 }
 
-/** Throws `FlowRecordMismatchError` unless the record belongs to what the runner supplied. `contractA` / `contractB`
- *  are compared only when BOTH sides know them (a record saved before the accept has none yet). */
+/** Throws `FlowRecordMismatchError` unless the record belongs to what the runner supplied. Every field is compared
+ *  only when BOTH sides know it (`swapId` is optional because a Seller resumes by `contractA`, with the swap id as a
+ *  cross-check only; a Buyer record has no `contractA` / `contractB` yet before its accept). `deploymentId` (R1-05) is
+ *  the rail's deployment identity: a record never continues against another contract, program or network. */
 export function checkRecordIdentity(
   record: FlowRecord,
-  expected: { role: FlowRole; swapId: string; did: string; railId: string; caip2: string; contractA?: string; contractB?: string },
+  expected: { role: FlowRole; swapId?: string; did: string; railId: string; caip2: string; deploymentId?: string; contractA?: string; contractB?: string },
 ): void {
   const compare = (field: string, want: string | undefined, have: string | undefined): void => {
     if (want !== undefined && have !== undefined && want !== have) throw new FlowRecordMismatchError(field, want, have);
@@ -453,6 +503,7 @@ export function checkRecordIdentity(
   compare("did", expected.did, record.did);
   compare("railId", expected.railId, record.railId);
   compare("caip2", expected.caip2, record.caip2);
+  compare("deploymentId", expected.deploymentId, record.deploymentId);
   compare("contractA", expected.contractA, record.contractA);
   compare("contractB", expected.contractB, record.contractB);
 }
@@ -477,21 +528,32 @@ function sha256Hex(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-/** Validates (a record that would not read back is refused here, not discovered at resume) and serialises. */
+/** Validates (a record that would not read back is refused here, not discovered at resume) and serialises. A record
+ *  that fails validation is `FlowRecordInvalidError` naming the offending path, never `FlowStoreCorruptError` (R1-09). */
 export function encodeFlowRecord(record: FlowRecord): Uint8Array {
-  const key = `${record.role}:${record.swapId}`;
+  const key = describeKey(record);
   const plain = JSON.parse(JSON.stringify(record)) as unknown;
-  parseRecord(plain, key); // throws FlowStoreCorruptError with the offending path
+  parseRecord(plain, key, true); // throws FlowRecordInvalidError with the offending path
   const body = canonical(plain);
   const text = `{"v":${FLOW_RECORD_VERSION},"sum":"${sha256Hex(body)}","record":${body}}`;
   const bytes = new TextEncoder().encode(text);
-  if (bytes.length > MAX_FLOW_RECORD_BYTES) throw new FlowRecordError(`flow record: "${key}" is ${bytes.length} bytes, over the ${MAX_FLOW_RECORD_BYTES}-byte cap`);
+  if (bytes.length > MAX_FLOW_RECORD_BYTES) throw new FlowRecordInvalidError(key, `the record is ${bytes.length} bytes, over the ${MAX_FLOW_RECORD_BYTES}-byte cap`);
   return bytes;
+}
+
+/** A label for a record in an error message: its key when it has one, else what it can be called. */
+function describeKey(record: FlowRecord): string {
+  try {
+    return recordKey(record);
+  } catch {
+    return `${String((record as { role?: unknown }).role)}:${String((record as { swapId?: unknown }).swapId)}`;
+  }
 }
 
 /** The record the bytes hold, or a typed error: `FlowStoreCorruptError` (not JSON, checksum mismatch, wrong shape,
  *  an unknown field), `FlowRecordVersionError` (a version this build does not know) or `FlowRecordMismatchError`
- *  (the stored role or swap id is not the one `key` names). Never an empty record. */
+ *  (the stored role is not the one `key` names, or the key's id is not the record's: the swap id for a Buyer record,
+ *  leg A's contract id for a Seller record). Never an empty record. */
 export function decodeFlowRecord(bytes: Uint8Array, key = "<record>"): FlowRecord {
   if (bytes.length > MAX_FLOW_RECORD_BYTES) throw new FlowStoreCorruptError(key, `record is ${bytes.length} bytes, over the ${MAX_FLOW_RECORD_BYTES}-byte cap`);
   let text: string;
@@ -518,25 +580,46 @@ export function decodeFlowRecord(bytes: Uint8Array, key = "<record>"): FlowRecor
   if (inner !== null && typeof inner === "object" && !Array.isArray(inner) && (inner as Record<string, unknown>).v !== FLOW_RECORD_VERSION) {
     throw new FlowRecordVersionError(key, (inner as Record<string, unknown>).v);
   }
-  const record = parseRecord(inner, key);
+  const record = parseRecord(inner, key, false);
   if (key !== "<record>") {
     const named = parseFlowKey(key);
     if (named.role !== record.role) throw new FlowRecordMismatchError("role", named.role, record.role);
-    if (named.swapId !== record.swapId) throw new FlowRecordMismatchError("swapId", named.swapId, record.swapId);
+    if (record.role === "seller") {
+      if (named.swapId !== record.contractA) throw new FlowRecordMismatchError("contractA", named.swapId, record.contractA);
+    } else if (named.swapId !== record.swapId) {
+      throw new FlowRecordMismatchError("swapId", named.swapId, record.swapId);
+    }
   }
   return record;
 }
 
-/** The record stored for (`role`, `swapId`), or `null` when none was ever saved. A damaged one throws (see `decode`). */
-export async function loadFlowRecord(store: FlowStore, role: FlowRole, swapId: string): Promise<FlowRecord | null> {
-  const key = flowKey(role, swapId);
-  const bytes = await store.load(key);
-  return bytes === null ? null : decodeFlowRecord(bytes, key);
+/** A stored record together with the digest `FlowStore.save` wants as `expected` for the next save of it. */
+export interface LoadedFlowRecord {
+  record: FlowRecord;
+  /** sha256 hex of the stored bytes the record was decoded from. */
+  digest: string;
 }
 
-/** Encodes `record` (validating it) and saves it under its own key. Resolves only once the bytes are durable. */
-export async function saveFlowRecord(store: FlowStore, record: FlowRecord): Promise<void> {
-  await store.save(flowKey(record.role, record.swapId), encodeFlowRecord(record));
+/** The record stored for (`role`, `id`) and the digest of its bytes, or `null` when none was ever saved. `id` is the swap
+ *  id for a Buyer and leg A's contract id for a Seller (R1-14). A damaged one throws (see `decodeFlowRecord`). */
+export async function loadFlowRecordWithDigest(store: FlowStore, role: FlowRole, id: string): Promise<LoadedFlowRecord | null> {
+  const key = flowKey(role, id);
+  const bytes = await store.load(key);
+  return bytes === null ? null : { record: decodeFlowRecord(bytes, key), digest: flowDigest(bytes) };
+}
+
+/** The record stored for (`role`, `id`), or `null` when none was ever saved. A damaged one throws (see `decode`). */
+export async function loadFlowRecord(store: FlowStore, role: FlowRole, id: string): Promise<FlowRecord | null> {
+  return (await loadFlowRecordWithDigest(store, role, id))?.record ?? null;
+}
+
+/** Encodes `record` (validating it) and saves it under its own key, as a compare-and-swap: `expected` is the digest of
+ *  the bytes the caller last loaded or wrote (`null` = create). Resolves only once the bytes are durable. Returns the
+ *  digest of the bytes now stored, which is the `expected` of the next save. */
+export async function saveFlowRecord(store: FlowStore, record: FlowRecord, expected: string | null): Promise<string> {
+  const bytes = encodeFlowRecord(record);
+  await store.save(recordKey(record), bytes, expected);
+  return flowDigest(bytes);
 }
 
 // --- the strict reader --------------------------------------------------------------------------------------------------
@@ -551,9 +634,15 @@ const MAX_TEXT = 8192;
 /** Parse, don't validate: turns an untrusted JSON value into the typed record or throws `FlowStoreCorruptError` naming
  *  the first bad path. Every object is closed: an unknown key is an error. */
 class Reader {
-  constructor(private readonly key: string) {}
+  /** `building`: the record is being WRITTEN (encode, or a helper that built it): a failure is `FlowRecordInvalidError`.
+   *  Otherwise the bytes were READ from a store: a failure is `FlowStoreCorruptError` (R1-09). */
+  constructor(
+    private readonly key: string,
+    private readonly building: boolean,
+  ) {}
 
   fail(path: string, message: string): never {
+    if (this.building) throw new FlowRecordInvalidError(this.key, `${path}: ${message}`);
     throw new FlowStoreCorruptError(this.key, `${path}: ${message}`);
   }
 
@@ -712,15 +801,19 @@ class Reader {
   }
 }
 
-const COMMON_REQUIRED = ["v", "role", "swapId", "did", "railId", "caip2", "createdAtMs", "updatedAtMs", "revision", "frames", "ledger"] as const;
-const COMMON_OPTIONAL = ["contractA", "contractB", "lockTimeMs", "legB"] as const;
-const SELLER_REQUIRED = ["preimage", "statement", "claimAttempted", "claimRecords", "neverLandedClaims", "claimOutcome", "revealPosted", "receiptPosted", "legBRefund"] as const;
+const COMMON_REQUIRED = ["v", "role", "swapId", "did", "railId", "caip2", "deploymentId", "createdAtMs", "updatedAtMs", "revision", "frames", "ledger"] as const;
+const COMMON_OPTIONAL = ["contractB", "lockTimeMs", "legB"] as const;
+// A Seller record is keyed by contract A (R1-14), so it has one from birth; a Buyer learns it with accept A.
+const SELLER_REQUIRED = ["contractA", "preimage", "statement", "claimAttempted", "claimRecords", "neverLandedClaims", "claimOutcome", "revealPosted", "receiptPosted", "legBRefund"] as const;
 const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature"] as const;
 const BUYER_REQUIRED = ["legBVerified", "lock", "legBClaimAttempted", "legBClaimed", "refund", "refundNotes"] as const;
-const BUYER_OPTIONAL = ["ownAccountLine"] as const;
+const BUYER_OPTIONAL = ["contractA", "ownAccountLine"] as const;
 
-function parseRecord(value: unknown, key: string): FlowRecord {
-  const r: Reader = new Reader(key);
+/** A Buyer's `reveal-b` entry holds only the digest of the reveal text (R1-18): the full text carries the secret. */
+const DIGEST_TEXT = /^sha256:[0-9a-f]{64}$/;
+
+function parseRecord(value: unknown, key: string, building: boolean): FlowRecord {
+  const r: Reader = new Reader(key, building);
   const path = "record";
   if (value === null || typeof value !== "object" || Array.isArray(value)) r.fail(path, "must be an object");
   const role = (value as Record<string, unknown>).role;
@@ -755,15 +848,17 @@ function parseRecord(value: unknown, key: string): FlowRecord {
     path,
   );
 
-  const ledger = parseLedger(r, o.ledger, `${path}.ledger`, role, contractA, contractB);
+  const did = r.string(o.did, `${path}.did`, { pattern: DID });
+  const ledger = parseLedger(r, o.ledger, `${path}.ledger`, role, did, contractA, contractB);
 
   const common: FlowRecordBase = {
     v: FLOW_RECORD_VERSION,
     role,
     swapId,
-    did: r.string(o.did, `${path}.did`, { pattern: DID }),
+    did,
     railId: r.string(o.railId, `${path}.railId`, { max: 128 }),
     caip2: r.string(o.caip2, `${path}.caip2`, { max: 128 }),
+    deploymentId: r.string(o.deploymentId, `${path}.deploymentId`, { max: 512 }),
     createdAtMs,
     updatedAtMs,
     revision: r.int(o.revision, `${path}.revision`, 1),
@@ -778,7 +873,7 @@ function parseRecord(value: unknown, key: string): FlowRecord {
   return role === "seller" ? parseSeller(r, o, path, common) : parseBuyer(r, o, path, common);
 }
 
-function parseLedger(r: Reader, value: unknown, path: string, role: FlowRole, contractA: string | undefined, contractB: string | undefined): LedgerEntry[] {
+function parseLedger(r: Reader, value: unknown, path: string, role: FlowRole, did: string, contractA: string | undefined, contractB: string | undefined): LedgerEntry[] {
   const allowed = role === "buyer" ? BUYER_KINDS : SELLER_KINDS;
   const seen = new Set<string>();
   return r.array(value, path, 64).map((item, i) => {
@@ -796,16 +891,31 @@ function parseLedger(r: Reader, value: unknown, path: string, role: FlowRole, co
       const contract = KIND_CONTRACT[kind] === "contractA" ? contractA : contractB;
       if (contract !== undefined && room !== dealRoom(contract)) r.fail(`${p}.room`, "is not the deal room of this kind's contract");
     }
-    const entry: LedgerEntry = { kind: kind as LedgerKind, room, text: r.line(o.text, `${p}.text`) };
+    const text = r.line(o.text, `${p}.text`);
+    // R1-18: the Buyer never holds the secret. Its reveal-b entry is the digest of the text, whatever a caller passes.
+    const digestOnly = role === "buyer" && kind === "reveal-b";
+    if (digestOnly && !DIGEST_TEXT.test(text)) r.fail(`${p}.text`, "a Buyer's reveal-b entry may hold only the sha256 digest of the reveal text, never the text (it carries the secret)");
+    const entry: LedgerEntry = { kind: kind as LedgerKind, room, text };
     if ("landed" in o) {
-      const l = r.object(o.landed, `${p}.landed`, ["seq", "nonce"]);
-      entry.landed = { seq: r.int(l.seq, `${p}.landed.seq`, 1), nonce: r.nullableString(l.nonce, `${p}.landed.nonce`) };
+      const l = r.object(o.landed, `${p}.landed`, ["seq", "nonce"], ["record"]);
+      const seq = r.int(l.seq, `${p}.landed.seq`, 1);
+      const nonce = r.nullableString(l.nonce, `${p}.landed.nonce`);
+      const record = r.optional(l, "record", (v, rp) => r.transcriptRecord(v, rp), `${p}.landed`);
+      if (record !== undefined) {
+        if (digestOnly) r.fail(`${p}.landed.record`, "must be absent for a reveal-b entry: its line carries the secret");
+        if (record.room !== room || record.line !== text || record.seq !== seq || record.nonce !== nonce || record.sender !== did) {
+          r.fail(`${p}.landed.record`, "is not this party's own record of the entry's text, room, seq and nonce");
+        }
+      }
+      entry.landed = { seq, nonce, ...(record === undefined ? {} : { record }) };
     }
     return entry;
   });
 }
 
 function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common: FlowRecordBase): SellerFlowRecord {
+  const contractA = common.contractA;
+  if (contractA === undefined) r.fail(`${path}.contractA`, "is required: a Seller record is keyed by leg A's contract id"); // unreachable: the field is required
   const preimage = r.string(o.preimage, `${path}.preimage`, { pattern: HEX32 });
   const statement = r.string(o.statement, `${path}.statement`, { pattern: HEX32 });
   if (!verifyHashPreimage(statement, preimage)) r.fail(`${path}.preimage`, "does not open the statement");
@@ -837,6 +947,7 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
   return {
     ...common,
     role: "seller",
+    contractA,
     preimage,
     statement,
     ...(attemptedAcceptB === undefined ? {} : { attemptedAcceptB }),
@@ -923,8 +1034,9 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
   };
 }
 
-/** Runs the reader over a record the caller just built, so a bad one never leaves the helper that made it. */
+/** Runs the reader over a record the caller just built, so a bad one never leaves the helper that made it. A failure is
+ *  `FlowRecordInvalidError` (R1-09). */
 function checked<T extends FlowRecord>(record: T): T {
-  parseRecord(JSON.parse(JSON.stringify(record)) as unknown, `${record.role}:${record.swapId}`);
+  parseRecord(JSON.parse(JSON.stringify(record)) as unknown, describeKey(record), true);
   return record;
 }

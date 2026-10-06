@@ -391,7 +391,7 @@ describe("Resume: a flow process dies mid-swap on a real anvil node and a fresh 
     expect(framesIn(await w.venue.read(dealRoom(p.acceptA.contract)), "reveal")).toHaveLength(0);
 
     const restarted = w.sellerProc();
-    const resumed = await SellerFlow.resume({ ...restarted.options, swapId: p.swapId });
+    const resumed = await SellerFlow.resume({ ...restarted.options, swapId: p.swapId, contractA: p.acceptA.contract });
     expect(resumed.next).toBe("claimLegA");
     expect(resumed.flow.statement).toBe(p.statement);
     const claimed = await resumed.flow.claimLegA(p.statement);
@@ -401,7 +401,7 @@ describe("Resume: a flow process dies mid-swap on a real anvil node and a fresh 
     const roomA = await w.venue.read(dealRoom(p.acceptA.contract));
     expect(framesIn(roomA, "reveal")).toHaveLength(1);
     expect(framesIn(roomA, "receipt")).toHaveLength(1);
-    expect((await SellerFlow.resume({ ...w.sellerProc().options, swapId: p.swapId })).next).toBe("done");
+    expect((await SellerFlow.resume({ ...w.sellerProc().options, swapId: p.swapId, contractA: p.acceptA.contract })).next).toBe("done");
 
     await w.mineBlocks(2);
     const secret = await buyerFlow.learnSecret();
@@ -436,7 +436,7 @@ describe("Resume: a flow process dies mid-swap on a real anvil node and a fresh 
     expect(await chainEvents(p.statement)).toEqual({ locked: 1, claimed: 1, refunded: 0 });
 
     const restarted = w.sellerProc();
-    const resumed = await SellerFlow.resume({ ...restarted.options, swapId: p.swapId });
+    const resumed = await SellerFlow.resume({ ...restarted.options, swapId: p.swapId, contractA: p.acceptA.contract });
     expect(resumed.next).toBe("claimLegA");
     const claimed = await resumed.flow.claimLegA(p.statement);
     expect(claimed.reveal).toBeDefined();

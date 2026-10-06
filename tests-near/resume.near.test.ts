@@ -146,7 +146,7 @@ describe("Resume on a real near-sandbox node: a Seller whose claim landed and wh
 
     // A new process: nothing in memory, only the Seller's store directory.
     const restarted = sellerProc();
-    const resumed = await SellerFlow.resume({ ...restarted.options, swapId });
+    const resumed = await SellerFlow.resume({ ...restarted.options, swapId, contractA: acceptA.contract });
     expect(resumed.next).toBe("claimLegA");
     expect(resumed.flow.statement).toBe(statement);
     const claimed = await resumed.flow.claimLegA(statement);
@@ -158,7 +158,7 @@ describe("Resume on a real near-sandbox node: a Seller whose claim landed and wh
     expect(framesIn(after, "receipt")).toHaveLength(1);
     await resumed.flow.claimLegA(statement); // confirmed: the recorded frames, nothing posted again
     expect((await venue.read(roomA)).length).toBe(after.length);
-    expect((await SellerFlow.resume({ ...sellerProc().options, swapId })).next).toBe("done");
+    expect((await SellerFlow.resume({ ...sellerProc().options, swapId, contractA: acceptA.contract })).next).toBe("done");
 
     const secret = await buyerFlow.learnSecret();
     expect(verifyHashPreimage(statement, secret)).toBe(true);

@@ -31,8 +31,8 @@ export class RecordingStore implements FlowStore {
   load(key: string): Promise<Uint8Array | null> {
     return this.inner.load(key);
   }
-  async save(key: string, bytes: Uint8Array): Promise<void> {
-    await this.inner.save(key, bytes);
+  async save(key: string, bytes: Uint8Array, expected: string | null): Promise<void> {
+    await this.inner.save(key, bytes, expected);
     this.saved.push(decoder.decode(bytes));
   }
   list(): Promise<string[]> {

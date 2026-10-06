@@ -19,6 +19,7 @@ import { LockPendingError, type BidParams } from "../../src/client/buyer.js";
 import { createEvmCounterRail } from "../../src/client/evm-rail.js";
 import { decodeFlowRecord } from "../../src/client/flow-record.js";
 import { MemoryFlowStore, flowKey } from "../../src/client/flow-store.js";
+import { sellerKeyOf } from "./seller-key.js";
 import { createNearCounterRail } from "../../src/client/near-rail.js";
 import { MemoryVenue } from "../../src/client/venue.js";
 import { swapId as computeSwapId } from "../../src/profile.js";
@@ -169,7 +170,7 @@ export const solWorld: WorldFactory = (ctl): World => {
     settlePending: async (role, error) => {
       // A signed transaction whose blockhash is still valid is "pending". Let its blockhash expire on the chain with no status for the
       // old signature: from then on "never landed" is provable and a fresh transaction may be signed.
-      const key = flowKey(role, swapId);
+      const key = role === "buyer" ? flowKey("buyer", swapId) : await sellerKeyOf(sellerStore); // R1-14: a Seller is keyed by contract A
       const record = decodeFlowRecord((await (role === "buyer" ? buyerStore : sellerStore).load(key))!, key);
       let height: number | undefined;
       const message = error instanceof Error ? error.message : "";

@@ -20,6 +20,7 @@ import {
   FLOW_RECORD_VERSION,
   FlowRecordConflictError,
   FlowRecordError,
+  FlowRecordInvalidError,
   FlowRecordMismatchError,
   FlowRecordVersionError,
   bumped,
@@ -31,17 +32,20 @@ import {
   evidenceToJson,
   ledgerEntry,
   loadFlowRecord,
+  loadFlowRecordWithDigest,
   markerFromJson,
   markerToJson,
   newBuyerRecord,
   newSellerRecord,
+  railDeploymentId,
+  recordKey,
   redactFlowRecord,
   saveFlowRecord,
   withLedgerIntent,
   withLedgerLanded,
   type FlowRecord,
 } from "../src/client/flow-record.js";
-import { FileFlowStore, FlowStoreCorruptError, MemoryFlowStore, flowKey } from "../src/client/flow-store.js";
+import { FileFlowStore, FlowRecordStaleError, FlowStoreCorruptError, MemoryFlowStore, flowDigest, flowKey } from "../src/client/flow-store.js";
 import {
   FORBIDDEN_FIELD_PATTERN,
   SAMPLE_BUYER,
@@ -80,7 +84,7 @@ const plain = (record: FlowRecord): Record<string, unknown> => JSON.parse(JSON.s
 describe("round trip", () => {
   it.each(sampleRecords().map((r) => [r.role, r] as const))("a fully populated %s record decodes to exactly what was encoded", (_role, record) => {
     const encoded = encodeFlowRecord(record);
-    const decoded = decodeFlowRecord(encoded, flowKey(record.role, record.swapId));
+    const decoded = decodeFlowRecord(encoded, recordKey(record));
     expect(decoded).toEqual(record);
     // and the bytes are stable: encoding what was decoded gives the same bytes
     expect(text(encodeFlowRecord(decoded))).toBe(text(encoded));
@@ -96,18 +100,38 @@ describe("round trip", () => {
   });
 
   it("fresh records are valid and minimal", () => {
-    const buyer = newBuyerRecord({ swapId: SAMPLE_SWAP_ID, did: SAMPLE_BUYER.did, railId: "evm-htlc", caip2: "eip155:31337", nowMs: 1_700_000_000_000 });
+    const buyer = newBuyerRecord({ swapId: SAMPLE_SWAP_ID, did: SAMPLE_BUYER.did, railId: "evm-htlc", caip2: "eip155:31337", deploymentId: "evm:0xrail:0xtoken", nowMs: 1_700_000_000_000 });
     expect(buyer).toMatchObject({ v: 1, role: "buyer", revision: 1, lock: { attempted: false, framePosted: false }, legBClaimAttempted: false, legBClaimed: false, ledger: [], refundNotes: [] });
     expect(decodeFlowRecord(encodeFlowRecord(buyer))).toEqual(buyer);
-    const seller = newSellerRecord({ swapId: SAMPLE_SWAP_ID, did: SAMPLE_SELLER.did, railId: "evm-htlc", caip2: "eip155:31337", nowMs: 1_700_000_000_000, preimage: SAMPLE_PREIMAGE, statement: SAMPLE_STATEMENT });
-    expect(seller).toMatchObject({ v: 1, role: "seller", revision: 1, claimAttempted: false, claimOutcome: "none", claimRecords: [], revealPosted: false });
+    const seller = newSellerRecord({
+      swapId: SAMPLE_SWAP_ID,
+      did: SAMPLE_SELLER.did,
+      railId: "evm-htlc",
+      caip2: "eip155:31337",
+      deploymentId: "evm:0xrail:0xtoken",
+      nowMs: 1_700_000_000_000,
+      contractA: SAMPLE_CONTRACT_A,
+      preimage: SAMPLE_PREIMAGE,
+      statement: SAMPLE_STATEMENT,
+    });
+    expect(seller).toMatchObject({ v: 1, role: "seller", revision: 1, contractA: SAMPLE_CONTRACT_A, claimAttempted: false, claimOutcome: "none", claimRecords: [], revealPosted: false });
     expect(decodeFlowRecord(encodeFlowRecord(seller))).toEqual(seller);
   });
 
   it("refuses to build a Seller record whose preimage does not open its statement", () => {
     expect(() =>
-      newSellerRecord({ swapId: SAMPLE_SWAP_ID, did: SAMPLE_SELLER.did, railId: "evm-htlc", caip2: "eip155:31337", nowMs: 1, preimage: `0x${"11".repeat(32)}`, statement: SAMPLE_STATEMENT }),
-    ).toThrow(FlowStoreCorruptError);
+      newSellerRecord({
+        swapId: SAMPLE_SWAP_ID,
+        did: SAMPLE_SELLER.did,
+        railId: "evm-htlc",
+        caip2: "eip155:31337",
+        deploymentId: "evm:0xrail:0xtoken",
+        nowMs: 1,
+        contractA: SAMPLE_CONTRACT_A,
+        preimage: `0x${"11".repeat(32)}`,
+        statement: SAMPLE_STATEMENT,
+      }),
+    ).toThrow(FlowRecordInvalidError); // R1-09: a record the builder refuses is not a corrupt STORED record
   });
 
   it("keeps non-ASCII text intact (a UTF-8 round trip)", () => {
@@ -123,7 +147,7 @@ describe("rule 6: damage is a typed error, never an empty record", () => {
   it("empty, truncated, non-UTF-8 and non-JSON bytes", () => {
     const full = good();
     for (const damaged of [new Uint8Array(0), full.subarray(0, full.length - 7), full.subarray(0, 12), Uint8Array.from([0xff, 0xfe, 0x7b, 0x7d]), bytes("not json at all")]) {
-      expect(() => decodeFlowRecord(damaged, "seller:" + SAMPLE_SWAP_ID)).toThrow(FlowStoreCorruptError);
+      expect(() => decodeFlowRecord(damaged, "seller:" + SAMPLE_CONTRACT_A)).toThrow(FlowStoreCorruptError);
     }
   });
 
@@ -154,7 +178,7 @@ describe("rule 6: damage is a typed error, never an empty record", () => {
     for (const v of [2, 0, "1", null, 1.5]) {
       const error = (() => {
         try {
-          decodeFlowRecord(envelope(record, { v }), "seller:" + SAMPLE_SWAP_ID);
+          decodeFlowRecord(envelope(record, { v }), "seller:" + SAMPLE_CONTRACT_A);
           return undefined;
         } catch (e) {
           return e;
@@ -189,7 +213,7 @@ describe("rule 6: damage is a typed error, never an empty record", () => {
     (record.legBRefund as Record<string, unknown>).done = "yes";
     const error = (() => {
       try {
-        decodeFlowRecord(envelope(record), "seller:" + SAMPLE_SWAP_ID);
+        decodeFlowRecord(envelope(record), "seller:" + SAMPLE_CONTRACT_A);
         return undefined;
       } catch (e) {
         return e;
@@ -197,19 +221,36 @@ describe("rule 6: damage is a typed error, never an empty record", () => {
     })();
     expect(error).toBeInstanceOf(FlowStoreCorruptError);
     expect((error as FlowStoreCorruptError).reason).toMatch(/record\.legBRefund\.done/);
-    expect((error as FlowStoreCorruptError).key).toBe("seller:" + SAMPLE_SWAP_ID);
+    expect((error as FlowStoreCorruptError).key).toBe("seller:" + SAMPLE_CONTRACT_A);
   });
 
-  it("a record cannot be encoded if it would not read back", () => {
+  it("a record cannot be encoded if it would not read back: FlowRecordInvalidError, never FlowStoreCorruptError (R1-09)", () => {
     const broken = sampleBuyerRecord();
     (broken as { revision: number }).revision = 0;
-    expect(() => encodeFlowRecord(broken)).toThrow(FlowStoreCorruptError);
+    const error = (() => {
+      try {
+        encodeFlowRecord(broken);
+        return undefined;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(error).toBeInstanceOf(FlowRecordInvalidError);
+    expect(error).not.toBeInstanceOf(FlowStoreCorruptError);
+    expect((error as FlowRecordInvalidError).reason).toMatch(/record\.revision/);
+    expect((error as FlowRecordInvalidError).key).toBe(recordKey(broken));
   });
 });
 
 describe("the closed schema: every field type, every unknown field", () => {
   type Mutation = [label: string, edit: (record: Record<string, unknown>) => void];
   const at = (record: Record<string, unknown>, ...path: string[]): Record<string, unknown> => path.reduce((o, k) => o[k] as Record<string, unknown>, record);
+  /** A well-formed signed-record JSON for ledger entry `i` of `r`, to be broken one field at a time. */
+  const landedRecordOf = (r: Record<string, unknown>, i: number): Record<string, unknown> => {
+    const entry = (r.ledger as Array<Record<string, unknown>>)[i]!;
+    const landed = entry.landed as { seq: number; nonce: string | null };
+    return { room: entry.room, seq: landed.seq, timestampMs: 1, sender: r.did, nonce: landed.nonce, signature: "sig", line: entry.text };
+  };
 
   const common: Mutation[] = [
     ["an unknown top-level field", (r) => void (r.surprise = 1)],
@@ -217,6 +258,10 @@ describe("the closed schema: every field type, every unknown field", () => {
     ["swapId in upper case", (r) => void (r.swapId = SAMPLE_SWAP_ID.toUpperCase().replace("0X", "0x"))],
     ["a did that is not did:key", (r) => void (r.did = "alice")],
     ["an empty railId", (r) => void (r.railId = "")],
+    ["no deploymentId (R1-05: required for every record created from now on)", (r) => void delete r.deploymentId],
+    ["an empty deploymentId", (r) => void (r.deploymentId = "")],
+    ["a deploymentId that is not a string", (r) => void (r.deploymentId = 7)],
+    ["a deploymentId over 512 characters", (r) => void (r.deploymentId = "d".repeat(513))],
     ["a non-integer createdAtMs", (r) => void (r.createdAtMs = 1.5)],
     ["a negative createdAtMs", (r) => void (r.createdAtMs = -1)],
     ["updatedAtMs before createdAtMs", (r) => void (r.updatedAtMs = 5)],
@@ -236,6 +281,10 @@ describe("the closed schema: every field type, every unknown field", () => {
     ["a ledger kind that does not exist", (r) => void (((r.ledger as unknown[])[0] as Record<string, unknown>).kind = "refund-c")],
     ["a ledger entry with an extra field", (r) => void (((r.ledger as unknown[])[0] as Record<string, unknown>).extra = 1)],
     ["a ledger entry landed at seq 0", (r) => void (((r.ledger as Array<Record<string, unknown>>)[0]!.landed as Record<string, unknown>).seq = 0)],
+    ["a landed record whose line is not the entry's text", (r) => void (((r.ledger as Array<Record<string, unknown>>)[0]!.landed as Record<string, unknown>).record = { ...landedRecordOf(r, 0), line: "tclk1 {\"other\":1}" })],
+    ["a landed record whose seq is not the mark's seq", (r) => void (((r.ledger as Array<Record<string, unknown>>)[0]!.landed as Record<string, unknown>).record = { ...landedRecordOf(r, 0), seq: 99 })],
+    ["a landed record whose room is not the entry's room", (r) => void (((r.ledger as Array<Record<string, unknown>>)[0]!.landed as Record<string, unknown>).record = { ...landedRecordOf(r, 0), room: "tclk-other" })],
+    ["a landed record sent by another party", (r) => void (((r.ledger as Array<Record<string, unknown>>)[0]!.landed as Record<string, unknown>).record = { ...landedRecordOf(r, 0), sender: "did:key:zOther" })],
     ["a ledger entry with a multi-line text", (r) => void (((r.ledger as unknown[])[0] as Record<string, unknown>).text = "a\nb")],
     ["a duplicate ledger kind", (r) => void (r.ledger as unknown[]).push({ ...((r.ledger as unknown[])[0] as Record<string, unknown>) })],
     ["an offers-room kind posted to a deal room", (r) => void (((r.ledger as unknown[])[0] as Record<string, unknown>).room = dealRoom(SAMPLE_CONTRACT_A))],
@@ -247,6 +296,9 @@ describe("the closed schema: every field type, every unknown field", () => {
     ["a preimage on a Buyer record (rule 5: it lives only in the Seller's record)", (r) => void (r.preimage = SAMPLE_PREIMAGE)],
     ["a statement on a Buyer record", (r) => void (r.statement = SAMPLE_STATEMENT)],
     ["a Seller-only ledger kind", (r) => void (r.ledger as unknown[]).push({ kind: "accept-a", room: OFFER_ROOM, text: "tclk1 {}" })],
+    ["a reveal-b entry that holds the full reveal text instead of its digest (R1-18)", (r) => void (((r.ledger as unknown[])[4] as Record<string, unknown>).text = "tclk1 {\"type\":\"reveal\"}")],
+    ["a reveal-b digest in upper case", (r) => void (((r.ledger as unknown[])[4] as Record<string, unknown>).text = `sha256:${"3C".repeat(32)}`)],
+    ["a reveal-b entry with a landed record (its line would carry the secret)", (r) => void (((r.ledger as unknown[])[4] as Record<string, unknown>).landed = { seq: 7, nonce: null, record: { room: dealRoom(SAMPLE_CONTRACT_B), seq: 7, timestampMs: 1, sender: r.did, nonce: null, signature: "s", line: `sha256:${"3c".repeat(32)}` } })],
     ["legBVerified as a string", (r) => void (r.legBVerified = "true")],
     ["lock missing", (r) => void delete r.lock],
     ["lock with an unknown field", (r) => void (at(r, "lock").secret = "x")],
@@ -271,6 +323,8 @@ describe("the closed schema: every field type, every unknown field", () => {
 
   const sellerOnly: Mutation[] = [
     ["a Seller record with no preimage", (r) => void delete r.preimage],
+    ["a Seller record with no contractA (R1-14: it is the record's key, so it exists from birth)", (r) => void delete r.contractA],
+    ["a Seller record whose contractA is not 0x + 64 hex", (r) => void (r.contractA = "contract")],
     ["a preimage that does not open the statement", (r) => void (r.preimage = `0x${"22".repeat(32)}`)],
     ["a preimage that is not 0x + 64 hex", (r) => void (r.preimage = "secret")],
     ["a Buyer-only field on a Seller record", (r) => void (r.legBVerified = true)],
@@ -373,12 +427,12 @@ describe("rule 5: the preimage lives in exactly one place", () => {
 describe("the key pins the record", () => {
   it("a record stored under another role's or another swap's key is a mismatch, not a resume", () => {
     const bytesOfBuyer = encodeFlowRecord(sampleBuyerRecord());
-    expect(() => decodeFlowRecord(bytesOfBuyer, flowKey("seller", SAMPLE_SWAP_ID))).toThrow(FlowRecordMismatchError);
+    expect(() => decodeFlowRecord(bytesOfBuyer, flowKey("seller", SAMPLE_CONTRACT_A))).toThrow(FlowRecordMismatchError);
     expect(() => decodeFlowRecord(bytesOfBuyer, flowKey("buyer", `0x${"01".repeat(32)}`))).toThrow(FlowRecordMismatchError);
     expect(() => decodeFlowRecord(bytesOfBuyer, flowKey("buyer", SAMPLE_SWAP_ID))).not.toThrow();
     const error = (() => {
       try {
-        decodeFlowRecord(bytesOfBuyer, flowKey("seller", SAMPLE_SWAP_ID));
+        decodeFlowRecord(bytesOfBuyer, flowKey("seller", SAMPLE_CONTRACT_A));
         return undefined;
       } catch (e) {
         return e;
@@ -389,14 +443,22 @@ describe("the key pins the record", () => {
 });
 
 describe("checkRecordIdentity: the runner's DID, rail, chain and contracts must match", () => {
-  const expected = () => ({ role: "seller" as const, swapId: SAMPLE_SWAP_ID, did: SAMPLE_SELLER.did, railId: "trustcore.sol-htlc-v1", caip2: "solana:localnet-flop" });
+  const expected = () => ({
+    role: "seller" as const,
+    swapId: SAMPLE_SWAP_ID,
+    did: SAMPLE_SELLER.did,
+    railId: "trustcore.sol-htlc-v1",
+    caip2: "solana:localnet-flop",
+    deploymentId: "sol:program-sample:mint-sample",
+  });
 
   it("passes when everything matches (contracts only when both sides know them)", () => {
     const record = sampleSellerRecord();
     expect(() => checkRecordIdentity(record, expected())).not.toThrow();
     expect(() => checkRecordIdentity(record, { ...expected(), contractA: SAMPLE_CONTRACT_A, contractB: SAMPLE_CONTRACT_B })).not.toThrow();
-    const young = newSellerRecord({ ...expected(), nowMs: 1, preimage: SAMPLE_PREIMAGE, statement: SAMPLE_STATEMENT });
-    expect(() => checkRecordIdentity(young, { ...expected(), contractA: SAMPLE_CONTRACT_A })).not.toThrow(); // the record has none yet
+    const young = newBuyerRecord({ ...expected(), nowMs: 1 });
+    expect(() => checkRecordIdentity(young, { ...expected(), role: "buyer", contractA: SAMPLE_CONTRACT_A })).not.toThrow(); // a Buyer record has none yet
+    expect(() => checkRecordIdentity(record, { role: "seller", did: SAMPLE_SELLER.did, railId: "trustcore.sol-htlc-v1", caip2: "solana:localnet-flop" })).not.toThrow(); // a Seller resumes by contractA: swapId is optional
   });
 
   it.each([
@@ -405,6 +467,7 @@ describe("checkRecordIdentity: the runner's DID, rail, chain and contracts must 
     ["did", { did: SAMPLE_BUYER.did }],
     ["railId", { railId: "evm-htlc" }],
     ["caip2", { caip2: "solana:devnet" }],
+    ["deploymentId", { deploymentId: "sol:another-program:mint-sample" }],
     ["contractA", { contractA: `0x${"03".repeat(32)}` }],
     ["contractB", { contractB: `0x${"04".repeat(32)}` }],
   ])("a different %s is a FlowRecordMismatchError naming it", (field, change) => {
@@ -424,7 +487,7 @@ describe("checkRecordIdentity: the runner's DID, rail, chain and contracts must 
 describe("rule 3: the frame ledger", () => {
   const roomA = dealRoom(SAMPLE_CONTRACT_A);
   const fresh = () => {
-    const record = newBuyerRecord({ swapId: SAMPLE_SWAP_ID, did: SAMPLE_BUYER.did, railId: "evm-htlc", caip2: "eip155:31337", nowMs: 1 });
+    const record = newBuyerRecord({ swapId: SAMPLE_SWAP_ID, did: SAMPLE_BUYER.did, railId: "evm-htlc", caip2: "eip155:31337", deploymentId: "evm:0xrail:0xtoken", nowMs: 1 });
     return { ...record, contractA: SAMPLE_CONTRACT_A };
   };
 
@@ -444,8 +507,8 @@ describe("rule 3: the frame ledger", () => {
   });
 
   it("refuses an entry the role never posts or whose room does not fit (the record stays valid)", () => {
-    expect(() => withLedgerIntent(fresh(), { kind: "accept-a", room: OFFER_ROOM, text: "tclk1 {}" })).toThrow(FlowStoreCorruptError);
-    expect(() => withLedgerIntent(fresh(), { kind: "lock-a", room: dealRoom(SAMPLE_CONTRACT_B), text: "tclk1 {}" })).toThrow(FlowStoreCorruptError);
+    expect(() => withLedgerIntent(fresh(), { kind: "accept-a", room: OFFER_ROOM, text: "tclk1 {}" })).toThrow(FlowRecordInvalidError);
+    expect(() => withLedgerIntent(fresh(), { kind: "lock-a", room: dealRoom(SAMPLE_CONTRACT_B), text: "tclk1 {}" })).toThrow(FlowRecordInvalidError);
   });
 
   it("marks an entry landed with the venue's seq and nonce; repeating the same is a no-op, a different seq is a conflict", () => {
@@ -523,52 +586,182 @@ describe("loadFlowRecord / saveFlowRecord over both stores", () => {
 
   it("returns null when nothing was saved, and the record when it was (memory store)", async () => {
     const store = new MemoryFlowStore();
-    expect(await loadFlowRecord(store, "seller", SAMPLE_SWAP_ID)).toBeNull();
+    expect(await loadFlowRecord(store, "seller", SAMPLE_CONTRACT_A)).toBeNull();
     const record = sampleSellerRecord();
-    await saveFlowRecord(store, record);
-    expect(await store.list()).toEqual([flowKey("seller", SAMPLE_SWAP_ID)]);
-    expect(await loadFlowRecord(store, "seller", SAMPLE_SWAP_ID)).toEqual(record);
+    await saveFlowRecord(store, record, null);
+    expect(await store.list()).toEqual([flowKey("seller", SAMPLE_CONTRACT_A)]); // a Seller record is keyed by contractA (R1-14)
+    expect(await loadFlowRecord(store, "seller", SAMPLE_CONTRACT_A)).toEqual(record);
+    expect(await loadFlowRecord(store, "seller", SAMPLE_SWAP_ID)).toBeNull(); // the swap id is not its key
     expect(await loadFlowRecord(store, "buyer", SAMPLE_SWAP_ID)).toBeNull();
   });
 
   it("round-trips through a file store, and a fresh instance (a restarted process) reads the same record", async () => {
     const dir = join(root, "flows");
-    await saveFlowRecord(new FileFlowStore(dir), sampleBuyerRecord());
+    await saveFlowRecord(new FileFlowStore(dir), sampleBuyerRecord(), null);
     expect(await loadFlowRecord(new FileFlowStore(dir), "buyer", SAMPLE_SWAP_ID)).toEqual(sampleBuyerRecord());
   });
 
   it("a damaged file is a typed error from load, never null: a corrupt store header, and a corrupt record under a valid header", async () => {
     const dir = join(root, "flows");
     const store = new FileFlowStore(dir);
-    await saveFlowRecord(store, sampleSellerRecord());
-    const file = join(dir, `seller-${SAMPLE_SWAP_ID}.json`);
+    await saveFlowRecord(store, sampleSellerRecord(), null);
+    const file = join(dir, `seller-${SAMPLE_CONTRACT_A}.json`);
     const whole = readFileSync(file);
     writeFileSync(file, whole.subarray(0, whole.length - 9)); // truncated on disk
-    await expect(loadFlowRecord(store, "seller", SAMPLE_SWAP_ID)).rejects.toThrow(FlowStoreCorruptError);
+    await expect(loadFlowRecord(store, "seller", SAMPLE_CONTRACT_A)).rejects.toThrow(FlowStoreCorruptError);
     // a store that hands back bytes that are not a record at all
     const memory = new MemoryFlowStore();
-    await memory.save(flowKey("seller", SAMPLE_SWAP_ID), bytes("{}"));
-    await expect(loadFlowRecord(memory, "seller", SAMPLE_SWAP_ID)).rejects.toThrow(FlowRecordVersionError);
-    await memory.save(flowKey("seller", SAMPLE_SWAP_ID), bytes("garbage"));
-    await expect(loadFlowRecord(memory, "seller", SAMPLE_SWAP_ID)).rejects.toThrow(FlowStoreCorruptError);
+    const key = flowKey("seller", SAMPLE_CONTRACT_A);
+    await memory.save(key, bytes("{}"), null);
+    await expect(loadFlowRecord(memory, "seller", SAMPLE_CONTRACT_A)).rejects.toThrow(FlowRecordVersionError);
+    await memory.save(key, bytes("garbage"), flowDigest(bytes("{}")));
+    await expect(loadFlowRecord(memory, "seller", SAMPLE_CONTRACT_A)).rejects.toThrow(FlowStoreCorruptError);
   });
 
   it("a failed store write propagates (the flow must not go on): nothing is stored, the old record survives", async () => {
     const store = new MemoryFlowStore();
     const first = sampleBuyerRecord();
-    await saveFlowRecord(store, first);
+    const digest = await saveFlowRecord(store, first, null);
     store.failSave(2);
-    await expect(saveFlowRecord(store, bumped(first, first.updatedAtMs + 1))).rejects.toThrow(/injected fault/);
+    await expect(saveFlowRecord(store, bumped(first, first.updatedAtMs + 1), digest)).rejects.toThrow(/injected fault/);
     expect(await loadFlowRecord(store, "buyer", SAMPLE_SWAP_ID)).toEqual(first);
   });
 
   it("only the Seller's store entry holds the preimage", async () => {
     const store = new MemoryFlowStore();
-    await saveFlowRecord(store, sampleBuyerRecord());
-    await saveFlowRecord(store, sampleSellerRecord());
+    await saveFlowRecord(store, sampleBuyerRecord(), null);
+    await saveFlowRecord(store, sampleSellerRecord(), null);
     for (const key of await store.list()) {
       const holds = text((await store.load(key))!).includes(SAMPLE_PREIMAGE.slice(2));
       expect(holds, key).toBe(key.startsWith("seller:"));
     }
+  });
+});
+
+describe("R1-14: a Seller record is keyed by leg A's contract id, a Buyer record by the swap id", () => {
+  it("recordKey: buyer:<swapId> and seller:<contractA>", () => {
+    expect(recordKey(sampleBuyerRecord())).toBe(`buyer:${SAMPLE_SWAP_ID}`);
+    expect(recordKey(sampleSellerRecord())).toBe(`seller:${SAMPLE_CONTRACT_A}`);
+  });
+
+  it("a Seller record decoded under seller:<swapId> is a mismatch naming contractA: a squatter's copied swap id takes no slot", () => {
+    const bytesOfSeller = encodeFlowRecord(sampleSellerRecord());
+    expect(() => decodeFlowRecord(bytesOfSeller, flowKey("seller", SAMPLE_CONTRACT_A))).not.toThrow();
+    const error = (() => {
+      try {
+        decodeFlowRecord(bytesOfSeller, flowKey("seller", SAMPLE_SWAP_ID));
+        return undefined;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(error).toBeInstanceOf(FlowRecordMismatchError);
+    expect((error as FlowRecordMismatchError).field).toBe("contractA");
+    expect((error as FlowRecordMismatchError).expected).toBe(SAMPLE_SWAP_ID);
+    expect((error as FlowRecordMismatchError).actual).toBe(SAMPLE_CONTRACT_A);
+  });
+
+  it("two Seller records with one swap id and different contract ids live in two separate slots", async () => {
+    const store = new MemoryFlowStore();
+    const one = sampleSellerRecord();
+    const otherContract = `0x${"d4".repeat(32)}`;
+    const other = sampleSellerRecord();
+    const two = { ...other, contractA: otherContract, ledger: other.ledger.map((e) => (e.room === dealRoom(SAMPLE_CONTRACT_A) ? { ...e, room: dealRoom(otherContract) } : e)) };
+    await saveFlowRecord(store, one, null);
+    await saveFlowRecord(store, two, null); // no FlowRecordExistsError: the swap id is not the key
+    expect(await store.list()).toEqual([`seller:${one.contractA}`, `seller:${two.contractA}`].sort());
+    expect((await loadFlowRecord(store, "seller", one.contractA))?.swapId).toBe(two.swapId);
+  });
+});
+
+describe("R1-05: the record pins the rail's deployment", () => {
+  it("railDeploymentId is the rail's own deploymentId once it has one, else a value derived from its rail id", () => {
+    expect(railDeploymentId({ railId: "evm-htlc" })).toBe("rail:evm-htlc");
+    expect(railDeploymentId({ railId: "evm-htlc", deploymentId: "evm:0xaa:0xbb" })).toBe("evm:0xaa:0xbb");
+  });
+
+  it("a record created for one deployment refuses another on resume: FlowRecordMismatchError naming deploymentId", () => {
+    const record = sampleBuyerRecord();
+    const base = { role: "buyer" as const, swapId: SAMPLE_SWAP_ID, did: SAMPLE_BUYER.did, railId: "btc-htlc", caip2: "bip122:0f9188f13cb7b2c71f2a335e3a4fc328" };
+    expect(() => checkRecordIdentity(record, { ...base, deploymentId: record.deploymentId })).not.toThrow();
+    const error = (() => {
+      try {
+        checkRecordIdentity(record, { ...base, deploymentId: "evm:0xother:0xtoken" });
+        return undefined;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(error).toBeInstanceOf(FlowRecordMismatchError);
+    expect((error as FlowRecordMismatchError).field).toBe("deploymentId");
+    expect((error as FlowRecordMismatchError).actual).toBe(record.deploymentId);
+  });
+
+  it("the field is part of the stored bytes and cannot be dropped: a record without it neither encodes nor decodes", () => {
+    const record = sampleSellerRecord();
+    expect(text(encodeFlowRecord(record))).toContain(`"deploymentId":"${record.deploymentId}"`);
+    const without = { ...record } as Partial<FlowRecord>;
+    delete without.deploymentId;
+    expect(() => encodeFlowRecord(without as FlowRecord)).toThrow(FlowRecordInvalidError);
+    expect(() => decodeFlowRecord(envelope(without))).toThrow(FlowStoreCorruptError);
+  });
+});
+
+describe("R1-18: a Buyer never holds the secret, not even in a ledger entry", () => {
+  const revealText = `tclk1 {"type":"reveal","from":"${SAMPLE_BUYER.did}","contract":"${SAMPLE_CONTRACT_B}","ref":"${SAMPLE_CONTRACT_B}","secret":"${SAMPLE_PREIMAGE}"}`;
+  const withReveal = (entryText: string): FlowRecord => {
+    const record = sampleBuyerRecord();
+    return { ...record, ledger: record.ledger.map((entry) => (entry.kind === "reveal-b" ? { ...entry, text: entryText } : entry)) };
+  };
+
+  it("a Buyer reveal-b entry that holds the full reveal text (the preimage) is refused when encoded and when decoded", () => {
+    const full = withReveal(revealText);
+    expect(() => encodeFlowRecord(full)).toThrow(FlowRecordInvalidError);
+    expect(() => encodeFlowRecord(full)).toThrow(/reveal-b/);
+    // and a file that somehow holds one is refused on load as well (defence in depth: the writer is one flag at one call site)
+    expect(() => decodeFlowRecord(envelope(plain(full)), recordKey(full))).toThrow(FlowStoreCorruptError);
+    expect(() => decodeFlowRecord(envelope(plain(full)), recordKey(full))).toThrow(/reveal-b/);
+  });
+
+  it("the digest form is accepted, and a Seller's own reveal-a keeps its full text (it is the Seller's record)", () => {
+    const digest = withReveal(`sha256:${"ab".repeat(32)}`);
+    expect(decodeFlowRecord(encodeFlowRecord(digest), recordKey(digest))).toEqual(digest);
+    const seller = sampleSellerRecord();
+    const sellerReveal = { ...seller, ledger: seller.ledger.map((entry) => (entry.kind === "reveal-a" ? { ...entry, text: revealText } : entry)) };
+    expect(text(encodeFlowRecord(sellerReveal))).toContain(SAMPLE_PREIMAGE.slice(2));
+  });
+});
+
+describe("R1-12 (record part): a landed mark can carry the signed record", () => {
+  const roomA = dealRoom(SAMPLE_CONTRACT_A);
+  const recordFor = (line: string) => ({ room: roomA, seq: 5, timestampMs: 1_700_000_000_500, sender: SAMPLE_BUYER.did, nonce: "10005", signature: "sig-5", line });
+
+  it("round-trips, and is the signed record of this party's own line", () => {
+    const base = sampleBuyerRecord();
+    const entry = { kind: "lock-a" as const, room: roomA, text: "tclk1 {\"lock\":1}" };
+    const record: FlowRecord = {
+      ...base,
+      ledger: [...base.ledger.filter((e) => e.kind !== "lock-a"), { ...entry, landed: { seq: 5, nonce: "10005", record: recordFor(entry.text) } }],
+    };
+    expect(decodeFlowRecord(encodeFlowRecord(record), recordKey(record))).toEqual(record);
+    expect(ledgerEntry(withLedgerLanded(withLedgerIntent(fresh(), entry), "lock-a", { seq: 5, nonce: "10005", record: recordFor(entry.text) }), "lock-a")?.landed?.record?.seq).toBe(5);
+  });
+
+  function fresh() {
+    return { ...newBuyerRecord({ swapId: SAMPLE_SWAP_ID, did: SAMPLE_BUYER.did, railId: "evm-htlc", caip2: "eip155:31337", deploymentId: "evm:0xrail:0xtoken", nowMs: 1 }), contractA: SAMPLE_CONTRACT_A };
+  }
+});
+
+describe("R1-02 (record part): saveFlowRecord and loadFlowRecordWithDigest are a compare-and-swap pair", () => {
+  it("the digest a load returns is the one the next save must present; a stale one is FlowRecordStaleError", async () => {
+    const store = new MemoryFlowStore();
+    const first = sampleBuyerRecord();
+    const digest = await saveFlowRecord(store, first, null);
+    const loaded = await loadFlowRecordWithDigest(store, "buyer", SAMPLE_SWAP_ID);
+    expect(loaded?.digest).toBe(digest);
+    expect(loaded?.digest).toBe(flowDigest((await store.load(recordKey(first)))!));
+    const next = await saveFlowRecord(store, bumped(first, first.updatedAtMs + 1), digest);
+    expect(next).not.toBe(digest);
+    await expect(saveFlowRecord(store, bumped(first, first.updatedAtMs + 2), digest)).rejects.toBeInstanceOf(FlowRecordStaleError);
   });
 });
