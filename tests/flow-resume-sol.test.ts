@@ -587,9 +587,16 @@ describe("resume: Buyer leg B claim (rules 1 and 3, the closed paper gap)", () =
     expect(saved.legBClaimed).toBe(false);
     await restartBuyer(r);
     await r.buyer.claimLegB(secret); // paperRail.claim now throws "claim on a claimed record"; the note shows this very secret
-    expect((await buyerRecord(r)).legBClaimed).toBe(true);
+    // R1-06: a note found already claimed is ADOPTED, not taken as this flow's own claim (it could be anyone's: paper notes are not bound
+    // to who wrote them), so the refund of leg A is never barred by it; the frames are posted all the same, once.
+    const adopted = await buyerRecord(r);
+    expect(adopted.legBClaimed).toBe(false);
+    expect(adopted.legBClaimAdopted).toBe(true);
     expect(await framesOf(r, dealRoom(p.contractB), "reveal")).toHaveLength(1);
     expect(await framesOf(r, dealRoom(p.contractB), "receipt")).toHaveLength(1);
+    // leg A was seen claimed (Solana claims leg B only once it is), so nothing is left to refund and `next` says done
+    expect(adopted.refund.claimSeen).toBe(true);
+    expect(await restartBuyer(r)).toBe("done");
   });
 
   it("a claim attempted with no known outcome blocks the refund (a refund never follows a leg B claim)", async () => {

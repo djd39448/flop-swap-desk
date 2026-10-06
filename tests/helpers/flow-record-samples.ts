@@ -76,6 +76,7 @@ export function sampleBuyerRecord(): BuyerFlowRecord {
     },
     legBClaimAttempted: true,
     legBClaimed: false,
+    legBClaimAdopted: true, // R1-06: leg B's note read claimed with the secret and this flow's own claim never returned
     refund: {
       attempted: true,
       recovery: { chain: "btc", txid: "cd".repeat(32), rawTx: "02000000000102cafebabe" },

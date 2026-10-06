@@ -287,6 +287,9 @@ export class BuyerFlow {
   /** P8: true from just before the leg B paper claim is written (saved first), and the signed refund's recovery handle
    *  from the moment the rail signed it until the refund is confirmed. */
   private legBClaimAttempted = false;
+  /** R1-06: leg B's paper note already read claimed with this swap's secret when the flow looked at it and this flow's own claim never
+   *  returned: ADOPTED, never a reason to refuse the refund of leg A (paper notes are not bound to who wrote them). */
+  private legBClaimAdopted = false;
   private refundAttempted = false;
   /** R1-15: `refundLegA` found leg A claimed (the refund lost the race to a claim) and routed the Buyer to `learnSecret`. */
   private refundClaimSeen = false;
@@ -368,7 +371,7 @@ export class BuyerFlow {
       if (journal.isLanded("receipt-refund-a")) return "done";
       // R1-15: the refund lost the race to a claim: `refundLegA` only throws its routing error from here on, and the way on is
       // learnSecret then claimLegB (after which leg B's receipt makes the swap done), not refundLegA for ever.
-      if (this.refundClaimSeen) return this.legBClaimed && journal.isLanded("receipt-b") ? "done" : "learnSecret";
+      if (this.refundClaimSeen) return this.legBDone() ? "done" : "learnSecret";
       return "refundLegA";
     }
     if (!this.legBVerified) return "verifyLegBLocked";
@@ -380,8 +383,19 @@ export class BuyerFlow {
       if (this.legALockAttempted && this.offerA !== undefined && this.clock() >= this.offerA.refundAfterMs) return "refundLegA";
       return "lockLegA";
     }
-    if (this.legBClaimAttempted || this.legBClaimed) return journal.isLanded("receipt-b") ? "done" : "learnSecret";
+    if (this.legBClaimAttempted || this.legBClaimed) return this.legBDone() ? "done" : "learnSecret";
     return "learnSecret";
+  }
+
+  /**
+   * R1-06: leg B is settled for `next` when its receipt landed AND the claim is this flow's own, or was adopted and leg A has been seen
+   * claimed (so nothing is left to refund). An adopted claim with leg A not seen claimed is NOT done: `next` keeps saying `learnSecret`,
+   * which is the doorway to `refundLegA` after leg A's refund time (a Seller can write leg B's note `claimed` at no cost and never claim
+   * leg A, so a paper note must never stop the Buyer's refund).
+   */
+  private legBDone(): boolean {
+    const receipt = this.#journal?.isLanded("receipt-b") === true;
+    return receipt && (this.legBClaimed || (this.legBClaimAdopted && this.refundClaimSeen));
   }
 
   /**
@@ -513,6 +527,7 @@ export class BuyerFlow {
     this.lockFramePosted = lock.framePosted || ledgerLanded(record, "lock-a");
     this.legBClaimAttempted = record.legBClaimAttempted;
     this.legBClaimed = record.legBClaimed;
+    this.legBClaimAdopted = record.legBClaimAdopted === true;
     this.refundAttempted = record.refund.attempted;
     this.refundClaimSeen = record.refund.claimSeen === true;
     if (record.refund.recovery !== undefined) this.refundRecovery = record.refund.recovery;
@@ -539,6 +554,7 @@ export class BuyerFlow {
       },
       legBClaimAttempted: this.legBClaimAttempted,
       legBClaimed: this.legBClaimed,
+      ...(this.legBClaimAdopted ? { legBClaimAdopted: true as const } : {}),
       refund: {
         attempted: this.refundAttempted,
         ...(this.refundRecovery === undefined ? {} : { recovery: this.refundRecovery }),
@@ -707,6 +723,9 @@ export class BuyerFlow {
   ): Promise<{ acceptB: AcceptFrame; acceptBRecord: TranscriptRecord }> {
     this.usable();
     if (this.offerA === undefined) throw new Error("buyer: no leg A offer to pair leg B against");
+    // R1-12: with a store, a pairing whose accept B the ledger shows as landed is DONE: the recorded result is returned, nothing is
+    // re-verified, re-posted or read (the offers room is a short ring, so a read can miss a line that did land).
+    if (this.#journal !== undefined && this.#journal.isLanded("accept-b") && this.acceptB !== undefined) return this.recordedPairingResult(offerBRecord, acceptARecord);
     // P8: with a store, a pairing that is already recorded is confirmed again (same frames only), not refused; a
     // same-process double call is still refused while one is in flight.
     if ((this.offerB !== undefined && this.#journal === undefined) || this.legBPairingPending) {
@@ -718,6 +737,21 @@ export class BuyerFlow {
     } finally {
       this.legBPairingPending = false;
     }
+  }
+
+  /** R1-12: the result of an `acceptLegB` that is already confirmed, read back from the record's frame slots. Mirrors
+   *  `SellerFlow.recordedAcceptResult`: the pairing the runner supplies must be the saved one (a party never posts a second,
+   *  different accept), and then nothing but the stored answer is used. */
+  private recordedPairingResult(offerBRecord: TranscriptRecord, acceptARecord: TranscriptRecord): { acceptB: AcceptFrame; acceptBRecord: TranscriptRecord } {
+    const record = this.#journal?.record;
+    const acceptB = this.acceptB;
+    if (record === undefined || acceptB === undefined) throw new Error("buyer: leg B has not been accepted yet");
+    if (record.frames.offerB?.text !== offerBRecord.line || record.frames.acceptA?.text !== acceptARecord.line) {
+      throw new FlowRecordConflictError("buyer: a different pairing than the one this swap saved; a party never posts a second, different accept");
+    }
+    const stored = record.frames.acceptB?.record;
+    if (stored === undefined) throw new FlowStoreCorruptError(`buyer:${record.swapId}`, "accept B is recorded as done but its signed record is missing");
+    return { acceptB, acceptBRecord: recordFromJson(stored) };
   }
 
   private async acceptLegBUnlatched(
@@ -1374,25 +1408,99 @@ export class BuyerFlow {
       return { reveal, receipt };
     }
     // P8 (rules 1 and 3): the intent is saved BEFORE the note write. The repeated paper write that threw "claim on a
-    // claimed record" is no longer reached: a note that already shows this very secret is our claim, and the missing
+    // claimed record" is no longer reached: a note that already shows this very secret is a claim of this swap, and the missing
     // frames are posted (each once, as the saved text, or adopted). The reveal frame carries the secret, so its ledger
     // entry holds only the digest of its text (rule 5: the secret is on no record but the Seller's); the text is built
     // again from the secret learned again.
-    if (!this.legBClaimed) {
+    //
+    // R1-06: only a paper claim THIS call made (`paperRail.claim` returned) sets `legBClaimed`, which bars the refund of leg A. A note
+    // that was already claimed with the secret may be this flow's own claim from before a crash, or a note the Seller (who always holds
+    // the secret) or anyone holding a leaked one wrote at no cost: the flow cannot tell them apart, so the claim is ADOPTED (recorded
+    // once, the frames posted) and never bars the refund. R1-07: a refusal that is definitive (the note is refunded, or leg B's refund
+    // time has come) clears the attempt latch, so a claim that provably did not land never freezes the refund either.
+    if (!this.legBClaimed && !this.legBClaimAdopted) {
       this.legBClaimAttempted = true;
       await this.persist();
+      let ownClaim = true;
       try {
         await this.paperRail.claim(acceptB.contract, secret);
       } catch (error) {
         const note = await this.paperRail.read(acceptB.contract);
-        if (note === null || note.status !== "claimed" || note.secret !== secret) throw error;
+        if (note !== null && note.status === "claimed" && note.secret === secret) {
+          ownClaim = false;
+        } else {
+          if (!this.legBNoteClaimable(note)) {
+            this.legBClaimAttempted = false; // R1-07: the attempt provably did not land
+            await this.persist();
+          }
+          throw error;
+        }
       }
-      this.legBClaimed = true;
+      if (ownClaim) this.legBClaimed = true;
+      else this.adoptLegBClaim();
       await this.persist();
     }
     const reveal = await journal.ensurePosted({ kind: "reveal-b", room: dealRoom(acceptB.contract), text: revealText, digestOnly: true });
     const receipt = await journal.ensurePosted({ kind: "receipt-b", room: dealRoom(acceptB.contract), text: receiptText });
+    if (this.legBClaimAdopted) await this.noteLegAClaimSeen();
     return { reveal, receipt };
+  }
+
+  /** R1-07: leg B's paper note can still take a claim: it reads locked and leg B's refund time has not come. */
+  private legBNoteClaimable(note: Awaited<ReturnType<PaperRail["read"]>>): boolean {
+    return note !== null && note.status === "locked" && this.clock() < note.refundAfterMs;
+  }
+
+  /** R1-06: leg B's note read claimed with this swap's secret and this flow's own claim never returned. The claim is adopted: recorded
+   *  once (like a refund note, never one entry per call), and from here the refund of leg A stays available. */
+  private adoptLegBClaim(): void {
+    this.legBClaimAdopted = true;
+    const note =
+      "leg B's paper note read claimed with this swap's secret and this flow's own claim never returned: the claim is adopted, not this flow's own; " +
+      "paper notes are not bound to who wrote them, so the refund of leg A stays available (R1-06)";
+    if (!this.refundNotes.includes(note)) this.refundNotes.push(note);
+  }
+
+  /**
+   * R1-07: `refundLegA` found a leg B claim ATTEMPT whose outcome is not recorded. Leg B's note decides, never the latch:
+   *  - claimed with this swap's secret: the claim is adopted (R1-06) and the refund goes on;
+   *  - not claimed and no longer claimable (refunded, missing, or leg B's refund time has come): the attempt provably did not land, the
+   *    latch is cleared and saved, and the refund goes on;
+   *  - still locked and claimable: the attempt may yet land or may have landed unseen: the latch stays and the refund is refused.
+   */
+  private async settleLegBClaimAttempt(): Promise<void> {
+    const { offerB, acceptB } = this.requirePaired();
+    const termsB = offerAcceptLockTerms(offerB, acceptB);
+    const note = await this.paperRail.read(acceptB.contract);
+    if (note !== null && note.status === "claimed" && verifySecret(termsB.lock, termsB.statement, note.secret ?? "")) {
+      this.adoptLegBClaim();
+      await this.persist();
+      return;
+    }
+    if (this.legBNoteClaimable(note)) {
+      throw new Error("buyer: refusing to refund leg A - a claim of leg B was attempted and its outcome is not recorded; call learnSecret() then claimLegB() to settle it first (P8)");
+    }
+    this.legBClaimAttempted = false;
+    await this.persist();
+  }
+
+  /** R1-06: after a claim of leg B was adopted, look once at leg A. Claimed means nothing is left to refund, and only then can `next`
+   *  say done. A failed read, or a leg A that is not claimed (yet), leaves `next` at `learnSecret`, the safe direction. */
+  private async noteLegAClaimSeen(): Promise<void> {
+    if (this.refundClaimSeen || this.lockedAccounts === undefined) return;
+    const railRef = this.lockedRailRef ?? this.lockedHashLock;
+    if (railRef === undefined) return;
+    const { offerA, acceptA } = this.requirePaired();
+    try {
+      const termsA = offerAcceptLockTerms(offerA, acceptA);
+      const connected = await this.rail.connect(termsA, this.lockedAccounts);
+      const evidence = await connected.verifyLockFinal(termsA, railRef, this.lockedAccounts);
+      if (evidence.rail?.status !== "claimed") return;
+    } catch {
+      return;
+    }
+    this.refundClaimSeen = true;
+    await this.persist();
   }
 
   /**
@@ -1462,11 +1570,10 @@ export class BuyerFlow {
     if (this.legBClaimed) {
       throw new Error("buyer: refusing to refund leg A — this flow already claimed leg B");
     }
-    // P8: a leg B claim that was attempted without a known outcome might have been written: settle it with `claimLegB`
-    // first (fail closed); a refund must never follow a leg B claim.
-    if (this.legBClaimAttempted) {
-      throw new Error("buyer: refusing to refund leg A - a claim of leg B was attempted and its outcome is not recorded; call learnSecret() then claimLegB() to settle it first (P8)");
-    }
+    // P8: a leg B claim that was attempted without a known outcome might have been written. R1-07: leg B's note decides, never the
+    // latch alone: a claim of this swap's secret is adopted (R1-06), one that provably did not land clears the latch, and only an
+    // attempt that may still land refuses the refund (fail closed).
+    if (this.legBClaimAttempted && !this.legBClaimAdopted) await this.settleLegBClaimAttempt();
     // R4-2 (Solana): leg A's own Claimed state is checked FIRST. On Solana (S2-1) `checkPendingClaim` reads only the
     // escrow's own state at finalized (Claimed and its stored preimage): no history scan, so nothing anyone can pad. A
     // paid Seller must always get the "call learnSecret() then claimLegB()" routing, never "leg A is owed". A leak by a

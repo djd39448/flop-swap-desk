@@ -282,9 +282,15 @@ export interface BuyerFlowState {
     evidence?: WriteEvidenceJson;
     framePosted: boolean;
   };
-  /** Set BEFORE the paper-note claim of leg B is written. */
+  /** Set BEFORE the paper-note claim of leg B is written; cleared again only when leg B's note proves the attempt did not land
+   *  (the note is refunded or missing, or leg B's refund time has come: R1-07). */
   legBClaimAttempted: boolean;
+  /** True only when THIS flow's own paper claim of leg B returned (R1-06). Once true, the Buyer never refunds leg A. */
   legBClaimed: boolean;
+  /** R1-06: leg B's paper note already read claimed with this swap's secret when the flow looked at it, and this flow's own claim did
+   *  not return. Paper notes are not bound to who wrote them, so such a claim is ADOPTED (the frames are posted) but never bars the
+   *  refund of leg A. Mutually exclusive with `legBClaimed`; needs `legBClaimAttempted`. */
+  legBClaimAdopted?: true;
   refund: {
     attempted: boolean;
     /** The refund's signature / txid / bytes, recorded before it is sent where the rail can give one. */
@@ -292,7 +298,8 @@ export interface BuyerFlowState {
     evidence?: WriteEvidenceJson;
     framesPosted: boolean;
     /** R1-15: set once `refundLegA` found leg A claimed (the refund lost the race to a claim) and routed the Buyer to
-     *  `learnSecret`: from then on `next` says `learnSecret`, not `refundLegA` for ever. */
+     *  `learnSecret`: from then on `next` says `learnSecret`, not `refundLegA` for ever. Also set (R1-06) when `claimLegB`, adopting
+     *  a leg B note that was already claimed, read leg A Claimed: the one fact "leg A was seen claimed". */
     claimSeen?: true;
   };
   refundNotes: string[];
@@ -810,7 +817,7 @@ const COMMON_OPTIONAL = ["contractB", "lockTimeMs", "legB"] as const;
 const SELLER_REQUIRED = ["contractA", "preimage", "statement", "claimAttempted", "claimRecords", "neverLandedClaims", "claimOutcome", "revealPosted", "receiptPosted", "legBRefund"] as const;
 const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature"] as const;
 const BUYER_REQUIRED = ["legBVerified", "lock", "legBClaimAttempted", "legBClaimed", "refund", "refundNotes"] as const;
-const BUYER_OPTIONAL = ["contractA", "ownAccountLine"] as const;
+const BUYER_OPTIONAL = ["contractA", "ownAccountLine", "legBClaimAdopted"] as const;
 
 /** A Buyer's `reveal-b` entry holds only the digest of the reveal text (R1-18): the full text carries the secret. */
 const DIGEST_TEXT = /^sha256:[0-9a-f]{64}$/;
@@ -1019,6 +1026,17 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
   const legBClaimAttempted = r.bool(o.legBClaimAttempted, `${path}.legBClaimAttempted`);
   const legBClaimed = r.bool(o.legBClaimed, `${path}.legBClaimed`);
   if (legBClaimed && !legBClaimAttempted) r.fail(`${path}.legBClaimed`, "needs legBClaimAttempted");
+  const legBClaimAdopted = r.optional(
+    o,
+    "legBClaimAdopted",
+    (v, p) => {
+      if (r.bool(v, p) !== true) r.fail(p, "must be true when present");
+      return true as const;
+    },
+    path,
+  );
+  if (legBClaimAdopted !== undefined && !legBClaimAttempted) r.fail(`${path}.legBClaimAdopted`, "needs legBClaimAttempted");
+  if (legBClaimAdopted !== undefined && legBClaimed) r.fail(`${path}.legBClaimAdopted`, "a leg B claim is this flow's own or adopted, never both");
 
   return {
     ...common,
@@ -1036,6 +1054,7 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
     },
     legBClaimAttempted,
     legBClaimed,
+    ...(legBClaimAdopted === undefined ? {} : { legBClaimAdopted }),
     refund: {
       attempted: refundAttempted,
       ...(refundRecovery === undefined ? {} : { recovery: refundRecovery }),
