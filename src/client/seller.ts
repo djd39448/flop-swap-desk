@@ -82,6 +82,16 @@
 // in an ES `#private` field (and, with a store, in this flow's own record); `toJSON` and `util.inspect` show
 // public data only, like the signers.
 //
+// Review round 1 (P8-FIXES-R1.md), what a runner can rely on:
+//  - R1-03: a save the store refused (or refused as stale, R1-02: another instance saved first) makes this flow a crashed one: every
+//    public step throws `FlowStoreWriteFailedError` until the runner drops it and calls `resume()`. A claim whose attempt the record never saw is
+//    never sent behind a refused save, and a refused save inside the reveal post is that same typed error, not a failed post to retry.
+//  - R1-02 / R1-14: the record is keyed `seller:<contractA>`; a second `acceptLegA` of the same offer on one store is a `FlowRecordExistsError`
+//    before anything is minted or posted (resume it with the key the error names). R1-16: overlapping calls of one step are refused.
+//  - R1-11: only the lock frame tclk's machine accepted for contract A stops the account line. R1-12: a line the ledger shows as landed is never
+//    posted again. R1-13: a resumed claim is looked for from the block marker saved with the attempt (EVM, Bitcoin), and a claim recorded as
+//    landed is not searched for at all. R1-22: the exchanges of a FAILED claim join `exchanges` only once the reveal is posted.
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
 // B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a;
 // P6-SOL-SPEC.md sections 3-5; P8-RESUME-SPEC.md.

@@ -73,6 +73,11 @@
 //  - R1-08 / R1-15: a recorded refund that landed and failed is resolved (one fresh refund follows); a refund that lost the race to a
 //    claim saves that fact, so `next` says `learnSecret`. R1-09: a refund note is recorded once. R1-16: overlapping calls of one step
 //    are refused.
+//  - R1-06 / R1-07: leg B's paper note is not bound to who wrote it. Only a claim THIS flow made (`paperRail.claim` returned) bars the refund of
+//    leg A; a note found already claimed with the swap's secret is ADOPTED (frames posted, note recorded once) and never bars it, and `next` is
+//    never `done` for an adopted claim until leg A was seen claimed. A claim attempt that provably did not land (leg B's note is refunded, missing,
+//    or past its refund time) is cleared from the record; one that may still land keeps the refund refused. R1-12: a confirmed `acceptLegB`
+//    returns its recorded result.
 //
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
 // P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3; P4-BTC-SPEC.md §7a;
