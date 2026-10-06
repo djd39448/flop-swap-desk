@@ -39,6 +39,7 @@ import {
   NearHtlcRail,
   type NearHtlcTerms,
   type NearRailConfig,
+  type NearHtlcRailOptions,
   type NearSigner,
   type NearWriteEvidence,
 } from "../rails/near-htlc.js";
@@ -52,6 +53,7 @@ import {
   type CounterAssetRail,
   type LockRecovery,
   type LockRecoveryOutcome,
+  type LockResendOutcome,
   type PreparedLock,
   type RailAccounts,
   type RailBlockMarker,
@@ -69,6 +71,8 @@ export interface NearCounterRailOptions {
    *  implementation lives only in `near-signer-memory.ts` (test/harness code). */
   signer: NearSigner;
   clock: () => number;
+  /** Harness passthrough to `NearHtlcRail.connect` (the settle wait of `recoverLock`, R1-19; defaults to a real timer). */
+  sleep?: NearHtlcRailOptions["sleep"];
 }
 
 /** D-N5: only the payee's resolved NEAR account id is ever required to build a lock — the
@@ -151,26 +155,67 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
   }
 
   /**
-   * P8-RESUME-SPEC.md "Buyer lock A", NEAR: what became of the ONE lock transaction `prepareLock` signed. Reads, in
-   * this order: the access key's final nonce FIRST (a view that only moves forward, so a landing after it cannot be
-   * missed by the reads below); then the transaction by its hash (`recoverByTxHash`; a hash the node holds is
-   * `landed`, a node still waiting for finality is `pending`); then the lock itself by its payer-keyed ref (a row
-   * there is `landed` even if the node has forgotten the transaction); and only if all three show nothing, the
-   * nonce: at or past the transaction's own means it can never be accepted, `never-landed`; below it, `pending`
-   * (it may still be in flight or may never have been sent; nothing new is signed either way). A typed chain failure
-   * of the transaction (`NearTxFailedError`, `NearLockRefusedError`, `NearLockUnknownError`) propagates unchanged.
+   * P8-RESUME-SPEC.md "Buyer lock A", NEAR, READ-ONLY (R1-01 part 2, R1-10, R1-19): what became of the ONE lock
+   * transaction `prepareLock` signed. Nothing is signed and nothing is sent. Reads, in this order: the access key's
+   * final nonce FIRST (a view that only moves forward, so a landing after it cannot be missed by the reads below);
+   * then the transaction by its hash (`recoverByTxHash`; a hash the node holds is `landed`, a node still waiting for
+   * finality is `pending`); then the lock itself by its payer-keyed ref (a row there is `landed` even if the node has
+   * forgotten the transaction, and even if the lock has since been claimed or refunded). If all three show nothing:
+   * a nonce below the transaction's means it was perhaps never sent and perhaps still in flight, which this rail
+   * cannot tell: `unknown` (`resendLock` settles it). A nonce at or past the transaction's means it can never be
+   * accepted, but its `ft_on_transfer` receipt creates the row a couple of blocks AFTER the nonce moved, so the row is
+   * read once more at a final block at least three blocks past the one the nonce was seen at (R1-19): a row there is
+   * `landed`, none is `never-landed`, and a chain that has not got that far yet is `pending`. A typed chain failure of
+   * the transaction (`NearTxFailedError`, `NearLockRefusedError`, `NearLockUnknownError`) propagates unchanged.
    */
   async recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome> {
-    return this.recoverWrite(prepared.ref, prepared.recovery, "lock");
+    const checked = this.checkHandle(prepared.ref, prepared.recovery);
+    return this.readWrite(prepared.ref, checked.recovery, checked.nonce, "lock");
   }
 
-  /** P8-RESUME-SPEC.md "Buyer refund A", NEAR: the refund twin of `recoverLock`, over the handle `refund`'s
-   *  `onSigned` recorded. `landed` also when the lock reads `Refunded`. */
+  /**
+   * R1-10, NEAR: re-sends the IDENTICAL persisted signed lock bytes, once, after `recoverLock` answered `unknown` (the
+   * transaction is unknown to the node, no lock row shows, and the nonce is not past it: it may never have been
+   * sent). Identical bytes have one hash and one nonce, so this can never lock twice. Reads again first (anything
+   * already decided is answered without a send). The node then answers: it executed the transaction (read back by
+   * hash: `landed`, or the typed failure of the lock); `Expired`, or an invalid-nonce answer (after a look at the
+   * transaction by hash, and a lock row read three blocks later, R1-19): `never-landed`, so a fresh `prepareLock` may
+   * follow; anything else it threw (a transport failure) leaves it `pending`.
+   */
+  async resendLock(prepared: PreparedLock): Promise<LockResendOutcome> {
+    const checked = this.checkHandle(prepared.ref, prepared.recovery);
+    return this.resendWrite(prepared.ref, checked.recovery, checked.nonce, "lock");
+  }
+
+  /** P8-RESUME-SPEC.md "Buyer refund A", NEAR, READ-ONLY: the refund twin of `recoverLock`, over the handle `refund`'s
+   *  `onSigned` recorded. `landed` also when the lock reads `Refunded`; `pending` while it reads `Refunding` (the
+   *  payout is in flight). A nonce below the refund's with the lock still `Locked` is `unknown`: the signed refund
+   *  may never have been sent (R1-10), and `resendRefund` settles it. */
   async recoverRefund(ref: string, recovery: LockRecovery): Promise<LockRecoveryOutcome> {
-    return this.recoverWrite(ref, recovery, "refund");
+    const checked = this.checkHandle(ref, recovery);
+    return this.readWrite(ref, checked.recovery, checked.nonce, "refund");
   }
 
-  private async recoverWrite(ref: string, recovery: LockRecovery | undefined, kind: "lock" | "refund"): Promise<LockRecoveryOutcome> {
+  /**
+   * R1-10, NEAR: the refund twin of `resendLock`. The lock is read first and the refund is sent only while it still
+   * reads `Locked`: `Refunded` is `landed`, `Refunding` is `pending`, a lock that is claimed, being claimed or absent
+   * can no longer be refunded (`never-landed`; the caller then routes to `learnSecret`). Then the identical bytes go
+   * out once: executed is read back by hash (`landed`, or the typed `NearRefundFailedError` when the payout failed);
+   * `Expired` or an invalid-nonce answer is `never-landed` (after the re-reads above), so exactly one fresh refund may
+   * follow; a transport failure is `pending`.
+   */
+  async resendRefund(ref: string, recovery: LockRecovery): Promise<LockResendOutcome> {
+    const checked = this.checkHandle(ref, recovery);
+    return this.resendWrite(ref, checked.recovery, checked.nonce, "refund");
+  }
+
+  /** Checks the persisted handle before any call: it is a NEAR handle, its ref is this leg's own `0x<hash lock>:<payer>`
+   *  for this signer, its bytes decode and hash to the recorded transaction hash, and they were signed by this rail's
+   *  own account and key. Returns the handle (narrowed) and the transaction's nonce. */
+  private checkHandle(
+    ref: string,
+    recovery: LockRecovery | undefined,
+  ): { recovery: Extract<LockRecovery, { chain: "near" }>; nonce: bigint } {
     if (recovery === undefined) {
       throw new RailRecoveryRefusedError("no-handle", ref, "near-htlc needs the transaction hash and signed bytes recorded at prepare time");
     }
@@ -194,8 +239,29 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
     if (header.signerId !== signer.accountId || `ed25519:${base58.encode(header.publicKey.data)}` !== signer.publicKey) {
       throw new RailRecoveryRefusedError("handle-mismatch", ref, "the recorded transaction was not signed by this rail's own account and key");
     }
+    return { recovery, nonce: header.nonce };
+  }
 
-    const keyNonce = await this.nearRail.finalAccessKeyNonce();
+  /** What a lock row (or none) says about a recorded write of `kind`, once the row can be trusted: a lock shows a landed
+   *  lock whatever status it has since reached; a refund shows landed only as `Refunded` (and pending as `Refunding`,
+   *  its payout in flight). `null`: the row says nothing for this write. */
+  private rowVerdict(row: { status: string } | null, kind: "lock" | "refund"): "landed" | "pending" | null {
+    if (row === null) return null;
+    if (kind === "lock") return "landed";
+    if (row.status === "Refunded") return "landed";
+    if (row.status === "Refunding") return "pending";
+    return null;
+  }
+
+  /** The read-only decision of `recoverLock` / `recoverRefund` (see `recoverLock`). */
+  private async readWrite(
+    ref: string,
+    recovery: Extract<LockRecovery, { chain: "near" }>,
+    txNonce: bigint,
+    kind: "lock" | "refund",
+  ): Promise<LockRecoveryOutcome> {
+    const signer = this.options.signer;
+    const key = await this.nearRail.finalAccessKey();
     try {
       const evidence = await this.nearRail.recoverByTxHash(recovery.txHash, signer.accountId, ref);
       if (evidence !== null) return "landed";
@@ -204,9 +270,50 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
       if (error instanceof NearTimeoutError) return "pending";
       throw error;
     }
-    const lock = await this.nearRail.readLock(ref);
-    if (lock !== null && (kind === "lock" || lock.status === "Refunded")) return "landed";
-    return keyNonce >= header.nonce ? "never-landed" : "pending";
+    const verdict = this.rowVerdict(await this.nearRail.readLock(ref), kind);
+    if (verdict !== null) return verdict;
+    // Unknown to the node and no row: it can only be proven dead once the access key's nonce is past it.
+    if (key.nonce < txNonce) return "unknown";
+    return this.settledVerdict(ref, key.blockHeight, kind);
+  }
+
+  /** R1-19: the answer once a transaction is known to be unable to land any more (its nonce was consumed, or the node
+   *  called it expired): the lock row is read at a final block three blocks past `observedHeight`; a row there decides
+   *  `landed` / `pending`, no row is `never-landed`, and a chain too slow to get there is `pending`. */
+  private async settledVerdict(ref: string, observedHeight: number, kind: "lock" | "refund"): Promise<"landed" | "never-landed" | "pending"> {
+    const settled = await this.nearRail.readLockSettled(ref, observedHeight);
+    if (!settled.settled) return "pending";
+    return this.rowVerdict(settled.lock, kind) ?? "never-landed";
+  }
+
+  /** The decision of `resendLock` / `resendRefund` (see `resendLock`). */
+  private async resendWrite(
+    ref: string,
+    recovery: Extract<LockRecovery, { chain: "near" }>,
+    txNonce: bigint,
+    kind: "lock" | "refund",
+  ): Promise<LockResendOutcome> {
+    const read = await this.readWrite(ref, recovery, txNonce, kind);
+    if (read !== "unknown") return read; // landed, pending or provably never-landed: nothing to send
+    if (kind === "refund") {
+      // a refund can only land on a lock that still reads Locked (the payout of a refund that failed puts it back)
+      const row = await this.nearRail.readLock(ref);
+      if (row === null || row.status !== "Locked") return "never-landed";
+    }
+    const signer = this.options.signer;
+    const answer = await this.nearRail.resendSigned(recovery.signedTxBase64, ref);
+    if (answer.kind === "unreachable") return "pending"; // the send's own outcome is not known
+    try {
+      const evidence = await this.nearRail.recoverByTxHash(recovery.txHash, signer.accountId, ref);
+      if (evidence !== null) return "landed";
+    } catch (error) {
+      if (error instanceof NearTimeoutError) return "pending";
+      throw error;
+    }
+    if (answer.kind === "sent") return "pending"; // executed, yet the node does not show it by hash: ask again
+    // Expired, or the nonce was already consumed (by another transaction, or by this one before the node showed it):
+    // the node's own look at the transaction found nothing, so decide from the lock row a few blocks later.
+    return this.settledVerdict(ref, await this.nearRail.optimisticHeight(), kind);
   }
 
   /** Sends exactly what `prepareLock` most recently built and signed — `NearHtlcRail.commitLock`
@@ -418,6 +525,7 @@ class NearCounterRail implements CounterAssetRail {
       rpc: this.options.rpc,
       signer: this.options.signer,
       clock: this.options.clock,
+      ...(this.options.sleep === undefined ? {} : { sleep: this.options.sleep }),
     });
     return new ConnectedNearCounterRail(nearRail, this.options, accounts, terms);
   }

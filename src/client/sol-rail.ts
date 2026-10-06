@@ -189,7 +189,8 @@ class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
    * `never-landed`: the blockhash expired with no status, the transaction itself is absent at finalized, and the
    * node's ledger reaches back to the signing slot; the transaction can no longer land, a fresh `prepareLock` is
    * allowed (it refuses an existing escrow). A finalized failure of the transaction (`SolLockRefusedError`, ...) and
-   * a transport failure propagate unchanged. The signed bytes are not part of the handle, so there is no re-send.
+   * a transport failure propagate unchanged. The signed bytes are not part of the handle, so there is no re-send:
+   * read-only like every rail's `recoverLock` (R1-01), it never answers `unknown`, and the rail has no `resendLock`.
    */
   async recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome> {
     const handle = this.requireSolHandle(prepared.ref, prepared.recovery);

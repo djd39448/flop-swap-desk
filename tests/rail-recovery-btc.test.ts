@@ -4,9 +4,11 @@
 // A Buyer that dies between `prepareLock` and the end of `commitLock` must find out what became of the ONE funding
 // transaction it signed, from the txid and bytes it persisted, and must never fund a second time:
 //   - `prepareLock` hands out the funding txid and exact bytes (the recovery handle);
-//   - `recoverLock` asks the node by txid, re-sends the IDENTICAL bytes if the node does not know them, and stops
-//     with a typed error if the node refuses them (rule 2: never a second funding); it makes no wallet call;
-//   - a refund hands its txid and bytes to `onSigned` before anything is sent, and `recoverRefund` resolves it.
+//   - `recoverLock` is READ-ONLY (R1-01 part 2): it asks the node by txid and answers `landed` or `unknown`, and sends
+//     nothing; `resendLock` re-sends the IDENTICAL bytes if the node does not know them, and stops with a typed error
+//     if the node refuses them (rule 2: never a second funding); neither makes a wallet call;
+//   - a refund hands its txid and bytes to `onSigned` before anything is sent; `recoverRefund` reads what became of it
+//     and `resendRefund` re-sends the identical bytes.
 // Everything runs against a mocked bitcoind surface (the pattern tests/btc-htlc.test.ts uses): no node, no wallet.
 
 import { sha256 } from "@noble/hashes/sha2.js";
@@ -162,7 +164,7 @@ describe("Bitcoin prepareLock: the recovery handle", () => {
 
 // -- recoverLock -------------------------------------------------------------------------------------------------------
 
-describe("Bitcoin recoverLock", () => {
+describe("Bitcoin recoverLock (read-only, R1-01 part 2)", () => {
   it("a funding the node already knows (mempool) is landed, and nothing is sent or signed", async () => {
     const { rail, calls, mark } = await connected(baseHandlers({ getrawtransaction: () => ({ confirmations: 0 }) }));
     mark();
@@ -180,48 +182,18 @@ describe("Bitcoin recoverLock", () => {
     expect(methods(calls)).not.toContain("sendrawtransaction");
   });
 
-  it("an unknown funding is re-sent as the IDENTICAL persisted bytes (testmempoolaccept, then sendrawtransaction once), never re-prepared", async () => {
+  it("an unknown funding is `unknown` (never never-landed, never pending): the read sends NOTHING, not even a testmempoolaccept, and builds nothing", async () => {
     const { rail, calls, mark, since } = await connected(baseHandlers({ getrawtransaction: notFound }));
     mark();
-    await expect(rail.recoverLock(PREPARED)).resolves.toBe("landed");
-    const seen = since();
-    expect(seen.find((c) => c.method === "testmempoolaccept")?.params).toEqual([[FUNDING_HEX]]);
-    const sends = seen.filter((c) => c.method === "sendrawtransaction");
-    expect(sends).toHaveLength(1);
-    expect(sends[0]?.params).toEqual([FUNDING_HEX]);
-    expect(walletCalls(calls)).toEqual([]); // no walletcreatefundedpsbt / walletprocesspsbt: no second funding is ever built
-  });
-
-  it.each(["txn-already-in-mempool", "txn-already-known"])("the node answering '%s' on the re-send means the first broadcast got there: landed, nothing sent twice", async (reason) => {
-    const { rail, calls } = await connected(
-      baseHandlers({ getrawtransaction: notFound, testmempoolaccept: () => [{ txid: FUNDING_TXID, allowed: false, "reject-reason": reason }] }),
-    );
-    await expect(rail.recoverLock(PREPARED)).resolves.toBe("landed");
-    expect(methods(calls)).not.toContain("sendrawtransaction");
-  });
-
-  it("inputs gone (the node refuses the persisted bytes): a typed error for a person, no send, and no new funding", async () => {
-    const { rail, calls } = await connected(
-      baseHandlers({ getrawtransaction: notFound, testmempoolaccept: () => [{ txid: FUNDING_TXID, allowed: false, "reject-reason": "missing-inputs" }] }),
-    );
-    const error = await rail.recoverLock(PREPARED).catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(RailRecoveryRefusedError);
-    expect((error as RailRecoveryRefusedError).code).toBe("rebroadcast-refused");
-    expect((error as RailRecoveryRefusedError).ref).toBe(REF);
-    expect((error as Error).message).toMatch(/missing-inputs/);
-    expect((error as Error).message).toMatch(/not re-prepared/);
+    await expect(rail.recoverLock(PREPARED)).resolves.toBe("unknown");
+    const seen = methods(since());
+    expect(seen).toEqual(["getblockchaininfo", "getblockhash", "getrawtransaction"]); // the pin check and the one lookup, nothing else
+    expect(methods(calls)).not.toContain("testmempoolaccept");
     expect(methods(calls)).not.toContain("sendrawtransaction");
     expect(walletCalls(calls)).toEqual([]);
   });
 
-  it("a conflicting spend of the same inputs is refused the same way", async () => {
-    const { rail } = await connected(
-      baseHandlers({ getrawtransaction: notFound, testmempoolaccept: () => [{ txid: FUNDING_TXID, allowed: false, "reject-reason": "txn-mempool-conflict" }] }),
-    );
-    await expect(rail.recoverLock(PREPARED)).rejects.toMatchObject({ code: "rebroadcast-refused" });
-  });
-
-  it("a transport failure while asking the node is NOT 'not broadcast': it propagates and nothing is re-sent", async () => {
+  it("a transport failure while asking the node is NOT 'unknown': it propagates and nothing is re-sent", async () => {
     const { rail, calls } = await connected(
       baseHandlers({
         getrawtransaction: () => {
@@ -232,20 +204,6 @@ describe("Bitcoin recoverLock", () => {
     await expect(rail.recoverLock(PREPARED)).rejects.toThrow(/connection reset/);
     expect(methods(calls)).not.toContain("testmempoolaccept");
     expect(methods(calls)).not.toContain("sendrawtransaction");
-  });
-
-  it("a failure of sendrawtransaction after an allowed testmempoolaccept propagates as it is (the outcome is unknown)", async () => {
-    const { rail } = await connected(
-      baseHandlers({
-        getrawtransaction: notFound,
-        sendrawtransaction: () => {
-          throw new Error("reply lost");
-        },
-      }),
-    );
-    const error = await rail.recoverLock(PREPARED).catch((e: unknown) => e);
-    expect(error).not.toBeInstanceOf(RailRecoveryRefusedError);
-    expect((error as Error).message).toMatch(/reply lost/);
   });
 
   it("refuses a PreparedLock with no handle, before asking the node anything", async () => {
@@ -274,6 +232,96 @@ describe("Bitcoin recoverLock", () => {
       expect((error as RailRecoveryRefusedError).code, label).toBe("handle-mismatch");
     }
     expect(since()).toEqual([]); // not one RPC call for any of them
+  });
+});
+
+describe("Bitcoin resendLock (R1-01 part 2: the re-send is its own call)", () => {
+  it("an unknown funding is re-sent as the IDENTICAL persisted bytes (testmempoolaccept, then sendrawtransaction once), never re-prepared", async () => {
+    const { rail, calls, mark, since } = await connected(baseHandlers({ getrawtransaction: notFound }));
+    mark();
+    await expect(rail.resendLock?.(PREPARED)).resolves.toBe("landed");
+    const seen = since();
+    expect(seen.find((c) => c.method === "testmempoolaccept")?.params).toEqual([[FUNDING_HEX]]);
+    const sends = seen.filter((c) => c.method === "sendrawtransaction");
+    expect(sends).toHaveLength(1);
+    expect(sends[0]?.params).toEqual([FUNDING_HEX]);
+    expect(walletCalls(calls)).toEqual([]); // no walletcreatefundedpsbt / walletprocesspsbt: no second funding is ever built
+  });
+
+  it("a funding the node learned about in the meantime is landed WITHOUT any send", async () => {
+    const { rail, calls } = await connected(baseHandlers({ getrawtransaction: () => ({ confirmations: 0 }) }));
+    await expect(rail.resendLock?.(PREPARED)).resolves.toBe("landed");
+    expect(methods(calls)).not.toContain("testmempoolaccept");
+    expect(methods(calls)).not.toContain("sendrawtransaction");
+  });
+
+  it.each(["txn-already-in-mempool", "txn-already-known"])("the node answering '%s' on the re-send means the first broadcast got there: landed, nothing sent twice", async (reason) => {
+    const { rail, calls } = await connected(
+      baseHandlers({ getrawtransaction: notFound, testmempoolaccept: () => [{ txid: FUNDING_TXID, allowed: false, "reject-reason": reason }] }),
+    );
+    await expect(rail.resendLock?.(PREPARED)).resolves.toBe("landed");
+    expect(methods(calls)).not.toContain("sendrawtransaction");
+  });
+
+  it("inputs gone (the node refuses the persisted bytes): a typed error for a person, no send, and no new funding", async () => {
+    const { rail, calls } = await connected(
+      baseHandlers({ getrawtransaction: notFound, testmempoolaccept: () => [{ txid: FUNDING_TXID, allowed: false, "reject-reason": "missing-inputs" }] }),
+    );
+    const error = await rail.resendLock?.(PREPARED).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(RailRecoveryRefusedError);
+    expect((error as RailRecoveryRefusedError).code).toBe("rebroadcast-refused");
+    expect((error as RailRecoveryRefusedError).ref).toBe(REF);
+    expect((error as Error).message).toMatch(/missing-inputs/);
+    expect((error as Error).message).toMatch(/not re-prepared/);
+    expect(methods(calls)).not.toContain("sendrawtransaction");
+    expect(walletCalls(calls)).toEqual([]);
+  });
+
+  it("a conflicting spend of the same inputs is refused the same way", async () => {
+    const { rail } = await connected(
+      baseHandlers({ getrawtransaction: notFound, testmempoolaccept: () => [{ txid: FUNDING_TXID, allowed: false, "reject-reason": "txn-mempool-conflict" }] }),
+    );
+    await expect(rail.resendLock?.(PREPARED)).rejects.toMatchObject({ code: "rebroadcast-refused" });
+  });
+
+  it("a transport failure while asking the node is NOT 'not broadcast': it propagates and nothing is re-sent", async () => {
+    const { rail, calls } = await connected(
+      baseHandlers({
+        getrawtransaction: () => {
+          throw new Error("connection reset");
+        },
+      }),
+    );
+    await expect(rail.resendLock?.(PREPARED)).rejects.toThrow(/connection reset/);
+    expect(methods(calls)).not.toContain("testmempoolaccept");
+    expect(methods(calls)).not.toContain("sendrawtransaction");
+  });
+
+  it("a failure of sendrawtransaction after an allowed testmempoolaccept propagates as it is (the outcome is unknown)", async () => {
+    const { rail } = await connected(
+      baseHandlers({
+        getrawtransaction: notFound,
+        sendrawtransaction: () => {
+          throw new Error("reply lost");
+        },
+      }),
+    );
+    const error = await rail.resendLock?.(PREPARED).catch((e: unknown) => e);
+    expect(error).not.toBeInstanceOf(RailRecoveryRefusedError);
+    expect((error as Error).message).toMatch(/reply lost/);
+  });
+
+  it("refuses a missing, foreign or inconsistent handle before asking the node anything", async () => {
+    const { rail, mark, since } = await connected(baseHandlers());
+    mark();
+    for (const prepared of [
+      { ref: REF },
+      { ref: REF, recovery: { chain: "near", txHash: "x", signedTxBase64: "AAAA" } satisfies LockRecovery },
+      { ref: REF, recovery: { chain: "btc", txid: FUNDING_TXID, rawTx: REFUND_HEX } satisfies LockRecovery },
+    ]) {
+      await expect(rail.resendLock?.(prepared)).rejects.toBeInstanceOf(RailRecoveryRefusedError);
+    }
+    expect(since()).toEqual([]);
   });
 });
 
@@ -384,7 +432,7 @@ describe("Bitcoin refund: onSigned / onNotBroadcast", () => {
 
 // -- recoverRefund -----------------------------------------------------------------------------------------------------
 
-describe("Bitcoin recoverRefund", () => {
+describe("Bitcoin recoverRefund (read-only) and resendRefund", () => {
   const RECOVERY: LockRecovery = { chain: "btc", txid: REFUND_TXID, rawTx: REFUND_HEX };
   const recoverHandlers = (overrides: Partial<Handlers> = {}): Handlers =>
     baseHandlers({
@@ -405,35 +453,48 @@ describe("Bitcoin recoverRefund", () => {
     expect(methods(pending.calls)).not.toContain("sendrawtransaction");
   });
 
-  it("a refund that dropped out of the mempool while the funding is still unspent is re-sent as the IDENTICAL bytes (pending), not rebuilt", async () => {
+  it("a refund the node does not know while the funding is still unspent is `unknown`: the READ re-sends nothing; resendRefund sends the IDENTICAL bytes (pending), not a rebuilt refund", async () => {
     const { rail, calls } = await connected(recoverHandlers());
-    await expect(rail.recoverRefund?.(REF, RECOVERY)).resolves.toBe("pending");
+    await expect(rail.recoverRefund?.(REF, RECOVERY)).resolves.toBe("unknown");
+    expect(calls.filter((c) => c.method === "sendrawtransaction")).toHaveLength(0);
+    expect(methods(calls)).not.toContain("testmempoolaccept");
+    await expect(rail.resendRefund?.(REF, RECOVERY)).resolves.toBe("pending");
     const sends = calls.filter((c) => c.method === "sendrawtransaction");
     expect(sends).toHaveLength(1);
     expect(sends[0]?.params).toEqual([REFUND_HEX]);
     expect(walletCalls(calls)).toEqual([]);
   });
 
-  it("the funding output spent by something else (a claim) means this refund can no longer land: never-landed, nothing sent", async () => {
+  it("the funding output spent by something else (a claim) means this refund can no longer land: never-landed from the read and from the resend, nothing sent", async () => {
     const { rail, calls } = await connected(recoverHandlers({ gettxout: () => null }));
     await expect(rail.recoverRefund?.(REF, RECOVERY)).resolves.toBe("never-landed");
+    await expect(rail.resendRefund?.(REF, RECOVERY)).resolves.toBe("never-landed");
     expect(methods(calls)).not.toContain("sendrawtransaction");
   });
 
-  it("a refund that shows up between the two reads is not called dead", async () => {
-    let lookups = 0;
-    const { rail } = await connected(
-      recoverHandlers({
-        gettxout: () => null,
-        getrawtransaction: () => {
-          lookups += 1;
-          // 1: recoverRefund's own look, 2: resendRefundIfDropped's look, 3: the final re-check finds it
-          if (lookups < 3) return notFound();
-          return { confirmations: 0 };
-        },
-      }),
-    );
-    await expect(rail.recoverRefund?.(REF, RECOVERY)).resolves.toBe("pending");
+  it("a refund that shows up between the two reads is not called dead (the read and the resend alike)", async () => {
+    for (const call of ["recoverRefund", "resendRefund"] as const) {
+      let lookups = 0;
+      const { rail } = await connected(
+        recoverHandlers({
+          gettxout: () => null,
+          getrawtransaction: () => {
+            lookups += 1;
+            // recoverRefund: 1 the first look, 2 the re-check finds it. resendRefund: 1 the first look, 2 inside
+            // resendRefundIfDropped, 3 the final re-check finds it.
+            if (lookups < (call === "recoverRefund" ? 2 : 3)) return notFound();
+            return { confirmations: 0 };
+          },
+        }),
+      );
+      await expect(rail[call]?.(REF, RECOVERY), call).resolves.toBe("pending");
+    }
+  });
+
+  it("a refund the node learned about between recoverRefund and resendRefund is not re-sent", async () => {
+    const { rail, calls } = await connected(recoverHandlers({ getrawtransaction: () => ({ confirmations: 0 }) }));
+    await expect(rail.resendRefund?.(REF, RECOVERY)).resolves.toBe("pending");
+    expect(methods(calls)).not.toContain("sendrawtransaction");
   });
 
   it("a transport failure propagates; a wrong or inconsistent handle is refused before any call", async () => {
@@ -445,6 +506,7 @@ describe("Bitcoin recoverRefund", () => {
       }),
     );
     await expect(failing.rail.recoverRefund?.(REF, RECOVERY)).rejects.toThrow(/connection reset/);
+    await expect(failing.rail.resendRefund?.(REF, RECOVERY)).rejects.toThrow(/connection reset/);
 
     const { rail, mark, since } = await connected(recoverHandlers());
     mark();
@@ -453,6 +515,7 @@ describe("Bitcoin recoverRefund", () => {
       { chain: "btc", txid: REFUND_TXID, rawTx: FUNDING_HEX } satisfies LockRecovery, // bytes of another transaction
     ]) {
       await expect(rail.recoverRefund?.(REF, bad)).rejects.toBeInstanceOf(RailRecoveryRefusedError);
+      await expect(rail.resendRefund?.(REF, bad)).rejects.toBeInstanceOf(RailRecoveryRefusedError);
     }
     expect(since()).toEqual([]);
   });

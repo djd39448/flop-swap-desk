@@ -47,6 +47,7 @@ import {
   type CounterAssetRail,
   type LockRecovery,
   type LockRecoveryOutcome,
+  type LockResendOutcome,
   type PreparedLock,
   type RailAccounts,
   type RailBlockMarker,
@@ -214,15 +215,28 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
   }
 
   /**
-   * P8-RESUME-SPEC.md "Buyer lock A", Bitcoin: never re-prepares. The node is asked about the persisted funding txid
-   * (`recoverFunding`): known (mempool or chain) is `landed`. Unknown: the IDENTICAL persisted bytes are re-sent
-   * (`rebroadcastFunding`: `testmempoolaccept` then `sendrawtransaction`, "already known" counting as success) and an
-   * accepted re-send is `landed`. A node that refuses the bytes (inputs spent, a conflicting transaction, policy)
-   * throws `RailRecoveryRefusedError("rebroadcast-refused")`: a second funding could double-spend the swap's inputs
-   * or create a second outpoint, so a person decides. This rail never answers `pending` or `never-landed`, and no
-   * wallet call (`walletcreatefundedpsbt`, `walletprocesspsbt`) is ever made here.
+   * P8-RESUME-SPEC.md "Buyer lock A", Bitcoin, READ-ONLY (R1-01 part 2): never re-prepares and never sends. The node is
+   * asked about the persisted funding txid (`recoverFunding`: `getrawtransaction`, mempool included): known is `landed`,
+   * unknown is `unknown`. A signed Bitcoin transaction stays valid for as long as its inputs are unspent, so this rail
+   * can never prove the funding dead and never answers `never-landed` or `pending` for a lock. Re-sending the identical
+   * bytes is `resendLock`, a separate call the flow makes only after its own guards. No wallet call
+   * (`walletcreatefundedpsbt`, `walletprocesspsbt`), no `testmempoolaccept` and no `sendrawtransaction` is made here.
    */
   async recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome> {
+    const handle = requireBtcHandle(prepared.ref, prepared.recovery, true);
+    const known = await this.btcRail.recoverFunding(handle.txid);
+    return known.broadcast ? "landed" : "unknown";
+  }
+
+  /**
+   * R1-01 (part 2), Bitcoin: re-sends the IDENTICAL persisted funding bytes (`rebroadcastFunding`: `testmempoolaccept`
+   * then `sendrawtransaction`, "already known" counting as success; resending identical bytes cannot create a second
+   * outpoint). The node is asked about the txid first, so a funding that reached it meanwhile is `landed` without a
+   * send. A node that refuses the bytes (inputs spent, a conflicting transaction, policy) throws
+   * `RailRecoveryRefusedError("rebroadcast-refused")`: a second funding could double-spend the swap's inputs or create
+   * a second outpoint, so a person decides. Never signs or prepares anything.
+   */
+  async resendLock(prepared: PreparedLock): Promise<LockResendOutcome> {
     const handle = requireBtcHandle(prepared.ref, prepared.recovery, true);
     const known = await this.btcRail.recoverFunding(handle.txid);
     if (known.broadcast) return "landed";
@@ -274,15 +288,31 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
   }
 
   /**
-   * P8-RESUME-SPEC.md "Buyer refund A", Bitcoin: resolves the ONE refund this flow signed, from its recorded txid and
-   * bytes. Known to the node: `landed` once it has a confirmation, else `pending`. Unknown: `resendRefundIfDropped`
-   * decides (it re-sends the IDENTICAL bytes only while the funding output is still unspent by anyone, mempool
-   * included, and never builds a second refund): re-sent is `pending`; not re-sent means that output is spent by
-   * another transaction (a claim), so this refund can no longer land: `never-landed` (a caller then routes to
-   * `learnSecret`). The txid is looked up once more before that verdict, so a refund that reached the node between
-   * the two reads is never called dead.
+   * P8-RESUME-SPEC.md "Buyer refund A", Bitcoin, READ-ONLY (R1-01 part 2): what became of the ONE refund this flow
+   * signed, from its recorded txid. Known to the node: `landed` once it has a confirmation, else `pending`. Unknown:
+   * when the funding output is spent by another transaction (a claim; `gettxout` with the mempool answers nothing) the
+   * refund can no longer land: `never-landed` (a caller then routes to `learnSecret`); otherwise `unknown`, and
+   * `resendRefund` decides. The txid is looked up once more before the `never-landed` verdict, so a refund that reached
+   * the node between the two reads is never called dead. Sends nothing.
    */
   async recoverRefund(ref: string, recovery: LockRecovery): Promise<LockRecoveryOutcome> {
+    const handle = requireBtcHandle(ref, recovery, false);
+    const known = await this.btcRail.recoverFunding(handle.txid);
+    if (known.broadcast) return known.confirmations !== null && known.confirmations >= 1 ? "landed" : "pending";
+    if (await this.btcRail.fundingOutputUnspent(ref)) return "unknown";
+    const again = await this.btcRail.recoverFunding(handle.txid);
+    if (again.broadcast) return again.confirmations !== null && again.confirmations >= 1 ? "landed" : "pending";
+    return "never-landed";
+  }
+
+  /**
+   * R1-01 (part 2), Bitcoin: `resendRefundIfDropped` decides (it re-sends the IDENTICAL recorded bytes only while the
+   * funding output is still unspent by anyone, mempool included, and never builds a second refund): re-sent is
+   * `pending` (accepted, not yet confirmed). Not re-sent means the refund is known (`landed` once confirmed, else
+   * `pending`) or the output is spent by another transaction, so this refund can no longer land: `never-landed`. The
+   * txid is read first, so a refund that reached the node meanwhile is never re-sent.
+   */
+  async resendRefund(ref: string, recovery: LockRecovery): Promise<LockResendOutcome> {
     const handle = requireBtcHandle(ref, recovery, false);
     const known = await this.btcRail.recoverFunding(handle.txid);
     if (known.broadcast) return known.confirmations !== null && known.confirmations >= 1 ? "landed" : "pending";

@@ -36,7 +36,9 @@ import { base58 } from "@scure/base";
 
 import { buildSignedTransaction, type NearAction, type NearTransactionV0 } from "./near-borsh.js";
 import {
+  NearExpiredTransactionError,
   NearFunctionCallPanicError,
+  NearInvalidNonceError,
   NearRpc,
   NearUnknownTransactionError,
   type NearBlockRef,
@@ -445,6 +447,16 @@ export const NEAR_CLAIM_LANDING_MARGIN_MS = 30_000;
 /** H9: how long `commitLock` waits before its one re-read of a lock that was not yet visible --
  *  long enough for a later final block on the sandbox (blocks ~0.65 s, finality ~2 blocks). */
 export const NEAR_LOCK_REREAD_DELAY_MS = 2_000;
+
+/** R1-19: how many final blocks past the one at which a transaction's effect on the access key's nonce was seen the
+ *  lock row is read again before a lock is called "never landed". The nonce moves when the transaction is included
+ *  (block N); `ft_on_transfer` creates the row a couple of blocks later, so a row read at a final block before N + 3
+ *  can still miss a lock that is on its way. */
+export const NEAR_RECEIPT_SETTLE_BLOCKS = 3;
+/** How long `readLockSettled` sleeps between two reads of the head while it waits for the settle height, and how many
+ *  times it asks before it gives up and says "not settled" (the caller answers `pending`). About 14 s on the sandbox. */
+export const NEAR_SETTLE_POLL_MS = 700;
+export const NEAR_SETTLE_MAX_POLLS = 20;
 
 export interface NearWriteEvidence {
   ref: string;
@@ -1018,8 +1030,68 @@ export class NearHtlcRail {
    * never land (the "nonce can no longer accept it" proof `recoverLock` uses for `never-landed`).
    */
   async finalAccessKeyNonce(): Promise<bigint> {
+    return (await this.finalAccessKey()).nonce;
+  }
+
+  /** R1-19: `finalAccessKeyNonce` with the height of the final block it was read at (the view's own `block_height`),
+   *  which a caller needs to know how long to wait before it believes "no lock shows". */
+  async finalAccessKey(): Promise<{ nonce: bigint; blockHeight: number }> {
     const key = await this.near.viewAccessKey(this.signer.accountId, this.signer.publicKey);
-    return BigInt(key.nonce);
+    return { nonce: BigInt(key.nonce), blockHeight: key.blockHeight };
+  }
+
+  /** The OPTIMISTIC head's height: the newest block the node has, which a transaction that was just reported expired or
+   *  consumed can already have been included in (the final head lags it by a couple of blocks). */
+  async optimisticHeight(): Promise<number> {
+    const block = await this.near.block({ finality: "optimistic" });
+    return block.header.height;
+  }
+
+  /**
+   * R1-19: the lock stored under `ref`, read at a FINAL block at least `NEAR_RECEIPT_SETTLE_BLOCKS` past
+   * `observedHeight` (the height at which the transaction's inclusion was observed). `ft_on_transfer` creates the row a
+   * couple of blocks after the transaction is included, so a row read earlier proves nothing about a lock that has not
+   * appeared yet. Waits (the injected `sleep`) for the final head to get there, at most `NEAR_SETTLE_MAX_POLLS` reads of
+   * the head; `settled: false` means it did not (a stalled or slow chain), and the caller must not call the lock dead.
+   * Read-only.
+   */
+  async readLockSettled(ref: string, observedHeight: number): Promise<{ settled: boolean; lock: NearLockView | null }> {
+    const target = observedHeight + NEAR_RECEIPT_SETTLE_BLOCKS;
+    for (let polls = 0; ; polls += 1) {
+      const head = await this.currentBlockMarker();
+      if (head >= target) return { settled: true, lock: await this.getLock(ref, { blockId: head }) };
+      if (polls >= NEAR_SETTLE_MAX_POLLS) return { settled: false, lock: null };
+      await this.sleep(NEAR_SETTLE_POLL_MS);
+    }
+  }
+
+  /**
+   * R1-10: sends the IDENTICAL signed bytes a caller persisted before their send (`prepareLock`'s or `refund`'s
+   * `signedTxBase64`), exactly once, and says what the node answered. Never signs anything: identical bytes have one
+   * transaction hash and one nonce, so this can never move funds twice (the contract refuses a duplicate lock and a
+   * second refund, and the access key's nonce admits the transaction only once). Answers:
+   *   - `sent`: the node accepted and executed it (`wait_until: FINAL`); the caller reads what it did by hash;
+   *   - `expired`: the node's `Expired` answer: the block hash the transaction is built on is too old, it can never
+   *     be included from now on;
+   *   - `invalid-nonce`: the access key's nonce was already consumed (by another transaction, or by this very one,
+   *     which a lagging node had not shown yet): the caller re-reads before it concludes anything;
+   *   - `unreachable`: anything else the send threw (a transport failure, a timeout while waiting for finality): the
+   *     send's own outcome is not known.
+   * The chain pin is re-checked first; a refusal there throws and nothing was sent.
+   */
+  async resendSigned(signedTxBase64: string, ref: string): Promise<{ kind: "sent" | "expired" | "invalid-nonce" } | { kind: "unreachable"; error: unknown }> {
+    await this.assertPinnedChain();
+    this.rpc.setIdNamespace(`write:${ref}:${this.clock()}`);
+    try {
+      await this.near.sendTx(signedTxBase64, "FINAL");
+      return { kind: "sent" };
+    } catch (error) {
+      if (error instanceof NearExpiredTransactionError) return { kind: "expired" };
+      if (error instanceof NearInvalidNonceError) return { kind: "invalid-nonce" };
+      return { kind: "unreachable", error };
+    } finally {
+      this.rpc.setIdNamespace(undefined);
+    }
   }
 
   /**

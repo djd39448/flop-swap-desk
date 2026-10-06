@@ -4,6 +4,13 @@
 // P8 crash-resume matrix (tests/resume-*.test.ts) can drive the REAL flows over the REAL near rail over the same simulator.
 // The only additions are the ones recovery needs: `EXPERIMENTAL_tx_status` by transaction hash, and counters of the sends it
 // applied. Nothing about the simulated contract changed.
+//
+// R1-10 / R1-19 additions (rail recovery of a transaction that was signed and saved but never sent, or that landed while the
+// node still hides it): the node now models what a real one answers to `send_tx` -- `InvalidNonce` for a nonce the access key
+// has already consumed, `Expired` for a block hash older than `txValidityPeriodBlocks` (or one it never had) -- and block
+// heights move on demand (`advanceBlocks`). `lockRowDelayBlocks` delays the `ft_on_transfer` receipt that creates a lock row
+// (the row is invisible to a read at an earlier block), and `txStatusUnknown` makes `EXPERIMENTAL_tx_status` answer
+// UNKNOWN_TRANSACTION for every hash (a lagging node). All default to the old behaviour.
 
 import { sha256 } from "@noble/hashes/sha2.js";
 import { base58 } from "@scure/base";
@@ -67,6 +74,8 @@ export interface DecodedFunctionCall {
   /** P8 additions, for `EXPERIMENTAL_tx_status`: the transaction as a node would describe it. */
   publicKeyBytes: Uint8Array;
   nonce: bigint;
+  /** R1-10: the block hash the transaction was built on (base58), which decides whether it can still be included. */
+  blockHashBase58: string;
   argsBase64: string;
   gas: bigint;
   deposit: bigint;
@@ -86,7 +95,7 @@ export function decodeSignedTxFunctionCall(signedTxBase64: string): DecodedFunct
   const publicKeyBytes = r.readBytes(32);
   const nonce = r.readU64();
   const receiverId = r.readString();
-  r.readBytes(32); // block hash
+  const blockHashBase58 = base58.encode(r.readBytes(32));
   const actionCount = r.readU32();
   if (actionCount !== 1) throw new Error(`decodeSignedTxFunctionCall: expected exactly 1 action, got ${actionCount}`);
   const tag = r.readU8();
@@ -96,7 +105,7 @@ export function decodeSignedTxFunctionCall(signedTxBase64: string): DecodedFunct
   const gas = r.readU64();
   const deposit = r.readU128();
   const argsJson = JSON.parse(new TextDecoder().decode(argsBytes)) as Record<string, unknown>;
-  return { signerId, receiverId, methodName, argsJson, publicKeyBytes, nonce, argsBase64: Buffer.from(argsBytes).toString("base64"), gas, deposit };
+  return { signerId, receiverId, methodName, argsJson, publicKeyBytes, nonce, blockHashBase58, argsBase64: Buffer.from(argsBytes).toString("base64"), gas, deposit };
 }
 
 // ── the stateful fake NEAR node ──────────────────────────────────────────────────────────────
@@ -112,7 +121,25 @@ export interface LockRow {
   /** hex, no `0x` (matches the contract's own `get_lock` field — near-htlc.ts's `parseLockView`
    *  adds the `0x` prefix back on read). */
   preimage: string | null;
+  /** R1-19: the first block height at which a read shows this row (the `ft_on_transfer` receipt's block); absent = at once. */
+  visibleFromHeight?: number;
 }
+
+/** A JSON-RPC error body the node answers with (the shape a real near-sandbox gave, see tests/near-rpc.test.ts). */
+export interface SimRpcErrorBody {
+  code: number;
+  message: string;
+  name?: string;
+  cause?: unknown;
+  data?: unknown;
+}
+class SimRpcError extends Error {
+  constructor(readonly body: SimRpcErrorBody) {
+    super(body.message);
+  }
+}
+const invalidTx = (reason: unknown): SimRpcError =>
+  new SimRpcError({ code: -32000, message: "Server error", name: "HANDLER_ERROR", cause: { name: "INVALID_TRANSACTION", info: {} }, data: { TxExecutionError: { InvalidTxError: reason } } });
 
 export class StatefulNearRpc {
   private readonly locks = new Map<string, LockRow>();
@@ -121,6 +148,19 @@ export class StatefulNearRpc {
   private readonly accountsWithoutKeys = new Set<string>();
   private readonly readsRemainingBeforeUnregister = new Map<string, number>();
   private blockHeight = 100;
+  /** R1-10: block height by block hash (every block the node ever had), for the `Expired` check of `send_tx`. */
+  private readonly heightByHash = new Map<string, number>();
+  /** R1-10: a transaction built on a block more than this many blocks behind the head is `Expired` (nearcore's
+   *  `transaction_validity_period`; the real default is 86400, so a test that wants an expiry sets a small one). */
+  txValidityPeriodBlocks = 86_400;
+  /** R1-19: blocks between a lock transaction's inclusion and the `ft_on_transfer` receipt that creates its row. */
+  lockRowDelayBlocks = 0;
+  /** R1-19: `EXPERIMENTAL_tx_status` answers UNKNOWN_TRANSACTION for every hash (a lagging or load-balanced node). */
+  txStatusUnknown = false;
+  /** R1-10: every `send_tx` that reached this node, and how many of them it rejected as expired or as an invalid nonce. */
+  sendTxReceived = 0;
+  sendTxExpired = 0;
+  sendTxInvalidNonce = 0;
   nowMs: number;
   forceNextClaimTxFailure = false;
   forceNextRefundTxFailure = false;
@@ -144,6 +184,27 @@ export class StatefulNearRpc {
     nowMs: number,
   ) {
     this.nowMs = nowMs;
+    this.heightByHash.set(this.blockHashFor(this.blockHeight), this.blockHeight);
+  }
+
+  /** R1-19 / R1-10: the chain moves on by `n` blocks (and its time by `msPerBlock` each, 0 keeps `nowMs`). */
+  advanceBlocks(n: number, msPerBlock = 0): void {
+    for (let i = 0; i < n; i += 1) {
+      this.blockHeight += 1;
+      this.heightByHash.set(this.blockHashFor(this.blockHeight), this.blockHeight);
+      this.nowMs += msPerBlock;
+    }
+  }
+  get height(): number {
+    return this.blockHeight;
+  }
+  /** R1-10: another transaction of this account's key took nonces up to `nonce` (the key's nonce never moves back). */
+  consumeNonce(accountId: string, nonce: number): void {
+    this.nonces.set(accountId, Math.max(this.nonces.get(accountId) ?? 0, nonce));
+  }
+  /** R1-10: the key's current nonce, as `view_access_key` reports it. */
+  nonceOf(accountId: string): number {
+    return this.nonces.get(accountId) ?? 0;
   }
 
   registerStorage(accountId: string): void {
@@ -191,9 +252,10 @@ export class StatefulNearRpc {
   private currentBlock(): { height: number; hash: string; timestampNs: string } {
     return { height: this.blockHeight, hash: this.blockHashFor(this.blockHeight), timestampNs: `${BigInt(Math.round(this.nowMs)) * 1_000_000n}` };
   }
-  private lockViewJson(hashLockHex: string, payer: string): string {
+  private lockViewJson(hashLockHex: string, payer: string, atHeight: number = this.blockHeight): string {
     const row = this.locks.get(this.key(payer, hashLockHex));
     if (row === undefined) return "null";
+    if (row.visibleFromHeight !== undefined && row.visibleFromHeight > atHeight) return "null"; // the receipt is not executed yet
     return JSON.stringify({
       status: row.status,
       payer: row.payer,
@@ -234,7 +296,8 @@ export class StatefulNearRpc {
       const argsBase64 = params.args_base64 as string;
       const args = JSON.parse(Buffer.from(argsBase64, "base64").toString("utf8")) as Record<string, unknown>;
       if (methodName === "get_lock") {
-        return this.callFunctionResult(this.lockViewJson(args.hash_lock as string, args.payer as string));
+        const atHeight = typeof params.block_id === "number" ? params.block_id : this.blockHeight;
+        return this.callFunctionResult(this.lockViewJson(args.hash_lock as string, args.payer as string, atHeight));
       }
       if (methodName === "storage_balance_of") {
         const accountId = args.account_id as string;
@@ -257,6 +320,19 @@ export class StatefulNearRpc {
 
   private handleSendTx(params: Record<string, unknown>): unknown {
     const decoded = decodeSignedTxFunctionCall(params.signed_tx_base64 as string);
+    this.sendTxReceived += 1;
+    // R1-10: what a real node checks first. A block hash it never had, or one too far behind the head, is `Expired`; a nonce
+    // the access key has already consumed (by another transaction, or by this very one) is `InvalidNonce`.
+    const builtOn = this.heightByHash.get(decoded.blockHashBase58);
+    if (builtOn === undefined || this.blockHeight - builtOn > this.txValidityPeriodBlocks) {
+      this.sendTxExpired += 1;
+      throw invalidTx("Expired");
+    }
+    const keyNonce = this.nonces.get(decoded.signerId) ?? 0;
+    if (Number(decoded.nonce) <= keyNonce) {
+      this.sendTxInvalidNonce += 1;
+      throw invalidTx({ InvalidNonce: { tx_nonce: Number(decoded.nonce), ak_nonce: keyNonce } });
+    }
     // The access key's nonce moves to the transaction's own (never backwards), as on a real node.
     this.nonces.set(decoded.signerId, Math.max(this.nonces.get(decoded.signerId) ?? 0, Number(decoded.nonce)));
     let failure: unknown = null;
@@ -282,6 +358,8 @@ export class StatefulNearRpc {
           claimByMs: Number(msg.claim_by_ms),
           refundAfterMs: Number(msg.refund_after_ms),
           preimage: null,
+          // the transaction is included in the block this send is about to create; its receipt executes `lockRowDelayBlocks` later
+          ...(this.lockRowDelayBlocks > 0 ? { visibleFromHeight: this.blockHeight + 1 + this.lockRowDelayBlocks } : {}),
         });
       }
       // S3: `ft_on_transfer` refuses without ever panicking — the outer transfer call still
@@ -321,7 +399,7 @@ export class StatefulNearRpc {
       throw new Error(`StatefulNearRpc: unhandled send_tx method ${decoded.methodName}`);
     }
 
-    this.blockHeight += 1;
+    this.advanceBlocks(1);
     const block = this.currentBlock();
     const status = failure === null ? { SuccessValue: successValue } : { Failure: failure };
     // P8: remember the transaction under its own hash, for `EXPERIMENTAL_tx_status` (the lost-reply recovery path).
@@ -342,14 +420,14 @@ export class StatefulNearRpc {
   }
 
   /** P8: what `EXPERIMENTAL_tx_status` answers for `txHash`: the applied transaction, or the node's UNKNOWN_TRANSACTION. */
-  private handleTxStatus(params: Record<string, unknown>): { result: unknown } | { error: { code: number; message: string; name?: string; cause?: unknown } } {
-    const known = this.appliedTxs.get(String(params.tx_hash));
+  private handleTxStatus(params: Record<string, unknown>): { result: unknown } | { error: SimRpcErrorBody } {
+    const known = this.txStatusUnknown ? undefined : this.appliedTxs.get(String(params.tx_hash));
     if (known === undefined) return { error: { code: -32000, message: "Server error", name: "HANDLER_ERROR", cause: { name: "UNKNOWN_TRANSACTION", info: {} } } };
     return { result: known };
   }
 
   /** The one dispatch point every fake `fetch` call routes through. */
-  handle(method: string, params: unknown): { result: unknown } | { error: { code: number; message: string; name?: string; cause?: unknown } } {
+  handle(method: string, params: unknown): { result: unknown } | { error: SimRpcErrorBody } {
     try {
       if (method === "EXPERIMENTAL_tx_status") return this.handleTxStatus(params as Record<string, unknown>);
       if (method === "status") return { result: { chain_id: "near-sandbox-flop", protocol_version: 86, sync_info: {} } };
@@ -368,6 +446,7 @@ export class StatefulNearRpc {
       }
       throw new Error(`StatefulNearRpc: unhandled method ${method}`);
     } catch (error) {
+      if (error instanceof SimRpcError) return { error: error.body };
       return { error: { code: -32000, message: error instanceof Error ? error.message : String(error) } };
     }
   }
@@ -376,7 +455,7 @@ export class StatefulNearRpc {
 export function fetchFor(node: StatefulNearRpc): typeof fetch {
   return (async (_url: unknown, init?: RequestInit) => {
     const parsed = JSON.parse(String(init?.body)) as { id: number | string; method: string; params: unknown };
-    let outcome: { result: unknown } | { error: { code: number; message: string; name?: string; cause?: unknown } };
+    let outcome: { result: unknown } | { error: SimRpcErrorBody };
     try {
       outcome = node.handle(parsed.method, parsed.params);
     } catch (error) {

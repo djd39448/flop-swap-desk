@@ -183,14 +183,31 @@ export type LockRecovery =
 
 /**
  * P8-RESUME-SPEC.md: what the chain says about a recorded transaction (a lock via `recoverLock`, a refund via
- * `recoverRefund`). `landed`: it is on chain (the caller then reads the evidence it needs, `verifyLockFinal` or
- * `lockRecorded`). `pending`: not decided yet, nothing new may be signed, ask again later. `never-landed`: the rail
- * can PROVE the transaction can no longer land (Solana: the blockhash expired with no status and the node's ledger
- * covers the signing slot; NEAR: the access key's nonce has moved past the transaction's, and no lock is visible),
- * so a fresh one may be built. Bitcoin never answers `never-landed` (a signed Bitcoin transaction stays valid for as
- * long as its inputs are unspent); EVM answers it for "no lock is visible", see `EvmHtlcRail.readLock`.
+ * `recoverRefund`). Reading and re-sending are two separate calls (review round 1, R1-01): `recoverLock` and
+ * `recoverRefund` only READ, they never send anything, so a caller can run its own deadline and clock guards (rule 4)
+ * between "what became of it" and "send it again".
+ *   - `landed`: it is on chain (the caller then reads the evidence it needs, `verifyLockFinal` or `lockRecorded`).
+ *   - `pending`: not decided yet, nothing new may be signed or sent, ask again later.
+ *   - `never-landed`: the rail can PROVE the transaction can no longer land (Solana: the blockhash expired with no
+ *     status and the node's ledger covers the signing slot; NEAR: the access key's nonce moved to or past the
+ *     transaction's and, three blocks later, no lock shows; Bitcoin refund: the funding output is spent by another
+ *     transaction), so a fresh one may be built. EVM answers it for "no lock is visible", see `EvmHtlcRail.readLock`.
+ *   - `unknown`: the node does not know the transaction and the rail cannot prove it dead (Bitcoin: the txid is
+ *     unknown, a signed transaction stays valid as long as its inputs are unspent; NEAR: unknown to the node, no lock
+ *     row, nonce not yet past). Nothing new may be SIGNED. The caller may re-send the IDENTICAL persisted bytes with
+ *     `resendLock` / `resendRefund` once its own guards allow a new outward action; that call is what settles it.
  */
-export type LockRecoveryOutcome = "landed" | "never-landed" | "pending";
+export type LockRecoveryOutcome = "landed" | "never-landed" | "pending" | "unknown";
+
+/**
+ * R1-01 (part 2): what `resendLock` / `resendRefund` answer after sending the identical persisted bytes once (or after
+ * finding there was nothing left to send): `landed` (accepted, or already known), `never-landed` (the rail proved the
+ * bytes can no longer land: NEAR's `Expired` or invalid-nonce answer, after a re-read of the lock row three blocks
+ * later; Bitcoin refund: the funding output is spent by another transaction), or `pending` (the send's own outcome is
+ * not known: a transport failure, or a node still waiting for finality; nothing was signed, ask again later). A
+ * Bitcoin funding the node refuses is a thrown `RailRecoveryRefusedError("rebroadcast-refused")`, never an outcome.
+ */
+export type LockResendOutcome = "landed" | "never-landed" | "pending";
 
 /**
  * P8-RESUME-SPEC.md: the recorder a refund accepts, the twin of the Solana claim's `onSigned` / `onNotBroadcast`
@@ -207,9 +224,9 @@ export interface RailRefundOptions {
 
 /** Why a recovery refused to proceed. `no-handle`: the rail needs a recovery handle and the record has none.
  *  `handle-mismatch`: the handle is for another rail, or does not belong to this ref or is internally inconsistent.
- *  `rebroadcast-refused` (Bitcoin): the node refused the persisted signed bytes (inputs gone, a conflicting spend,
- *  a policy rejection): a second funding must NOT be built automatically (it could double-spend the swap's inputs
- *  or create a second outpoint), so a person decides. `lock-conflict` (EVM): a lock exists under this hash lock
+ *  `rebroadcast-refused` (Bitcoin, thrown by `resendLock`): the node refused the persisted signed bytes (inputs gone, a
+ *  conflicting spend, a policy rejection): a second funding must NOT be built automatically (it could double-spend the
+ *  swap's inputs or create a second outpoint), so a person decides. `lock-conflict` (EVM): a lock exists under this hash lock
  *  that is not this party's own, so this party's lock can never land. */
 export type RailRecoveryCode = "no-handle" | "handle-mismatch" | "rebroadcast-refused" | "lock-conflict";
 
@@ -271,22 +288,36 @@ export interface ConnectedCounterAssetRail {
   /**
    * P8-RESUME-SPEC.md "Buyer lock A": after a crash between `prepareLock` and the end of `commitLock`, find out from
    * the chain what became of the ONE transaction `prepareLock` signed, using the persisted `PreparedLock` (`ref` plus
-   * `recovery`). Never signs anything new. Per rail: Bitcoin asks the node about the funding txid and, if the node
-   * does not know it, re-sends the IDENTICAL persisted bytes (answering `landed` once accepted, or throwing
-   * `RailRecoveryRefusedError("rebroadcast-refused")` when the node refuses them); NEAR asks by transaction hash, then
-   * by the lock itself, then compares the access key's nonce (`never-landed` only when the nonce has moved past the
-   * transaction's); Solana asks by signature (`never-landed` only when the blockhash expired and the node's ledger
-   * covers the signing slot); EVM reads the lock by its hash lock. A typed chain failure of the transaction itself
+   * `recovery`). READ-ONLY (R1-01): it never signs anything and never sends anything, on any rail. Per rail: Bitcoin
+   * asks the node about the funding txid (`landed` when the node knows it, else `unknown`); NEAR asks by transaction
+   * hash, then by the lock itself, then compares the access key's nonce (`never-landed` only when the nonce has moved
+   * to or past the transaction's and a re-read three blocks later still shows no lock; `unknown` while the nonce is
+   * below it); Solana asks by signature (`never-landed` only when the blockhash expired and the node's ledger covers
+   * the signing slot); EVM reads the lock by its hash lock. A typed chain failure of the transaction itself
    * (`NearTxFailedError`, `SolLockRefusedError`, ...) propagates unchanged. A caller runs its own deadline guards
-   * before calling this (rule 4); this method decides nothing about time.
+   * before any NEW outward action that follows (`resendLock`, a fresh `prepareLock`; rule 4); recognising a lock that
+   * already landed is not one.
    */
   recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome>;
+  /**
+   * R1-01 (part 2): re-send the IDENTICAL persisted bytes of the lock `prepared` names, once, after `recoverLock`
+   * answered `unknown`. Never signs anything new, and can never move funds twice (identical bytes have one hash and
+   * one nonce). Bitcoin re-broadcasts the funding (`rebroadcastFunding`); NEAR sends the persisted
+   * `signedTxBase64`. It first re-reads (a transaction that landed meanwhile is answered `landed` without a send).
+   * Optional: a rail that never answers `unknown` (`evm-htlc`, `sol-htlc`) omits it. The caller applies its rule-4
+   * guards (deadline, leg-B note, chain clock) BEFORE calling this.
+   */
+  resendLock?(prepared: PreparedLock): Promise<LockResendOutcome>;
   /** P8-RESUME-SPEC.md "Buyer refund A": the refund twin of `recoverLock`, resolving a refund recorded through
    *  `refund`'s `onSigned`. Optional: `evm-htlc` omits it (its refund leaves no handle before the send; a repeated
-   *  refund is recognised from the lock's own state). Never signs anything new, except that Bitcoin re-sends the
-   *  IDENTICAL recorded refund bytes when they dropped out of the mempool and the funding output is still unspent
-   *  (the existing `resendRefundIfDropped` rule). */
+   *  refund is recognised from the lock's own state). READ-ONLY, like `recoverLock`: the identical recorded bytes are
+   *  re-sent only by `resendRefund`. */
   recoverRefund?(ref: string, recovery: LockRecovery): Promise<LockRecoveryOutcome>;
+  /** R1-01 (part 2): the refund twin of `resendLock`: re-send the IDENTICAL recorded refund bytes once, after
+   *  `recoverRefund` answered `unknown`. Bitcoin re-sends only while the funding output is still unspent by anyone
+   *  (the existing `resendRefundIfDropped` rule); NEAR sends the persisted bytes only while the lock still reads
+   *  `Locked`. Never signs anything new. Optional, like `recoverRefund`. */
+  resendRefund?(ref: string, recovery: LockRecovery): Promise<LockResendOutcome>;
   /** Solana only (S2-2): resolve one recorded claim by its signature (never by a scan or a resend). Optional: a rail
    *  with no such concept omits it. */
   recoverClaim?(ref: string, record: RailClaimRecord): Promise<RailClaimRecovery>;

@@ -4,10 +4,13 @@
 // dies between `prepareLock` and the end of `commitLock` must find out what became of the ONE signed transaction, from
 // the transaction hash and bytes it persisted:
 //   - `prepareLock` hands out the hash and the complete signed bytes;
-//   - `recoverLock` reads the access key's nonce FIRST, then the transaction by hash, then the lock by ref, and says
-//     `never-landed` only when the nonce has moved past the transaction's and nothing else shows it (a landing between
-//     the reads cannot be missed because the views only move forward);
-//   - a refund hands its hash and bytes to `onSigned` before anything is sent, and `recoverRefund` resolves it.
+//   - `recoverLock` is READ-ONLY (R1-01 part 2, R1-10): it reads the access key's nonce FIRST, then the transaction by
+//     hash, then the lock by ref, and says `never-landed` only when the nonce has moved past the transaction's and a lock
+//     row read three blocks later (R1-19) still shows nothing (a landing between the reads cannot be missed because the
+//     views only move forward); a transaction the node does not know with the nonce still below it is `unknown`;
+//   - `resendLock` sends the IDENTICAL persisted bytes once and answers from what the node says (executed: landed;
+//     `Expired` or an invalid nonce: never-landed after a re-read of the lock; a transport failure: pending);
+//   - a refund hands its hash and bytes to `onSigned` before anything is sent; `recoverRefund` / `resendRefund` resolve it.
 // Runs against a method-dispatching mock of the near-sandbox JSON-RPC surface (no node, no key outside memory).
 
 import { sha256 } from "@noble/hashes/sha2.js";
@@ -70,10 +73,15 @@ interface Node {
   tx: "unknown" | "timeout" | "transport-error" | ((txHash: string) => Record<string, unknown>);
   /** What `send_tx` answers (and the hook that changes the world when a transaction is sent). */
   onSend?: (signedTxBase64: string) => Record<string, unknown>;
+  /** A JSON-RPC error `send_tx` answers with instead (the node's own `Expired` / invalid-nonce shapes, a timeout, ...). */
+  sendError?: Record<string, unknown>;
   /** `status().chain_id` per call, last one repeats. */
   chainIds: string[];
   /** Runs before the reply to a named method, so a test can move the chain between two reads. */
   before?: (method: string) => void;
+  /** The head's height: every `block` read answers it, and every sleep of the rail (the settle wait) moves it by one block. */
+  head: number;
+  sleeps: number;
   calls: Call[];
 }
 
@@ -91,7 +99,7 @@ function lockRow(overrides: Record<string, unknown> = {}): Record<string, unknow
 }
 
 function newNode(overrides: Partial<Node> = {}): Node {
-  return { keyNonce: 4, lock: null, tx: "unknown", chainIds: ["near-sandbox-flop"], calls: [], ...overrides };
+  return { keyNonce: 4, lock: null, tx: "unknown", chainIds: ["near-sandbox-flop"], head: 10, sleeps: 0, calls: [], ...overrides };
 }
 
 function functionCall(methodName: string, args: unknown, deposit: string): Record<string, unknown> {
@@ -129,7 +137,7 @@ function reply(node: Node, method: string, params: Record<string, unknown>): { r
       return { result: { chain_id: id, protocol_version: 86, sync_info: {} } };
     }
     case "block":
-      return { result: { header: { height: 10, hash: BLOCK_HASH, timestamp_nanosec: "1800000000000000000" } } }; // chain time past refundAfterMs
+      return { result: { header: { height: node.head, hash: BLOCK_HASH, timestamp_nanosec: "1800000000000000000" } } }; // chain time past refundAfterMs
     case "query": {
       switch (params.request_type) {
         case "view_account":
@@ -145,6 +153,7 @@ function reply(node: Node, method: string, params: Record<string, unknown>): { r
       }
     }
     case "send_tx":
+      if (node.sendError !== undefined) return { error: node.sendError };
       if (node.onSend === undefined) return { error: { code: -32601, message: "this test does not send" } };
       return { result: node.onSend(String(params.signed_tx_base64)) };
     case "EXPERIMENTAL_tx_status": {
@@ -168,7 +177,16 @@ async function connect(node: Node): Promise<ConnectedCounterAssetRail> {
     return { text: async () => text, arrayBuffer: async () => bytes.buffer } as Response;
   }) as typeof fetch;
   const rpc = new CapturingRpc({ endpoint: CONFIG.endpoint, fetch: fetchImpl, clock: () => 5000 });
-  const rail = createNearCounterRail({ config: CONFIG, rpc, signer: buyerSigner, clock: () => 5000 });
+  const rail = createNearCounterRail({
+    config: CONFIG,
+    rpc,
+    signer: buyerSigner,
+    clock: () => 5000,
+    sleep: async () => {
+      node.sleeps += 1;
+      node.head += 1;
+    },
+  });
   return rail.connect(lockTerms(), ACCOUNTS);
 }
 
@@ -255,13 +273,13 @@ describe("NEAR recoverLock", () => {
     expect(methods(node)).not.toContain("send_tx");
   });
 
-  it("unknown to the node, no lock, nonce still below the transaction's: pending (it may be in flight or never sent), and nothing new is signed", async () => {
+  it("unknown to the node, no lock, nonce still below the transaction's: unknown (never sent, or still in flight: this rail cannot tell), and nothing is sent or signed", async () => {
     const node = newNode({ keyNonce: 4 });
     const { rail, prepared: p } = await prepared(node);
     node.tx = "unknown";
     const blockReadsBefore = node.calls.filter((c) => c.method === "block").length; // building a transaction reads a block
-    await expect(rail.recoverLock(p)).resolves.toBe("pending");
-    await expect(rail.recoverLock(p)).resolves.toBe("pending");
+    await expect(rail.recoverLock(p)).resolves.toBe("unknown");
+    await expect(rail.recoverLock(p)).resolves.toBe("unknown");
     expect(methods(node)).not.toContain("send_tx");
     expect(node.calls.filter((c) => c.method === "block").length).toBe(blockReadsBefore); // so a recovery signed nothing
   });
@@ -502,21 +520,25 @@ describe("NEAR recoverRefund", () => {
     await expect(rail.recoverRefund?.(REF, recovery)).resolves.toBe("landed");
   });
 
-  it("unknown, the lock still Locked: pending while the nonce is below the refund's, never-landed once it has moved past", async () => {
+  it("unknown, the lock still Locked: unknown while the nonce is below the refund's (R1-10: the refund may never have been sent), never-landed once it has moved past; nothing is sent", async () => {
     const { node, rail, recovery } = await signedRefund();
     node.tx = "unknown";
     const header = decodeSignedTransactionHeader(Uint8Array.from(Buffer.from((recovery as { signedTxBase64: string }).signedTxBase64, "base64")));
     node.keyNonce = Number(header.nonce) - 1;
-    await expect(rail.recoverRefund?.(REF, recovery)).resolves.toBe("pending");
+    const sendsBefore = methods(node).filter((m) => m === "send_tx").length;
+    await expect(rail.recoverRefund?.(REF, recovery)).resolves.toBe("unknown");
     node.keyNonce = Number(header.nonce);
     await expect(rail.recoverRefund?.(REF, recovery)).resolves.toBe("never-landed");
+    expect(methods(node).filter((m) => m === "send_tx").length).toBe(sendsBefore); // the reads sent nothing
   });
 
-  it("a lock that is merely Locked is NOT 'landed' for a refund (only a lock recovery treats any row as landed)", async () => {
+  it("a lock that is merely Locked is NOT 'landed' for a refund (only a lock recovery treats any row as landed); a lock being refunded is pending", async () => {
     const { node, rail, recovery } = await signedRefund();
     node.tx = "unknown";
     node.keyNonce = 0;
     node.lock = lockRow({ status: "Locked" });
+    await expect(rail.recoverRefund?.(REF, recovery)).resolves.toBe("unknown");
+    node.lock = lockRow({ status: "Refunding" }); // a refund's payout is in flight
     await expect(rail.recoverRefund?.(REF, recovery)).resolves.toBe("pending");
   });
 
@@ -527,5 +549,208 @@ describe("NEAR recoverRefund", () => {
     const from = node.calls.length;
     await expect(rail.recoverRefund?.(REF, { chain: "sol", signature: "s", blockhash: "b", lastValidBlockHeight: 1 })).rejects.toBeInstanceOf(RailRecoveryRefusedError);
     expect(node.calls.length).toBe(from);
+  });
+});
+
+// -- resendLock / resendRefund (R1-01 part 2, R1-10): the re-send is its own call --------------------------------------
+
+const rpcError = (cause: string | undefined, data?: unknown, code = -32000, message = "Server error"): Record<string, unknown> => ({
+  code,
+  message,
+  name: "HANDLER_ERROR",
+  ...(cause === undefined ? {} : { cause: { name: cause, info: {} } }),
+  ...(data === undefined ? {} : { data }),
+});
+const EXPIRED = rpcError("INVALID_TRANSACTION", { TxExecutionError: { InvalidTxError: "Expired" } });
+const INVALID_NONCE = rpcError("INVALID_TRANSACTION", { TxExecutionError: { InvalidTxError: { InvalidNonce: { tx_nonce: 5, ak_nonce: 9 } } } });
+const SEND_TIMEOUT = rpcError("TIMEOUT_ERROR");
+const INTERNAL = { code: -32603, message: "internal error" };
+
+describe("NEAR resendLock", () => {
+  const sendsOf = (node: Node): string[] => node.calls.filter((c) => c.method === "send_tx").map((c) => String((c.params as Record<string, unknown>).signed_tx_base64));
+
+  it("sends the IDENTICAL persisted bytes exactly once; the node executing them makes the lock landed (read back by hash)", async () => {
+    const node = newNode({ keyNonce: 4 });
+    node.onSend = (signed) => {
+      node.lock = lockRow();
+      node.tx = (hash) => outcome("lock", hash);
+      return outcome("lock", base58.encode(sha256(Buffer.from(signed, "base64").subarray(0, -65))));
+    };
+    const { rail, prepared: p, signedTxBase64 } = await prepared(node);
+    node.tx = "unknown";
+    await expect(rail.recoverLock(p)).resolves.toBe("unknown");
+    expect(sendsOf(node)).toEqual([]); // the read sent nothing
+    await expect(rail.resendLock?.(p)).resolves.toBe("landed");
+    expect(sendsOf(node)).toEqual([signedTxBase64]);
+  });
+
+  it("anything already decided by the re-read is answered WITHOUT a send: a lock that landed meanwhile, a transaction the node now knows, a nonce already past", async () => {
+    const landedRow = newNode({ keyNonce: 4, lock: lockRow() });
+    const a = await prepared(landedRow);
+    await expect(a.rail.resendLock?.(a.prepared)).resolves.toBe("landed");
+
+    const known = newNode({ keyNonce: 4 });
+    const b = await prepared(known);
+    known.tx = (hash) => outcome("lock", hash);
+    known.lock = lockRow();
+    await expect(b.rail.resendLock?.(b.prepared)).resolves.toBe("landed");
+
+    const past = newNode({ keyNonce: 4 });
+    const c = await prepared(past);
+    past.keyNonce = 5;
+    await expect(c.rail.resendLock?.(c.prepared)).resolves.toBe("never-landed");
+
+    for (const node of [landedRow, known, past]) expect(sendsOf(node)).toEqual([]);
+  });
+
+  it("the node's Expired answer: never-landed (after the node's own look by hash and a lock row read three blocks later), so a fresh lock may follow", async () => {
+    const node = newNode({ keyNonce: 4, sendError: EXPIRED });
+    const { rail, prepared: p } = await prepared(node);
+    node.tx = "unknown";
+    await expect(rail.resendLock?.(p)).resolves.toBe("never-landed");
+    expect(sendsOf(node)).toHaveLength(1);
+    // it looked at the transaction by hash again and read the head (optimistic) before it believed "no lock"
+    const seen = node.calls.slice(-8).map((c) => `${c.method}${c.method === "block" ? `:${JSON.stringify((c.params as Record<string, unknown>).finality ?? "")}` : ""}`);
+    expect(seen).toContain("block:\"optimistic\"");
+  });
+
+  it("an invalid-nonce answer while the lock shows up on the re-read: landed (the nonce was consumed by this very transaction)", async () => {
+    const node = newNode({ keyNonce: 4, sendError: INVALID_NONCE });
+    const { rail, prepared: p } = await prepared(node);
+    node.tx = "unknown";
+    node.before = (method) => {
+      if (method === "send_tx") node.lock = lockRow(); // the lock appears once the send is answered
+    };
+    await expect(rail.resendLock?.(p)).resolves.toBe("landed");
+  });
+
+  it("an invalid-nonce answer, the node now knows the transaction by hash: landed", async () => {
+    const node = newNode({ keyNonce: 4, sendError: INVALID_NONCE });
+    const { rail, prepared: p } = await prepared(node);
+    node.tx = "unknown";
+    node.before = (method) => {
+      if (method === "send_tx") {
+        node.tx = (hash) => outcome("lock", hash);
+        node.lock = lockRow();
+      }
+    };
+    await expect(rail.resendLock?.(p)).resolves.toBe("landed");
+  });
+
+  it("an invalid-nonce answer with no lock anywhere: never-landed (another transaction took the nonce)", async () => {
+    const node = newNode({ keyNonce: 4, sendError: INVALID_NONCE });
+    const { rail, prepared: p } = await prepared(node);
+    node.tx = "unknown";
+    await expect(rail.resendLock?.(p)).resolves.toBe("never-landed");
+  });
+
+  it.each([
+    ["a timeout while the node waits for finality", SEND_TIMEOUT],
+    ["a transport-level failure", INTERNAL],
+  ])("%s: pending (the send's own outcome is not known), the identical bytes are sent once and nothing else is signed", async (_label, error) => {
+    const node = newNode({ keyNonce: 4, sendError: error });
+    const { rail, prepared: p, signedTxBase64 } = await prepared(node);
+    node.tx = "unknown";
+    const blockReadsBefore = node.calls.filter((c) => c.method === "block").length;
+    await expect(rail.resendLock?.(p)).resolves.toBe("pending");
+    expect(sendsOf(node)).toEqual([signedTxBase64]);
+    expect(node.calls.filter((c) => c.method === "block").length).toBe(blockReadsBefore); // no new transaction was built
+  });
+
+  it("an executed lock that failed on chain propagates its typed error (never folded into an outcome)", async () => {
+    const node = newNode({ keyNonce: 4 });
+    node.onSend = (signed) => {
+      node.tx = (hash) => outcome("lock", hash, { Failure: { ActionError: { kind: "FunctionCallError" } } });
+      return outcome("lock", base58.encode(sha256(Buffer.from(signed, "base64").subarray(0, -65))));
+    };
+    const { rail, prepared: p } = await prepared(node);
+    node.tx = "unknown";
+    await expect(rail.resendLock?.(p)).rejects.toBeInstanceOf(NearTxFailedError);
+  });
+
+  it("a chain pin that no longer matches stops the re-send before anything is sent; a missing or foreign handle is refused before any call", async () => {
+    // status #1 is connect's, #2 the recovery by hash's pin check, #3 the re-send's own: that one answers another chain
+    const node = newNode({ keyNonce: 4, chainIds: ["near-sandbox-flop", "near-sandbox-flop", "testnet"] });
+    node.onSend = () => outcome("lock", "x");
+    const { rail, prepared: p } = await prepared(node);
+    node.tx = "unknown";
+    await expect(rail.resendLock?.(p)).rejects.toThrow(/does not match pin/);
+    expect(sendsOf(node)).toEqual([]);
+
+    const from = node.calls.length;
+    await expect(rail.resendLock?.({ ref: p.ref })).rejects.toMatchObject({ code: "no-handle" });
+    await expect(rail.resendLock?.({ ref: p.ref, recovery: { chain: "btc", txid: "aa".repeat(32), rawTx: "00" } })).rejects.toMatchObject({ code: "handle-mismatch" });
+    expect(node.calls.length).toBe(from);
+  });
+});
+
+describe("NEAR resendRefund", () => {
+  const sendsOf = (node: Node): string[] => node.calls.filter((c) => c.method === "send_tx").map((c) => String((c.params as Record<string, unknown>).signed_tx_base64));
+
+  async function signedRefund(overrides: Partial<Node> = {}): Promise<{ node: Node; rail: ConnectedCounterAssetRail; recovery: Extract<LockRecovery, { chain: "near" }> }> {
+    const node = newNode({ lock: lockRow(), keyNonce: 4, ...overrides });
+    node.onSend = (signed) => {
+      node.lock = lockRow({ status: "Refunded" });
+      node.tx = (hash) => outcome("refund", hash);
+      return outcome("refund", base58.encode(sha256(Buffer.from(signed, "base64").subarray(0, -65))));
+    };
+    const rail = await connect(node);
+    let recovery: LockRecovery | undefined;
+    await rail.refund(REF, { onSigned: (r) => void (recovery = r) });
+    if (recovery?.chain !== "near") throw new Error("expected a near handle");
+    // the crash: the process never learned that the refund was sent (the world is rolled back to before the send)
+    node.lock = lockRow();
+    node.tx = "unknown";
+    node.keyNonce = 4;
+    node.calls.length = 0;
+    return { node, rail, recovery };
+  }
+
+  it("a refund never sent, the lock still Locked: sent as the IDENTICAL bytes, once; executed means landed", async () => {
+    const { node, rail, recovery } = await signedRefund();
+    await expect(rail.recoverRefund?.(REF, recovery)).resolves.toBe("unknown");
+    expect(sendsOf(node)).toEqual([]);
+    await expect(rail.resendRefund?.(REF, recovery)).resolves.toBe("landed");
+    expect(sendsOf(node)).toEqual([recovery.signedTxBase64]);
+  });
+
+  it("the lock is read first and the refund is sent only while it reads Locked: Refunded is landed, Refunding pending, claimed or absent never-landed, with no send", async () => {
+    for (const [lock, expected] of [
+      [lockRow({ status: "Refunded" }), "landed"],
+      [lockRow({ status: "Refunding" }), "pending"],
+      [lockRow({ status: "Claimed", preimage: PREIMAGE_HEX }), "never-landed"],
+      [lockRow({ status: "Claiming", preimage: PREIMAGE_HEX }), "never-landed"],
+      [null, "never-landed"],
+    ] as const) {
+      const { node, rail, recovery } = await signedRefund();
+      node.lock = lock === null ? null : { ...lock };
+      await expect(rail.resendRefund?.(REF, recovery), String(lock?.status)).resolves.toBe(expected);
+      expect(sendsOf(node), String(lock?.status)).toEqual([]);
+    }
+  });
+
+  it("the node's Expired answer: never-landed, so exactly one fresh refund may follow; an invalid nonce with the lock still Locked is the same", async () => {
+    for (const error of [EXPIRED, INVALID_NONCE]) {
+      const { node, rail, recovery } = await signedRefund();
+      node.sendError = error;
+      await expect(rail.resendRefund?.(REF, recovery)).resolves.toBe("never-landed");
+      expect(sendsOf(node)).toHaveLength(1);
+    }
+  });
+
+  it("a refund whose payout failed on chain (lock back to Locked) propagates NearRefundFailedError: a landed transaction is never called never-landed", async () => {
+    const { node, rail, recovery } = await signedRefund();
+    node.onSend = (signed) => {
+      node.tx = (hash) => outcome("refund", hash); // executed fine at the top level, but the lock reads Locked again
+      return outcome("refund", base58.encode(sha256(Buffer.from(signed, "base64").subarray(0, -65))));
+    };
+    await expect(rail.resendRefund?.(REF, recovery)).rejects.toMatchObject({ name: "NearRefundFailedError" });
+  });
+
+  it("a transport failure is pending, and the bytes were sent once", async () => {
+    const { node, rail, recovery } = await signedRefund();
+    node.sendError = INTERNAL;
+    await expect(rail.resendRefund?.(REF, recovery)).resolves.toBe("pending");
+    expect(sendsOf(node)).toEqual([recovery.signedTxBase64]);
   });
 });

@@ -729,6 +729,19 @@ export class BtcHtlcRail {
   }
 
   /**
+   * R1-01 (part 2): whether the funding output `ref` names is still unspent by anyone, the mempool included
+   * (`gettxout(txid, vout, true)`). A read: it never sends anything. `false` means another transaction (most likely a
+   * claim, mined or not) already spends it, so a refund of it can no longer land; `true` says nothing more than "not
+   * spent yet". `resendRefundIfDropped` makes the same read before it re-sends.
+   */
+  async fundingOutputUnspent(ref: string): Promise<boolean> {
+    const { txid, vout } = parseOutpointRef(ref);
+    await this.assertPinnedChain();
+    const txout = await this.request<Record<string, unknown> | null>("gettxout", [txid, vout, true]);
+    return txout !== null;
+  }
+
+  /**
    * P4-BTC-FIXES-R2.md R2-1: idempotent resend of a previously-broadcast refund whose bytes are
    * already recorded (`refundRawTx`, `refund()`'s own `WriteEvidence.rawTx`) — NEVER rebuilds or
    * re-signs anything; resending identical bytes always reproduces the identical `refundTxid` (a

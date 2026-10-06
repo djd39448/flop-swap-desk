@@ -1042,8 +1042,9 @@ export class BuyerFlow {
    * for the ONE transaction `prepareLock` signed: `landed` records the evidence and posts the lock frame (once, as the
    * saved text, or adopted); `pending` stops with `LockPendingError` (nothing new is signed); `never-landed` means the
    * rail can prove that transaction can no longer land, so exactly one fresh `prepareLock` for the same lock is signed,
-   * saved, and sent (its ref must be the same: a different one is refused). Bitcoin never gets here: its recovery
-   * re-sends the saved bytes itself and a node that refuses them is a typed error for a person.
+   * saved, and sent (its ref must be the same: a different one is refused). Bitcoin never answers `never-landed`: its
+   * `unknown` leads to `resendLock`, which sends the saved bytes again, and a node that refuses them is a typed error
+   * for a person (R1-01 part 2: reading and re-sending are separate rail calls).
    */
   private async recoverLockA(
     connected: ConnectedCounterAssetRail,
@@ -1055,7 +1056,17 @@ export class BuyerFlow {
     if (prepared === undefined || hashLock === undefined) {
       throw new Error("buyer: a lock was attempted but its prepared handle was not recorded; refusing to guess (rule 6)");
     }
-    const outcome: LockRecoveryOutcome = await connected.recoverLock(prepared);
+    let outcome: LockRecoveryOutcome = await connected.recoverLock(prepared);
+    if (outcome === "unknown") {
+      // R1-01 (part 2): `recoverLock` only READS. The node does not know the transaction and the rail cannot prove it
+      // dead, so the identical saved bytes are sent once more, as `recoverLock` itself used to do. Until the flow's own
+      // rule-4 guards run before this call, this stays exactly today's behaviour. A rail that answers `unknown` and has
+      // no `resendLock` cannot be recovered by this flow: nothing is guessed.
+      if (connected.resendLock === undefined) {
+        throw new RailRecoveryRefusedError("no-handle", prepared.ref, "the rail does not know this transaction and offers no way to send it again");
+      }
+      outcome = await connected.resendLock(prepared);
+    }
     if (outcome === "pending") throw new LockPendingError(prepared.ref);
     let writeEvidence: RailWriteEvidence;
     if (outcome === "landed") {
@@ -1458,6 +1469,9 @@ export class BuyerFlow {
     let outcome: LockRecoveryOutcome | undefined;
     if (handle !== undefined && connected.recoverRefund !== undefined) {
       outcome = await connected.recoverRefund(railRef, handle);
+      // R1-01 (part 2): `recoverRefund` only READS; an `unknown` answer is settled by sending the identical recorded bytes
+      // once more (the rail re-reads first and sends only while the refund can still land), as it used to do inside.
+      if (outcome === "unknown" && connected.resendRefund !== undefined) outcome = await connected.resendRefund(railRef, handle);
     }
     const observed = await connected.verifyLockFinal(termsA, railRef, this.lockedAccounts);
     if (observed.rail?.status === "refunded" && observed.rail.final) {
@@ -1475,7 +1489,7 @@ export class BuyerFlow {
           "call learnSecret() then claimLegB() instead of refundLegA() (G7)",
       );
     }
-    if (outcome === "pending" || outcome === "landed") {
+    if (outcome === "pending" || outcome === "landed" || outcome === "unknown") {
       throw new Error("buyer: refund broadcast but not yet confirmed; call refundLegA() again once it confirms (G7)");
     }
     if (handle?.chain === "btc") {

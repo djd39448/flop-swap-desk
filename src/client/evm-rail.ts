@@ -148,7 +148,8 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
    * already moved it on). No row is `never-landed` in the weak sense this rail can offer: EVM cannot prove a
    * transaction is not still pending in some node's pool, but a repeated `approve` is harmless and a repeated `lock`
    * reverts on the contract's duplicate hash-lock check, so re-running `commitLock` cannot lock twice. A row owned by
-   * another payer can never be turned into this party's lock: `RailRecoveryRefusedError("lock-conflict")`.
+   * another payer can never be turned into this party's lock: `RailRecoveryRefusedError("lock-conflict")`. Read-only,
+   * like every rail's `recoverLock` (R1-01); this rail never answers `unknown` and has no `resendLock`.
    */
   async recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome> {
     const row = await this.rail.readLock(prepared.ref as Hex);

@@ -3,20 +3,16 @@
 // P8-RESUME-SPEC.md "Tests", the hermetic crash matrix, NEAR harness: the real flows over the real NEAR rail over the stateful NEAR RPC
 // simulator of tests/client-flows-near-rpc.test.ts. See tests/helpers/crash-matrix.ts for what is cut, how, and what is counted afterwards.
 //
-// Two cuts do not finish the swap, for one reason: the NEAR rail can only call a transaction that was never sent "never landed" once the
-// access key's nonce has moved past it, and nothing moves it, so a recovery answers "pending" for as long as nothing else is signed.
-//   - a Buyer that dies right BEFORE `commitLock` leaves a signed lock transaction that was never sent: `lockLegA` keeps refusing without
-//     signing anything. Nothing is locked, so this is a liveness limit, not a fund-safety one; the Seller takes leg B back.
-//   - a Buyer that dies right AFTER signing its refund (the signature is saved, nothing is sent) cannot build a second refund while the
-//     first could still land: `refundLegA` keeps answering "not yet confirmed". Leg A stays locked until a person acts (the funds are
-//     in the escrow, not lost); the Seller still takes leg B back.
-// Both are open issues of the rail's nonce proof, reported rather than fixed here.
+// Two cuts used to stop the swap here (builders' open issue (b), R1-10): the NEAR rail could only call a transaction that was never
+// sent "never landed" once the access key's nonce had moved past it, and nothing moves it, so a recovery answered "pending" for
+// as long as nothing else was signed (a Buyer that died right before `commitLock`, or right after signing its refund). Since the
+// rail seam splits reading from re-sending (R1-01 part 2, R1-10), `recoverLock` / `recoverRefund` answer "unknown" for such a
+// transaction and the identical saved bytes are sent once more (`resendLock` / `resendRefund`): the node accepts them, and the
+// swap now runs to its end like every other cut. The stall expectations are gone; the rail-level cases (accepted, `Expired`,
+// invalid nonce, transport failure) are in tests/rail-recovery-near.test.ts.
 
 import { describeDoubleCrash, describeMatrix } from "./helpers/matrix-suite.js";
 import { nearWorld } from "./helpers/matrix-worlds.js";
 
-const nearStalls = (action: { what: string }, mode: string) =>
-  action.what === "chain:commitLock" && mode === "before" ? ("lock-pending" as const) : action.what === "chain:refund.signed" ? ("refund-pending" as const) : undefined;
-
-await describeMatrix("near", nearWorld, { stalls: nearStalls });
-await describeDoubleCrash("near", nearWorld, { stalls: nearStalls });
+await describeMatrix("near", nearWorld);
+await describeDoubleCrash("near", nearWorld);
