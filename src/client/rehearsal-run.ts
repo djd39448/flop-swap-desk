@@ -273,6 +273,27 @@ const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 /** The pre-flight rows a refund does not depend on (the claim's `pending` read, the log scans, the Seller's gas: leg B refunds on paper). */
 const REFUND_NOT_NEEDED: ReadonlySet<string> = new Set(["pending", "log range", "seller ETH"]);
 
+/**
+ * The flows' own refusals that the runner reacts to, by the text each carries. They are coupled by text on purpose (the flows have no
+ * typed error for them), so `tests/rehearsal-run.test.ts` reads src/client/seller.ts and src/client/buyer.ts and fails if one of these
+ * patterns no longer matches what the flows say.
+ */
+export const FLOW_MESSAGE = Object.freeze({
+  /** `claimLegA`: the evidence reader does not (yet) read the lock final; nothing was signed, asking again is safe. */
+  lockNotFinal: /before verifyLockFinal\(A\) is true/,
+  /** `claimLegA`: the Seller's claim window (claim-by, or the margin before the refund time) has closed. */
+  claimWindowClosed: /at\/after its claimByMs|claim-inclusion margin/,
+  /** `refundLegA`: the refund was sent and does not read final yet. */
+  refundUnconfirmed: /not yet confirmed/,
+  /** `refundLegA`: leg A was never locked, so the Buyer has nothing at stake on the chain. */
+  neverLocked: /never locked, nothing to refund/,
+});
+
+/** A refund is attempted only once the local clock AND the chain's head are both at or past the refund time (the contract judges the chain's). */
+export function refundTimeReached(localMs: number, chainMs: number, refundAfterMs: number): boolean {
+  return localMs >= refundAfterMs && chainMs >= refundAfterMs;
+}
+
 const ZERO_ADDRESS: Address = "0x0000000000000000000000000000000000000000";
 
 const HEX_QUANTITY = /^0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)$/;
@@ -627,12 +648,12 @@ async function driveSettle(w: World): Promise<number> {
       // lag it by a block: the claim refuses before it signs anything, so waiting and asking again is safe, a few times. Anything else (or
       // a lock that stays unreadable) is a real refusal, reported.
       const message = messageOf(error);
-      if (/at\/after its claimByMs|claim-inclusion margin/.test(message)) {
+      if (FLOW_MESSAGE.claimWindowClosed.test(message)) {
         throw new RunnerRefusal(
           `${describeFailure(error, (t) => t)}; the Seller's claim window has closed, so leg A will go back to the Buyer: run --refund once leg A's refund time ${iso(run.deadlines.legA.refundAfterMs)} has come`,
         );
       }
-      if (!/before verifyLockFinal\(A\) is true/.test(message) || attempt >= CLAIM_REREAD_ATTEMPTS || w.env.now() - claimStartedMs > w.config.waitLimitMs) throw error;
+      if (!FLOW_MESSAGE.lockNotFinal.test(message) || attempt >= CLAIM_REREAD_ATTEMPTS || w.env.now() - claimStartedMs > w.config.waitLimitMs) throw error;
       log(`the lock does not read final to the evidence reader yet (${describeFailure(error, (t) => t)}); asking again (${attempt}/${CLAIM_REREAD_ATTEMPTS})`);
       await w.env.sleep(w.pollMs);
     }
@@ -664,7 +685,7 @@ async function untilRefundTime(w: World, label: string, refundAfterMs: number, c
   for (;;) {
     const local = w.clock();
     const head = chain ? await latestBlockMs(w.rpc) : local;
-    if (local >= refundAfterMs && head >= refundAfterMs) return true;
+    if (refundTimeReached(local, head, refundAfterMs)) return true;
     const remaining = Math.max(refundAfterMs - local, refundAfterMs - head);
     if (!wait) {
       w.log(`${label} is refundable from ${iso(refundAfterMs)}: the local clock reads ${iso(local)}${chain ? ` and the chain's head ${iso(head)}` : ""}; run --refund again after that (or add --wait to wait here)`);
@@ -717,8 +738,8 @@ async function driveRefund(w: World, wait: boolean): Promise<number> {
       break;
     } catch (error) {
       const message = messageOf(error);
-      if (/never locked, nothing to refund/.test(message)) break; // leg A was never locked: the Buyer has nothing at stake on chain
-      if (!/not yet confirmed/.test(message) || w.env.now() - refundStartedMs > w.config.waitLimitMs) throw error;
+      if (FLOW_MESSAGE.neverLocked.test(message)) break; // leg A was never locked: the Buyer has nothing at stake on chain
+      if (!FLOW_MESSAGE.refundUnconfirmed.test(message) || w.env.now() - refundStartedMs > w.config.waitLimitMs) throw error;
       // The refund was signed and sent; it reads final only once the finalized block passes the one it landed in. The tip now is above it.
       log("the refund of leg A is not final yet; waiting for the finalized block to pass the current head");
       await waitFinalized(w, await blockNumberNow(w.rpc), "refund of leg A");

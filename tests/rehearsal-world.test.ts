@@ -179,6 +179,23 @@ describe("DurableNoteStore", () => {
     expect(await (await DurableNoteStore.open(path)).get("tclk-paper-ab", "k1")).toBe("tclkpaper1 claimed");
   });
 
+  it("a note whose write failed is not a note: the store answers as before, and a later write is judged against what was really stored", async () => {
+    const dir = await temp();
+    const path = join(dir, "notes.json");
+    const store = await DurableNoteStore.open(path);
+    await store.set("n", "k", "v1", { ifAbsent: true });
+    const before = await readFile(path, "utf8");
+    await rm(path);
+    await mkdir(path); // the write cannot land: the rename onto a directory fails
+    await expect(store.set("n", "k", "v2", { if: "v1" })).rejects.toThrow();
+    expect(await store.get("n", "k")).toBe("v1");
+    expect(store.raw("n", "k")).toBe("v1");
+    await rm(path, { recursive: true });
+    await writeFile(path, before);
+    expect(await store.set("n", "k", "v2", { if: "v1" })).toBe(true); // v1 is still what it was compared with
+    expect(await (await DurableNoteStore.open(path)).get("n", "k")).toBe("v2");
+  });
+
   it("serialises overlapping writes (one wins an ifAbsent race)", async () => {
     const dir = await temp();
     const store = await DurableNoteStore.open(join(dir, "notes.json"));

@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { EXIT, parseRunRecord, runRehearsal, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { EXIT, FLOW_MESSAGE, parseRunRecord, refundTimeReached, runRehearsal, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
 import { loadOrCreateIdentity } from "../src/client/rehearsal-world.js";
 import { BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
 import { keyScanner } from "./helpers/evm-local.js";
@@ -331,6 +331,49 @@ describe("bad configs and a failing endpoint", () => {
     expect(result.stdout).not.toContain("SECRETPATHKEYPART");
     expect(result.stderr).not.toContain("SECRETPATHKEYPART");
     expect(result.stdout).toMatch(/FAIL\s+chain id\s+eth_chainId failed/);
+  });
+});
+
+describe("the runner reacts to the flows' own refusals by their text", () => {
+  const source = async (name: string): Promise<string> => readFile(join(REPO_ROOT, "src", "client", name), "utf8");
+
+  it("matches the texts the flows really carry (a flow that rewords one breaks this test, not a run)", async () => {
+    const seller = await source("seller.ts");
+    const buyer = await source("buyer.ts");
+    // `claimLegA`'s four deadline refusals (before and after the finality read), and its finality refusal.
+    expect(seller).toContain("seller: refusing to claim leg A at/after its claimByMs (chain time) (B2/C3)");
+    expect(seller).toContain("seller: refusing to claim leg A at/after its claimByMs (chain time, re-checked after verifyLockFinal) (E4)");
+    expect(seller).toContain("less than the claim-inclusion margin");
+    expect(seller).toContain("seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11)");
+    expect(buyer).toContain("buyer: refund signed but not yet confirmed");
+    expect(buyer).toContain("buyer: leg A was never locked, nothing to refund");
+    for (const text of [
+      "seller: refusing to claim leg A at/after its claimByMs (chain time) (B2/C3)",
+      "seller: refusing to claim leg A at/after its claimByMs (chain time, re-checked after verifyLockFinal) (E4)",
+      "seller: refusing to claim leg A - less than the claim-inclusion margin (300000 ms) remains before refundAfterMs (chain time) (B2/C3)",
+    ]) {
+      expect(FLOW_MESSAGE.claimWindowClosed.test(text), text).toBe(true);
+      expect(FLOW_MESSAGE.lockNotFinal.test(text), text).toBe(false);
+    }
+    const notFinal = "seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): no lock at the finalized view";
+    expect(FLOW_MESSAGE.lockNotFinal.test(notFinal)).toBe(true);
+    expect(FLOW_MESSAGE.claimWindowClosed.test(notFinal)).toBe(false);
+    expect(FLOW_MESSAGE.refundUnconfirmed.test("buyer: refund signed but not yet confirmed; it may never have been sent; call refundLegA() again later (G7)")).toBe(true);
+    expect(FLOW_MESSAGE.neverLocked.test("buyer: leg A was never locked, nothing to refund")).toBe(true);
+    // And they do not fire on each other or on an unrelated refusal.
+    expect(FLOW_MESSAGE.refundUnconfirmed.test("buyer: leg A was never locked, nothing to refund")).toBe(false);
+    expect(FLOW_MESSAGE.neverLocked.test("buyer: refund signed but not yet confirmed")).toBe(false);
+    for (const pattern of Object.values(FLOW_MESSAGE)) expect(pattern.test("evm-htlc: connected chain id 1 does not match pin")).toBe(false);
+  });
+});
+
+describe("refundTimeReached", () => {
+  it("needs the local clock AND the chain's head at or past the refund time (the contract judges the chain's)", () => {
+    expect(refundTimeReached(1_000, 1_000, 1_000)).toBe(true);
+    expect(refundTimeReached(2_000, 2_000, 1_000)).toBe(true);
+    expect(refundTimeReached(2_000, 999, 1_000)).toBe(false); // the clock is ahead of a chain that has not got there
+    expect(refundTimeReached(999, 2_000, 1_000)).toBe(false); // the chain is ahead of a clock that has not got there
+    expect(refundTimeReached(999, 999, 1_000)).toBe(false);
   });
 });
 
