@@ -79,6 +79,19 @@
 //    or past its refund time) is cleared from the record; one that may still land keeps the refund refused. R1-12: a confirmed `acceptLegB`
 //    returns its recorded result.
 //
+// Review round 2 (P8-FIXES-R2.md), what a runner can rely on:
+//  - R2-02: a claim of leg A that `refundLegA` saw (the refund lost the race, before any refund attempt was saved), or this flow's own claim
+//    of leg B, wins over the "lock attempted, not recognised" refund route in `next`: `learnSecret`, then `done` once leg B's receipt landed.
+//    An adopted-only leg B note still leaves the refund doorway open (R1-06).
+//  - R2-06: `acceptLegB` refuses an accept A record timestamped at or after offer A's `expiresMs`, and refuses to post accept B at or after
+//    offer B's `expiresMs` by the flow clock (`SwapExpiredError`, nothing posted or saved: leg A is never locked before accept B). `next`
+//    says `abandoned` for a saved pairing whose accept B never landed before offer B expired: nothing to call, nothing at stake.
+//  - R2-10: `claimLegB` and `refundLegA` share one in-flight flag: the second of two overlapping calls is refused.
+//  - R2-16: a lock recognised at or after leg A's refund time is recorded but its lock frame is not posted (tclk's machine rejects it);
+//    the refund path and its frames are unchanged.
+//  - R2-17: after a `never-landed` answer the lock is read by its ref once more (after the rail's `settleDelay` where it has one) before
+//    the saved handle is replaced; a lock found there is recorded as landed. Recovery assumes one consistent RPC node per chain.
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
 // P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3; P4-BTC-SPEC.md §7a;
 // P6-SOL-SPEC.md sections 3-5; P8-RESUME-SPEC.md.
@@ -371,7 +384,9 @@ export class BuyerFlow {
   /** P8: the next safe step by the stored record alone (no I/O besides the clock). `"learnSecret"` is also the way back into
    *  `claimLegB` (the secret is never stored here, it is read again); after leg A's `refundAfterMs` a runner may call
    *  `refundLegA` where this says `learnSecret`. A lock that was attempted but is not recognised yet is `"lockLegA"` (it reads
-   *  the chain first and records a lock that landed, at any time) until leg A's refund time, then `"refundLegA"` (R1-01). */
+   *  the chain first and records a lock that landed, at any time) until leg A's refund time, then `"refundLegA"` (R1-01), unless a claim of
+   *  leg A was seen or this flow claimed leg B, which is `"learnSecret"` or `"done"` (R2-02). `"abandoned"` (R2-06): a saved pairing whose
+   *  accept B never landed before leg B's offer expired. */
   private nextStep(): BuyerNextStep {
     const journal = this.#journal;
     if (journal === undefined || !journal.isLanded("offer-a")) return "bid";

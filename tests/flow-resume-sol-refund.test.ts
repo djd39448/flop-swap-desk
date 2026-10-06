@@ -43,7 +43,7 @@ describe("R2-15 (Solana): a refund that landed and failed is resolved, and exact
 
     // the program's clock catches up; the process restarts: `recoverRefund` throws SolRefundFailedError for the saved handle, which the
     // flow resolves (the lock reads Locked and final), and ONE fresh refund is built, sent and confirmed
-    node.midFlight = undefined;
+    delete node.midFlight;
     node.nowMs = legA.refundAfterMs;
     expect(await restartBuyer(r)).toBe("refundLegA");
     await r.buyer.refundLegA();
