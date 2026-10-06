@@ -7,9 +7,11 @@
 //
 //   flavour "btc"  (rail id btc-htlc): the ref is an outpoint `txid:0` that exists only once a funding was PREPARED (a second
 //                  prepare picks another input and so another outpoint); the recovery handle is `{txid, rawTx}`; `recoverLock`
-//                  asks the node about the txid and, if unknown, re-sends the IDENTICAL bytes (never answers pending or
-//                  never-landed); a refund is recorded with `onSigned` before it is sent and `recoverRefund` re-sends the
-//                  identical bytes while the output is unspent; `checkPendingClaim` and `resendRefundIfDropped` exist.
+//                  only READS (R1-01 part 2): the node knows the txid (`landed`) or not (`unknown`, never pending or
+//                  never-landed), and `resendLock` sends the IDENTICAL bytes; a refund is recorded with `onSigned` before it is
+//                  sent, `recoverRefund` reads (`landed`, `unknown` while the output is unspent, `never-landed` once another
+//                  transaction spent it) and `resendRefund` re-sends the identical bytes while the output is unspent;
+//                  `checkPendingClaim` and `resendRefundIfDropped` exist.
 //   flavour "near" (rail id near-htlc): the ref is `0x<hash lock>:<payer>`; the handle is `{txHash, signedTxBase64}`; a lock the
 //                  node has no row for is `never-landed` (the nonce proof; `nonceProof: false` makes it `pending`, the real
 //                  adapter's stall); `lockRecorded` and `checkPendingClaim` exist.
@@ -30,6 +32,7 @@ import {
   type CounterAssetRail,
   type LockRecovery,
   type LockRecoveryOutcome,
+  type LockResendOutcome,
   type PreparedLock,
   type RailAccounts,
   type RailBlockMarker,
@@ -195,6 +198,9 @@ class LedgerConnected implements ConnectedCounterAssetRail {
   private prepared: PreparedFunding | undefined;
   readonly resendRefundIfDropped?: (ref: string, priorEvidence: RailWriteEvidence) => Promise<RailWriteEvidence>;
   readonly lockRecorded?: (ref: string) => Promise<{ exists: boolean; reason?: string }>;
+  /** Bitcoin only (R1-01 part 2): the identical-bytes re-sends; the near flavour never answers `unknown` and has none. */
+  readonly resendLock?: (prepared: PreparedLock) => Promise<LockResendOutcome>;
+  readonly resendRefund?: (ref: string, recovery: LockRecovery) => Promise<LockResendOutcome>;
 
   constructor(
     private readonly options: LedgerRailOptions,
@@ -203,6 +209,8 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     private readonly accounts: RailAccounts,
   ) {
     if (options.flavour === "btc") {
+      this.resendLock = (prepared) => this.btcResendLock(prepared);
+      this.resendRefund = (ref, recovery) => this.btcResendRefund(ref, recovery);
       this.resendRefundIfDropped = async (ref, prior) => {
         this.options.hooks.alive();
         const output = this.options.chain.outputs.get(ref);
@@ -289,21 +297,33 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     if (handle === undefined) throw new RailRecoveryRefusedError("no-handle", prepared.ref, "the ledger rail needs the recovery handle");
     if (this.options.flavour === "btc") {
       if (handle.chain !== "btc") throw new RailRecoveryRefusedError("handle-mismatch", prepared.ref, `a ${handle.chain} handle for the btc rail`);
+      // READ-ONLY: the node knows the funding or it does not. Nothing is sent here (`resendLock` sends).
       if (this.chain.knownTxs.has(handle.txid)) return "landed";
       if (this.chain.provesNeverLanded) return "never-landed";
-      if (this.chain.refuseRebroadcast) throw new RailRecoveryRefusedError("rebroadcast-refused", prepared.ref, "the node refuses the persisted funding (its inputs are gone)");
-      // Identical bytes, again. The matrix keeps the facts of the funding on the chain object by txid.
-      const funding = this.chain.builtFundings.get(handle.txid);
-      if (funding === undefined) throw new RailRecoveryRefusedError("handle-mismatch", prepared.ref, "this chain never built that funding");
-      await this.options.hooks.act("lock.rebroadcast", async () => {
-        this.chain.counts.rebroadcasts += 1;
-        this.applyFunding(funding);
-      });
-      return "landed";
+      return "unknown";
     }
     if (handle.chain !== "near") throw new RailRecoveryRefusedError("handle-mismatch", prepared.ref, `a ${handle.chain} handle for the near rail`);
     if (this.chain.outputs.has(prepared.ref)) return "landed";
     return this.chain.nonceProof ? "never-landed" : "pending";
+  }
+
+  /** Bitcoin: the identical persisted bytes go out again, once (`recoverLock` answered `unknown`). A node that refuses them is a typed
+   *  error for a person (a second funding is never built). */
+  private async btcResendLock(prepared: PreparedLock): Promise<LockResendOutcome> {
+    this.options.hooks.alive();
+    const handle = prepared.recovery;
+    if (handle === undefined) throw new RailRecoveryRefusedError("no-handle", prepared.ref, "the ledger rail needs the recovery handle");
+    if (handle.chain !== "btc") throw new RailRecoveryRefusedError("handle-mismatch", prepared.ref, `a ${handle.chain} handle for the btc rail`);
+    if (this.chain.knownTxs.has(handle.txid)) return "landed"; // it landed meanwhile: nothing to send
+    if (this.chain.refuseRebroadcast) throw new RailRecoveryRefusedError("rebroadcast-refused", prepared.ref, "the node refuses the persisted funding (its inputs are gone)");
+    // Identical bytes, again. The matrix keeps the facts of the funding on the chain object by txid.
+    const funding = this.chain.builtFundings.get(handle.txid);
+    if (funding === undefined) throw new RailRecoveryRefusedError("handle-mismatch", prepared.ref, "this chain never built that funding");
+    await this.options.hooks.act("lock.rebroadcast", async () => {
+      this.chain.counts.rebroadcasts += 1;
+      this.applyFunding(funding);
+    });
+    return "landed";
   }
 
   // --- claim ------------------------------------------------------------------------------------------------------------
@@ -365,18 +385,28 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     const btc = this.options.flavour === "btc";
     if (btc) {
       if (recovery.chain !== "btc") throw new RailRecoveryRefusedError("handle-mismatch", ref, `a ${recovery.chain} handle for the btc rail`);
+      // READ-ONLY (R1-01 part 2): `resendRefund` re-sends.
       if (this.chain.knownTxs.has(recovery.txid)) return "landed";
-      if (output?.status === "locked") {
-        // dropped (or never sent) while the output is unspent: the identical bytes go out again, never a second refund
-        await this.sendRefund(ref, recovery, "refund.rebroadcast");
-        this.chain.counts.rebroadcasts += 1;
-        return "landed";
-      }
+      if (output?.status === "locked") return "unknown"; // dropped (or never sent) while the output is unspent
       return "never-landed"; // the output is spent by another transaction (a claim)
     }
     if (recovery.chain !== "near") throw new RailRecoveryRefusedError("handle-mismatch", ref, `a ${recovery.chain} handle for the near rail`);
     if (output?.status === "refunded") return "landed";
     return this.chain.nonceProof ? "never-landed" : "pending";
+  }
+
+  /** Bitcoin: the identical recorded refund bytes go out again, only while the funding output is still unspent, never a second build. */
+  private async btcResendRefund(ref: string, recovery: LockRecovery): Promise<LockResendOutcome> {
+    this.options.hooks.alive();
+    const output = this.chain.outputs.get(ref);
+    if (recovery.chain !== "btc") throw new RailRecoveryRefusedError("handle-mismatch", ref, `a ${recovery.chain} handle for the btc rail`);
+    if (this.chain.knownTxs.has(recovery.txid)) return "landed";
+    if (output?.status === "locked") {
+      await this.sendRefund(ref, recovery, "refund.rebroadcast");
+      this.chain.counts.rebroadcasts += 1;
+      return "landed";
+    }
+    return "never-landed";
   }
 
   // --- reads ------------------------------------------------------------------------------------------------------------

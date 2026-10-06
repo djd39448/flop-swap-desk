@@ -19,6 +19,7 @@ import { PaperRail, dealRoom, encodeFrame, tryDecodeFrame, type AcceptFrame } fr
 import { base58 } from "@scure/base";
 import { describe, expect, it } from "vitest";
 
+import { LockPendingError } from "../src/client/buyer.js";
 import { RailRecoveryRefusedError } from "../src/client/counter-rail.js";
 import { FlowRecordConflictError, FlowRecordMismatchError, decodeFlowRecord, encodeFlowRecord, type FlowRecord } from "../src/client/flow-record.js";
 import { flowKey } from "../src/client/flow-store.js";
@@ -26,7 +27,7 @@ import { plant, sellerKeyOf } from "./helpers/seller-key.js";
 import { PREFIX, STEPS, SETTLE, readSwap, resumeRole, runScript } from "./helpers/crash-matrix.js";
 import { evmWorld, ledgerWorldWith } from "./helpers/matrix-worlds.js";
 import { ProcessDied, crashRail, failVenuePosts } from "./helpers/resume-flows.js";
-import { bid, buyerRecord, framesOf, isFrame, isLine, legA, restartBuyer, restartSeller, rig, sellerRecord, toLines, toLocked, toPaired, type Rig } from "./helpers/resume-sol-rig.js";
+import { bid, buyerRecord, expireBuyerLock, framesOf, isFrame, isLine, legA, restartBuyer, restartSeller, rig, sellerRecord, toLines, toLocked, toPaired, type Rig } from "./helpers/resume-sol-rig.js";
 import { legBDeadlines } from "./helpers/sol-flow-harness.js";
 import type { LedgerChain } from "./helpers/ledger-rail.js";
 
@@ -154,16 +155,23 @@ describe("rule 4: a resumed step runs the guards its original runs", () => {
     return { r, p };
   }
 
-  it("lockLegA: leg B taken meanwhile by someone holding the secret stops the recovery before the chain is asked; nothing is sent", async () => {
+  // R1-01: the guards gate every NEW outward action. The chain is read first; a lock that is still undecided is `pending`
+  // (nothing new may be done), and only a saved lock proven dead (its blockhash expired) leads to a NEW lock, which every guard
+  // then gates. (Recognising a lock that LANDED runs no guard at all: tests/flow-resume-evm.test.ts, F1 and F1b.)
+  it("lockLegA: leg B taken meanwhile by someone holding the secret refuses a NEW lock (the saved one proven dead); nothing is sent", async () => {
     const { r, p } = await diedBeforeCommit();
     await new PaperRail(r.h.noteStore, r.h.clock).claim(p.contractB, r.h.sellerLock.preimage);
+    await expect(r.buyer.lockLegA()).rejects.toBeInstanceOf(LockPendingError); // read first: undecided, nothing new
+    await expireBuyerLock(r);
     await expect(r.buyer.lockLegA()).rejects.toThrow(/leg B no longer verifies/);
     expect(r.h.node.sent.lock).toBe(0);
   });
 
-  it("lockLegA (Solana): a chain clock that drifted from the local clock stops the recovery before the chain is asked", async () => {
+  it("lockLegA (Solana): a chain clock that drifted from the local clock refuses a NEW lock (the saved one proven dead); nothing is sent", async () => {
     const { r } = await diedBeforeCommit();
     r.h.node.nowMs = r.h.clockRef.ms + 10 * 60_000;
+    await expect(r.buyer.lockLegA()).rejects.toBeInstanceOf(LockPendingError);
+    await expireBuyerLock(r);
     await expect(r.buyer.lockLegA()).rejects.toThrow(/finalized clock/);
     expect(r.h.node.sent.lock).toBe(0);
   });

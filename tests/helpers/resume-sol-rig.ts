@@ -5,6 +5,7 @@
 // tests/flow-resume-sol.test.ts and tests/flow-resume-validate.test.ts.
 
 import { tryDecodeFrame, type OfferFrame, type TranscriptRecord } from "@flop-labs/tclk";
+import { base58 } from "@scure/base";
 
 import type { BuyerFlow } from "../../src/client/buyer.js";
 import { decodeFlowRecord, type BuyerFlowRecord, type SellerFlowRecord } from "../../src/client/flow-record.js";
@@ -80,6 +81,16 @@ export async function toLocked(r: Rig) {
   return p;
 }
 
+
+/** The Buyer's saved lock is a signed Solana transaction nobody sent: its blockhash expires on the chain with no status for the signature,
+ *  so "never landed" is provable and the rail answers it (a NEW lock may then be built, after the flow's own guards). */
+export async function expireBuyerLock(r: Rig): Promise<void> {
+  const handle = (await buyerRecord(r)).lock.prepared?.recovery;
+  if (handle === undefined || handle.chain !== "sol") throw new Error("expected a saved Solana lock handle");
+  r.h.node.chain.finalizedHeight = handle.lastValidBlockHeight + 1;
+  r.h.node.chain.blockhash = base58.encode(new Uint8Array(32).fill(0x66));
+  r.h.node.chain.lastValidBlockHeight = handle.lastValidBlockHeight + 400;
+}
 
 export const framesOf = async (r: Rig, room: string, type: string): Promise<TranscriptRecord[]> => framesIn(await r.h.venue.read(room), type);
 export const isFrame = (line: string, type: string): boolean => tryDecodeFrame(line)?.type === type;

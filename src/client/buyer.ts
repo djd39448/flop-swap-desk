@@ -331,9 +331,10 @@ export class BuyerFlow {
     return { store, venue: this.venue, identity: this.identity, clock: this.clock };
   }
 
-  /** P8: the next safe step by the stored record alone (no I/O). `"learnSecret"` is also the way back into `claimLegB`
-   *  (the secret is never stored here, it is read again); after leg A's `refundAfterMs` a runner may call `refundLegA`
-   *  where this says `learnSecret`. */
+  /** P8: the next safe step by the stored record alone (no I/O besides the clock). `"learnSecret"` is also the way back into
+   *  `claimLegB` (the secret is never stored here, it is read again); after leg A's `refundAfterMs` a runner may call
+   *  `refundLegA` where this says `learnSecret`. A lock that was attempted but is not recognised yet is `"lockLegA"` (it reads
+   *  the chain first and records a lock that landed, at any time) until leg A's refund time, then `"refundLegA"` (R1-01). */
   private nextStep(): BuyerNextStep {
     const journal = this.#journal;
     if (journal === undefined || !journal.isLanded("offer-a")) return "bid";
@@ -341,7 +342,13 @@ export class BuyerFlow {
     if (this.refundAttempted) return journal.isLanded("receipt-refund-a") ? "done" : "refundLegA";
     if (!this.legBVerified) return "verifyLegBLocked";
     if (!journal.isLanded("account-a")) return "postAccountLineA";
-    if (this.lockEvidence === undefined || !this.lockFramePosted) return "lockLegA";
+    if (this.lockEvidence === undefined || !this.lockFramePosted) {
+      // R1-01 (variant F1b): a lock that was attempted and is not recognised yet is read by `lockLegA`, which finds it landed
+      // whatever the clock says. Once leg A's refund time has come, though, the way out of a landed lock is `refundLegA`
+      // (nobody can claim it any more on the rails with a claim deadline), and `lockLegA` would only refuse a late new lock.
+      if (this.legALockAttempted && this.offerA !== undefined && this.clock() >= this.offerA.refundAfterMs) return "refundLegA";
+      return "lockLegA";
+    }
     if (this.legBClaimAttempted || this.legBClaimed) return journal.isLanded("receipt-b") ? "done" : "learnSecret";
     return "learnSecret";
   }
@@ -912,10 +919,83 @@ export class BuyerFlow {
       await this.announceLockA(acceptA.contract, this.lockEvidence.ref);
       return { hashLock: this.lockedHashLock, writeEvidence: this.lockEvidence };
     }
-    // P8: a lock attempted without a known outcome (a crash, a failed reply) goes through the recover path below. It
-    // runs every guard the original step runs (rule 4): recovery may re-send the saved bytes or build one fresh lock.
-    const recovering = this.#journal !== undefined && this.legALockAttempted;
+    // P8, R1-01: a lock attempted without a known outcome (a crash, a failed reply) is RECOVERED, and recovery READS THE CHAIN
+    // FIRST. Rule 4's guards (the deadline arithmetic, leg B's note, the chain clock, ...) gate every NEW outward action: a fresh
+    // lock, a re-send of the saved bytes. Recognising a lock that already landed, recording it and posting its frame is not a new
+    // lock and happens whatever the clock says; before this fix a guard that failed after the crash (the clock had moved on, the
+    // Seller had claimed and so leg B's note read claimed) stopped the call before the chain was read, `next` stayed lockLegA for
+    // ever, and the Buyer never learnt the secret of a lock that was already claimed. The Seller's own claim guards decide whether
+    // a recorded lock can still be claimed.
+    if (this.#journal !== undefined && this.legALockAttempted) return this.recoverLockA(offerA, offerB, acceptA, acceptB);
 
+    await this.checkLockGuards(offerA, offerB, acceptB);
+
+    const termsA = offerAcceptLockTerms(offerA, acceptA);
+    const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
+    const accounts = this.rail.resolveAccounts(dealRoomARecords, {
+      contract: acceptA.contract,
+      payerDid: termsA.payer,
+      payeeDid: termsA.payee,
+    });
+    this.checkAccounts(accounts);
+
+    const connected = await this.rail.connect(termsA, accounts);
+    await this.checkChainClock(connected);
+
+    const fromBlock = await connected.currentBlockMarker();
+
+    // G3 (client half of H2): build (and, for a rail that needs one, sign) the lock transaction
+    // WITHOUT broadcasting it yet — `prepared.ref` is already fully determined at this point (a
+    // Bitcoin outpoint hashes the prepared transaction's own bytes; an EVM ref is simply the
+    // hashLock, already known regardless).
+    const prepared = await connected.prepareLock(termsA, 0);
+
+    // P22-P24-EVM-FIXES-R3.md E3 + P4-BTC-FIXES.md G1/G3: record everything `refundLegA`/
+    // `learnSecret` will ever need BEFORE this flow ever risks a broadcast — the hash lock
+    // (always known in advance), the resolved accounts (G1: frozen here, permanently, so a
+    // pubkey/account line posted after this point can neither add to nor conflict with what this
+    // flow already committed to acting on), and the rail's own write ref (G3: already known from
+    // `prepared`, not from whatever `commitLock` eventually returns — a failed evidence capture
+    // or a failed lock-frame post, or even a flaky read on the broadcast's own response, must
+    // never leave this flow believing leg A was "never locked" when the write may already have
+    // reached the network).
+    const hashLock = termsA.statement;
+    this.lockedHashLock = hashLock;
+    this.lockedFromBlock = fromBlock;
+    this.lockedAccounts = accounts;
+    this.lockedRailRef = prepared.ref;
+
+    // G2: from this point on this flow can no longer be sure a retry would not double-fund —
+    // latch it permanently, right before the one call that might actually reach the network.
+    this.legALockAttempted = true;
+    this.preparedLock = prepared;
+    // P8 (rule 1): the prepared lock (ref plus the rail's recovery handle), the hash lock, the marker and the frozen
+    // accounts are durable BEFORE the broadcast. If this save fails nothing was sent; if another instance saved first the
+    // compare-and-swap refuses this one (R1-02) and, as for any refused save, the flow is dead until `resume()` (R1-03).
+    await this.persist();
+
+    const before = connected.exchanges.length;
+    const writeEvidence = await connected.commitLock();
+    this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+    this.lockEvidence = writeEvidence;
+    await this.persist();
+
+    // P4-BTC-FIXES-R3.md K5: posting the lock frame is broken out into its own idempotent method
+    // (`announceLockA`) so `reconcileLockA` can re-post it later if THIS post itself is what fails
+    // (or is lost) — a genuinely-funded outpoint must never stay invisible to tclk's own machine
+    // just because the one frame that would have announced it never landed.
+    await this.announceLockA(acceptA.contract, writeEvidence.ref);
+
+    return { hashLock, writeEvidence };
+  }
+
+  /**
+   * Rule 4's guards for a NEW lock action (R1-01): a fresh lock, or the re-send of a saved one. The deadline arithmetic is
+   * re-run with `clock()` as the lock time (P22-P24-EVM-FIXES.md B3); the asset, the amount floor and leg B's match to leg A's
+   * want are re-checked (K3, G6, C2: defence in depth where real value is spent); and leg B must still verify on the paper
+   * rail right now (E1: `legBVerified` is only "was true once"). Never run to RECOGNISE a lock that already landed.
+   */
+  private async checkLockGuards(offerA: OfferFrame, offerB: OfferFrame, acceptB: AcceptFrame): Promise<void> {
     const deadlineCheck = checkSwapDeadlines(offerA, offerB, this.clock(), this.rail.policy);
     if (!deadlineCheck.ok) {
       throw new Error(
@@ -961,88 +1041,28 @@ export class BuyerFlow {
     if (!legBStillLocked) {
       throw new Error("buyer: refusing to lock leg A — leg B no longer verifies on the paper rail (E1)");
     }
+  }
 
-    const termsA = offerAcceptLockTerms(offerA, acceptA);
-    let accounts: RailAccounts;
-    if (recovering) {
-      // G1: the accounts frozen at the first attempt; the deal room is not read again.
-      if (this.lockedAccounts === undefined) throw new Error("buyer: refusing to recover the lock - its resolved accounts were never recorded");
-      accounts = this.lockedAccounts;
-    } else {
-      const dealRoomARecords = await this.venue.read(dealRoom(acceptA.contract));
-      accounts = this.rail.resolveAccounts(dealRoomARecords, {
-        contract: acceptA.contract,
-        payerDid: termsA.payer,
-        payeeDid: termsA.payee,
-      });
-    }
+  /** D-08 and P7 (F1): the Seller's account line must have resolved, and so must this Buyer's own proven payer line. */
+  private checkAccounts(accounts: RailAccounts): void {
     if (accounts.payee === undefined) {
       throw new Error("buyer: refusing to lock leg A — the Seller's account line has not resolved (D-08)");
     }
-
     // P7 fix pass (F1): our own proven payer line must also resolve before we lock. The Seller
     // and every evidence reader now require it; locking without it would only produce a lock that
     // reads unverified everywhere.
     if (accounts.payer === undefined) {
       throw new Error("buyer: refusing to lock leg A, our own proven payer account line has not resolved (P7)");
     }
+  }
 
-    const connected = await this.rail.connect(termsA, accounts);
-
-    // R3-7 (Solana only): refuse to lock while the chain's finalized clock and the local clock disagree by more than the
-    // named bound. Known limit: the Buyer's protection on Solana is legB.refundAfterMs - legA.refundAfterMs; a halt or a
-    // clock lag longer than that is not covered.
-    if (this.rail.railId === SOL_RAIL_ID) {
-      const problem = chainClockProblem(await connected.chainTimeMs(), this.clock(), this.rail.maxChainClockSkewMs);
-      if (problem !== null) throw new Error(`buyer: refusing to lock leg A - ${problem}`);
-    }
-
-    if (recovering) return this.recoverLockA(connected, termsA, acceptA.contract);
-
-    const fromBlock = await connected.currentBlockMarker();
-
-    // G3 (client half of H2): build (and, for a rail that needs one, sign) the lock transaction
-    // WITHOUT broadcasting it yet — `prepared.ref` is already fully determined at this point (a
-    // Bitcoin outpoint hashes the prepared transaction's own bytes; an EVM ref is simply the
-    // hashLock, already known regardless).
-    const prepared = await connected.prepareLock(termsA, 0);
-
-    // P22-P24-EVM-FIXES-R3.md E3 + P4-BTC-FIXES.md G1/G3: record everything `refundLegA`/
-    // `learnSecret` will ever need BEFORE this flow ever risks a broadcast — the hash lock
-    // (always known in advance), the resolved accounts (G1: frozen here, permanently, so a
-    // pubkey/account line posted after this point can neither add to nor conflict with what this
-    // flow already committed to acting on), and the rail's own write ref (G3: already known from
-    // `prepared`, not from whatever `commitLock` eventually returns — a failed evidence capture
-    // or a failed lock-frame post, or even a flaky read on the broadcast's own response, must
-    // never leave this flow believing leg A was "never locked" when the write may already have
-    // reached the network).
-    const hashLock = termsA.statement;
-    this.lockedHashLock = hashLock;
-    this.lockedFromBlock = fromBlock;
-    this.lockedAccounts = accounts;
-    this.lockedRailRef = prepared.ref;
-
-    // G2: from this point on this flow can no longer be sure a retry would not double-fund —
-    // latch it permanently, right before the one call that might actually reach the network.
-    this.legALockAttempted = true;
-    this.preparedLock = prepared;
-    // P8 (rule 1): the prepared lock (ref plus the rail's recovery handle), the hash lock, the marker and the frozen
-    // accounts are durable BEFORE the broadcast. If this save fails nothing was sent.
-    await this.persist();
-
-    const before = connected.exchanges.length;
-    const writeEvidence = await connected.commitLock();
-    this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
-    this.lockEvidence = writeEvidence;
-    await this.persist();
-
-    // P4-BTC-FIXES-R3.md K5: posting the lock frame is broken out into its own idempotent method
-    // (`announceLockA`) so `reconcileLockA` can re-post it later if THIS post itself is what fails
-    // (or is lost) — a genuinely-funded outpoint must never stay invisible to tclk's own machine
-    // just because the one frame that would have announced it never landed.
-    await this.announceLockA(acceptA.contract, writeEvidence.ref);
-
-    return { hashLock, writeEvidence };
+  /** R3-7 (Solana only): refuse to lock while the chain's finalized clock and the local clock disagree by more than the
+   *  named bound. Known limit: the Buyer's protection on Solana is legB.refundAfterMs - legA.refundAfterMs; a halt or a
+   *  clock lag longer than that is not covered. */
+  private async checkChainClock(connected: ConnectedCounterAssetRail): Promise<void> {
+    if (this.rail.railId !== SOL_RAIL_ID) return;
+    const problem = chainClockProblem(await connected.chainTimeMs(), this.clock(), this.rail.maxChainClockSkewMs);
+    if (problem !== null) throw new Error(`buyer: refusing to lock leg A - ${problem}`);
   }
 
   /**
@@ -1069,50 +1089,77 @@ export class BuyerFlow {
   }
 
   /**
-   * P8-RESUME-SPEC.md "Buyer lock A" (rules 1 and 2): what a saved lock turned into. The rail answers from the chain
-   * for the ONE transaction `prepareLock` signed: `landed` records the evidence and posts the lock frame (once, as the
-   * saved text, or adopted); `pending` stops with `LockPendingError` (nothing new is signed); `never-landed` means the
-   * rail can prove that transaction can no longer land, so exactly one fresh `prepareLock` for the same lock is signed,
-   * saved, and sent (its ref must be the same: a different one is refused). Bitcoin never answers `never-landed`: its
-   * `unknown` leads to `resendLock`, which sends the saved bytes again, and a node that refuses them is a typed error
-   * for a person (R1-01 part 2: reading and re-sending are separate rail calls).
+   * P8-RESUME-SPEC.md "Buyer lock A" (rules 1, 2 and 4), review round 1 R1-01: what a saved lock turned into. The chain is
+   * READ FIRST, before any guard, because recognising a lock that already landed is not a new lock:
+   *   - `landed`: the evidence is recorded and the lock frame is posted (once, as the saved text, or adopted), whatever the
+   *     clock says, whatever leg B's note says, whatever the chain clock says. The Seller's own claim guards decide what can
+   *     still follow; the Buyer is then routed to `learnSecret` (a claim) or `refundLegA` (after the refund time).
+   *   - `pending`: `LockPendingError`; nothing was signed and nothing is sent.
+   *   - `unknown` (Bitcoin: the node does not know the funding; NEAR: not known, no row, nonce not past) and `never-landed`
+   *     (the rail proved the transaction can no longer land): from here on a NEW outward action may follow, so EVERY guard of
+   *     the original `lockLegA` runs first. `unknown` is then settled by `resendLock`, which sends the identical saved bytes
+   *     once (never a second funding; a node that refuses them is a typed error for a person); `never-landed` leads to
+   *     exactly one fresh `prepareLock`, which is saved, then sent, and whose ref must be the saved one (a different one is
+   *     refused).
+   * The accounts are the ones frozen at the first attempt; the deal room is not read again (G1).
    */
   private async recoverLockA(
-    connected: ConnectedCounterAssetRail,
-    termsA: ReturnType<typeof offerAcceptLockTerms>,
-    contract: string,
+    offerA: OfferFrame,
+    offerB: OfferFrame,
+    acceptA: AcceptFrame,
+    acceptB: AcceptFrame,
   ): Promise<{ hashLock: string; writeEvidence: RailWriteEvidence }> {
     const prepared = this.preparedLock;
     const hashLock = this.lockedHashLock;
     if (prepared === undefined || hashLock === undefined) {
       throw new Error("buyer: a lock was attempted but its prepared handle was not recorded; refusing to guess (rule 6)");
     }
+    // G1: the accounts frozen at the first attempt.
+    const accounts = this.lockedAccounts;
+    if (accounts === undefined) throw new Error("buyer: refusing to recover the lock - its resolved accounts were never recorded");
+    const termsA = offerAcceptLockTerms(offerA, acceptA);
+    const connected = await this.rail.connect(termsA, accounts);
+
     let outcome: LockRecoveryOutcome = await connected.recoverLock(prepared);
+    if (outcome === "landed") return this.recordLockLanded(prepared, hashLock, acceptA.contract);
+    if (outcome === "pending") throw new LockPendingError(prepared.ref);
+
+    // `unknown` or `never-landed`: the next thing this flow does is a NEW outward action. Every guard first (rule 4).
+    await this.checkLockGuards(offerA, offerB, acceptB);
+    this.checkAccounts(accounts);
+    await this.checkChainClock(connected);
+
     if (outcome === "unknown") {
-      // R1-01 (part 2): `recoverLock` only READS. The node does not know the transaction and the rail cannot prove it
-      // dead, so the identical saved bytes are sent once more, as `recoverLock` itself used to do. Until the flow's own
-      // rule-4 guards run before this call, this stays exactly today's behaviour. A rail that answers `unknown` and has
-      // no `resendLock` cannot be recovered by this flow: nothing is guessed.
+      // `recoverLock` only READS (R1-01 part 2). The node does not know the transaction and the rail cannot prove it dead, so the
+      // identical saved bytes are sent once more. A rail that answers `unknown` and has no `resendLock` cannot be recovered by this
+      // flow: nothing is guessed.
       if (connected.resendLock === undefined) {
         throw new RailRecoveryRefusedError("no-handle", prepared.ref, "the rail does not know this transaction and offers no way to send it again");
       }
       outcome = await connected.resendLock(prepared);
+      if (outcome === "landed") return this.recordLockLanded(prepared, hashLock, acceptA.contract);
+      if (outcome === "pending") throw new LockPendingError(prepared.ref);
     }
-    if (outcome === "pending") throw new LockPendingError(prepared.ref);
-    let writeEvidence: RailWriteEvidence;
-    if (outcome === "landed") {
-      writeEvidence = { ref: prepared.ref, raw: [], ...(prepared.recovery?.chain === "btc" ? { txid: prepared.recovery.txid } : {}) };
-    } else {
-      const fresh = await connected.prepareLock(termsA, 0);
-      if (fresh.ref !== prepared.ref) {
-        throw new RailRecoveryRefusedError("handle-mismatch", prepared.ref, `a fresh prepareLock named ${fresh.ref}; the saved lock is never replaced by a different one`);
-      }
-      this.preparedLock = fresh;
-      await this.persist(); // BEFORE the second send
-      const before = connected.exchanges.length;
-      writeEvidence = await connected.commitLock();
-      this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+
+    // never-landed: the rail proved the first transaction can no longer land, so ONE fresh lock for the same terms is built
+    const fresh = await connected.prepareLock(termsA, 0);
+    if (fresh.ref !== prepared.ref) {
+      throw new RailRecoveryRefusedError("handle-mismatch", prepared.ref, `a fresh prepareLock named ${fresh.ref}; the saved lock is never replaced by a different one`);
     }
+    this.preparedLock = fresh;
+    await this.persist(); // BEFORE the second send
+    const before = connected.exchanges.length;
+    const writeEvidence = await connected.commitLock();
+    this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+    this.lockEvidence = writeEvidence;
+    await this.persist();
+    await this.announceLockA(acceptA.contract, writeEvidence.ref);
+    return { hashLock, writeEvidence };
+  }
+
+  /** The chain showed this flow's lock (R1-01: no guard applies): its evidence is recorded and its frame is posted. */
+  private async recordLockLanded(prepared: PreparedLock, hashLock: string, contract: string): Promise<{ hashLock: string; writeEvidence: RailWriteEvidence }> {
+    const writeEvidence: RailWriteEvidence = { ref: prepared.ref, raw: [], ...(prepared.recovery?.chain === "btc" ? { txid: prepared.recovery.txid } : {}) };
     this.lockEvidence = writeEvidence;
     await this.persist();
     await this.announceLockA(contract, writeEvidence.ref);

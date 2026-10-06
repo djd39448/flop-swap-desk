@@ -18,6 +18,7 @@ import { LockPendingError } from "../src/client/buyer.js";
 import { FlowRecordConflictError, ledgerEntry } from "../src/client/flow-record.js";
 import { sellerKeyOf } from "./helpers/seller-key.js";
 import { swapId as computeSwapId } from "../src/profile.js";
+import { offerAcceptLockTerms } from "../src/swap.js";
 import { encodeFrameWith } from "../src/rails/custom-frames.js";
 import { SOL_RAIL_ID } from "../src/rails/custom-rails.js";
 import { ProcessDied, crashRail, failVenuePosts, loseVenueReplies } from "./helpers/resume-flows.js";
@@ -25,6 +26,7 @@ import {
   bid,
   bidParams,
   buyerRecord,
+  expireBuyerLock,
   framesOf,
   isFrame,
   isLine,
@@ -38,6 +40,14 @@ import {
   toPaired,
 } from "./helpers/resume-sol-rig.js";
 import { framesIn, legBDeadlines, solHarness } from "./helpers/sol-flow-harness.js";
+import type { BuyerFlowRecord } from "../src/client/flow-record.js";
+import type { Rig } from "./helpers/resume-sol-rig.js";
+
+/** Nothing was signed, saved or sent beyond what the crash left: no lock reached the chain, and the saved handle is the original one. */
+async function expectNothingNewSigned(r: Rig, saved: BuyerFlowRecord["lock"]["prepared"]): Promise<void> {
+  expect(r.h.node.sent.lock).toBe(0);
+  expect((await buyerRecord(r)).lock.prepared).toEqual(saved);
+}
 
 describe("resume: the whole swap, with both parties restarted after every step", () => {
   it("settles with one lock, one claim and each frame exactly once, and names the next step at every point", async () => {
@@ -429,15 +439,21 @@ describe("resume: Buyer lock A (rules 1, 2 and 4)", () => {
     expect(after.lock.prepared!.ref).toBe(saved.lock.prepared!.ref);
   });
 
-  it("a restart does not skip the guards: deadlines that are no longer safe stop the recovery before the chain is asked", async () => {
+  it("a restart does not skip the guards for a NEW lock: once the saved one is proven dead, deadlines that are no longer safe refuse the fresh lock, and nothing is signed (R1-01)", async () => {
     const r = rig();
     await toLines(r);
     await restartBuyer(r, { rail: crashRail(r.h.buyerRail, { before: ["commitLock"] }) });
     await expect(r.buyer.lockLegA()).rejects.toBeInstanceOf(ProcessDied);
     await restartBuyer(r);
+    const saved = (await buyerRecord(r)).lock.prepared;
     r.h.setTime(legA.refundAfterMs); // far too late for a safe lock
+    // the chain is read FIRST: the saved lock is still undecided, so nothing new may be done whatever the clock says
+    await expect(r.buyer.lockLegA()).rejects.toBeInstanceOf(LockPendingError);
+    await expectNothingNewSigned(r, saved);
+    // the saved lock is proven dead: a NEW lock would follow, so every guard runs first, and this one refuses
+    await expireBuyerLock(r);
     await expect(r.buyer.lockLegA()).rejects.toThrow(/deadlines are no longer safe at lock time/);
-    expect(r.h.node.sent.lock).toBe(0);
+    await expectNothingNewSigned(r, saved);
   });
 
   it("the lock frame failed to post after the lock landed: the same call again posts the saved frame once (no second lock)", async () => {
@@ -752,3 +768,47 @@ function deepHas(root: unknown, needle: string, seen = new WeakSet<object>()): b
     return descriptor !== undefined && "value" in descriptor && deepHas(descriptor.value, needle, seen);
   });
 }
+
+// --- review round 1, R1-01 with R1-04: a lock that landed and was claimed is recognised, whatever the clock or the chain clock says ---------
+
+describe("resume R1-01 + R1-04 (Solana): a lock that landed and was then claimed is recognised, then the secret is learnt and leg B claimed", () => {
+  /** The lock lands and the process dies before the evidence or the frame is saved; the Seller claims the escrow through its own rail. */
+  async function lockedThenClaimed() {
+    const r = rig();
+    const p = await toLines(r);
+    await restartBuyer(r, { rail: crashRail(r.h.buyerRail, { after: ["commitLock"] }) });
+    await expect(r.buyer.lockLegA()).rejects.toBeInstanceOf(ProcessDied);
+    expect(r.h.node.sent.lock).toBe(1);
+    expect(await framesOf(r, dealRoom(p.contractA), "lock")).toHaveLength(0);
+    // the Seller (holding the secret) claims the escrow it can see on chain, without waiting for the Buyer's lock frame
+    const termsA = offerAcceptLockTerms(p.offerA, p.accepted.acceptA);
+    const sellerConnected = await r.h.sellerRail.connect(termsA, { payer: r.h.buyerWallet.publicKey, payee: r.h.sellerWallet.publicKey });
+    const ref = `${p.accepted.acceptA.statement}:${r.h.buyerWallet.publicKey}`;
+    await sellerConnected.claim(ref, r.h.sellerLock.preimage, legA.refundAfterMs - 10 * 60_000);
+    expect(r.h.node.sent.claim).toBe(1);
+    return { r, p };
+  }
+
+  it("F1-sol: lockLegA resolves (before: SolLockRefusedError 'nothing was locked'), next becomes learnSecret, learnSecret returns the preimage, claimLegB succeeds", async () => {
+    const { r, p } = await lockedThenClaimed();
+    expect(await restartBuyer(r)).toBe("lockLegA");
+    const locked = await r.buyer.lockLegA();
+    expect(locked.writeEvidence.ref).toBe(`${p.accepted.acceptA.statement}:${r.h.buyerWallet.publicKey}`);
+    expect(r.h.node.sent.lock).toBe(1); // nothing new was signed
+    expect(await framesOf(r, dealRoom(p.contractA), "lock")).toHaveLength(1);
+    expect(await restartBuyer(r)).toBe("learnSecret");
+    const secret = await r.buyer.learnSecret();
+    expect(secret).toBe(r.h.sellerLock.preimage);
+    await r.buyer.claimLegB(secret);
+    expect((await new PaperRail(r.h.noteStore, r.h.clock).read(p.contractB))?.status).toBe("claimed");
+    expect(await restartBuyer(r)).toBe("done");
+  });
+
+  it("the chain-clock guard (R3-7) no longer stops the Buyer from recognising a lock that already landed", async () => {
+    const { r } = await lockedThenClaimed();
+    r.h.node.nowMs = r.h.clockRef.ms + 10 * 60_000; // the finalized clock and the local clock disagree by far more than the bound
+    await restartBuyer(r);
+    await r.buyer.lockLegA(); // before: "refusing to lock leg A - ... finalized clock ..." before the chain was read
+    expect(await restartBuyer(r)).toBe("learnSecret");
+  });
+});

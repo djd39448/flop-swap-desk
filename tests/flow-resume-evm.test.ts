@@ -23,7 +23,7 @@ import { swapId as computeSwapId } from "../src/profile.js";
 import { EvmMockNode } from "./helpers/evm-mock-node.js";
 import { identity, type Identity } from "./helpers/identity.js";
 import { evmSigner } from "./helpers/proven-lines.js";
-import { crashRail, resumeBuyer, resumeSeller } from "./helpers/resume-flows.js";
+import { ProcessDied, crashRail, resumeBuyer, resumeSeller } from "./helpers/resume-flows.js";
 import { framesIn } from "./helpers/sol-flow-harness.js";
 import { getAddress, type Address } from "viem";
 
@@ -330,5 +330,93 @@ describe("EVM resume: Buyer refund A (rules 1, 2 and 3)", () => {
     const secret = await r.buyer.learnSecret();
     await r.buyer.claimLegB(secret);
     expect(r.node.count("refund")).toBe(0);
+  });
+});
+
+// --- review round 1, R1-01: the chain is read BEFORE any guard, so a lock that landed is always recognised -----------------------------
+
+describe("EVM resume R1-01: a lock that already landed is recognised whatever the clock says (rule 4 gates NEW actions only)", () => {
+  /** The Buyer's approve and lock land and the process dies before the evidence or the lock frame is saved. */
+  async function lockLandedUnrecorded(r: Rig) {
+    const p = await toLines(r);
+    await restartBuyer(r, { rail: crashRail(r.buyerOptions.rail, { after: ["commitLock"] }) });
+    await expect(r.buyer.lockLegA()).rejects.toBeInstanceOf(ProcessDied);
+    expect(r.node.row(p.statement)?.status).toBe(1); // leg A is locked on chain
+    expect(await framesOf(r, dealRoom(p.contractA), "lock")).toHaveLength(0);
+    return p;
+  }
+
+  it("F1: the Seller claimed meanwhile (no lock frame needed on EVM) and the Buyer comes back 46 minutes later: lockLegA resolves, next becomes learnSecret, learnSecret returns the preimage, claimLegB succeeds before leg B's refund time", async () => {
+    const r = rig();
+    const p = await lockLandedUnrecorded(r);
+    r.clockRef.ms = T0 + 2 * 60_000;
+    await r.seller.claimLegA(r.seller.statement!);
+    expect(r.node.row(p.statement)?.status).toBe(2); // Claimed: the secret is public on chain
+
+    // 46 minutes after T0 the reveal window is shorter than the 45 minutes rule 1 asks for (it was 2 640 000 ms < 2 700 000 ms):
+    // before the fix every lockLegA call threw "deadlines are no longer safe at lock time" before the chain was read, and nothing
+    // ever named learnSecret, so leg B was refunded to the Seller at its refund time
+    r.clockRef.ms = T0 + 46 * 60_000;
+    expect(await restartBuyer(r)).toBe("lockLegA");
+    const locked = await r.buyer.lockLegA();
+    expect(locked.writeEvidence.ref).toBe(p.statement);
+    expect(await framesOf(r, dealRoom(p.contractA), "lock")).toHaveLength(1); // a funded lock is never left unannounced
+    expect([r.node.count("approve"), r.node.count("lock")]).toEqual([1, 1]); // nothing new was sent
+
+    expect(await restartBuyer(r)).toBe("learnSecret");
+    const secret = await r.buyer.learnSecret();
+    expect(secret).toBe(r.sellerLock.preimage);
+    r.clockRef.ms = legBWindow.refundAfterMs - 60_000;
+    await r.buyer.claimLegB(secret);
+    expect((await r.buyerOptions.paperRail.read(p.contractB))?.status).toBe("claimed");
+    expect(await restartBuyer(r)).toBe("done");
+  });
+
+  it("F1, the leg-B note guard: once the secret is public anyone can write leg B's note as claimed; that no longer stops the Buyer from recognising its own landed lock", async () => {
+    const r = rig();
+    const p = await lockLandedUnrecorded(r);
+    r.clockRef.ms = T0 + 2 * 60_000;
+    await r.seller.claimLegA(r.seller.statement!);
+    await new PaperRail(r.noteStore, () => r.clockRef.ms).claim(p.contractB, r.sellerLock.preimage); // a note written by someone who knows the secret
+    expect(await restartBuyer(r)).toBe("lockLegA");
+    await r.buyer.lockLegA(); // before the fix: "leg B no longer verifies on the paper rail (E1)"
+    expect(await restartBuyer(r)).toBe("learnSecret");
+    expect(await framesOf(r, dealRoom(p.contractA), "lock")).toHaveLength(1);
+  });
+
+  it("F1b: the Seller never claims: after leg A's refundAfterMs next names refundLegA, lockLegA still records the landed lock, and refundLegA refunds (row status 3)", async () => {
+    const r = rig();
+    const p = await lockLandedUnrecorded(r);
+    r.clockRef.ms = legAWindow.refundAfterMs + 1;
+    expect(await restartBuyer(r)).toBe("refundLegA"); // before the fix: lockLegA for ever, though refundLegA would work
+    await r.buyer.lockLegA(); // recognised and announced: no deadline guard applies to a lock that already landed
+    expect([r.node.count("approve"), r.node.count("lock")]).toEqual([1, 1]);
+    expect(await framesOf(r, dealRoom(p.contractA), "lock")).toHaveLength(1);
+    await r.buyer.refundLegA();
+    expect(r.node.row(p.statement)?.status).toBe(3);
+    expect(r.node.count("refund")).toBe(1);
+    expect(await restartBuyer(r)).toBe("done");
+  });
+
+  it("F1b, a runner that simply follows next: refundLegA goes straight from the unrecognised lock to the refund", async () => {
+    const r = rig();
+    const p = await lockLandedUnrecorded(r);
+    r.clockRef.ms = legAWindow.refundAfterMs + 1;
+    expect(await restartBuyer(r)).toBe("refundLegA");
+    await r.buyer.refundLegA();
+    expect(r.node.row(p.statement)?.status).toBe(3);
+    expect(await restartBuyer(r)).toBe("done");
+  });
+
+  it("a lock that did NOT land is another matter: with the guard window gone, lockLegA refuses a NEW lock and sends nothing", async () => {
+    const r = rig();
+    const p = await toLines(r);
+    await restartBuyer(r, { rail: crashRail(r.buyerOptions.rail, { before: ["commitLock"] }) });
+    await expect(r.buyer.lockLegA()).rejects.toBeInstanceOf(ProcessDied);
+    r.clockRef.ms = T0 + 46 * 60_000;
+    expect(await restartBuyer(r)).toBe("lockLegA");
+    await expect(r.buyer.lockLegA()).rejects.toThrow(/deadlines are no longer safe at lock time/);
+    expect([r.node.count("approve"), r.node.count("lock")]).toEqual([0, 0]);
+    expect(r.node.row(p.statement)).toBeUndefined();
   });
 });
