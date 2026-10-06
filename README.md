@@ -15,6 +15,8 @@ hash time-locked escrows, one shared secret, and no one in the middle holding an
 - **Client** (`src/client`): the party-side agent that holds *your* keys and drives the rails: the Buyer and
   Seller flows (`BuyerFlow`, `SellerFlow`), one adapter per counter-asset rail (EVM, Bitcoin, NEAR and Solana, see
   the leg sections below) and crash-resume (see "Resume").
+- **Rehearsal runner** (`bin/swap-rehearsal-evm.mjs`, `src/client/rehearsal-*.ts`): one process, both parties, a dry run by default;
+  `--yes` runs a swap on an EVM chain and writes the evidence bundle (see "Deploying EvmHashRail to Base Sepolia").
 
 Design document: `SPEC-ATOMIC-SWAP-DESK.md` in
 [djd39448/flop-contrib](https://github.com/djd39448/flop-contrib).
@@ -154,7 +156,8 @@ This builds `dist/` and the contracts, then spawns a real `anvil` node (found vi
 `verifyLockFinal(A)` is `true` and allowed two blocks later; the Buyer learning the secret from
 the on-chain `Claimed` log alone when the Seller never posts a reveal frame), and
 `tests-anvil/local-signer.anvil.test.ts` (the settle and refund paths again with both parties' accounts local, keys
-generated at test time; see "Key files"). `npm test` never
+generated at test time; see "Key files"), and `tests-anvil/rehearsal-runner.anvil.test.ts` (the rehearsal runner as a child
+process: the dry run, a settle, a kill and a resume, and the refund paths; see "Deploying EvmHashRail to Base Sepolia"). `npm test` never
 spawns `anvil` — a missing binary fails `test:anvil` loudly instead.
 
 **Fixture capture is opt-in.** Every client-flow scenario writes its watch-root bundle to a
@@ -202,8 +205,8 @@ whose key lives in a closure.
 3. Never use the airdrop key, and never a key that holds mainnet value or anything you would miss. A key file is
    for a throwaway testnet account that you fund from a faucet. The conventional names for the G1 rehearsal are
    `flop-swap-desk-keys\base-sepolia.buyer.key` and `base-sepolia.seller.key`, outside this repository. The
-   G1 runner (P9-6, not built yet) will take the two paths from its config file (`buyerKeyFile`,
-   `sellerKeyFile`); nothing in this repository reads an environment variable for a key.
+   G1 runner (`bin/swap-rehearsal-evm.mjs`, see "Deploying EvmHashRail to Base Sepolia") takes the two paths from its config
+   file (`buyerKeyFile`, `sellerKeyFile`); nothing in this repository reads an environment variable for a key.
 
 **What the loader refuses** (with a typed `EvmKeyFileError`; its `code` is `not-found`, `unreadable`, `not-a-file`,
 `empty` or `malformed`, and `problem` names the exact case): an empty path, a missing file, a directory or other
@@ -292,7 +295,8 @@ EVM contract, with every verdict re-derivable from the exact captured RPC bytes 
 `anvil-local` (chain id `31337`), an ephemeral node this repo itself starts and stops, never a
 real network, and never with mainnet value at any point in this build (D-09/D-10). The
 Base Sepolia deploy (P2.5), a real testnet with a real key loaded from a key file and never printed (see "Key
-files") and the account lines exchanged for real, is Dave's own G1 step and is not built here.
+files") and the account lines exchanged for real, is Dave's own G1 step: the commands and the rehearsal runner that drives
+the swap are under "Deploying EvmHashRail to Base Sepolia", and none of it has met the real chain yet.
 
 Re-deriving a verdict from the captured bytes (see "Audit replay" above, F3) detects the bytes
 being tampered with after the fact — never that the capturing process told the truth about the
@@ -421,6 +425,193 @@ written down instead of hidden.
 - **A restart costs gas at most.** After a crash a repeated `approve`, `lock`, `claim` or `refund` is refused by the
   contract (a duplicate hash lock, a spent status), so a resumed EVM flow cannot lock or pay twice; the price of
   the repeat is gas (see "Resume").
+
+## Deploying EvmHashRail to Base Sepolia
+
+This section is for Dave's own G1 steps (P9-6): deploy the escrow to Base Sepolia, pin it by its code, and run the first real
+swap with the rehearsal runner `bin/swap-rehearsal-evm.mjs`. **No deploy and no broadcast ever happens unless Dave runs the
+`forge create` command below himself or passes `--yes` to the runner.** The runner's default is a dry run that only reads; it
+posts nothing to any HTTP venue (the venue and the paper notes are two local files); and the only network it speaks to is
+`rails.evm.endpoint`. Nothing in this repository has been run against the real Base Sepolia: the runner is tested against a real
+`anvil` node (`tests-anvil/rehearsal-runner.anvil.test.ts`) and against a fake read-only chain (`tests/rehearsal-run.test.ts`).
+
+**The G1 terms (the P9 spec's, unchanged).** Testnet only: the chain allow list accepts 31337 (anvil) and 84532 (Base Sepolia) and
+nothing else, and Base mainnet's USDC is refused by value in any asset book. Zero mainnet value: the accounts are throwaway
+accounts funded from faucets. Never the airdrop key, and never a key that holds anything you would miss. The fee recipient is zero or
+receive-only: the runner bids with `feeBps` 0 (this branch has no fee contract; `docs/FEES.md`), so there is no fee recipient in play.
+The session that wrote this never sees a key (see "Key files").
+
+### Dave's steps, in order
+
+1. Make three throwaway accounts: the Buyer's and the Seller's (two key files, see "Key files": `cast wallet new`, the key copied
+   into a one-line file, mode 0600, outside this repository) and a deployer (either of the two, or a third; it needs ETH only).
+2. Fund them from the faucets: Base Sepolia ETH for all of them (both parties pay gas: the Buyer an approve, a lock and, on the refund
+   path, a refund; the Seller a claim), and Circle's test USDC (`faucet.circle.com`, Base Sepolia) for the Buyer. The runner's dry
+   run says exactly how much it needs.
+3. Deploy the escrow (next section) and check its code.
+4. Hand the session the contract address and the RPC URL; the session writes the config for review (the shape is below).
+5. Run the dry run, read the table, then run `--yes`. For the refund path run `--yes --stop-after lock`, then `--refund` (wall
+   clock: at least three hours, see "Deadlines").
+6. Keep the bundle (`out`): it is the proof, replayed offline by `examples/audit-export.mjs`.
+
+### Deploy the escrow
+
+`contracts/EvmHashRail.sol` has no constructor, no owner, no fee and no salt, so one `forge create` from a funded deployer is the
+whole deployment. Run these from the repository root (the contract is named by its path, and the code hash below holds for
+exactly that path and the pinned toolchain in `foundry.toml`, see `PROVENANCE.md`). The first command stores the deployer's key in
+Foundry's own encrypted keystore (it asks for the key and a password at the prompt; the key never goes into a file of this
+repository); the second deploys; the third reads the deployed code back and hashes it.
+
+```bash
+cast wallet import base-sepolia-deployer --interactive
+```
+
+```bash
+forge create contracts/EvmHashRail.sol:EvmHashRail --rpc-url https://sepolia.base.org --account base-sepolia-deployer --broadcast
+```
+
+```bash
+cast code <deployed address> --rpc-url https://sepolia.base.org | cast keccak
+```
+
+`forge create` prints the deployed address and the transaction hash: write both down (they go into the config and the notes of the
+run). The last command must print the runtime code hash `PROVENANCE.md` records, `0x6ab36fa3...2da27` (3416 bytes). This repository's
+own tool says the same thing and also prints the byte length, and it never prints the URL (an endpoint may carry a key):
+
+```bash
+node bin/evm-code-hash.mjs https://sepolia.base.org <deployed address>
+```
+
+Its output is two lines, `keccak256 0x...` and `bytes 3416`. That `keccak256` string is the `contractCodeHash` of the config below. If
+it differs from the one in `PROVENANCE.md`, the code at that address is not this source built with this toolchain: do not use the
+address. (The desk would refuse it anyway: `contractCodeHash` is required on a Base Sepolia config, and `connect()` and the
+evidence reader both check it, see "Trust the contract by its code".)
+
+### The config
+
+One JSON file; relative paths are relative to the file. `rails.evm` is exactly an `EvmRailConfig`: the same object goes into the
+bundle's `rails.json` and may be passed to `bin/watch.mjs --rails`. Every object is closed: a field the runner does not know is
+refused by name (never by value), so a key pasted under a wrong name cannot ride into a log or a bundle.
+
+```json
+{
+  "rails": {
+    "evm": {
+      "pin": { "chainId": 84532, "name": "base-sepolia", "caip2": "eip155:84532", "finality": { "mode": "tag", "tag": "finalized" } },
+      "endpoint": "https://sepolia.base.org",
+      "contract": "<the deployed address>",
+      "assets": { "USDC": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" },
+      "contractCodeHash": "<the keccak256 line of bin/evm-code-hash.mjs>",
+      "maxLogRange": 500,
+      "receiptTimeoutMs": 600000
+    }
+  },
+  "buyerKeyFile": "flop-swap-desk-keys/base-sepolia.buyer.key",
+  "sellerKeyFile": "flop-swap-desk-keys/base-sepolia.seller.key",
+  "deadlines": "known-good",
+  "amount": "1000000",
+  "out": "bundles/g1-first-swap"
+}
+```
+
+| field | meaning |
+|---|---|
+| `rails.evm.pin` | the chain pin, as in every `EvmRailConfig` (84532 is tied to the name `base-sepolia`); `finality` `tag` `finalized` is the default and the one the lag is measured against |
+| `rails.evm.endpoint` | the JSON-RPC URL, one for the whole run (there is no nonce manager: a load balancer that answers some calls from a node a block behind can make a write fail with `nonce too low`, which costs liveness only). It may carry no credentials, query or fragment (refused); a key in its PATH cannot be told from a path, so use a keyless endpoint such as `https://sepolia.base.org`: the URL is written into the bundle |
+| `rails.evm.contract`, `assets.USDC` | the deployed escrow, and Circle's Base Sepolia USDC (an asset book entry is the token allow list) |
+| `rails.evm.contractCodeHash` | required on 84532 (see above) |
+| `rails.evm.maxLogRange` | the endpoint's `eth_getLogs` cap in blocks (500 on the public endpoint; the default on 84532); the dry run probes it |
+| `rails.evm.receiptTimeoutMs` | how long one receipt wait lasts (default 180 s); a timeout is a typed error that says the transaction was sent and may still be mined, and `--resume` reads the chain before it sends anything |
+| `buyerKeyFile`, `sellerKeyFile` | the two key files, loaded by `loadEvmLocalAccount` (see "Key files"); they must be two different files |
+| `deadlines` | `"known-good"` (default, the set below) or `{ "legA": { "claimByMin", "refundAfterMin", "expiresMin" }, "legB": { ... } }` in whole minutes after the run's start; the dry run checks the rules with the numbers it is given |
+| `amount` | leg A's amount in the token's minimal units (USDC has 6 decimals: `"1000000"` is 1 USDC), a decimal integer string |
+| `out` | the bundle directory: absent or empty when the bundle is written |
+| `asset` (default `"USDC"`), `flopAmount` (default `"52070000"`, FLOP on the paper rail, no value) | which asset-book entry moves, and leg B's paper amount |
+| `clock` (default `"system"`), `pollMs` (5000), `waitLimitMs` (two hours) | the clock the flows read (`"chain"` follows the chain's head and is for a local anvil node only: it is refused on any other chain), how often a wait polls the chain, and the longest one wait for finality may last |
+
+### Deadlines
+
+`"known-good"` is the set `tests-anvil/client-flows.anvil.test.ts` runs against `EVM_LOCAL_POLICY`, in minutes after the run's start
+(t0): leg A (USDC, on the chain) is claimable until t0+60 and refundable from t0+90, and its offer expires at t0+30; leg B (FLOP, the
+paper note) is claimable until t0+120 and refundable from t0+180, and its offer expires at t0+40. The lock is expected within 10
+minutes of t0. SPEC 3.5's rules hold for it at any lock time up to 45 minutes after t0 (rule 1, a 45-minute reveal window, is the
+binding one). Two things follow for a real chain. The Seller may claim only once the lock reads at the finalized block, which on Base
+Sepolia trailed the head by 14.5 to 39 minutes in the 92 samples of 2026-10-06 (one earlier probe read 19.5 minutes); the dry run measures the lag it sees and fails the
+`finality budget` row if lag plus ten minutes does not fit before leg A's claim-by (P9-4 sets the Base Sepolia policy numbers from the
+24-hour sample, and may move these windows). And a refund rehearsal is slow by nature: leg A cannot be refunded before t0+90 and leg B
+(which the Seller refunds on paper so the swap folds to `refunded`) not before t0+180, so it costs at least three hours of wall clock;
+there is no time warp on a real chain.
+
+### The runner
+
+```bash
+node bin/swap-rehearsal-evm.mjs <config.json> [--state-dir DIR] [--yes [--stop-after lock] | --resume | --refund [--wait]]
+```
+
+It needs `npm run build` first (it imports from `dist/`). One process plays both the Buyer and the Seller of one swap, over a local
+venue and a local paper-note file, signing with the two local key files. Modes (at most one):
+
+- **no flag, the dry run.** Loads both key files (to show the two addresses; never a key), reads the chain, prints the pre-flight
+  table and the plan, and sends nothing and writes nothing (not even the state directory). Exit 0 only if every check that is needed
+  holds, so a green dry run is what `--yes` would accept.
+- **`--yes`.** Runs the same checks first and refuses (exit 3, nothing sent) unless they hold. Then it runs the choreography the anvil
+  suite runs: bid, accept, the leg B lock on paper, both account lines (signed locally), the leg A approve and lock on the chain, a real
+  wait until the lock reads at the finalized block, the claim, the Buyer learning the secret and claiming leg B, a real wait until the
+  claim is final; then it writes the bundle to `out` and replays it with `examples/audit-export.mjs --expect <swapId>=settled`. Each
+  step prints one `step <role>.<method> done` line. `--stop-after lock` ends after the lock is recorded: the Seller never claims (the
+  first half of the refund rehearsal).
+- **`--resume`.** After a stop or a kill, continues the run in `--state-dir`: both roles are rebuilt from their P8 records (see
+  "Resume"), the local venue and notes are read back from their files, and each step reads what it needs from the records and the
+  chain, so there is never a second lock or claim. A run started with `--stop-after lock` stops at the lock again.
+- **`--refund`.** The Buyer refunds leg A once leg A's refund time has come (the local clock and the chain's head must both be past it),
+  the Seller refunds leg B (the paper note) once its own has, then the bundle and `--expect <swapId>=refunded` (`refunded-b` when
+  leg A was never locked). A refund time that has not come is reported (exit 5) and the command can be repeated later; `--wait` waits
+  for it here instead. The runner waits until the refund is final before it writes the bundle. If the Seller already claimed, the Buyer's flow refuses
+  the refund (the lock was claimed); use `--resume`, which learns the secret and claims leg B.
+
+`--state-dir` (default `.state/rehearsal-evm`, gitignored) holds `run.json` (the swap's public parameters: its id, deadlines, the two
+DIDs and addresses), `buyer/` and `seller/` (each party's P8 flow records, and an Ed25519 seed that signs only that party's lines of
+the local venue: not a wallet, minted once from the system CSPRNG), `world/` (the venue's rooms and the paper notes), `runner.lock`
+(one runner per swap) and, once the bundle is written and replays, `outcome.json` (a repeat then only says how the run ended). **This
+directory is secret-grade** (the Seller's record holds the swap secret): see "The store and its directory" under "Resume" for what that
+means on Windows. One state directory is one swap; start a new one in a new directory. The bundle after a resume lacks the crashed
+process's RPC exchanges (see "Limits of resume"). The config, the key paths and the state directory path are printed; a key never is.
+
+Exit codes: 0 done (or a clean dry run); 2 bad arguments, config or state; 3 the pre-flight failed (nothing was sent); 4 a step refused
+(the first line of its reason is printed, with the endpoint removed); 5 not yet (a refund time has not come); 6 the bundle was written
+but `audit-export` did not accept it.
+
+### What the dry-run table means
+
+Each row is a read; a `FAIL` row stops `--yes`, a `WARN` row is information. A `--resume` or `--refund` runs the chain rows again (and,
+for a refund, shows a row that only a claim or a log scan uses as a warning, so a diagnostic cannot stand between a party and its refund).
+
+| row | what it checks, and what to do when it fails |
+|---|---|
+| `endpoint` | the host only is shown, never the URL |
+| `chain id` | `eth_chainId` equals the pin (84532). Another number: the URL is not Base Sepolia |
+| `escrow code` | the keccak of `eth_getCode(contract)` equals `contractCodeHash`. A mismatch or empty code: wrong address, or the deploy has not landed or the node is a block behind (retry) |
+| `finalized` | the `finalized` tag exists and how far it trails the head in blocks and seconds. No tag and no `fallbackConfirmations`: no lock would ever read final, so the Seller could never claim |
+| `finality budget` | lag plus ten minutes (the time to land the lock) fits before leg A's claim-by. A fail: the endpoint's lag is too long for the deadline set; widen leg A's windows |
+| `pending` | the `pending` tag answers; the claim's last deadline guard reads it |
+| `state at finalized` | `locks()` can be read at the finalized block by its hash (EIP-1898), which the evidence reader needs; a pruned node fails it |
+| `log range` | one `eth_getLogs` probe of `maxLogRange` blocks must be accepted and one of one more block refused; or what the endpoint does is reported (`WARN`: looser than the config, safe; `FAIL`: it refuses even `maxLogRange`, lower it) |
+| `clock` | the local clock and the chain's head differ by under a minute (a refund and a claim are judged against both); fix the machine's time if it fails |
+| `gas price`, `buyer ETH`, `seller ETH` | each party's ETH against its gas: generous per-call ceilings (approve 120,000, lock 400,000, claim 200,000, refund 200,000 gas, against 44,000, 214,000 and 65,000 measured on anvil with the mock token) at twice the node's gas price. Fund the address shown |
+| `buyer token`, `buyer allowance` | the Buyer's USDC against the amount (the allowance is information: the lock's own approve sets it to the amount) |
+| `deadlines` | SPEC 3.5 rules 1 to 3 and the Seller's claim-inclusion margin, with the rail's own policy and the real numbers, and the absolute times of every deadline |
+| `state directory`, `bundle directory` | no earlier run in the state directory (use `--resume`, `--refund` or a new directory) and an absent or empty `out` |
+
+### Known limits of the runner
+
+- **Not run against the real Base Sepolia.** The chain-side behaviour is established on anvil and on a fake read-only chain; the
+  first real run is Dave's. The lag, the log cap and the state read are measured by the dry run on the day, not assumed.
+- **A stuck claim is not re-priced.** The Seller's claim pays viem's default fee; a claim that sits pending past leg A's refund time can
+  lose the swap's atomicity (see "Known limits of the EVM leg"). The Base Sepolia claim margin and fee choice are P9-4's.
+- **A run is one endpoint.** There is no failover and no nonce manager.
+- **The Seller's key is loaded for a refund too** (both key files must load in every mode), although leg B's refund is on paper.
+- **Windows.** The state directory and the key files rely on the folder's ACLs, not mode bits (see "Key files" and "Resume").
+- **Solana devnet is not part of this section** and stays as the Solana section says: localnet only.
 
 ## Bitcoin leg (local, keyless)
 

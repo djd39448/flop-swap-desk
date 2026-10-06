@@ -480,3 +480,25 @@ signs). Nothing here has talked to a live signet node.
 - Live test: `tests-regtest/btc-htlc.regtest.test.ts` gained assertions about the real Bitcoin Core 31.1 node (what
   `estimatesmartfee` answers with no data; that `walletcreatefundedpsbt` takes the rate as `fee_rate` in sat/vB); the regtest
   suite is still 29 tests and no regtest request changed.
+
+## First-party rehearsal runner files (P9-6, handoff/P9-G1-READINESS-SPEC.md, rule 4) - unaudited, testnet-only
+
+Not vendored: original to this repo. The runner is dry-run by default and Dave runs it; it posts to no HTTP venue and its only
+network is `rails.evm.endpoint`. No key material in any of them: the two EVM keys are loaded by `loadEvmLocalAccount` from files
+the operator names and are never printed, stored or inspected; the tests generate their keys at test time.
+
+- `bin/swap-rehearsal-evm.mjs` - the command line (arguments, exit code); everything else is in `src/client/`.
+- `src/client/rehearsal-config.ts` - the closed config file (`rails.evm` rebuilt from known fields only, no credentials in the
+  endpoint, `clock: "chain"` for anvil only, the known-good deadline set); `src/client/rehearsal-preflight.ts` - the read-only
+  pre-flight table (chain id, code pin, finalized lag, `pending`, state at the finalized hash, log cap, clock, balances, deadlines);
+  `src/client/rehearsal-world.ts` - the in-memory venue and paper notes made durable (atomic file writes), the two parties'
+  Ed25519 venue seeds, and the one-runner lock; `src/client/rehearsal-run.ts` - the modes (dry run, `--yes`, `--resume`,
+  `--refund`), `run.json` and `outcome.json`, the bundle and the `audit-export` replay.
+- Hermetic tests: `tests/rehearsal-config.test.ts`, `tests/rehearsal-world.test.ts`, `tests/rehearsal-preflight.test.ts`,
+  `tests/rehearsal-run.test.ts` (the runner and its command line against a fake read-only chain served by a throwaway local HTTP
+  server), and the helper `tests/helpers/fake-chain.ts`.
+- Live test: `tests-anvil/rehearsal-runner.anvil.test.ts` (the runner as a child process against real anvil nodes: the dry run, a
+  settle, a kill and a resume at two cuts, and the refund paths; every file it wrote and its output scanned for both keys and for
+  the venue seeds) and the `blockTimeSeconds` option of `tests-anvil/helpers/anvil.ts`.
+- The gas ceilings of the pre-flight were measured on anvil with the mock token (approve 44,000, lock 214,000, claim 65,000 gas);
+  a refund was not measured.
