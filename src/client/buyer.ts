@@ -402,7 +402,10 @@ export class BuyerFlow {
       if (journal.isLanded("receipt-refund-a")) return "done";
       // R1-15: the refund lost the race to a claim: `refundLegA` only throws its routing error from here on, and the way on is
       // learnSecret then claimLegB (after which leg B's receipt makes the swap done), not refundLegA for ever.
-      if (this.refundClaimSeen) return this.legBDone() ? "done" : "learnSecret";
+      // R3-03: this flow's own claim of leg B ends the refund route the same way (a person ran learnSecret and claimLegB by hand
+      // after a refund attempt was saved: `refundLegA` refuses for ever once leg B is claimed, so `next` must not name it). The frames
+      // of a leg A refund that had landed then stay unposted (the transcript only). `legBClaimAdopted` stays unread here, as below (R1-06).
+      if (this.refundClaimSeen || this.legBClaimed) return this.legBDone() ? "done" : "learnSecret";
       return "refundLegA";
     }
     if (!this.legBVerified) return "verifyLegBLocked";
