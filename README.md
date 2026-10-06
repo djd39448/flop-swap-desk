@@ -152,7 +152,9 @@ This builds `dist/` and the contracts, then spawns a real `anvil` node (found vi
 `tests-anvil/client-flows.anvil.test.ts` (the Seller/Buyer flows end to end: the happy path to
 `settled`; both refund paths, `refunded` and `refunded-b`; a claim refused before
 `verifyLockFinal(A)` is `true` and allowed two blocks later; the Buyer learning the secret from
-the on-chain `Claimed` log alone when the Seller never posts a reveal frame). `npm test` never
+the on-chain `Claimed` log alone when the Seller never posts a reveal frame), and
+`tests-anvil/local-signer.anvil.test.ts` (the settle and refund paths again with both parties' accounts local, keys
+generated at test time; see "Key files"). `npm test` never
 spawns `anvil` — a missing binary fails `test:anvil` loudly instead.
 
 **Fixture capture is opt-in.** Every client-flow scenario writes its watch-root bundle to a
@@ -173,10 +175,71 @@ finishes, so `npm run test:anvil` never leaves anything behind under the OS temp
 `KEEP_ANVIL_BUNDLES=1` to keep them around for inspecting a scenario's exact written bundle by
 hand.
 
-**Keyless throughout (D-10):** no private key, mnemonic, or seed for any EVM account exists
-anywhere in this build — writes go out as JSON-RPC accounts (`eth_sendTransaction` from one of
-anvil's own unlocked addresses) via a plain-address viem `WalletClient`. tclk's Ed25519 test
+**Keyless in the repository (D-10):** no private key, mnemonic, or seed for any EVM account exists
+anywhere in this repository, in a fixture, in a capture or in a test (tests generate their keys at test
+time). The default account is a plain address, a JSON-RPC account: writes go out as `eth_sendTransaction`
+from one of anvil's own unlocked addresses via a plain-address viem `WalletClient`. The one other kind of
+account is a local one loaded at run time from a key file the operator names (next section, "Key files"):
+viem then signs in this process and every write goes out as `eth_sendRawTransaction`. tclk's Ed25519 test
 identities (`tests/helpers/identity.ts`) sign the deal-room transcript; they are not wallet keys.
+
+### Key files (a local signer for a public chain, P9-1)
+
+A public RPC endpoint (Base Sepolia) holds no keys, so a party that is not on anvil signs in its own process.
+`createEvmCounterRail({ config, rpc, account, clock })` takes `account` as an `Address` (a JSON-RPC account, as
+before) or as a viem `LocalAccount`, and the only supported way to get a `LocalAccount` is
+`loadEvmLocalAccount(path)` in `src/client/evm-key-file.ts`: it reads one key from a file and returns an account
+whose key lives in a closure.
+
+**Making a key file (you do this, on your own machine; the session never sees a key):**
+
+1. Create a throwaway account with `cast wallet new`. It prints an address and a private key. Copy the private key
+   (the `0x` followed by 64 hex characters) into a new file, on one line, and nothing else: no label, no
+   comment, no second line. Clear the terminal's scrollback afterwards.
+2. Make the file readable by you alone: on Linux or macOS `chmod 600 <file>`; on Windows keep the key directory
+   private to your user (for example `icacls <dir> /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"`), because the
+   mode bits mean nothing there and the loader does not check them on win32.
+3. Never use the airdrop key, and never a key that holds mainnet value or anything you would miss. A key file is
+   for a throwaway testnet account that you fund from a faucet. The conventional names for the G1 rehearsal are
+   `flop-swap-desk-keys\base-sepolia.buyer.key` and `base-sepolia.seller.key`, outside this repository. The
+   G1 runner (P9-6, not built yet) will take the two paths from its config file (`buyerKeyFile`,
+   `sellerKeyFile`); nothing in this repository reads an environment variable for a key.
+
+**What the loader refuses** (with a typed `EvmKeyFileError`; its `code` is `not-found`, `unreadable`, `not-a-file`,
+`empty` or `malformed`, and `problem` names the exact case): an empty path, a missing file, a directory or other
+non-regular file, a file it cannot read, an empty file, more than one line (one trailing newline or CRLF is fine),
+whitespace or non-printable characters anywhere in the line (a mnemonic phrase, a labelled `key: 0x...`, a byte
+order mark, UTF-16), a missing `0x`, a length other than 64 hex digits, a non-hex character, a value that is not a
+valid secp256k1 key, and a file over 256 bytes. The message names the path and the problem and never any byte of
+the content, not even its length. On Linux and macOS a file that group or other users can access (mode `& 0o077`)
+is still loaded but raises one warning (`process.emitWarning`, code `EVM_KEY_FILE_MODE`, or the caller's own
+`warn` callback) that names the path and the mode.
+
+**What the desk prints: only addresses.** The loaded account is frozen; `JSON.stringify`, `util.inspect`
+(with or without custom inspection), `String()`, `Object.keys` and `structuredClone` show only its address and
+the type `"local"`. No flow record, store entry, venue line, capture or evidence bundle holds a key: the tests
+generate keys at test time, run whole swaps with them, and scan every capture, line, store record, rendering and
+written bundle for the key (`tests/evm-local-signer.test.ts`, `tests-anvil/local-signer.anvil.test.ts`).
+
+**How a local account writes.** `approve`, `lock`, `claim` and `refund` are signed by viem in this process and sent
+as `eth_sendRawTransaction`, never `eth_sendTransaction`. The nonce, gas and fee fields are viem's own defaults,
+read through the same `CapturingRpc` (so the captures show them; they are public data): one `eth_fillTransaction`
+on a client's first write where the node answers it (anvil does), otherwise `eth_getTransactionCount`,
+`eth_getBlockByNumber`, a fee read (`eth_maxPriorityFeePerGas`) and `eth_estimateGas`. The EIP-191 account proof
+is `account.signMessage` instead of the `personal_sign` call and is verified exactly as before. There is no nonce
+manager: the nonce is the endpoint's `pending` transaction count at each write. A count that lags (a load balancer
+behind a public endpoint) makes the node refuse the new transaction (`nonce too low`) or, when the fee is higher,
+replace a still-pending one; either way a repeat cannot pay twice, because the contract refuses it (a duplicate
+hash lock reverts, a spent status refuses). The P8 recover paths and their order (the flow saves its intent, then
+broadcasts) are unchanged; EVM still records no transaction handle before a send, because viem returns a hash only
+once the node has the transaction, so a restart decides from the chain (a lock row, a `Claimed` log, a refunded
+status), as before.
+
+**Receipt waits.** `EvmRailConfig.receiptTimeoutMs` (a positive integer of at most a day, in milliseconds; omit it for
+viem's own 180 seconds) bounds every receipt wait of every write, including the vendored rail's. When it runs out the
+write throws `EvmReceiptTimeoutError` (`hash`, `timeoutMs`): the transaction was broadcast and may still be mined;
+nothing was refused. Read the chain before sending anything again (the resumed flows do: `readLock`,
+`verifyLockFinal`, `findClaimedPreimage`). A slower public chain raises the number; it changes nothing about safety.
 
 **The claim endpoint sees the real preimage once, at the one moment it must.** Before
 `EvmHtlcRail.claim` ever sends a real transaction, it runs two preimage-free simulations against
@@ -196,8 +259,8 @@ therefore be one the operator trusts with that; this build never sends a claim b
 EVM contract, with every verdict re-derivable from the exact captured RPC bytes — but on
 `anvil-local` (chain id `31337`), an ephemeral node this repo itself starts and stops, never a
 real network, and never with mainnet value at any point in this build (D-09/D-10). The
-Base Sepolia deploy (P2.5) — a real testnet, a real key loaded from env and never printed, the
-account lines exchanged for real — is Dave's own G1 step and is not built here.
+Base Sepolia deploy (P2.5), a real testnet with a real key loaded from a key file and never printed (see "Key
+files") and the account lines exchanged for real, is Dave's own G1 step and is not built here.
 
 Re-deriving a verdict from the captured bytes (see "Audit replay" above, F3) detects the bytes
 being tampered with after the fact — never that the capturing process told the truth about the
@@ -231,7 +294,9 @@ victim's observation, it does not fold to `settled`, and the victim still does
 lines lack proofs replays the same way, with the payee unresolved. Schemes by rail:
 
 - `evm-htlc`: `eip191`, an EIP-191 `personal_sign` by the account; verified by recovering the
-  address. Anvil's node-held accounts sign over RPC, so no key is in this repo's code.
+  address. Anvil's node-held accounts sign over RPC, so no key is in this repo's code; a local account
+  (see "Key files") signs the same message with `account.signMessage` in its own process, and the line it
+  produces verifies identically.
 - `btc-htlc`: `bip322`, a BIP-322 simple signature for the P2WPKH address of the pubkey line's key,
   signed keylessly by the node wallet (`walletprocesspsbt`) and verified with `@scure/btc-signer`;
   the BIP's published vectors are pinned in `tests/btc-proof.test.ts`.
@@ -301,10 +366,13 @@ written down instead of hidden.
   lock, records it and posts the lock frame, so the board catches up (not at or after leg A's `refundAfterMs`, when
   tclk's machine would reject the frame: see "Limits of resume"); without a store only
   `reconcileLockA()` in the same process does.
-- **A claim's last guard still has two round trips after it.** viem's chain-id assertion and
-  `eth_sendTransaction` follow the final deadline check, each a single attempt (transport retries
-  are off) bounded by the RPC timeout (45 s by default), well inside the 5-minute
-  claim-inclusion margin.
+- **A claim's last guard still has a few round trips after it.** With a JSON-RPC account viem's chain-id
+  assertion and `eth_sendTransaction` follow the final deadline check; with a local account (see "Key files")
+  the fill or the individual nonce, block, fee and gas reads, and `eth_sendRawTransaction`: at most six calls
+  (a refused fill, then five). Each is a single attempt (transport retries are off) bounded by the RPC timeout
+  (45 s by default), so the worst case is 4.5 minutes, inside the 5-minute claim-inclusion margin. The real preimage
+  reaches the endpoint only after that guard, first in the gas estimate (or the fill), then in the broadcast
+  (`tests/evm-local-signer.test.ts` pins both facts).
 - **The claim endpoint is trusted with the preimage** at the moment the claim is sent (see
   above).
 - **A restart costs gas at most.** After a crash a repeated `approve`, `lock`, `claim` or `refund` is refused by the

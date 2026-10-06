@@ -381,3 +381,28 @@ changed, so `docs/PROFILE.md` is unchanged, and no fixture was added or recaptur
 - Live tests (each spawns its own throwaway local node and never touches a public network):
   `tests-anvil/resume.anvil.test.ts`, `tests-regtest/resume.regtest.test.ts`, `tests-near/resume.near.test.ts` and
   `tests-sol/resume.sol.test.ts`.
+
+## First-party EVM signer files (P9-1, handoff/P9-G1-READINESS-SPEC.md) - unaudited, testnet-only
+
+Not vendored: original to this repo, written for the G1 readiness stage (a real key on a public testnet, Dave's own key
+files). Unaudited and testnet-only like every file above. No key material is in the repository: the tests generate their
+keys at test time, and the loader reads a key only from a file an operator names at run time.
+
+- `src/client/evm-key-file.ts` - `loadEvmLocalAccount(path)`: reads one `0x`-prefixed 32-byte hex key, refuses everything
+  else with the typed `EvmKeyFileError` (a message that names the path and the problem and never any content), warns on a
+  group- or world-accessible file on POSIX (the check is skipped on win32), and returns a frozen viem `LocalAccount` that
+  prints, serialises and inspects as its address and type only (`sealLocalAccount`).
+- Extended first-party files: `src/rails/evm-htlc.ts` (the `account` option is an `Address` or a `LocalAccount`; local
+  accounts send `eth_sendRawTransaction`; `EvmRailConfig.receiptTimeoutMs`; the typed `EvmReceiptTimeoutError`; the public
+  client's `waitForTransactionReceipt` is wrapped so the vendored rail's receipt waits are bounded too, while
+  `src/vendor/evm-hash-rail.ts` stays byte-identical) and `src/client/evm-rail.ts` (the same option; the EIP-191 account
+  proof is `account.signMessage` for a local account, verified as before).
+- Hermetic tests: `tests/evm-key-file.test.ts` (every refusal, the warning on both platforms, every serialisation of the
+  account scanned for the key), `tests/evm-local-signer.test.ts` (raw sends, nonces, the claim's preimage ordering, the
+  proof, receipt timeouts, whole swaps with local accounts including a lost lock reply recovered through the P8 path, and a
+  scan of every capture, venue line, store record and rendering for the key) and the helper `tests/helpers/evm-local.ts`
+  (key generation into a temporary file loaded by the real loader, a key scanner that answers a boolean only, and a mock
+  node that also answers nonce, gas, fee and raw-send reads). Like the P8 tests they sit outside the `typecheck` gate (see
+  the P8 section's type-checking note).
+- Live test: `tests-anvil/local-signer.anvil.test.ts` (a Buyer and a Seller with local accounts, funded by anvil's account 0,
+  settle and refund end to end, bundles scanned for the keys and replayed through `examples/audit-export.mjs`).
