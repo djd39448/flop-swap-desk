@@ -509,6 +509,16 @@ export class BuyerFlow {
     await this.#journal?.update((r) => r);
   }
 
+  /**
+   * R1-03: every public step starts here. A flow whose save was refused (the store refused it, the disk failed, a second
+   * instance saved first) holds latches in memory that the store never saw: a prepared lock, a refund handle, a claim
+   * attempt. Acting on them again could send a second lock or a second refund, so such a flow is treated as a crashed
+   * one: every step throws `FlowStoreWriteFailedError` until the runner drops it and builds a new one with `resume()`.
+   */
+  private usable(): void {
+    this.#journal?.assertUsable();
+  }
+
   private requirePaired(): { offerA: OfferFrame; offerB: OfferFrame; acceptA: AcceptFrame; acceptB: AcceptFrame } {
     if (this.offerA === undefined || this.offerB === undefined || this.acceptA === undefined || this.acceptB === undefined) {
       throw new Error("buyer: leg B has not been accepted yet");
@@ -519,6 +529,7 @@ export class BuyerFlow {
   /** Open leg A: a bid naming the counter-asset this Buyer pays and the FLOP it wants back,
    *  with `rails: ["evm-htlc"]` and `feeBps` 0 (every deployment we operate). */
   async bid(params: BidParams): Promise<OfferFrame> {
+    this.usable();
     if (this.offerA !== undefined) {
       if (this.#journal === undefined) throw new Error("buyer: already bid for this flow");
       // P8: confirmed already (this process, or rebuilt from the record): the recorded offer, nothing posted again.
@@ -635,6 +646,7 @@ export class BuyerFlow {
     acceptARecord: TranscriptRecord,
     lockTimeMs: number,
   ): Promise<{ acceptB: AcceptFrame; acceptBRecord: TranscriptRecord }> {
+    this.usable();
     if (this.offerA === undefined) throw new Error("buyer: no leg A offer to pair leg B against");
     // P8: with a store, a pairing that is already recorded is confirmed again (same frames only), not refused; a
     // same-process double call is still refused while one is in flight.
@@ -775,6 +787,7 @@ export class BuyerFlow {
   /** Verify leg B is actually locked on the paper rail before trusting it as cover for locking
    *  leg A — a signed `lock` frame alone is not evidence of anything (tclk#180). */
   async verifyLegBLocked(): Promise<void> {
+    this.usable();
     const { offerB, acceptB } = this.requirePaired();
     const termsB = offerAcceptLockTerms(offerB, acceptB);
     const verified = await this.paperRail.verifyLock(termsB, acceptB.contract);
@@ -789,6 +802,7 @@ export class BuyerFlow {
    *  (P7 fix pass F1): `lockLegA` refuses without it, and the Seller and every evidence reader need
    *  it to bind the lock's payer to this DID. */
   async postAccountLineA(address: string): Promise<TranscriptRecord> {
+    this.usable();
     const { offerA, acceptA } = this.requirePaired();
     const journal = this.#journal;
     if (journal === undefined) {
@@ -852,6 +866,7 @@ export class BuyerFlow {
    * deadline arithmetic, for leg B's own lock state instead.
    */
   async lockLegA(): Promise<{ hashLock: string; writeEvidence: RailWriteEvidence }> {
+    this.usable(); // R1-03
     // P4-BTC-FIXES.md G2: refuse outright when this leg's lock has already been attempted
     // (whether or not it is known to have succeeded), or another call is already in flight —
     // checked, and the in-flight flag set, before anything else runs (including before this
@@ -1102,6 +1117,7 @@ export class BuyerFlow {
    * saw the `lock` frame despite the money genuinely being on chain.
    */
   async reconcileLockA(): Promise<{ locked: boolean; verified: boolean; reason?: string }> {
+    this.usable(); // R1-03
     if (!this.legALockAttempted) {
       throw new Error("buyer: nothing to reconcile — leg A lock was never attempted (G2)");
     }
@@ -1163,6 +1179,7 @@ export class BuyerFlow {
    *  statement (`findClaimedPreimage` already re-checks this; `parseSwapContext`-level frame
    *  authentication covers the reveal-frame path here). */
   async learnSecret(): Promise<string> {
+    this.usable(); // R1-03
     const { offerA, acceptA } = this.requirePaired();
     if (this.lockedHashLock === undefined) throw new Error("buyer: leg A has not been locked yet");
     const hashLock = this.lockedHashLock;
@@ -1208,6 +1225,7 @@ export class BuyerFlow {
   /** Claim leg B on the paper rail with the learned secret, then reveal it there too (SPEC:
    *  the Buyer's own reveal on leg B, distinct from the Seller's reveal on leg A). */
   async claimLegB(secret: string): Promise<{ reveal: TranscriptRecord; receipt: TranscriptRecord }> {
+    this.usable(); // R1-03
     const { offerB, acceptB } = this.requirePaired();
     const termsB = offerAcceptLockTerms(offerB, acceptB);
     if (!verifySecret(termsB.lock, termsB.statement, secret)) {
@@ -1286,6 +1304,7 @@ export class BuyerFlow {
    * the read below still routes to `learnSecret`/`claimLegB`, exactly as before.
    */
   async refundLegA(): Promise<RailWriteEvidence> {
+    this.usable(); // R1-03
     const { offerA, acceptA } = this.requirePaired();
     if (this.lockedHashLock === undefined) throw new Error("buyer: leg A was never locked, nothing to refund");
     if (this.clock() < offerA.refundAfterMs) {

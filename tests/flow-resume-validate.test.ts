@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { tryDecodeFrame, type AcceptFrame } from "@flop-labs/tclk";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { BuyerFlow, LockPendingError } from "../src/client/buyer.js";
+import { BuyerFlow } from "../src/client/buyer.js";
 import { createEvmCounterRail } from "../src/client/evm-rail.js";
 import {
   FlowRecordMismatchError,
@@ -24,7 +24,7 @@ import {
   type FlowRecord,
 } from "../src/client/flow-record.js";
 import { FlowNotFoundError, FlowRecordExistsError } from "../src/client/flow-resume.js";
-import { FileFlowStore, FlowStoreCorruptError, FlowStoreFaultError, flowDigest, flowKey } from "../src/client/flow-store.js";
+import { FileFlowStore, FlowStoreCorruptError, FlowStoreFaultError, FlowStoreWriteFailedError, flowDigest, flowKey } from "../src/client/flow-store.js";
 import { SellerFlow } from "../src/client/seller.js";
 import { ANVIL_LOCAL_PIN } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
@@ -195,7 +195,7 @@ describe("durable before visible: when the intent cannot be saved, the action do
     expect(framesIn(await r.h.venue.read("tclk-offers"), "accept")).toHaveLength(0);
   });
 
-  it("the Buyer's prepared lock: if the save before commitLock fails, nothing is sent; the next call starts clean", async () => {
+  it("the Buyer's prepared lock: if the save before commitLock fails, nothing is sent; the next call REFUSES, and the flow starts clean only after resume (R1-03)", async () => {
     const r = rig();
     await toLines(r);
     r.buyerStore.failSaveWhen((_n, key, bytes) => {
@@ -204,10 +204,15 @@ describe("durable before visible: when the intent cannot be saved, the action do
     });
     await expect(r.buyer.lockLegA()).rejects.toBeInstanceOf(FlowStoreFaultError);
     expect(r.h.node.sent.lock).toBe(0);
-    // the failed save was kept in memory as an intent; the same call now recovers: the signed lock was never sent, so it is pending
+    // the refused save is a crash of the in-memory flow: the prepared lock it latched was never durable, so even with the fault
+    // cleared the SAME flow refuses (it used to recover on that latch, which on Bitcoin broadcast an unrecorded funding)
     r.buyerStore.clearFaults();
-    await expect(r.buyer.lockLegA()).rejects.toBeInstanceOf(LockPendingError);
+    await expect(r.buyer.lockLegA()).rejects.toBeInstanceOf(FlowStoreWriteFailedError);
     expect(r.h.node.sent.lock).toBe(0);
+    // a fresh flow resumed from the store knows nothing was attempted, and locks once
+    expect(await restartBuyer(r)).toBe("lockLegA");
+    await r.buyer.lockLegA();
+    expect(r.h.node.sent.lock).toBe(1);
   });
 
   it("the Seller's claim signature: if the save that carries it fails, the claim is not sent (nothing leaks)", async () => {
