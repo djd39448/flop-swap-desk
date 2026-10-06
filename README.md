@@ -241,6 +241,36 @@ write throws `EvmReceiptTimeoutError` (`hash`, `timeoutMs`): the transaction was
 nothing was refused. Read the chain before sending anything again (the resumed flows do: `readLock`,
 `verifyLockFinal`, `findClaimedPreimage`). A slower public chain raises the number; it changes nothing about safety.
 
+**Trust the contract by its code, not its address (P9-2).** `EvmRailConfig.contractCodeHash` is the keccak256 of the
+escrow's deployed runtime code, the bytes `eth_getCode` answers (`0x` and 64 hex digits). A Base Sepolia (84532) config
+must carry it: a config without it is refused by every entry point that validates one (`EvmHtlcRail.connect`, the watcher's
+`--rails`, the replay, `examples/audit-export.mjs`); an anvil config may carry it or not, and one without it behaves exactly as
+before. When it is present, `connect()` reads `eth_getCode(contract, "latest")` right after the chain-id check and refuses,
+before any write, a contract whose code is empty or hashes differently, with the typed `EvmContractCodeError` (`problem`
+`empty`, `malformed` or `mismatch`; the expected and the observed hash are named, and both are public data). The evidence
+reader records the same read in every capture of a pinned config and judges it against the auditor's own pin: a leg whose code
+differs, whose capture never read the code, or that was taken without the pin reads `railVerified: null` with the reason, so the
+board never folds on an unpinned contract (a capture cannot opt itself out of the auditor's pin). `node bin/evm-code-hash.mjs
+<rpc-url> <address>` prints two lines, `keccak256 0x...` and `bytes <n>`, for whatever is deployed (exit 3 on an address with no
+code, 4 on an endpoint that fails; it never prints the URL, which may carry a key): that is the value to put in `rails.json`.
+`PROVENANCE.md` records the value the vendored `EvmHashRail.sol` builds to with the pinned toolchain, which a contract deployed
+from this repository's source must report. The pin is not part of the deployment id (the address is), so adding it does not
+invalidate a saved flow.
+
+**Log scans fit the endpoint's range cap (P9-3).** The public Base Sepolia endpoint refuses `eth_getLogs` over more than 500
+blocks. Every log scan this build makes is therefore split into calls of at most `EvmRailConfig.maxLogRange` blocks (both ends
+counted, so a 500-block call is `to - from + 1 = 500`): the lookup of a lock's, claim's or refund's own event after the write,
+and `findClaimedPreimage`, which is also the resumed Seller's scan for its own claim and the Buyer's discovery of the secret. The
+default is 500 when `pin.chainId` is 84532 and no limit on anvil (one call to `latest` with no extra read, exactly as before);
+any positive integer may be set on either. With a limit, the tip is read once (a fresh `eth_blockNumber`) and `[from, tip]` is
+cut into ranges. `findClaimedPreimage` reads the newest range first and stops at the first valid preimage, so the usual answer
+costs one call and a claim from a long wait costs one call per 500 blocks. Nothing is cut short silently: a scan makes at most
+`MAX_LOG_SCAN_CHUNKS` (100) calls, which is 50,000 blocks at 500 (about 28 hours of Base's 2-second blocks), and a range that
+does not fit throws `EvmLogScanBoundError` naming the blocks it did not read instead of answering "no claim". A preimage found
+inside the newest 100 ranges is still returned. The write-evidence lookup needs the whole range to prove there is exactly one
+log, so it throws before reading anything. A scan reads up to the tip it saw at its start; a claim mined after that is found by
+the next call (the flows' own retries and polls make it).
+
 **The claim endpoint sees the real preimage once, at the one moment it must.** Before
 `EvmHtlcRail.claim` ever sends a real transaction, it runs two preimage-free simulations against
 the configured RPC endpoint (`eth_call`, never broadcast): a zero-preimage `claim()` that must
@@ -1447,12 +1477,15 @@ the refusal and the latch stay as they were.
   head was measured 8 to 91 blocks behind its tip (92 samples on 2026-10-06, 90th percentile 79): an unsafe-head reorg
   can re-include a claim well below the tip its attempt saw, and a resumed Seller that misses its own landed claim never
   posts its reveal and receipt (liveness only, the Buyer still learns the secret from its own scan); the earlier 64 sat
-  inside that lag. The price is one `eth_getLogs` over about 256 blocks more, which stays under the 500-block window
-  recorded for the public Base Sepolia endpoint. That scan is one call from the marker to the tip and is not split into
-  chunks, so a `claimLegA` that comes more than about 244 blocks after the attempt was saved (about 8 minutes at Base's
-  2-second blocks) asks such an endpoint for more than its window: the call fails before anything is sent or posted, and
-  so does every retry, until the runner uses an endpoint with a wider window (argued from the window, not run against
-  that endpoint). The Buyer's lock marker keeps no margin; that is not a route under the default pin, which reads the
+  inside that lag. The price is about 256 blocks more to scan, which stays under the 500-block window recorded
+  for the public Base Sepolia endpoint, so a prompt resume is one `eth_getLogs` call. Since P9-3 that scan is chunked to the
+  window (`EvmRailConfig.maxLogRange`, 500 by default on Base Sepolia; newest range first, at most 100 calls; see "Log scans fit
+  the endpoint's range cap"), so the margin and the resume delay are no longer bounded by the endpoint's window: a
+  `claimLegA` that comes any time after the attempt was saved finds its claim in as many window-sized calls as the delay needs
+  (`tests/flow-resume-sell.test.ts` resumes 300, 600 and 1,000 blocks late against a mock that refuses a range over 500
+  blocks the way that endpoint does; not run against the real endpoint). Only a resume further behind than the bound (50,000
+  blocks) fails, with the typed `EvmLogScanBoundError` before anything is sent or posted, and so does every retry; it is
+  never read as "no claim". The Buyer's lock marker keeps no margin; that is not a route under the default pin, which reads the
   lock at the finalized tag, but a deployment that pins by confirmations below the chain's reorg depth needs one there
   as well. After a restart a repeated approve, lock, claim or refund is refused by the contract, so the only cost is
   gas.
