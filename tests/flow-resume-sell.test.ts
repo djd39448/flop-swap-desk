@@ -19,7 +19,8 @@ import { describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
 import type { CounterAssetRail } from "../src/client/counter-rail.js";
-import { decodeFlowRecord, FlowRecordConflictError, markerFromJson } from "../src/client/flow-record.js";
+import { decodeFlowRecord, FlowRecordConflictError, FlowRecordMismatchError, markerFromJson } from "../src/client/flow-record.js";
+import { FlowNotFoundError } from "../src/client/flow-resume.js";
 import { FlowRecordExistsError, FlowStoreFaultError, FlowStoreWriteFailedError } from "../src/client/flow-store.js";
 import { SellerFlow, RevealNotPostedError } from "../src/client/seller.js";
 import { PREFIX, STEPS, readSwap } from "./helpers/crash-matrix.js";
@@ -245,6 +246,13 @@ describe("R1-14: the Seller's record is keyed by leg A's contract id, so a copie
     const resumed = await SellerFlow.resume({ ...options(), store: s.w.stores.seller, contractA: accepted.acceptA.contract, swapId: s.w.swapId });
     expect(resumed.flow.recordedOfferA?.from).toBe(honest.from);
     expect(resumed.next).toBe("postAccountLineA");
+
+    // the swap id is only a cross-check: another swap id than the stored one stops the resume
+    const wrong = await SellerFlow.resume({ ...options(), store: s.w.stores.seller, contractA: accepted.acceptA.contract, swapId: `0x${"ab".repeat(32)}` }).catch((error: unknown) => error);
+    expect(wrong).toBeInstanceOf(FlowRecordMismatchError);
+    expect((wrong as FlowRecordMismatchError).field).toBe("swapId");
+    // and a contract A the store holds no record for is "not found", never a squatter's record
+    await expect(SellerFlow.resume({ ...options(), store: s.w.stores.seller, contractA: `0x${"cd".repeat(32)}` })).rejects.toBeInstanceOf(FlowNotFoundError);
   });
 });
 

@@ -16,25 +16,15 @@ import {
   PREFIX,
   REFUND_BOTH,
   SETTLE,
-  finishStalled,
   inspectRun,
   readSwap,
   resumeRole,
   runScript,
   STEPS,
-  type Action,
   type Expected,
-  type Mode,
   type Step,
   type WorldFactory,
 } from "./crash-matrix.js";
-
-export interface MatrixOptions {
-  /** Cuts after which this world cannot finish the swap and stops safely, and why: a signed lock that stays pending (leg A is then
-   *  never locked and the Seller takes leg B back) or a signed refund that stays pending (leg A stays locked until a person acts).
-   *  Everything else must finish as the script says. */
-  stalls?: (action: Action, mode: Mode) => "lock-pending" | "refund-pending" | undefined;
-}
 
 interface Plan {
   title: string;
@@ -50,7 +40,7 @@ const PLANS: Plan[] = [
   { title: "the Buyer never locks: the Seller takes leg B back", script: NEVER_LOCKED, expected: "never-locked", tailFrom: STEPS.legBRefundTime },
 ];
 
-export async function describeMatrix(world: string, factory: WorldFactory, options: MatrixOptions = {}): Promise<void> {
+export async function describeMatrix(world: string, factory: WorldFactory): Promise<void> {
   for (const plan of PLANS) {
     const reference = await runScript(factory, plan.script, []);
     const referenceFindings = await inspectRun(reference, plan.expected);
@@ -72,10 +62,8 @@ export async function describeMatrix(world: string, factory: WorldFactory, optio
             const ctl = run.world.ctl;
             expect(ctl.fired.map((fired) => fired.n)).toEqual([action.n]); // the planned crash happened, exactly once
             expect(run.deaths).toBe(1);
-            const stalls = options.stalls?.(action, mode);
-            expect(run.stalled).toBe(stalls);
-            if (stalls === "lock-pending") await finishStalled(run);
-            const findings = await inspectRun(run, stalls === "lock-pending" ? "never-locked" : stalls === "refund-pending" ? "refund-stuck" : plan.expected);
+            expect(run.stalled, "no cut stops the swap: a signed lock or refund the chain cannot decide is re-sent or proven dead (R1-10)").toBeUndefined();
+            const findings = await inspectRun(run, plan.expected);
             expect(findings.problems).toEqual([]);
             expect(ctl.unsaved).toEqual([]);
           });
@@ -94,13 +82,12 @@ const RECOVERY_CUTS = 4;
  * happened, its record did not); each of the next few outward actions of the run is then cut as well, before it and after it with the next
  * store write refused. The swap must still end exactly as if nothing had happened.
  */
-export async function describeDoubleCrash(world: string, factory: WorldFactory, options: MatrixOptions = {}): Promise<void> {
+export async function describeDoubleCrash(world: string, factory: WorldFactory): Promise<void> {
   const reference = await runScript(factory, SETTLE, []);
   const firsts = reference.world.ctl.actions.filter((action) => action.kind === "chain");
   describe(`${world}: the swap settles, and the recovery is cut too`, () => {
     for (const first of firsts) {
       for (const firstMode of ["before", "after-store-fail"] as const) {
-        if (options.stalls?.(first, firstMode) !== undefined) continue; // that cut stops the swap; the matrix above has it
         it(`#${first.n} ${first.what} / ${firstMode}; then each of the next ${RECOVERY_CUTS} outward actions is cut as well`, async () => {
           const probe = await runScript(factory, SETTLE, [{ n: first.n, mode: firstMode }]);
           const doomed = new Set(probe.world.ctl.doomed.map((action) => action.n));
@@ -113,10 +100,8 @@ export async function describeDoubleCrash(world: string, factory: WorldFactory, 
                 { n: second.n, mode },
               ]);
               expect(run.world.ctl.fired.map((fired) => fired.n).sort((a, b) => a - b), `${second.what} / ${mode}`).toEqual([first.n, second.n]);
-              const stalls = options.stalls?.(second, mode);
-              expect(run.stalled).toBe(stalls);
-              if (stalls === "lock-pending") await finishStalled(run);
-              const findings = await inspectRun(run, stalls === "lock-pending" ? "never-locked" : stalls === "refund-pending" ? "refund-stuck" : "settled");
+              expect(run.stalled, `${second.what} / ${mode}`).toBeUndefined();
+              const findings = await inspectRun(run, "settled");
               expect(findings.problems, `${second.what} / ${mode}`).toEqual([]);
               expect(run.world.ctl.unsaved).toEqual([]);
             }
