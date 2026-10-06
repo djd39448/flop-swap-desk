@@ -842,6 +842,146 @@ describe("FileFlowStore", () => {
       });
     });
 
+    describe("R3-18: a lock file that cannot be read at the acquire says so, and never 'another instance'", () => {
+      const eperm = (): Error => Object.assign(new Error("EPERM: operation not permitted (a scanner or an ACL holds the file)"), { code: "EPERM" });
+      const enoent = (): Error => Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
+      /** Makes every lock-file read for which `fails(n)` is true throw `make()`; `n` counts the lock reads from 1 after this call. */
+      const failLockReads = (fails: (read: number) => boolean, make: () => Error = eperm): { restore: () => void; reads: () => number } => {
+        const original = fsp.readFile;
+        let lockReads = 0;
+        const spy = vi.spyOn(fsp, "readFile").mockImplementation((async (path: unknown, options?: unknown) => {
+          if (String(path).endsWith(".lock")) {
+            lockReads += 1;
+            if (fails(lockReads)) throw make();
+          }
+          return (original as (p: unknown, o?: unknown) => Promise<unknown>).call(fsp, path, options);
+        }) as typeof fsp.readFile);
+        return { restore: () => spy.mockRestore(), reads: () => lockReads };
+      };
+
+      it("an own-pid leftover that stays unreadable for the whole wait refuses with reason unreadable, 'nothing was written' and the path, leaves the file alone, and the next readable save breaks it", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        writeFileSync(lockFile(dir), lockBody(process.pid)); // this process's pid with a body it does not hold: a predecessor's leftover
+        const fault = failLockReads(() => true); // every read of the lock file fails
+        let error: unknown;
+        try {
+          error = await new FileFlowStore(dir, { lockWaitMs: 200 }).save(KEY_BUYER, bytes("x"), null).catch((e: unknown) => e);
+        } finally {
+          fault.restore();
+        }
+        expect(error).toBeInstanceOf(FlowStoreLockedError);
+        expect((error as FlowStoreLockedError).reason).toBe("unreadable");
+        expect((error as FlowStoreLockedError).holderPid).toBeUndefined();
+        expect((error as FlowStoreLockedError).lockPath).toBe(lockFile(dir));
+        expect((error as Error).message).toContain(`the lock file could not be read (${lockFile(dir)}); nothing was written`);
+        expect((error as Error).message).not.toContain("another instance");
+        expect((error as Error).message).not.toContain("owns this swap");
+        expect(fault.reads()).toBeGreaterThanOrEqual(3); // it polled through the wait, not once
+        expect(readFileSync(lockFile(dir), "utf8")).toBe(lockBody(process.pid)); // a file that cannot be read is not broken
+        expect(await new FileFlowStore(dir).load(KEY_BUYER)).toBeNull(); // nothing was written
+        await new FileFlowStore(dir, { lockWaitMs: 100 }).save(KEY_BUYER, bytes("x"), null); // readable again: an own-pid leftover is broken
+        expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("x");
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+      });
+
+      it("control: the same save with a dead foreign pid in the lock file, read normally, still breaks the lock and succeeds", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        writeFileSync(lockFile(dir), lockBody(deadPid()));
+        const fault = failLockReads(() => false); // the same spy, passing every read through
+        try {
+          await new FileFlowStore(dir, { lockWaitMs: 200 }).save(KEY_BUYER, bytes("x"), null);
+        } finally {
+          fault.restore();
+        }
+        expect(fault.reads()).toBeGreaterThanOrEqual(1); // the acquire did read the file
+        expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("x");
+        expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+      });
+
+      it("a lock file unreadable only for the first reads is not refused: the acquire polls and then breaks the leftover", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        writeFileSync(lockFile(dir), lockBody(deadPid()));
+        const fault = failLockReads((read) => read <= 3); // a scanner holds the file briefly
+        try {
+          await new FileFlowStore(dir, { lockWaitMs: 1000 }).save(KEY_BUYER, bytes("x"), null);
+        } finally {
+          fault.restore();
+        }
+        expect(fault.reads()).toBeGreaterThanOrEqual(4);
+        expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("x");
+      });
+
+      it("a file that reads as missing right after the create said it exists is a create race: it keeps retrying (a leftover is then broken), and a wait that ends on it keeps the held refusal", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        writeFileSync(lockFile(dir), lockBody(deadPid()));
+        const brief = failLockReads((read) => read <= 2, enoent);
+        try {
+          await new FileFlowStore(dir, { lockWaitMs: 1000 }).save(KEY_BUYER, bytes("x"), null);
+        } finally {
+          brief.restore();
+        }
+        expect(text(await new FileFlowStore(dir).load(KEY_BUYER))).toBe("x");
+        const dir2 = join(root, "flows2");
+        mkdirSync(dir2);
+        writeFileSync(lockFile(dir2), lockBody(deadPid()));
+        const always = failLockReads(() => true, enoent);
+        let error: unknown;
+        try {
+          error = await new FileFlowStore(dir2, { lockWaitMs: 100 }).save(KEY_BUYER, bytes("x"), null).catch((e: unknown) => e);
+        } finally {
+          always.restore();
+        }
+        expect(error).toBeInstanceOf(FlowStoreLockedError);
+        expect((error as FlowStoreLockedError).reason).toBe("held");
+        expect((error as Error).message).toContain("the lock file could not be created or read");
+      });
+
+      it("the store-wide begin section says the same for its own unreadable lock file", async () => {
+        const dir = join(root, "flows");
+        mkdirSync(dir);
+        const beginLock = join(dir, "seller-begin.lock");
+        writeFileSync(beginLock, lockBody(process.pid));
+        const fault = failLockReads(() => true);
+        let ran = false;
+        let error: unknown;
+        try {
+          error = await new FileFlowStore(dir, { lockWaitMs: 100 })
+            .exclusive("seller-begin", async () => {
+              ran = true;
+            })
+            .catch((e: unknown) => e);
+        } finally {
+          fault.restore();
+        }
+        expect(ran).toBe(false);
+        expect(error).toBeInstanceOf(FlowStoreLockedError);
+        expect((error as FlowStoreLockedError).reason).toBe("unreadable");
+        expect((error as Error).message).toContain(`the lock file could not be read (${beginLock}); nothing was written`);
+        expect((error as Error).message).not.toContain("another instance");
+        expect((error as Error).message).not.toContain("another Seller begin");
+      });
+
+      it("the save's own check before the rename keeps its wording: 'nothing was renamed'", async () => {
+        const dir = join(root, "flows");
+        const store = new FileFlowStore(dir, { lockWaitMs: 100 });
+        await store.save(KEY_BUYER, bytes("v1"), null);
+        const fault = failLockReads(() => true); // the create succeeds (no file); assertHeld's and release's reads fail
+        let error: unknown;
+        try {
+          error = await store.save(KEY_BUYER, bytes("v2"), digestOf("v1")).catch((e: unknown) => e);
+        } finally {
+          fault.restore();
+        }
+        expect((error as FlowStoreLockedError).reason).toBe("unreadable");
+        expect((error as Error).message).toContain(`the lock file could not be read (${lockFile(dir)}); nothing was renamed`);
+        expect((error as Error).message).not.toContain("nothing was written");
+      });
+    });
+
     it("another key's lock does not block this key", async () => {
       const dir = join(root, "flows");
       mkdirSync(dir);

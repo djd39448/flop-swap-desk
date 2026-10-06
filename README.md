@@ -1242,15 +1242,21 @@ leg A at the same time.
     hung write): wait for it or drop the flow. A live pid that is not this process's says that another instance owns
     the swap. A pid that an unrelated process now has looks live as well (a recycled pid, or one that an early-boot
     service took after a reboot that killed a save mid-write; there is no boot-time heuristic): the message says so,
-    and once no instance of the swap is running the operator removes the file it names.
+    and once no instance of the swap is running the operator removes the file it names. A lock file that exists but
+    cannot be read is not `held`: see `unreadable`.
   - `stale`, a leftover that cannot be removed. A lock naming a dead pid, or this very pid without this process
     holding it, is broken; if the file is still there after five attempts (a read-only attribute, a handle that
     forbids deletion) the error reads "a stale lock file naming pid N could not be removed: remove <path>". Remove
     that file by hand at the path the error names: no process is writing the record.
-  - `unreadable`, the save's own lock file stayed unreadable through the retries of a transient EPERM, EBUSY or EACCES
-    (a scanner or indexer holding it) when the save looked at it just before the rename: "the lock file could not be
-    read ... nothing was renamed". The flow fails like after any refused save and the runner resumes; no other instance
-    is involved.
+  - `unreadable`, a lock file that stayed unreadable (EPERM, EBUSY or EACCES: a scanner, an indexer or an ACL holding
+    it), in either of two places. The acquire: the create said the file exists and every read of it failed for the
+    whole `lockWaitMs`, so no holder can be named; that includes a leftover naming the runner's own pid, which cannot
+    be told from a live lock unread and so is not broken: "the lock file could not be read (<path>); nothing was
+    written". The save's own check, just before the rename, which retried and still could not read its own lock file:
+    "the lock file could not be read (<path>); nothing was renamed". Neither says "another instance". The flow fails
+    like after any refused save and the runner resumes; once the file can be read, the next save breaks a leftover as
+    usual. A file that reads as missing right after the create said it exists is a create race, not this case: the
+    acquire simply tries again.
   - `lost`, the save's own lock file was removed or replaced while the save held it (nothing was renamed).
 - **One thread per store directory, a hard rule.** The set of held locks, and the begin queue below, belong to one
   thread (each worker thread has its own), while a lock file names only the process's pid, which all of its threads
