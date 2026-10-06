@@ -363,17 +363,21 @@ changed, so `docs/PROFILE.md` is unchanged, and no fixture was added or recaptur
   `flow-resume-sell.test.ts` and `flow-journal.test.ts`; `tests/helpers/ledger-rail.ts` and
   `tests/helpers/sol-stateful-chain.ts` were retyped (types only) and `tests/helpers/sol-fake-chain.ts`, a helper that
   predates the resume work, gained an opt-in read lag that is inert unless a test sets it. No helper file and no
-  fixture was added.
+  fixture was added. The follow-up pass after the Solana live suite added one more test file, named here so that this
+  list stays complete: `tests/sol-compute-limits.test.ts` (R3-17: the Solana claim and refund compute-unit limits in
+  `src/rails/sol-htlc.ts`, raised to 120,000 and 60,000, against the measured base plus thirty bump attempts; a rail
+  test, not a resume test), and it added cases to `tests/flow-store.test.ts` (R3-18: an unreadable lock file at the
+  acquire).
 - Type checking: `npm run typecheck` runs `tsc -p tsconfig.json`, whose `include` is `src` alone, so `tests/` and
   `tests/helpers/` stay outside that gate (and outside `npm run build`); they run under vitest, which does not check
   types. In review round 3 the P8 test files and the helpers they use (`tests/flow-resume-*.test.ts`,
   `flow-store.test.ts`, `flow-record.test.ts`, `flow-journal.test.ts`, `helpers/ledger-rail.ts` and
   `helpers/near-swap-rig.ts`, with their imports) were type-checked with a scratch tsconfig that extends the repo's
   (`noEmit`, nothing committed): no diagnostics, exit 0. A scratch config over every file in `tests/` still reports 77
-  diagnostics in 14 older test files outside that set (`client-flows-near`, `client-flows-btc`, `evm-evidence` and
-  others; most are fake counter-asset rails without the `deploymentId` that the resume work made required, the rest
-  evidence fakes and strictness mismatches), which this pass did not touch. Whether `tests/` joins the typecheck gate
-  is a separate hygiene pass.
+  diagnostics in 12 older test files and 2 helpers (`tests/helpers/scenario.ts` and `tests/helpers/fakeBoard.ts`)
+  outside that set (`client-flows-near`, `client-flows-btc`, `evm-evidence` and others; most are fake counter-asset
+  rails without the `deploymentId` that the resume work made required, the rest evidence fakes and strictness
+  mismatches), which this pass did not touch. Whether `tests/` joins the typecheck gate is a separate hygiene pass.
 - Live tests (each spawns its own throwaway local node and never touches a public network):
   `tests-anvil/resume.anvil.test.ts`, `tests-regtest/resume.regtest.test.ts`, `tests-near/resume.near.test.ts` and
   `tests-sol/resume.sol.test.ts`.

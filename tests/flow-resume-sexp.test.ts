@@ -8,7 +8,7 @@
 // Now acceptLegA refuses to post (or re-post) an accept A that has not landed once the flow's clock is within SELLER_OFFER_EXPIRY_MARGIN_MS of
 // offer A's `expiresMs`: SwapExpiredError, nothing posted, nothing minted, nothing saved. An accept A that DID land (its reply lost, its mark
 // never saved) is still adopted: the guard is for posting only. `next` says "abandoned" for an accept A that is not recorded as landed once
-// the offer has expired: nothing is at stake (no lock on either leg, the statement never public).
+// the offer has expired: nothing is at stake (no lock on either leg, the secret never revealed).
 //
 // Ported from the idempotency lens of review round 2 (IDEM2-6). The EVM world: offer A expires at T0 + 30 min.
 

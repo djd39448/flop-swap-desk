@@ -1100,7 +1100,8 @@ that was saved without a known outcome reads the chain and the venue first (see 
 `lockLegA`, `learnSecret`, `refundLegA`, `done` and `abandoned`; the Seller's are `acceptLegA`, `postAccountLineA`,
 `lockLegB`, `claimLegA`, `refundLegB`, `done` and `abandoned`. `abandoned` means the swap can no longer proceed and has
 nothing at stake: an accept that never landed before the offer it answers expired, or an accept B that the venue stamped
-at or after leg B's offer expiry while nothing is locked (see "Offers that expired" under "What a resumed step does").
+at or after leg B's offer expiry while leg B is not verified and no lock of leg A was attempted (nothing of the Buyer's
+is locked); see "Offers that expired" under "What a resumed step does".
 There is nothing to call; the runner drops the swap, and starts again from a fresh offer if it wants one. Not every
 dead end is named `abandoned`: the states where a runner that obeys only `next` waits with nothing at stake are listed
 under "Limits of resume".
