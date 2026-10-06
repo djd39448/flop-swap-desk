@@ -191,23 +191,29 @@ export async function findStoredSellerOffer(store: FlowStore, offerAText: string
   return null;
 }
 
-/** In-process queue per store object: the scan and the create of a Seller `begin` must not interleave with another
- *  `begin` on the same store. (Two processes on one store are fenced by the store's own compare-and-swap per key only: the
- *  README says one process per swap.) */
-const beginQueues = new WeakMap<object, Promise<void>>();
+/** In-process queues for the scan and the create of a Seller `begin`: they must not interleave with another `begin` on the
+ *  same STORE (R2-04). A store that names its storage (`scopeId`: every `FileFlowStore` on one directory) is queued by
+ *  that name, so two store OBJECTS on one directory share one queue; any other store is queued by the object itself.
+ *  Across processes the queue is not enough: the store's own `exclusive` section is (see `beginSeller`). */
+const beginQueuesByObject = new WeakMap<object, Promise<void>>();
+const beginQueuesByScope = new Map<string, Promise<void>>();
 
-async function serialisedPerStore<T>(store: object, work: () => Promise<T>): Promise<T> {
-  const previous = beginQueues.get(store) ?? Promise.resolve();
+async function serialisedPerStore<T>(store: FlowStore, work: () => Promise<T>): Promise<T> {
+  const scope = store.scopeId;
+  const previous = (scope === undefined ? beginQueuesByObject.get(store) : beginQueuesByScope.get(scope)) ?? Promise.resolve();
   let release!: () => void;
   const mine = new Promise<void>((done) => {
     release = done;
   });
-  beginQueues.set(store, previous.then(() => mine));
+  const tail = previous.then(() => mine);
+  if (scope === undefined) beginQueuesByObject.set(store, tail);
+  else beginQueuesByScope.set(scope, tail);
   await previous;
   try {
     return await work();
   } finally {
     release();
+    if (scope !== undefined && beginQueuesByScope.get(scope) === tail) beginQueuesByScope.delete(scope);
   }
 }
 
@@ -276,17 +282,24 @@ export class FlowJournal<R extends FlowRecord> {
 
   /** `begin` for a Seller's record, with the record BUILT only once the store is known to hold no Seller record for the offer
    *  whose exact text is `offerAText`: `build` is where the Seller mints its secret, so a second `acceptLegA` of one offer
-   *  (two processes, or two calls at once on one store object) is refused with `FlowRecordExistsError` BEFORE anything is
-   *  minted or posted (R1-02, review round 1). The scan and the create run one after the other per store object; two
-   *  processes on one store are fenced by the store's own per-key compare-and-swap only (the README says one process per swap). */
+   *  (two processes, or two calls at once on one store) is refused with `FlowRecordExistsError` BEFORE anything is
+   *  minted or posted (R1-02, review round 1). The key of a Seller record is contract A, which differs between two
+   *  accepts of one offer, so the per-key compare-and-swap cannot tell them apart: the scan, the mint and the create are
+   *  one critical section instead (R2-04). In one process every store object on one storage shares one queue
+   *  (`FlowStore.scopeId`); across processes the section runs inside the store's own `exclusive("seller-begin")` when it
+   *  offers one (`FileFlowStore` does, over a lock file in its directory). A store with neither has only its own object's
+   *  queue, and the README says one process per store directory. */
   static async beginSeller(deps: JournalDeps, offerAText: string, build: () => SellerFlowRecord): Promise<FlowJournal<SellerFlowRecord>> {
     return serialisedPerStore(deps.store, async () => {
-      const existing = await findStoredSellerOffer(deps.store, offerAText);
-      if (existing !== null) throw new FlowRecordExistsError(existing);
-      const initial = build();
-      const journal = new FlowJournal<SellerFlowRecord>(deps, initial, null);
-      await journal.run(() => initial, true);
-      return journal;
+      const begin = async (): Promise<FlowJournal<SellerFlowRecord>> => {
+        const existing = await findStoredSellerOffer(deps.store, offerAText);
+        if (existing !== null) throw new FlowRecordExistsError(existing);
+        const initial = build();
+        const journal = new FlowJournal<SellerFlowRecord>(deps, initial, null);
+        await journal.run(() => initial, true);
+        return journal;
+      };
+      return deps.store.exclusive === undefined ? begin() : deps.store.exclusive("seller-begin", begin);
     });
   }
 

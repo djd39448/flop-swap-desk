@@ -25,6 +25,7 @@ import {
   FlowStoreFaultError,
   FlowStoreKeyError,
   FlowStoreLockedError,
+  FlowStorePathError,
   FlowStoreWriteFailedError,
   MemoryFlowStore,
   flowDigest,
@@ -713,6 +714,94 @@ describe("FileFlowStore", () => {
     it("refuses a bad lockWaitMs", () => {
       expect(() => new FileFlowStore(root, { lockWaitMs: -1 })).toThrow();
       expect(() => new FileFlowStore(root, { lockWaitMs: 1.5 })).toThrow();
+    });
+  });
+
+  describe("R2-04: the scope id and the store-wide exclusive section", () => {
+    const beginLock = (dir: string): string => join(dir, "seller-begin.lock");
+
+    it("scopeId names the directory: two objects on one directory share it, two directories do not, a memory store has none", () => {
+      const dir = join(root, "flows");
+      expect(new FileFlowStore(dir).scopeId).toBe(new FileFlowStore(dir).scopeId);
+      expect(new FileFlowStore(join(root, "flows", ".", "")).scopeId).toBe(new FileFlowStore(dir).scopeId); // the same directory, spelled another way
+      expect(new FileFlowStore(join(root, "other")).scopeId).not.toBe(new FileFlowStore(dir).scopeId);
+      expect(new FileFlowStore(dir).scopeId).toBe(process.platform === "win32" ? new FileFlowStore(dir).directory.toLowerCase() : new FileFlowStore(dir).directory);
+      expect(new MemoryFlowStore().scopeId).toBeUndefined();
+    });
+
+    it("runs the work, hands back its answer, and leaves no lock file behind; the lock is never listed and never a record", async () => {
+      const dir = join(root, "flows");
+      const store = new FileFlowStore(dir);
+      await store.save(KEY_BUYER, bytes("x"), null);
+      let seenInside: string[] = [];
+      const answer = await store.exclusive("seller-begin", async () => {
+        seenInside = readdirSync(dir).sort();
+        expect(await store.list()).toEqual([KEY_BUYER]); // the lock file is outside the key grammar
+        return 42;
+      });
+      expect(answer).toBe(42);
+      expect(seenInside).toEqual([`buyer-${SWAP_A}.json`, "seller-begin.lock"]);
+      expect(readdirSync(dir)).toEqual([`buyer-${SWAP_A}.json`]);
+    });
+
+    it("sections of two store objects on one directory never overlap", async () => {
+      const dir = join(root, "flows");
+      let inside = 0;
+      let overlap = 0;
+      const section = async (): Promise<void> => {
+        inside += 1;
+        overlap = Math.max(overlap, inside);
+        await new Promise((done) => setTimeout(done, 15));
+        inside -= 1;
+      };
+      await Promise.all([1, 2, 3, 4].map((n) => new FileFlowStore(dir).exclusive("seller-begin", section).then(() => n)));
+      expect(overlap).toBe(1);
+      expect(readdirSync(dir)).toEqual([]);
+    });
+
+    it("a section held by a live process refuses the caller with FlowStoreLockedError naming it, and the work never runs", async () => {
+      const dir = join(root, "flows");
+      mkdirSync(dir);
+      const holder = livePid();
+      try {
+        writeFileSync(beginLock(dir), lockBody(holder.pid));
+        let ran = false;
+        const error = await new FileFlowStore(dir, { lockWaitMs: 0 }).exclusive("seller-begin", async () => void (ran = true)).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(FlowStoreLockedError);
+        expect((error as FlowStoreLockedError).holderPid).toBe(holder.pid);
+        expect((error as FlowStoreLockedError).lockPath).toBe(beginLock(dir));
+        expect(ran).toBe(false);
+        expect(readFileSync(beginLock(dir), "utf8")).toBe(lockBody(holder.pid)); // never broken
+      } finally {
+        holder.stop();
+      }
+    });
+
+    it("a section left by a dead process, or by this process's own predecessor, is broken", async () => {
+      const dir = join(root, "flows");
+      mkdirSync(dir);
+      for (const pid of [deadPid(), process.pid]) {
+        writeFileSync(beginLock(dir), lockBody(pid));
+        expect(await new FileFlowStore(dir, { lockWaitMs: 100 }).exclusive("seller-begin", async () => "ran")).toBe("ran");
+        expect(readdirSync(dir)).toEqual([]);
+      }
+    });
+
+    it("the lock is released when the work throws", async () => {
+      const dir = join(root, "flows");
+      const store = new FileFlowStore(dir, { lockWaitMs: 0 });
+      await expect(store.exclusive("seller-begin", async () => Promise.reject(new Error("boom")))).rejects.toThrow("boom");
+      expect(readdirSync(dir)).toEqual([]);
+      expect(await store.exclusive("seller-begin", async () => "again")).toBe("again");
+    });
+
+    it("a name outside the closed set is refused before anything is touched", async () => {
+      const dir = join(root, "flows");
+      const store = new FileFlowStore(dir);
+      for (const name of ["../escape", "seller-begin/x", "buyer-0x", ""]) {
+        await expect(store.exclusive(name as never, async () => 1)).rejects.toBeInstanceOf(FlowStorePathError);
+      }
+      expect(() => readdirSync(dir)).toThrow(); // not even the directory was made
     });
   });
 

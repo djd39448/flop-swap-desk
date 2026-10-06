@@ -424,6 +424,47 @@ describe.each<[string, () => FlowStore]>([
   });
 });
 
+describe("R2-04: the Seller begin queue is keyed by the store's scope id, not by the store object", () => {
+  /** Two handles on ONE storage that name it (`scopeId`) but offer no exclusive section: what a store of another kind
+   *  would look like, so only the in-process queue stands between two accepts of one offer. */
+  function handles(): [FlowStore, FlowStore] {
+    const inner = new MemoryFlowStore();
+    const handle = (): FlowStore => ({
+      scopeId: "one-storage",
+      load: (key) => inner.load(key),
+      save: (key, value, expected) => inner.save(key, value, expected),
+      list: () => inner.list(),
+    });
+    return [handle(), handle()];
+  }
+
+  it("two begins of one offer through two handles on one storage leave exactly one record (the other is FlowRecordExistsError, and never minted)", async () => {
+    const [a, b] = handles();
+    let built = 0;
+    const begin = (store: FlowStore, contract: string): Promise<unknown> =>
+      FlowJournal.beginSeller(rig(store).deps, OFFER_TEXT, () => {
+        built += 1;
+        return sellerRecord(contract, OFFER_TEXT);
+      });
+    const results = await Promise.allSettled([begin(a, `0x${"e1".repeat(32)}`), begin(b, `0x${"e2".repeat(32)}`)]);
+    expect(results.filter((res) => res.status === "fulfilled")).toHaveLength(1);
+    expect(results.find((res): res is PromiseRejectedResult => res.status === "rejected")?.reason).toBeInstanceOf(FlowRecordExistsError);
+    expect(built).toBe(1);
+    expect(await a.list()).toHaveLength(1);
+  });
+
+  it("handles with different scope ids are different stores and do not wait for each other", async () => {
+    const one = new MemoryFlowStore();
+    const two = new MemoryFlowStore();
+    const handle = (inner: MemoryFlowStore, scopeId: string): FlowStore => ({ scopeId, load: (k) => inner.load(k), save: (k, v, e) => inner.save(k, v, e), list: () => inner.list() });
+    const results = await Promise.allSettled([
+      FlowJournal.beginSeller(rig(handle(one, "s1")).deps, OFFER_TEXT, () => sellerRecord(`0x${"e1".repeat(32)}`, OFFER_TEXT)),
+      FlowJournal.beginSeller(rig(handle(two, "s2")).deps, OFFER_TEXT, () => sellerRecord(`0x${"e2".repeat(32)}`, OFFER_TEXT)),
+    ]);
+    expect(results.every((res) => res.status === "fulfilled")).toBe(true);
+  });
+});
+
 describe("R1-12 (journal part): a line the ledger shows as landed is never posted again", () => {
   it("B1: a confirmed offers-room line (a slot kind) is returned as recorded after the ring rolled; nothing is posted, nothing is read, the seq stays", async () => {
     const r = rig(new MemoryFlowStore());

@@ -196,7 +196,28 @@ export interface FlowStore {
   /** Every key with a saved value, sorted: `buyer:<swapId>` for each Buyer record and `seller:<contractA>` (leg A's
    *  tclk contract id, not the swap id: R1-14) for each Seller record. */
   list(): Promise<string[]>;
+  /**
+   * R2-04: names the storage this object reads and writes. Two objects with the same `scopeId` are two handles on ONE
+   * store (two `FileFlowStore` objects on one directory), so a queue that must serialise "everything on this store"
+   * (the Seller's begin scan) is keyed by it instead of by the object. Absent: the object itself is the scope (a
+   * `MemoryFlowStore` is its own storage).
+   */
+  readonly scopeId?: string;
+  /**
+   * R2-04: an optional store-wide exclusive section. Runs `work` while no other caller, in this process or in another
+   * one on the same storage, is inside the section of the same `name`; a caller that cannot get in within the
+   * store's wait is refused with a typed error and `work` never runs. A store that cannot give that across
+   * processes leaves the method out, and the caller falls back to its in-process queue alone.
+   */
+  exclusive?<T>(name: FlowExclusiveName, work: () => Promise<T>): Promise<T>;
 }
+
+/** The named store-wide sections a `FlowStore.exclusive` offers. `seller-begin`: the Seller's scan of the stored
+ *  records for an offer, its mint of a secret and its create of the record, which must not interleave between two
+ *  accepts of one offer (R2-04). The name is a closed set, so no caller can reach a file outside the store's own. */
+export type FlowExclusiveName = "seller-begin";
+
+const EXCLUSIVE_NAMES: ReadonlySet<string> = new Set<string>(["seller-begin"]);
 
 /** The digest `save` compares against: sha256 hex of the bytes. */
 export function flowDigest(bytes: Uint8Array): string {
@@ -494,6 +515,10 @@ interface HeldLock {
  * `FlowStoreCorruptError` on any mismatch. Stale `.tmp-` and `.lock` files are never read and never listed.
  */
 export class FileFlowStore implements FlowStore {
+  /** R2-04: the resolved absolute directory (lower-cased on Windows, where paths ignore case), so two objects on one
+   *  directory share one begin queue. A symlink or junction to the directory is another spelling this does not see:
+   *  that case is fenced by the begin lock file across processes and objects alike. */
+  readonly scopeId: string;
   private readonly dir: string;
   private readonly mode: number;
   private readonly lockWaitMs: number;
@@ -503,6 +528,7 @@ export class FileFlowStore implements FlowStore {
   constructor(dir: string, options: FileFlowStoreOptions = {}) {
     if (typeof dir !== "string" || dir === "") throw new FlowStorePathError("flow store: dir must be a non-empty path");
     this.dir = resolve(dir);
+    this.scopeId = process.platform === "win32" ? this.dir.toLowerCase() : this.dir;
     const mode = options.mode ?? 0o600;
     if (!Number.isInteger(mode) || mode < 0 || mode > 0o777) throw new FlowStorePathError("flow store: mode must be an integer 0..0o777");
     this.mode = mode;
@@ -577,6 +603,27 @@ export class FileFlowStore implements FlowStore {
         await this.compare(key, path, expected);
         await this.removeStaleTemps(path);
         await this.write(path, payload, lock);
+      } finally {
+        await lock.release();
+      }
+    });
+  }
+
+  /**
+   * R2-04: the named store-wide section, over a fixed `<name>.lock` file in the directory, taken with the same
+   * `acquireLock` as a key's lock (so the same rules hold: a dead holder's lock is broken, so is one naming this
+   * process's own pid that it does not hold, a live holder is a typed `FlowStoreLockedError` after `lockWaitMs`).
+   * The file name is outside the key grammar, so `list()` never shows it and `load` never reads it; it is removed when
+   * the section ends, whatever `work` did.
+   */
+  async exclusive<T>(name: FlowExclusiveName, work: () => Promise<T>): Promise<T> {
+    if (!EXCLUSIVE_NAMES.has(name)) throw new FlowStorePathError(`flow store: "${String(name)}" is not a store-wide section this build offers`);
+    const lockPath = this.underDir(`${name}.lock`);
+    return withProcessMutex(lockPath, async () => {
+      await fsp.mkdir(this.dir, { recursive: true, mode: 0o700 });
+      const lock = await this.acquireLock(name, lockPath);
+      try {
+        return await work();
       } finally {
         await lock.release();
       }
