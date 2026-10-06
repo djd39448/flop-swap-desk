@@ -19,12 +19,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { OFFER_ROOM, generateHashLock } from "@flop-labs/tclk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { FlowRecordVersionError } from "../src/client/flow-record.js";
 import { FlowRecordExistsError, FlowStoreLockedError } from "../src/client/flow-resume.js";
-import { FileFlowStore } from "../src/client/flow-store.js";
+import { FileFlowStore, FlowStoreCorruptError, flowDigest, type FlowStore, type MemoryFlowStore } from "../src/client/flow-store.js";
 import { SellerFlow } from "../src/client/seller.js";
 import { STEPS, readSwap } from "./helpers/crash-matrix.js";
 import { evmWorld } from "./helpers/matrix-worlds.js";
 import { started, type Started } from "./helpers/resume-world.js";
+import { sellerKeyOf } from "./helpers/seller-key.js";
 import { framesIn } from "./helpers/sol-flow-harness.js";
 
 let root: string;
@@ -163,5 +165,95 @@ describe("R2-04: the begin section across processes", () => {
     } finally {
       child.kill();
     }
+  });
+});
+
+// --- R2-05: the begin scan never skips a Seller record it cannot read ------------------------------------------------------------------
+
+describe("R2-05: an unreadable Seller record blocks every new accept on its store until a person moves it aside", () => {
+  const bytesOf = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+  /** The Seller accepted the offer once (secret p1, accept A1 and offer B1 posted). `mints` counts every secret minted since. */
+  async function acceptedOnce(): Promise<{ s: Started; offerA: Awaited<ReturnType<typeof afterTheBid>>["offerA"]; store: MemoryFlowStore; mints: () => number; again: (store?: FlowStore) => SellerFlow; key: string }> {
+    const s = await started(evmWorld, [STEPS.bid]);
+    const offerA = (await readSwap(s.w)).offerA;
+    if (offerA === undefined) throw new Error("the bid did not reach the offers room");
+    const store = s.w.stores.seller;
+    let minted = 0;
+    const flow = (over?: FlowStore): SellerFlow =>
+      new SellerFlow({
+        ...s.w.sellerOptions(),
+        store: over ?? store,
+        mintHashLock: () => {
+          minted += 1;
+          return generateHashLock();
+        },
+      });
+    await flow().acceptLegA(offerA, s.w.legB, s.w.lockTimeMs);
+    expect(minted).toBe(1);
+    return { s, offerA, store, mints: () => minted, again: flow, key: await sellerKeyOf(store) };
+  }
+
+  it("a garbage record: resume rejects with a corrupt-record error, a new acceptLegA of the same offer rejects with the typed error naming the key, and the room holds one accept A", async () => {
+    const { s, offerA, store, mints, again, key } = await acceptedOnce();
+    const stored = await store.load(key);
+    if (stored === null) throw new Error("the Seller record vanished");
+    await store.save(key, bytesOf("{garbage"), flowDigest(stored)); // disk damage
+
+    await expect(SellerFlow.resume({ ...s.w.sellerOptions(), store, swapId: s.w.swapId, contractA: key.slice("seller:".length) })).rejects.toThrow(/corrupt/);
+    const error = await again().acceptLegA(offerA, s.w.legB, s.w.lockTimeMs).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(FlowStoreCorruptError);
+    expect((error as FlowStoreCorruptError).key).toBe(key);
+    expect(mints()).toBe(1); // nothing was minted for the second call
+    expect(await sellerFrames(s)).toEqual({ accepts: 1, offers: 1 });
+  });
+
+  it("a record of a version this build does not know is refused as it is (FlowRecordVersionError), not skipped", async () => {
+    const { s, offerA, store, mints, again, key } = await acceptedOnce();
+    const stored = await store.load(key);
+    if (stored === null) throw new Error("the Seller record vanished");
+    const written = new TextDecoder().decode(stored);
+    expect(written.startsWith('{"v":1,')).toBe(true);
+    await store.save(key, bytesOf(written.replace('{"v":1,', '{"v":2,')), flowDigest(stored)); // written by a newer build, then a downgrade
+
+    await expect(again().acceptLegA(offerA, s.w.legB, s.w.lockTimeMs)).rejects.toBeInstanceOf(FlowRecordVersionError);
+    expect(mints()).toBe(1);
+    expect(await sellerFrames(s)).toEqual({ accepts: 1, offers: 1 });
+  });
+
+  it("a load that fails once with EIO for the key: acceptLegA rejects with that error, nothing is minted or posted, and once the disk answers again the offer is a FlowRecordExistsError", async () => {
+    const { s, offerA, store, mints, again, key } = await acceptedOnce();
+    let armed = true;
+    const flaky: FlowStore = {
+      scopeId: "flaky-handle",
+      list: () => store.list(),
+      save: (k, bytes, expected) => store.save(k, bytes, expected),
+      load: async (k) => {
+        if (armed && k === key) {
+          armed = false;
+          throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+        }
+        return store.load(k);
+      },
+    };
+    const error = await again(flaky).acceptLegA(offerA, s.w.legB, s.w.lockTimeMs).catch((e: unknown) => e);
+    expect((error as { code?: string }).code).toBe("EIO");
+    expect(mints()).toBe(1);
+    expect(await sellerFrames(s)).toEqual({ accepts: 1, offers: 1 });
+    await expect(again(flaky).acceptLegA(offerA, s.w.legB, s.w.lockTimeMs)).rejects.toBeInstanceOf(FlowRecordExistsError);
+    expect(mints()).toBe(1);
+  });
+
+  it("an unreadable record of ANOTHER swap blocks too: the scan cannot tell what it is for, so nothing is minted until a person moves it aside", async () => {
+    const s = await started(evmWorld, [STEPS.bid]);
+    const offerA = (await readSwap(s.w)).offerA;
+    if (offerA === undefined) throw new Error("the bid did not reach the offers room");
+    const store = s.w.stores.seller;
+    await store.save(`seller:0x${"7e".repeat(32)}`, bytesOf("not a record"), null);
+    let minted = 0;
+    const flow = new SellerFlow({ ...s.w.sellerOptions(), mintHashLock: () => ((minted += 1), generateHashLock()) });
+    await expect(flow.acceptLegA(offerA, s.w.legB, s.w.lockTimeMs)).rejects.toBeInstanceOf(FlowStoreCorruptError);
+    expect(minted).toBe(0);
+    expect(await sellerFrames(s)).toEqual({ accepts: 0, offers: 0 });
   });
 });

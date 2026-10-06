@@ -173,19 +173,21 @@ export function slotRecord(key: string, name: string, slot: FrameSlot | undefine
 
 /** The key of the Seller record already stored for the leg A offer whose exact text is `offerAText`, or `null`. A Seller
  *  record is keyed by contract A (R1-14), which does not exist until a statement is minted, so the store's own key cannot
- *  say "this offer was already accepted"; this scan can. A record that cannot be read is skipped (it is reported when its
- *  own key is resumed, and it cannot be told to be for this offer). */
+ *  say "this offer was already accepted"; this scan can.
+ *
+ *  R2-05: the scan NEVER skips a record it cannot read. A record that fails its checksum or schema
+ *  (`FlowStoreCorruptError`), carries a version this build does not know (`FlowRecordVersionError`), names another
+ *  key or role (`FlowRecordMismatchError`) or cannot be loaded at all (a disk error, a sharing violation) throws as it is:
+ *  an unreadable record cannot be told NOT to be the one for this offer, and passing over it would let a second accept
+ *  mint another secret and post a second, different accept A for an offer whose first accept (and secret) the damaged
+ *  record holds. A new Seller begin therefore stops on a store that holds an unreadable `seller:` record, until a person
+ *  moves that file aside. A record listed and then gone (`load` answers `null`) is not unreadable and is passed over. */
 export async function findStoredSellerOffer(store: FlowStore, offerAText: string): Promise<string | null> {
   for (const key of await store.list()) {
     if (!key.startsWith("seller:")) continue;
-    let record: FlowRecord;
-    try {
-      const bytes = await store.load(key);
-      if (bytes === null) continue;
-      record = decodeFlowRecord(bytes, key);
-    } catch {
-      continue;
-    }
+    const bytes = await store.load(key);
+    if (bytes === null) continue;
+    const record: FlowRecord = decodeFlowRecord(bytes, key);
     if (record.role === "seller" && record.frames.offerA?.text === offerAText) return key;
   }
   return null;
