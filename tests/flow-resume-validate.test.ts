@@ -7,8 +7,12 @@
 //   - durable before visible: when the store refuses to save an intent, the outward action it announces does not happen.
 // Runs on the Solana stateful harness with a `MemoryFlowStore` (fault injection) and, for the rail pin, an EVM rail object.
 
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { tryDecodeFrame, type AcceptFrame } from "@flop-labs/tclk";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 import { BuyerFlow, LockPendingError } from "../src/client/buyer.js";
 import { createEvmCounterRail } from "../src/client/evm-rail.js";
@@ -20,12 +24,14 @@ import {
   type FlowRecord,
 } from "../src/client/flow-record.js";
 import { FlowNotFoundError, FlowRecordExistsError } from "../src/client/flow-resume.js";
-import { FlowStoreCorruptError, FlowStoreFaultError, flowKey } from "../src/client/flow-store.js";
+import { FileFlowStore, FlowStoreCorruptError, FlowStoreFaultError, flowKey } from "../src/client/flow-store.js";
 import { SellerFlow } from "../src/client/seller.js";
 import { ANVIL_LOCAL_PIN } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { bid, bidParams, framesOf, isFrame, legA, restartBuyer, restartSeller, rig, toLines, toLocked, toPaired, type Rig } from "./helpers/resume-sol-rig.js";
-import { framesIn, legBDeadlines } from "./helpers/sol-flow-harness.js";
+import { BID, T0, framesIn, legBDeadlines, solHarness } from "./helpers/sol-flow-harness.js";
+import { resumeBuyer, resumeSeller } from "./helpers/resume-flows.js";
+import { swapId as computeSwapId } from "../src/profile.js";
 import { dealRoom } from "@flop-labs/tclk";
 
 /** Reads a stored record, lets `edit` change it, and stores the result again (valid shape, valid checksum). */
@@ -253,5 +259,62 @@ describe("durable before visible: when the intent cannot be saved, the action do
     await r.buyer.lockLegA();
     expect(r.h.node.sent.lock).toBe(1);
     expect(await framesOf(r, dealRoom(p.contractA), "lock")).toHaveLength(1);
+  });
+});
+
+describe("with FileFlowStore: a swap runs and resumes from files on disk", () => {
+  const dirs: string[] = [];
+  afterAll(async () => {
+    for (const dir of dirs) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("every step is saved to <role>-<swapId>.json, both parties restart from those files, and only the Seller's file holds the preimage", async () => {
+    const buyerDir = await mkdtemp(join(tmpdir(), "p8b-"));
+    const sellerDir = await mkdtemp(join(tmpdir(), "p8s-"));
+    dirs.push(buyerDir, sellerDir);
+    const buyerStore = new FileFlowStore(buyerDir);
+    const sellerStore = new FileFlowStore(sellerDir);
+    const h = solHarness({ buyerStore, sellerStore });
+    const swapId = computeSwapId(h.buyer.did, "00000001");
+    const restartBoth = async () => {
+      const b = await resumeBuyer(h.buyerOptions, buyerStore, swapId);
+      const s = await resumeSeller(h.sellerOptions, sellerStore, swapId);
+      return { buyer: b.flow, seller: s.flow, nexts: [b.next, s.next] };
+    };
+
+    let buyer = h.buyerFlow;
+    let seller = h.sellerFlow;
+    const offerA = await buyer.bid({ swapId, ...BID, claimByMs: legA.claimByMs, refundAfterMs: legA.refundAfterMs, expiresMs: T0 + 10 * 60_000 });
+    buyer = (await resumeBuyer(h.buyerOptions, buyerStore, swapId)).flow; // the Seller has no record yet
+    const accepted = await seller.acceptLegA(offerA, legBDeadlines(), legA.lockTimeMs);
+    ({ buyer, seller } = await restartBoth());
+    const { acceptBRecord } = await buyer.acceptLegB(accepted.offerBRecord, accepted.acceptARecord, legA.lockTimeMs);
+    await seller.lockLegB(acceptBRecord);
+    ({ buyer, seller } = await restartBoth());
+    await buyer.verifyLegBLocked();
+    await seller.postAccountLineA(h.sellerWallet.publicKey);
+    await buyer.postAccountLineA(h.buyerWallet.publicKey);
+    ({ buyer, seller } = await restartBoth());
+    await buyer.lockLegA();
+    ({ buyer, seller } = await restartBoth());
+    await seller.claimLegA(seller.statement!);
+    ({ buyer, seller } = await restartBoth());
+    const secret = await buyer.learnSecret();
+    await buyer.claimLegB(secret);
+    const finished = await restartBoth();
+    expect(finished.nexts).toEqual(["done", "done"]);
+    expect(h.node.sent).toEqual({ lock: 1, claim: 1, refund: 0 });
+
+    expect(await readdir(buyerDir)).toEqual([`buyer-${swapId}.json`]); // no temp file left behind
+    expect(await readdir(sellerDir)).toEqual([`seller-${swapId}.json`]);
+    expect(await readFile(join(sellerDir, `seller-${swapId}.json`), "utf8")).toContain(h.sellerLock.preimage.slice(2));
+    expect(await readFile(join(buyerDir, `buyer-${swapId}.json`), "utf8")).not.toContain(h.sellerLock.preimage.slice(2));
+    expect(await buyerStore.list()).toEqual([`buyer:${swapId}`]);
+
+    // a truncated file is a corrupt record on resume, never an empty one
+    const file = join(sellerDir, `seller-${swapId}.json`);
+    const bytes = await readFile(file);
+    await new FileFlowStore(sellerDir).save(`seller:${swapId}`, bytes.subarray(0, 10)); // a valid save of nonsense: the record decoder refuses it
+    await expect(resumeSeller(h.sellerOptions, sellerStore, swapId)).rejects.toBeInstanceOf(FlowStoreCorruptError);
   });
 });

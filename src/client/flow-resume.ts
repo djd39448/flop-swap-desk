@@ -289,43 +289,43 @@ export class FlowJournal<R extends FlowRecord> {
     const text = this.ledgerText(spec);
     // Throws FlowRecordConflictError when this kind was recorded with another room or text; returns `current` itself
     // (same object) when the entry already exists identically.
-    const withIntent = withLedgerIntent(this.current, { kind: spec.kind, room: spec.room, text });
-    const isNew = withIntent !== this.current;
+    const isNew = withLedgerIntent(this.current, { kind: spec.kind, room: spec.room, text }) !== this.current;
 
     let records: readonly TranscriptRecord[] | undefined;
     if (!isNew || spec.guard !== undefined) {
       records = await (spec.read ?? ((room: string) => this.deps.venue.read(room)))(spec.room);
       const found = this.findOwn(records, spec.text);
       if (found !== null) {
-        await this.markLanded(spec.kind, found, isNew ? withIntent : undefined, spec);
+        await this.markLanded(spec, text, found, true);
         return found;
       }
     }
     if (spec.guard !== undefined) spec.guard(records ?? []);
-    if (isNew) await this.save(withIntent); // durable BEFORE visible
+    // Durable BEFORE visible. Derived from the latest record at this moment, not from the one read above: another step
+    // may have saved while the room was being read.
+    if (isNew) await this.save(withLedgerIntent(this.current, { kind: spec.kind, room: spec.room, text }));
     const posted = await (spec.post ?? ((room: string, line: string) => this.deps.venue.post(room, line, this.deps.identity)))(spec.room, spec.text);
-    await this.markLanded(spec.kind, posted, undefined, spec);
+    await this.markLanded(spec, text, posted, false);
     return posted;
   }
 
   /** Records a line this party already posted (found in the room by the caller) as the one for `kind`: the ledger
    *  entry is written if missing and marked landed, in one save. A ledger entry with another text or room throws. */
   async adopt(spec: Pick<PostSpec, "kind" | "room" | "text" | "digestOnly" | "slot">, record: TranscriptRecord): Promise<void> {
-    const withIntent = withLedgerIntent(this.current, { kind: spec.kind, room: spec.room, text: this.ledgerText(spec) });
-    await this.markLanded(spec.kind, record, withIntent !== this.current ? withIntent : undefined, spec);
+    await this.markLanded(spec, this.ledgerText(spec), record, true);
   }
 
-  /** Saves `record`'s `seq` and `nonce` on the ledger entry of `kind`. Overwrites an older landed mark (a room read
-   *  just showed the line elsewhere or posted it anew). `base` carries an intent not yet saved (adopting on a first
-   *  attempt writes the entry and the landed mark in one save). */
-  private async markLanded(kind: LedgerKind, record: TranscriptRecord, base: R | undefined, spec: Pick<PostSpec, "text" | "slot">): Promise<void> {
-    const from = base ?? this.current;
-    const existing = ledgerEntry(from, kind);
-    if (existing === undefined) throw new FlowRecordConflictError(`flow record: "${kind}" has no ledger entry to mark as landed`);
+  /** Saves `record`'s `seq` and `nonce` on the ledger entry of `spec.kind` (writing the entry first, in the same save,
+   *  when `ensureIntent`). Overwrites an older landed mark (a room read just showed the line elsewhere or posted it
+   *  anew). Derived from the latest record, saved in the same synchronous step. */
+  private async markLanded(spec: Pick<PostSpec, "kind" | "room" | "text" | "slot">, ledgerText: string, record: TranscriptRecord, ensureIntent: boolean): Promise<void> {
+    const from = ensureIntent ? withLedgerIntent(this.current, { kind: spec.kind, room: spec.room, text: ledgerText }) : this.current;
+    const existing = ledgerEntry(from, spec.kind);
+    if (existing === undefined) throw new FlowRecordConflictError(`flow record: "${spec.kind}" has no ledger entry to mark as landed`);
     const slotKnown = spec.slot === undefined || from.frames[spec.slot]?.record?.seq === record.seq;
-    if (base === undefined && existing.landed?.seq === record.seq && existing.landed.nonce === record.nonce && slotKnown) return;
+    if (from === this.current && existing.landed?.seq === record.seq && existing.landed.nonce === record.nonce && slotKnown) return;
     const copy = cloneFlowRecord(from);
-    const entry = ledgerEntry(copy, kind);
+    const entry = ledgerEntry(copy, spec.kind);
     if (entry === undefined) throw new FlowRecordConflictError("flow record: ledger entry vanished on copy"); // unreachable
     entry.landed = { seq: record.seq, nonce: record.nonce };
     if (spec.slot !== undefined) copy.frames[spec.slot] = { text: spec.text, record: recordToJson(record) };

@@ -370,6 +370,13 @@ export class SellerFlow {
     return this.#journal?.record.swapId;
   }
 
+  /** P8: the Buyer's leg A offer this swap was started from, as the record kept it, so a resumed runner that no longer
+   *  has it (the offers room is a short ring) can pass it to `acceptLegA` again. Public data. */
+  get recordedOfferA(): OfferFrame | undefined {
+    const record = this.#journal?.record;
+    return record === undefined ? undefined : offerFromSlot(`seller:${record.swapId}`, "offerA", record.frames.offerA);
+  }
+
   /** P8: public data only (rule 5). `JSON.stringify(flow)` sees nothing else. */
   toJSON(): { role: "seller"; swapId: string | undefined; did: string; railId: string; caip2: string; statement: string | undefined } {
     return { role: "seller", swapId: this.swapId, did: this.identity.did, railId: this.rail.railId, caip2: this.rail.caip2, statement: this.statement };
