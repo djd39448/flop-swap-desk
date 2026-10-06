@@ -75,13 +75,17 @@ export class FlowNotFoundError extends FlowRecordError {
  * that comes at or after the offer's `expiresMs`, so a frame posted now would never fold into the swap: the venue would
  * show a swap that never existed while both parties went on to lock and claim real value on it. The step posts and
  * locks nothing; the swap is dead for this offer and starts over from a fresh one. `offerId` names the expired offer and
- * `expiresMs` is its deadline.
+ * `expiresMs` is its deadline. R3-01: the Buyer's accept B that the venue stamped at or after leg B's expiry IS in the room (it was
+ * posted before the stamp was known); that refusal passes `posted: true`, and the message then says nothing was locked rather than
+ * that nothing was posted.
  */
 export class SwapExpiredError extends Error {
   readonly offerId: string;
   readonly expiresMs: number;
-  constructor(offerId: string, expiresMs: number, detail?: string) {
-    super(`flow: offer ${offerId} expired at ${expiresMs}${detail === undefined ? "" : ` (${detail})`}; the swap can no longer proceed on it, nothing was posted or locked: start over from a fresh offer`);
+  constructor(offerId: string, expiresMs: number, detail?: string, options: { posted?: boolean } = {}) {
+    super(
+      `flow: offer ${offerId} expired at ${expiresMs}${detail === undefined ? "" : ` (${detail})`}; the swap can no longer proceed on it, ${options.posted === true ? "the accept is already in the room but nothing was locked" : "nothing was posted or locked"}: start over from a fresh offer`,
+    );
     this.name = "SwapExpiredError";
     this.offerId = offerId;
     this.expiresMs = expiresMs;

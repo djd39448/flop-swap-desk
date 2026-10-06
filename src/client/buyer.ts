@@ -92,6 +92,14 @@
 //  - R2-17: after a `never-landed` answer the lock is read by its ref once more (after the rail's `settleDelay` where it has one) before
 //    the saved handle is replaced; a lock found there is recorded as landed. Recovery assumes one consistent RPC node per chain.
 //
+// Review round 3 (P8-FIXES-R3.md), what a runner can rely on (the Buyer's items):
+//  - R3-01: with a store, `acceptLegB` throws `SwapExpiredError` instead of returning an accept B that the venue stamped at or after offer B's
+//    `expiresMs` (tclk's machine rejected it and the Seller refuses to lock leg B against it; the accept IS in the room, nothing is locked). `next`
+//    says `abandoned` for that saved state while leg B is unverified and no leg A lock was attempted (from the record alone, no I/O).
+//  - R3-03: after a saved refund attempt, this flow's own claim of leg B (by hand: learnSecret, claimLegB) leaves the refund route like a seen claim
+//    of leg A does: `next` says learnSecret until leg B's receipt landed, then done, never refundLegA (which refuses for ever once leg B is
+//    claimed). The frames of a leg A refund that had landed then stay unposted (the transcript only).
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
 // P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3; P4-BTC-SPEC.md §7a;
 // P6-SOL-SPEC.md sections 3-5; P8-RESUME-SPEC.md.
@@ -385,8 +393,9 @@ export class BuyerFlow {
    *  `claimLegB` (the secret is never stored here, it is read again); after leg A's `refundAfterMs` a runner may call
    *  `refundLegA` where this says `learnSecret`. A lock that was attempted but is not recognised yet is `"lockLegA"` (it reads
    *  the chain first and records a lock that landed, at any time) until leg A's refund time, then `"refundLegA"` (R1-01), unless a claim of
-   *  leg A was seen or this flow claimed leg B, which is `"learnSecret"` or `"done"` (R2-02). `"abandoned"` (R2-06): a saved pairing whose
-   *  accept B never landed before leg B's offer expired. */
+   *  leg A was seen or this flow claimed leg B, which is `"learnSecret"` or `"done"` (R2-02, R3-03). `"abandoned"` (R2-06): a saved pairing whose
+   *  accept B never landed before leg B's offer expired; (R3-01) or whose accept B landed stamped at or after that expiry while leg B is unverified
+   *  and no lock of leg A was attempted. */
   private nextStep(): BuyerNextStep {
     const journal = this.#journal;
     if (journal === undefined || !journal.isLanded("offer-a")) return "bid";
@@ -398,6 +407,11 @@ export class BuyerFlow {
       if (legB !== undefined && this.clock() >= legB.expiresMs) return "abandoned";
       return "acceptLegB";
     }
+    // R3-01: accept B landed, but the venue stamped it at or after leg B's offer expiry (a slow post, or a venue clock ahead of this one).
+    // tclk's machine rejected it and the Seller refuses to lock leg B against it, so `verifyLegBLocked` would wait for ever. While leg B is
+    // unverified and no leg A lock was attempted nothing is at stake (leg A is locked only after leg B verified): the swap is abandoned.
+    // Derived from the record alone, no I/O.
+    if (!this.legBVerified && !this.legALockAttempted && this.acceptBStampedLate()) return "abandoned";
     if (this.refundAttempted) {
       if (journal.isLanded("receipt-refund-a")) return "done";
       // R1-15: the refund lost the race to a claim: `refundLegA` only throws its routing error from here on, and the way on is
@@ -423,6 +437,14 @@ export class BuyerFlow {
     }
     if (this.legBClaimAttempted || this.legBClaimed) return this.legBDone() ? "done" : "learnSecret";
     return "learnSecret";
+  }
+
+  /** R3-01: the accept B this flow holds is stamped at or after leg B's offer expiry (the record's own stamp, never the clock): tclk's machine
+   *  rejected it ("offer has expired"), so it never folded into leg B's transcript. */
+  private acceptBStampedLate(): boolean {
+    const legB = this.#journal?.record.legB;
+    const stamped = this.acceptBRecord;
+    return legB !== undefined && stamped !== undefined && stamped.timestampMs >= legB.expiresMs;
   }
 
   /**
@@ -789,7 +811,19 @@ export class BuyerFlow {
     }
     const stored = record.frames.acceptB?.record;
     if (stored === undefined) throw new FlowStoreCorruptError(`buyer:${record.swapId}`, "accept B is recorded as done but its signed record is missing");
-    return { acceptB, acceptBRecord: recordFromJson(stored) };
+    const acceptBRecord = recordFromJson(stored);
+    if (this.offerB !== undefined) this.refuseLateAcceptB(this.offerB, acceptBRecord); // R3-01
+    return { acceptB, acceptBRecord };
+  }
+
+  /** R3-01: the store path of `acceptLegB` never hands back an accept B that the venue stamped at or after leg B's offer expiry. tclk's machine
+   *  rejects such an accept ("offer has expired"), so it never folds, and the Seller refuses to lock leg B against it: the swap that would follow
+   *  (verifyLegBLocked waiting for ever) is dead. The accept IS in the room and recorded as landed (it was posted before the stamp was known), so
+   *  `next` says `abandoned` from the saved record; nothing is locked on either leg, and leg A is never locked before accept B. */
+  private refuseLateAcceptB(offerB: OfferFrame, acceptBRecord: TranscriptRecord): void {
+    if (acceptBRecord.timestampMs >= offerB.expiresMs) {
+      throw new SwapExpiredError(offerB.id, offerB.expiresMs, `accept B is timestamped ${acceptBRecord.timestampMs}, at or after the offer's expiry`, { posted: true });
+    }
   }
 
   private async acceptLegBUnlatched(
@@ -931,6 +965,10 @@ export class BuyerFlow {
       slot: "acceptB",
       guard: () => this.checkAcceptBNotExpired(offerB),
     });
+    // R3-01: the post (or the adopted copy) carries the venue's own stamp. Checked before the in-memory pairing is set: a late accept B is
+    // never handed back, and a flow that refused it holds no pairing (verifyLegBLocked, lockLegA and the rest refuse until it is resumed,
+    // where `next` says abandoned).
+    this.refuseLateAcceptB(offerB, acceptBRecord);
     this.offerB = offerB;
     this.acceptA = acceptAFrame;
     this.acceptB = acceptB;

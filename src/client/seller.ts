@@ -108,6 +108,13 @@
 //  - R2-13: the block marker saved with the claim attempt is the tip minus a reorg margin (6 on Bitcoin, 256 on EVM since R3-08, floored at 0), so a
 //    claim a reorg mines below the tip is still inside the resumed scan.
 //
+// Review round 3 (P8-FIXES-R3.md), what a runner can rely on (the Seller's items; the store's and the Buyer's are in their own headers):
+//  - R3-01: `lockLegB` refuses an accept B record the venue stamped at or after offer B's `expiresMs` (`SwapExpiredError`: nothing is saved, locked or
+//    posted; tclk's machine rejects such an accept, so leg B would settle on a swap the venue never accepted). Only while no lock attempt is saved: an
+//    attempt that was saved is recovered whatever the stamp of its accept B, because recognising a lock that may have landed is not a new action.
+//  - R3-08: the EVM claim-marker margin is 256 blocks (the Base Sepolia safe head was measured up to 91 blocks behind the tip), under the public
+//    endpoint's 500-block `eth_getLogs` window.
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
 // B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a;
 // P6-SOL-SPEC.md sections 3-5; P8-RESUME-SPEC.md.
@@ -1113,6 +1120,10 @@ export class SellerFlow {
    * R2-07: with no argument the call continues a lock that was already attempted, from the signed accept B the record saved with that
    * attempt (`recordedAcceptB`): the offers room is a short ring and may no longer hold it. Every check below runs on it as on a record
    * the runner passes. A flow whose lock was never attempted has no accept B of its own and needs the runner's.
+   *
+   * R3-01: while no lock attempt is saved, an accept B record the venue stamped at or after offer B's `expiresMs` is refused with a
+   * `SwapExpiredError` (tclk's machine rejects it, so it never folds): nothing is saved, locked or posted. A saved attempt is recovered
+   * whatever the stamp of its accept B.
    */
   async lockLegB(given?: TranscriptRecord): Promise<TranscriptRecord> {
     this.usable(); // R1-03
@@ -1154,6 +1165,16 @@ export class SellerFlow {
       });
       if (frame.contract !== expectedContract) {
         throw new Error("seller: refusing to lock leg B — accept contract id does not match this offer/accept pair (B1)");
+      }
+
+      // R3-01: tclk's machine rejects an accept stamped at or after the offer's `expiresMs` ("offer has expired"), so an accept B like that
+      // never folds into leg B's transcript: locking leg B against it would settle real value on a swap the venue never accepted. The
+      // record's own stamp decides (the venue stamps a post when it arrives, a moment after the Buyer looked at its clock; a venue clock
+      // ahead of the Buyer's does the same). Leg B is this Seller's FIRST lock, so refusing is always safe: nothing is minted, saved, locked
+      // or posted, and the flow stays free to lock against a timely accept B. ONLY while no lock attempt is saved: an attempt that was
+      // saved is recovered whatever its stamp, because recognising a lock that may have landed is not a new action (rule 4, as clarified).
+      if (this.attemptedAcceptB === undefined && acceptBRecord.timestampMs >= offerB.expiresMs) {
+        throw new SwapExpiredError(offerB.id, offerB.expiresMs, `accept B is timestamped ${acceptBRecord.timestampMs}, at or after the offer's expiry`);
       }
 
       // R4-6 (Solana only): re-check the chain clock right before leg B's value moves (acceptLegA checked it much

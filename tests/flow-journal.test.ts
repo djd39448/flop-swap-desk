@@ -578,6 +578,15 @@ describe("R2-06 (support): SwapExpiredError", () => {
     expect(error.message).toMatch(/nothing was posted or locked/);
     expect(error.message).toContain("flow clock");
   });
+
+  it("R3-01: an accept that IS in the room (stamped late by the venue) says nothing was locked, not that nothing was posted", () => {
+    const error = new SwapExpiredError(`0x${"ab".repeat(32)}`, T0 + 1_800_000, "accept B is timestamped " + (T0 + 1_801_000), { posted: true });
+    expect(error.name).toBe("SwapExpiredError");
+    expect(error.message).toMatch(/the accept is already in the room but nothing was locked/);
+    expect(error.message).not.toMatch(/nothing was posted/);
+    expect(error.message).toContain(String(T0 + 1_801_000));
+    expect(new SwapExpiredError(`0x${"ab".repeat(32)}`, T0, undefined, {}).message, "an empty options object keeps the default wording").toMatch(/nothing was posted or locked/);
+  });
 });
 
 describe("R1-12 (journal part): a line the ledger shows as landed is never posted again", () => {
