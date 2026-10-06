@@ -52,7 +52,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { MemoryNoteStore, OFFER_ROOM, PaperRail, dealRoom, generateHashLock, paperNote, tryDecodeFrame, verifyHashPreimage, type LockTerms, type TranscriptRecord } from "@flop-labs/tclk";
+import { MemoryNoteStore, OFFER_ROOM, PaperRail, dealRoom, generateHashLock, paperNote, tryDecodeFrame, verifyHashPreimage, type HashLock, type LockTerms, type TranscriptRecord } from "@flop-labs/tclk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
@@ -158,6 +158,8 @@ interface Swap {
   sellerRail: CounterAssetRail;
   buyerFlow: BuyerFlow;
   sellerFlow: SellerFlow;
+  /** P8: the secret the Seller mints (the flow keeps it in a `#private` field, so the harness injects it). */
+  sellerLock: HashLock;
 }
 
 describe("Seller/Buyer client flows against a real solana-test-validator", () => {

@@ -72,7 +72,8 @@ describe("resume fails closed on bad state (rule 6)", () => {
     await toPaired(r);
     const key = flowKey("buyer", r.swapId);
     const bytes = (await r.buyerStore.load(key))!;
-    bytes[Math.floor(bytes.length / 2)] ^= 0x01;
+    const at = Math.floor(bytes.length / 2);
+    bytes[at] = (bytes[at] ?? 0) ^ 0x01;
     await r.buyerStore.save(key, bytes);
     await expect(restartBuyer(r)).rejects.toBeInstanceOf(FlowStoreCorruptError);
     // starting the swap over on top of it is refused too (the record is there, even if unreadable)
