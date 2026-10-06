@@ -99,7 +99,10 @@
 //  - R2-06: `acceptLegA` refuses to post, or re-post, an accept A that has not landed once the flow's clock is within SELLER_OFFER_EXPIRY_MARGIN_MS of
 //    offer A's `expiresMs` (`SwapExpiredError`: nothing is minted, saved or posted; tclk's machine would reject the accept). An accept A that DID land
 //    (its mark lost) is still adopted. `next` says `abandoned` for an accept A that is not recorded as landed once the offer has expired: nothing is
-//    at stake (no lock on either leg, the statement never public), so there is nothing to call.
+//    at stake (no lock on either leg, the secret never revealed: the accept A may be public, the secret is not), so there is nothing to call.
+//    R3-11: a FRESH accept A that the venue stamps late (its clock more than 5 s ahead of this flow's, or a post slower than the margin) is not
+//    caught: the Buyer refuses it by its stamp, nothing is locked, and `next` keeps naming `lockLegB` for ever, as it does once offer B expired
+//    unanswered (the record holds no accept B before a lock attempt, so `next` cannot tell). Nothing is at stake in either wait.
 //  - R2-07: `recordedAcceptB` returns the signed accept B the record saved with a lock attempt, and `lockLegB()` with no argument continues from it
 //    (the offers room is a short ring and may no longer hold it).
 //  - R2-11, R2-12: the exchange lists are ES `#private` fields (a claim the node refused before it reached the chain leaves the secret out of
@@ -495,13 +498,14 @@ export class SellerFlow {
   /** P8: the next safe step by the stored record alone (no I/O). After leg B's `refundAfterMs` the runner may call
    *  `refundLegB` where this says `claimLegA`, and a person can always call `claimLegA` and `refundLegB` whatever this says. R2-03: once leg B's
    *  note was seen claimed with this swap's secret (`legBClaimSeen`) it says `claimLegA` (or `done`), not `refundLegB`. R2-06: `abandoned` when
-   *  accept A never landed and offer A has expired (nothing to call, nothing at stake). */
+   *  accept A never landed and offer A has expired (nothing to call, nothing at stake). R3-11: it stays `lockLegB` once offer B expired
+   *  unanswered, and for a fresh accept A the venue stamped late (nothing at stake either; the record cannot tell). */
   private nextStep(): SellerNextStep {
     const journal = this.#journal;
     if (journal === undefined) return "acceptLegA";
     if (!(journal.isLanded("accept-a") && journal.isLanded("offer-b"))) {
       // R2-06: an accept A that never landed before its offer expired can never be posted (acceptLegA refuses), and nothing is at stake: no
-      // lock exists on either leg and the statement was never public. `next` says so instead of acceptLegA for ever. It is derived from
+      // lock exists on either leg and the secret was never revealed (R3-11). `next` says so instead of acceptLegA for ever. It is derived from
       // the record and the clock alone: an accept A that DID land and whose mark was lost is still adopted by acceptLegA (the guard is for
       // posting only), which a runner that obeys `next` never calls.
       const offerA = journal.isLanded("accept-a") ? undefined : this.recordedOfferA;
