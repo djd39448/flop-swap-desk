@@ -22,7 +22,7 @@ import type { CounterAssetRail } from "../src/client/counter-rail.js";
 import { decodeFlowRecord, FlowRecordConflictError, FlowRecordMismatchError, markerFromJson } from "../src/client/flow-record.js";
 import { FlowNotFoundError } from "../src/client/flow-resume.js";
 import { FlowRecordExistsError, FlowStoreFaultError, FlowStoreWriteFailedError } from "../src/client/flow-store.js";
-import { SellerFlow, RevealNotPostedError } from "../src/client/seller.js";
+import { CLAIM_MARKER_REORG_MARGIN_BTC, CLAIM_MARKER_REORG_MARGIN_EVM, SellerFlow, RevealNotPostedError } from "../src/client/seller.js";
 import { PREFIX, STEPS, readSwap } from "./helpers/crash-matrix.js";
 import { identity } from "./helpers/identity.js";
 import type { EvmMockNode } from "./helpers/evm-mock-node.js";
@@ -357,7 +357,8 @@ describe("R1-11: a stranger's lock frame in leg A's deal room never blocks the S
 describe("R1-13 (EVM): a resumed claim is looked for from the saved block marker, never from genesis", () => {
   const chainAdvanced = (node: EvmMockNode): void => {
     node.blockNumber = 500n; // the chain is far past block 0 when the lock lands
-    node.maxLogSpan = 10n; // a public RPC that refuses a scan over more than 10 blocks
+    // a public RPC that refuses a scan over more than 100 blocks (R2-13: the saved marker sits CLAIM_MARKER_REORG_MARGIN_EVM blocks below the tip)
+    node.maxLogSpan = 100n;
   };
 
   it("the claim was sent and the process died: the resumed claimLegA scans from the marker and posts the reveal and the receipt", async () => {
@@ -370,7 +371,9 @@ describe("R1-13 (EVM): a resumed claim is looked for from the saved block marker
     const saved = await sellerRecordOf(s.w);
     expect(saved.claimAttempted).toBe(true);
     expect(saved.claimFromBlock, "the marker is saved with the attempt, before the first send").toBeDefined();
-    expect(markerFromJson(saved.claimFromBlock!)).toBeGreaterThan(500n);
+    // the tip read before the claim send, minus the reorg margin (R2-13); the claim's own send then mined one block
+    expect(markerFromJson(saved.claimFromBlock!)).toBe(node!.blockNumber - 1n - BigInt(CLAIM_MARKER_REORG_MARGIN_EVM));
+    expect(markerFromJson(saved.claimFromBlock!)).toBeGreaterThan(400n);
 
     const back = await resumedSeller(s);
     const result = await back.flow.claimLegA(statement); // before the fix: the scan started at block 0 and the capped RPC refused it
@@ -379,7 +382,7 @@ describe("R1-13 (EVM): a resumed claim is looked for from the saved block marker
     const { contractA } = await contractsOf(s.w);
     expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(1);
     expect(await framesOfType(s, dealRoom(contractA), "receipt")).toBe(1);
-    expect(Math.min(...node!.logQueries.slice(-1).map(Number))).toBeGreaterThan(500);
+    expect(Math.min(...node!.logQueries.slice(-1).map(Number))).toBeGreaterThan(400);
   });
 
   it("a claim the record shows as landed is not searched for at all: with every log query refused the missing frames are still posted", async () => {
@@ -404,7 +407,7 @@ describe("R1-13 (EVM): a resumed claim is looked for from the saved block marker
 });
 
 describe("R1-13 (Bitcoin): the resumed recovery scans only from the saved marker height", () => {
-  it("the marker is the tip height read before the first send, and findClaimedPreimage is given it", async () => {
+  it("the marker is the tip height read before the first send minus the reorg margin, and findClaimedPreimage is given it", async () => {
     let chain: LedgerChain | undefined;
     const s = await started(ledgerWorldWith("btc", (c) => void (chain = c)));
     chain!.height = 700;
@@ -412,13 +415,13 @@ describe("R1-13 (Bitcoin): the resumed recovery scans only from the saved marker
     await resumedSeller(s, (o) => ({ rail: crashRail(o.rail, { after: ["claim"] }) }));
     await expect(s.c.seller.claimLegA(statement)).rejects.toBeInstanceOf(ProcessDied);
     const saved = await sellerRecordOf(s.w);
-    expect(saved.claimFromBlock).toEqual({ kind: "number", value: "700" });
+    expect(saved.claimFromBlock).toEqual({ kind: "number", value: String(700 - CLAIM_MARKER_REORG_MARGIN_BTC) }); // R2-13
 
     chain!.scanFrom.length = 0;
     chain!.height = 705;
     const back = await resumedSeller(s);
     await back.flow.claimLegA(statement);
-    expect(chain!.scanFrom, "every scan of the resumed recovery starts at the saved marker").toEqual([700]);
+    expect(chain!.scanFrom, "every scan of the resumed recovery starts at the saved marker").toEqual([700 - CLAIM_MARKER_REORG_MARGIN_BTC]);
     expect(s.w.counts().claims).toBe(1);
   });
 });

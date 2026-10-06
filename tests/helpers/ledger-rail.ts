@@ -65,6 +65,8 @@ interface Output {
   status: "locked" | "claimed" | "refunded";
   preimage?: string;
   fundingTxid: string;
+  /** The chain height the claim was mined at (set by `claim`); a test moves it to model a reorg that mines the claim lower (R2-13). */
+  claimHeight?: number;
 }
 
 export interface LedgerCounts {
@@ -342,6 +344,7 @@ class LedgerConnected implements ConnectedCounterAssetRail {
       this.chain.counts.claimSent += 1;
       output.status = "claimed";
       output.preimage = secret;
+      output.claimHeight = this.chain.height;
       this.chain.knownTxs.add(hex(`claim|${ref}`));
     });
     return { ref, raw: [], ...(this.options.flavour === "btc" ? { txid: hex(`claim|${ref}`) } : {}) };
@@ -444,6 +447,8 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     this.options.hooks.alive();
     this.chain.scanFrom.push(fromMarker);
     const output = this.chain.outputs.get(ref);
+    // a bounded block scan starts at the marker: a claim mined below it is not seen (R2-13)
+    if (typeof fromMarker === "number" && output?.claimHeight !== undefined && output.claimHeight < fromMarker) return null;
     return output?.status === "claimed" && output.preimage !== undefined ? output.preimage : null;
   }
 

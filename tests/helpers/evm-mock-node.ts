@@ -6,6 +6,8 @@
 // flows make (ERC20 approve, lock, claim, refund), the `locks(hashLock)` view, the three events, receipts and block tags. It does
 // NOT model gas, nonces, reorgs or any ERC20 balance: the contract's own state machine is what the resume paths depend on.
 //
+// A reorg is modelled only as far as the resume tests need it: `reorgLog` moves an event's log to another block number (R2-13).
+//
 // Fault knobs, each firing once: `rejectNextSend(fn)` answers the send with a JSON-RPC error WITHOUT applying it (the transaction
 // never happened); `loseNextSendReply(fn)` applies the effect and then answers with an error (the transaction landed, the reply was
 // lost). `sends` records every send that was applied, so a test can count approvals and locks exactly.
@@ -123,6 +125,16 @@ export class EvmMockNode {
   }
   loseNextSendReply(fn: SendKind): void {
     this.loseNext.add(fn);
+  }
+
+  /** R2-13: a reorg mined the transaction that emitted `event` for `hashLock` into another block, `blockNumber`, than the one it was first
+   *  seen in: the log moves (what `eth_getLogs` filters on); nothing else about the chain changes. */
+  reorgLog(event: keyof typeof EVENTS, hashLock: string, blockNumber: bigint): void {
+    const log = this.logs.find((candidate) => candidate.event === event && candidate.hashLock.toLowerCase() === hashLock.toLowerCase());
+    if (log === undefined) throw new Error(`mock evm node: no ${event} log for ${hashLock}`);
+    log.blockNumber = blockNumber;
+    log.raw.blockNumber = numberToHex(blockNumber);
+    log.raw.blockHash = this.blockHash(blockNumber);
   }
 
   count(fn: SendKind): number {

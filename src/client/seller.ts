@@ -275,6 +275,27 @@ const SOL_PUBLIC_SECRET_RETRIES = 2;
  *  this flow looked at its own clock; the margin keeps a post that would land at the edge from being sent at all. */
 export const SELLER_OFFER_EXPIRY_MARGIN_MS = 5_000;
 
+/** R2-13: how many blocks BELOW the chain tip a Bitcoin claim's saved block marker starts. The marker is the tip when the first claim is about to be
+ *  sent; a reorg that branches below it can mine the claim into a block under that height, and a resumed scan that starts AT the marker would never
+ *  see the Seller's own landed claim (its reveal and receipt would not be posted, and a new claim is refused: the input is spent). */
+export const CLAIM_MARKER_REORG_MARGIN_BTC = 6;
+/** R2-13: the same on EVM (blocks, bigint arithmetic). The scan is one `eth_getLogs` over this many blocks more, which a range-capped public RPC
+ *  still answers. */
+export const CLAIM_MARKER_REORG_MARGIN_EVM = 64;
+
+/** R2-13: `marker` (the chain tip read before the first claim send) minus the reorg margin of its kind (a bigint is an EVM block number, a number a
+ *  Bitcoin height), floored at 0. A value that is not a marker this build can save is returned as it is, so the save refuses it (R2-09). */
+export function claimMarkerWithReorgMargin(marker: RailBlockMarker): RailBlockMarker {
+  if (typeof marker === "bigint" && marker >= 0n) {
+    const margin = BigInt(CLAIM_MARKER_REORG_MARGIN_EVM);
+    return marker > margin ? marker - margin : 0n;
+  }
+  if (typeof marker === "number" && Number.isSafeInteger(marker) && marker >= 0) {
+    return marker > CLAIM_MARKER_REORG_MARGIN_BTC ? marker - CLAIM_MARKER_REORG_MARGIN_BTC : 0;
+  }
+  return marker;
+}
+
 /** The rails whose lock ref is `0x<hash lock>:<payer>` (payer-keyed locks): how each parses it. `undefined` for
  *  a rail with another ref shape. */
 function payerKeyedRefParser(railId: string): ((ref: string) => { hashLock: string } | null) | undefined {
@@ -1502,8 +1523,9 @@ export class SellerFlow {
     // BEFORE the first send on any rail (a Solana claim signature follows through `onSigned`, below).
     if (!this.claimAttempted) {
       // R1-13: the block marker is taken BEFORE the first send and saved in the same save as the attempt, so a claim that lands after it is
-      // found by a scan that starts here. Only the rails whose scan walks blocks need one (EVM, Bitcoin); a flow without a store is not resumed.
-      if (this.#journal !== undefined && this.rail.railId !== NEAR_RAIL_ID && !isSol) this.claimFromBlock = await connected.currentBlockMarker();
+      // found by a scan that starts there. Only the rails whose scan walks blocks need one (EVM, Bitcoin); a flow without a store is not resumed.
+      // R2-13: what is saved is the tip minus a reorg margin, so a claim that a reorg mines below the tip is still inside the scan.
+      if (this.#journal !== undefined && this.rail.railId !== NEAR_RAIL_ID && !isSol) this.claimFromBlock = claimMarkerWithReorgMargin(await connected.currentBlockMarker());
       this.claimAttempted = true;
       await this.persist();
     }
