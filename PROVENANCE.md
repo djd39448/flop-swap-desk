@@ -406,3 +406,55 @@ keys at test time, and the loader reads a key only from a file an operator names
   the P8 section's type-checking note).
 - Live test: `tests-anvil/local-signer.anvil.test.ts` (a Buyer and a Seller with local accounts, funded by anvil's account 0,
   settle and refund end to end, bundles scanned for the keys and replayed through `examples/audit-export.mjs`).
+
+## `EvmHashRail.sol` runtime code hash (P9-2, handoff/P9-G1-READINESS-SPEC.md, rule 2)
+
+A Base Sepolia config must carry `EvmRailConfig.contractCodeHash`, the keccak256 of the escrow's deployed RUNTIME code (the
+bytes `eth_getCode` answers); `EvmHtlcRail.connect` and the evidence reader refuse a contract whose code hashes differently
+(or is empty). This is the value the vendored `contracts/EvmHashRail.sol` builds to with the pinned toolchain:
+
+| what | value |
+|---|---|
+| runtime code (`deployedBytecode.object`), 3416 bytes, keccak256 | `0x6ab36fa334036370445c22ca9f7999872ae56777d3c969438fb4b2414152da27` |
+| creation code (`bytecode.object`), 3445 bytes, keccak256 (for reference; `forge create` sends this) | `0xb068f157be227cd9fef6611b4e9549aab69f8d8c334cc6375e40914edc754c7f` |
+
+**Dave's deployed contract must report the runtime value through `bin/evm-code-hash.mjs`** (`node bin/evm-code-hash.mjs
+<rpc-url> <address>` prints `keccak256 0x...` and `bytes 3416`); that is the string that goes into `contractCodeHash` in
+`rails.json`. Another value means the code at that address is not this source built with this toolchain, and the desk will
+refuse it.
+
+How the value was taken (2026-10-06, in the `flop-swap-desk-g1` worktree at branch `phase2-g1`, not from any earlier local
+build): `forge clean`, then `forge build` (forge 1.8.3, commit `cae51ad458f6abb64852b7709eb784352429825d`, built
+2026-09-15; solc `0.8.24+commit.e11b9ed9` from `foundry.toml`; optimizer on, 200 runs; EVM version `cancun`; metadata
+`bytecodeHash` `ipfs`; sources `contracts/EvmHashRail.sol` and `contracts/IERC20.sol`; `lib/forge-std` at `v1.16.2`). Then the
+hex string `deployedBytecode.object` of `out/EvmHashRail.sol/EvmHashRail.json` was hashed with keccak256 (viem's
+`keccak256`, the hash `eth_getCode` bytes are checked with). The contract has no immutables and no library links
+(`immutableReferences` absent, `linkReferences` empty), so the runtime code is the same bytes wherever it is deployed. The
+anvil suite checks the same fact on a real node (`tests-anvil/code-pin.anvil.test.ts`: the code a deployment leaves on chain
+hashes to the build's `deployedBytecode`).
+
+The runtime code ends with solc's CBOR metadata, whose hash covers the source texts, their paths (`contracts/EvmHashRail.sol`,
+`contracts/IERC20.sol`) and the compiler settings. So the value holds for this exact vendored source, built from this
+repository's root with this `foundry.toml` (`forge create contracts/EvmHashRail.sol:EvmHashRail ...`); a different solc, other
+settings, an edited file (a comment included) or another path gives another hash, and is refused until a person pins the new
+value on purpose. The earlier local reference in the G1 research sheet (the same two numbers, 3416 bytes and `0x6ab36fa3...`)
+was from an untracked build; this clean build reproduces it.
+
+## First-party code-pin and log-scan files (P9-2, P9-3) - unaudited, testnet-only
+
+Not vendored: original to this repo. No key material in any of them.
+
+- `src/rails/evm-code-pin.ts` - the one judgement of a contract's code against `contractCodeHash` (`judgeRuntimeCode`),
+  shared by `EvmHtlcRail.connect` and the evidence reader so they cannot disagree.
+- Extended first-party files: `src/rails/evm-htlc.ts` (`EvmRailConfig.contractCodeHash` and `maxLogRange`; the typed
+  `EvmContractCodeError` and `EvmLogScanBoundError`; `effectiveMaxLogRange`; the chunked write-evidence lookup and
+  `findClaimedPreimage`), `src/rails/evm-evidence.ts` (the capture records `eth_getCode` for a pinned config and the
+  decoder fails closed on it) and `src/client/seller.ts` (comments only). `src/vendor/evm-hash-rail.ts`, `vendor/tclk` and
+  `contracts/` are untouched.
+- `bin/evm-code-hash.mjs` - prints the keccak256 and byte length of the code at an address; read-only, one JSON-RPC call,
+  never prints the RPC URL.
+- Hermetic tests: `tests/evm-code-pin.test.ts`, `tests/evm-code-hash-bin.test.ts` (against a throwaway local HTTP server),
+  `tests/evm-log-scan.test.ts`, the P9-3 block of `tests/flow-resume-sell.test.ts`, and the helper `tests/helpers/scripted-rpc.ts`;
+  the stateful mock node (`tests/helpers/evm-mock-node.ts`) answers `eth_getCode`, a chain id, and refuses an `eth_getLogs` range
+  over its cap exactly as the public endpoint does.
+- Live tests: `tests-anvil/code-pin.anvil.test.ts` and `tests-anvil/log-scan.anvil.test.ts`.
