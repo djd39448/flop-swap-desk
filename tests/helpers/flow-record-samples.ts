@@ -137,6 +137,7 @@ export function sampleSellerRecord(): SellerFlowRecord {
     revealPosted: false,
     receiptPosted: false,
     legBRefund: { attempted: false, done: false, framesPosted: false },
+    legBClaimSeen: true, // R2-03: refundLegB found leg B's note claimed with this swap's secret
   };
 }
 

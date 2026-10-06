@@ -347,6 +347,10 @@ describe("the closed schema: every field type, every unknown field", () => {
     ["negative neverLandedClaims", (r) => void (r.neverLandedClaims = -1)],
     ["legBRefund missing a flag", (r) => void delete at(r, "legBRefund").done],
     ["frozen accounts with an unknown field", (r) => void (at(r, "frozenLegAAccounts").extra = "x")],
+    ["a legBClaimSeen of false (R2-03: it is true or absent)", (r) => void (r.legBClaimSeen = false)],
+    ["a legBClaimSeen that is not a boolean (R2-03)", (r) => void (r.legBClaimSeen = "yes")],
+    ["legBClaimSeen without lockedLegBContract: only a leg B note this flow locked can be seen claimed (R2-03)", (r) => void delete r.lockedLegBContract],
+    ["legBClaimSeen together with a finished refund of leg B: a note is claimed or refunded, never both (R2-03)", (r) => void (at(r, "legBRefund").done = true)],
   ];
 
   it.each(common)("buyer: %s is refused", (_label, edit) => {

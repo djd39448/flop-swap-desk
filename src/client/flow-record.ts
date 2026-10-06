@@ -269,6 +269,11 @@ export interface SellerFlowState {
   revealPosted: boolean;
   receiptPosted: boolean;
   legBRefund: { attempted: boolean; done: boolean; framesPosted: boolean };
+  /** R2-03: `refundLegB` found leg B's paper note already CLAIMED with this swap's secret (the Buyer took leg B), so the refund the paper
+   *  rail refused can never happen and the Seller's way on is `claimLegA` (the Seller mirror of the Buyer's `refund.claimSeen`, R1-15).
+   *  Set in the same save that clears `legBRefund.attempted`; from then on `next` says `claimLegA` (or `done` once the receipt is
+   *  posted), not `refundLegB` for ever. `true` or absent; it needs a confirmed leg B lock and is never set with a finished refund. */
+  legBClaimSeen?: true;
 }
 
 export interface BuyerFlowState {
@@ -847,7 +852,7 @@ const COMMON_REQUIRED = ["v", "role", "swapId", "did", "railId", "caip2", "deplo
 const COMMON_OPTIONAL = ["contractB", "lockTimeMs", "legB"] as const;
 // A Seller record is keyed by contract A (R1-14), so it has one from birth; a Buyer learns it with accept A.
 const SELLER_REQUIRED = ["contractA", "preimage", "statement", "claimAttempted", "claimRecords", "neverLandedClaims", "claimOutcome", "revealPosted", "receiptPosted", "legBRefund"] as const;
-const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature", "claimFromBlock"] as const;
+const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature", "claimFromBlock", "legBClaimSeen"] as const;
 const BUYER_REQUIRED = ["legBVerified", "lock", "legBClaimAttempted", "legBClaimed", "refund", "refundNotes"] as const;
 const BUYER_OPTIONAL = ["contractA", "ownAccountLine", "legBClaimAdopted"] as const;
 
@@ -977,6 +982,17 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
   if (claimFromBlock !== undefined && !claimAttempted) r.fail(`${path}.claimFromBlock`, "is saved with claimAttempted and needs it");
   if (claimOutcome === "failed-public" && publicClaimSignature === undefined) r.fail(`${path}.publicClaimSignature`, "is required for a failed-public claim: it is the proof the secret is public");
   const refundObject = r.object(o.legBRefund, `${path}.legBRefund`, ["attempted", "done", "framesPosted"]);
+  const legBClaimSeen = r.optional(
+    o,
+    "legBClaimSeen",
+    (v, p) => {
+      if (r.bool(v, p) !== true) r.fail(p, "must be true when present");
+      return true as const;
+    },
+    path,
+  );
+  if (legBClaimSeen !== undefined && lockedLegBContract === undefined) r.fail(`${path}.legBClaimSeen`, "needs lockedLegBContract: only a leg B note this flow locked can be seen claimed");
+  if (legBClaimSeen !== undefined && r.bool(refundObject.done, `${path}.legBRefund.done`)) r.fail(`${path}.legBClaimSeen`, "a leg B note is claimed or refunded, never both");
   const frozenLegAAccounts = r.optional(o, "frozenLegAAccounts", (v, p) => r.accounts(v, p), path);
   const frozenLegARailRef = r.optional(o, "frozenLegARailRef", (v, p) => r.string(v, p), path);
   const ownAccountLine = r.optional(
@@ -1012,6 +1028,7 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
       done: r.bool(refundObject.done, `${path}.legBRefund.done`),
       framesPosted: r.bool(refundObject.framesPosted, `${path}.legBRefund.framesPosted`),
     },
+    ...(legBClaimSeen === undefined ? {} : { legBClaimSeen }),
   };
 }
 

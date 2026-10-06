@@ -335,6 +335,9 @@ export class SellerFlow {
   private claimOutcome: "none" | "landed" | "failed-public" = "none";
   private legBRefundAttempted = false;
   private legBRefundDone = false;
+  /** R2-03: `refundLegB` found leg B's note claimed with this swap's secret (the Buyer took leg B): the refund can never happen, and
+   *  the Seller's way on is `claimLegA`. Saved with the record; `next` reads it before the refund latch. */
+  private legBClaimSeen = false;
   /** P8: a same-process double call of `acceptLegA` is refused while one is in flight (store mode only). */
   private acceptLegAPending = false;
   /** R1-16: set synchronously at the start of `postAccountLineA`, `claimLegA` and `refundLegB` and cleared when the call ends, the
@@ -427,6 +430,9 @@ export class SellerFlow {
     const journal = this.#journal;
     if (journal === undefined) return "acceptLegA";
     if (!(journal.isLanded("accept-a") && journal.isLanded("offer-b"))) return "acceptLegA";
+    // R2-03: leg B's note was seen claimed with this swap's secret (the Buyer took leg B) when a refund was tried: the refund can never
+    // happen, so the way on is the claim of leg A (on NEAR a revealed lock's claim retry works past the deadlines), then done.
+    if (this.legBClaimSeen) return journal.isLanded("receipt-a") ? "done" : "claimLegA";
     if (this.legBRefundAttempted || this.legBRefundDone) return journal.isLanded("receipt-refund-b") ? "done" : "refundLegB";
     // A leg B lock that was started is finished first (its recover path), whatever else is still open.
     const lockStarted = this.attemptedAcceptB !== undefined;
@@ -568,6 +574,7 @@ export class SellerFlow {
     this.claimOutcome = record.claimOutcome;
     this.legBRefundAttempted = record.legBRefund.attempted;
     this.legBRefundDone = record.legBRefund.done;
+    this.legBClaimSeen = record.legBClaimSeen === true;
   }
 
   /** The flow's live state laid over a record (the journal calls this on every save). Only things a resumed flow
@@ -588,6 +595,7 @@ export class SellerFlow {
       revealPosted: ledgerLanded(r, "reveal-a"),
       receiptPosted: ledgerLanded(r, "receipt-a"),
       legBRefund: { attempted: this.legBRefundAttempted, done: this.legBRefundDone, framesPosted: ledgerLanded(r, "receipt-refund-b") },
+      ...(this.legBClaimSeen ? { legBClaimSeen: true as const } : {}),
     };
   }
 
@@ -1715,6 +1723,23 @@ export class SellerFlow {
     return record;
   }
 
+  /** R2-03: whether a paper note is a claim of THIS swap: claimed, for this swap's statement, with a secret that opens it (a paper record is
+   *  world-writable, so a claimed note naming any other statement or secret is not taken as the Buyer's claim). */
+  private noteOpensOurStatement(note: { statement: string; secret?: string }): boolean {
+    const hashLock = this.#hashLock;
+    return hashLock !== undefined && note.statement === hashLock.hash && note.secret !== undefined && verifyHashPreimage(hashLock.hash, note.secret);
+  }
+
+  /** R2-03: the routing error of a `refundLegB` that leg B's claim made impossible. It names `claimLegA`: leg B went to the Buyer, so the
+   *  Seller's side of the swap is the payout on leg A (the Seller's mirror of the Buyer's `learnSecret` route, R1-15). */
+  private legBClaimedError(): Error {
+    return new Error(
+      "seller: leg B's note was claimed with this swap's secret (the Buyer took leg B), so it cannot be refunded; " +
+        "call claimLegA() to be paid on leg A (a runner may always call claimLegA and refundLegB whatever next says; " +
+        "on NEAR a revealed lock's claim retry works past the deadlines, on the other rails claimLegA refuses by deadline once its claim window has closed)",
+    );
+  }
+
   /** Refund leg B only at/after `B.refundAfterMs` (the tclk `PaperRail` itself also enforces
    *  this and would throw; this check exists so the error names the rule from this class's own
    *  vocabulary, not the rail's). */
@@ -1756,12 +1781,22 @@ export class SellerFlow {
     // refunded record" is no longer reached: a note that already shows our refund is taken as done, and the missing
     // frames are posted (each once, as the saved text, or adopted).
     if (!this.legBRefundDone) {
+      // R2-03: a claim of leg B that was already seen is final (a claimed note never becomes refundable): nothing is attempted or saved again.
+      if (this.legBClaimSeen) throw this.legBClaimedError();
       this.legBRefundAttempted = true;
       await this.persist();
       try {
         await this.paperRail.refund(contractB);
       } catch (error) {
         const note = await this.paperRail.read(contractB);
+        if (note !== null && note.status === "claimed" && this.noteOpensOurStatement(note)) {
+          // R2-03: the paper rail refused because the Buyer claimed leg B with this swap's secret. The refund latch is cleared (no refund is
+          // under way) and the fact is saved, so `next` says claimLegA (the Seller is paid on leg A) instead of refundLegB for ever.
+          this.legBRefundAttempted = false;
+          this.legBClaimSeen = true;
+          await this.persist();
+          throw this.legBClaimedError();
+        }
         if (note === null || note.status !== "refunded") throw error;
       }
       this.legBRefundDone = true;
