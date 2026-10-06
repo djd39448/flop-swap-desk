@@ -70,13 +70,36 @@ export class FlowNotFoundError extends FlowRecordError {
   }
 }
 
+/**
+ * R2-06: a step refused because the offer it answers has expired, by the flow's clock. tclk's machine rejects an accept
+ * that comes at or after the offer's `expiresMs`, so a frame posted now would never fold into the swap: the venue would
+ * show a swap that never existed while both parties went on to lock and claim real value on it. The step posts and
+ * locks nothing; the swap is dead for this offer and starts over from a fresh one. `offerId` names the expired offer and
+ * `expiresMs` is its deadline.
+ */
+export class SwapExpiredError extends Error {
+  readonly offerId: string;
+  readonly expiresMs: number;
+  constructor(offerId: string, expiresMs: number, detail?: string) {
+    super(`flow: offer ${offerId} expired at ${expiresMs}${detail === undefined ? "" : ` (${detail})`}; the swap can no longer proceed on it, nothing was posted or locked: start over from a fresh offer`);
+    this.name = "SwapExpiredError";
+    this.offerId = offerId;
+    this.expiresMs = expiresMs;
+  }
+}
+
 /** The next safe step of a resumed Seller, by method name. After leg B's `refundAfterMs` a runner may call
- *  `refundLegB` in place of `claimLegA`; `"done"` means every outward action of the swap is recorded as finished. */
-export type SellerNextStep = "acceptLegA" | "postAccountLineA" | "lockLegB" | "claimLegA" | "refundLegB" | "done";
+ *  `refundLegB` in place of `claimLegA`; `"done"` means every outward action of the swap is recorded as finished.
+ *  `"abandoned"` (R2-06) means the swap can no longer proceed and has nothing at stake: an accept A that never landed
+ *  before the offer expired. There is nothing to call; the runner drops the swap (and starts over from a fresh offer
+ *  if it wants one). */
+export type SellerNextStep = "acceptLegA" | "postAccountLineA" | "lockLegB" | "claimLegA" | "refundLegB" | "done" | "abandoned";
 
 /** The next safe step of a resumed Buyer, by method name. `"learnSecret"` is also the way back into `claimLegB`: the
  *  secret is never stored on a Buyer record, so it is read again from the venue or the chain. After leg A's
- *  `refundAfterMs` a runner may call `refundLegA` in place of `learnSecret`. */
+ *  `refundAfterMs` a runner may call `refundLegA` in place of `learnSecret`. `"abandoned"` (R2-06) means the swap can
+ *  no longer proceed and has nothing at stake (leg A was never locked and an offer it needs has expired): there is
+ *  nothing to call; the runner drops the swap. */
 export type BuyerNextStep =
   | "bid"
   | "acceptLegB"
@@ -85,7 +108,8 @@ export type BuyerNextStep =
   | "lockLegA"
   | "learnSecret"
   | "refundLegA"
-  | "done";
+  | "done"
+  | "abandoned";
 
 // --- conversions ----------------------------------------------------------------------------------------------------
 

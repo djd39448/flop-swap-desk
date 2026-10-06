@@ -32,7 +32,7 @@ import {
   type BuyerFlowRecord,
   type SellerFlowRecord,
 } from "../src/client/flow-record.js";
-import { FlowJournal, FlowRecordExistsError, FlowRecordStaleError, FlowStoreWriteFailedError, digestOfText, type JournalDeps, type PostSpec } from "../src/client/flow-resume.js";
+import { FlowJournal, FlowRecordExistsError, FlowRecordStaleError, FlowStoreWriteFailedError, SwapExpiredError, digestOfText, type JournalDeps, type PostSpec } from "../src/client/flow-resume.js";
 import { FileFlowStore, FlowStoreFaultError, MemoryFlowStore, flowDigest, flowKey, type FlowStore } from "../src/client/flow-store.js";
 import { MemoryVenue, type Venue } from "../src/client/venue.js";
 import { identity } from "./helpers/identity.js";
@@ -563,6 +563,20 @@ describe("R2-09: any error of the projection, the revision bump or the encoding 
     expect(journal.failed).toBe(false);
     await journal.update((record) => ({ ...(record as BuyerFlowRecord), legBVerified: true })); // still works
     expect(journal.record).toMatchObject({ legBVerified: true });
+  });
+});
+
+describe("R2-06 (support): SwapExpiredError", () => {
+  it("is a typed error that carries the offer id and its deadline and says the swap starts over", () => {
+    const error = new SwapExpiredError(`0x${"ab".repeat(32)}`, T0 + 1_800_000, "flow clock " + (T0 + 1_900_000));
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).toBe("SwapExpiredError");
+    expect(error.offerId).toBe(`0x${"ab".repeat(32)}`);
+    expect(error.expiresMs).toBe(T0 + 1_800_000);
+    expect(error.message).toContain(`0x${"ab".repeat(32)}`);
+    expect(error.message).toContain(String(T0 + 1_800_000));
+    expect(error.message).toMatch(/nothing was posted or locked/);
+    expect(error.message).toContain("flow clock");
   });
 });
 
