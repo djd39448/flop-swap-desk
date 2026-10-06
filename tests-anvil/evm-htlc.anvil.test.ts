@@ -95,7 +95,8 @@ describe("EvmHtlcRail against a real anvil node", () => {
   }
 
   it("connect refuses BASE_SEPOLIA_PIN against this anvil (chain id 31337)", async () => {
-    const wrongPinConfig: EvmRailConfig = { ...config, pin: BASE_SEPOLIA_PIN };
+    // P9-2: a Base Sepolia config must carry its escrow's code hash (any well-shaped value: the chain id is refused before the code is read).
+    const wrongPinConfig: EvmRailConfig = { ...config, pin: BASE_SEPOLIA_PIN, contractCodeHash: `0x${"ab".repeat(32)}` };
     await expect(
       EvmHtlcRail.connect({ config: wrongPinConfig, rpc: freshRpc(), account: payer, addressBook }),
     ).rejects.toThrow(/connected chain id 31337 does not match pin "base-sepolia"/);

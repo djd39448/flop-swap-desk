@@ -147,6 +147,9 @@ const TERMS: LockTerms = {
   refundAfterMs: 1_700_003_600_000,
 };
 
+/** P9-2: any well-shaped code hash; a Base Sepolia config must carry one, these tests are about other rules. */
+const PINNED_CODE_HASH = ("0x" + "ab".repeat(32)) as Hex;
+
 function configFor(pin: EvmChainPin): EvmRailConfig {
   return { pin, endpoint: "http://mock-anvil", contract: RAIL_CONTRACT, assets: { USDC: TOKEN } };
 }
@@ -173,13 +176,13 @@ describe("validateEvmRailConfig / connect — chain pin and asset book", () => {
     );
   });
 
-  it("accepts base-sepolia (84532), the one non-anvil id on the allow list, without a live chain", () => {
-    const config = configFor(BASE_SEPOLIA_PIN);
+  it("accepts base-sepolia (84532), the one non-anvil id on the allow list, without a live chain (P9-2: with its contractCodeHash)", () => {
+    const config: EvmRailConfig = { ...configFor(BASE_SEPOLIA_PIN), contractCodeHash: PINNED_CODE_HASH };
     expect(() => validateEvmRailConfig(config)).not.toThrow();
   });
 
   it("refuses when the live chain id differs from the pin (BASE_SEPOLIA_PIN against a 31337 node)", async () => {
-    const config = configFor(BASE_SEPOLIA_PIN);
+    const config: EvmRailConfig = { ...configFor(BASE_SEPOLIA_PIN), contractCodeHash: PINNED_CODE_HASH };
     const { rpc } = mockCapturingRpc({ eth_chainId: () => ({ result: "0x7a69" }) });
     await expect(EvmHtlcRail.connect({ config, rpc, account: PAYER, addressBook: ADDRESS_BOOK, clock: NOW })).rejects.toThrow(
       /connected chain id 31337 does not match pin "base-sepolia"/,

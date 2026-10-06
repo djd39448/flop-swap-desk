@@ -998,6 +998,7 @@ describe("evmEvidence — A4: the capture's own config must match the auditor's"
     const capturedConfig: EvmRailConfig = {
       ...CONFIG,
       pin: { chainId: 84532, name: "base-sepolia", caip2: "eip155:84532", finality: PIN.finality },
+      contractCodeHash: `0x${"ab".repeat(32)}`, // P9-2: a Base Sepolia config is only valid with its code pin
     };
     const capture = buildCapture({ config: capturedConfig, exchanges: standardExchanges({ callResult: encodeLocksResult({ status: Status.Locked }) }) });
     const result = evmEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });

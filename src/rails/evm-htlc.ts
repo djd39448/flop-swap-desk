@@ -44,6 +44,7 @@ import type { LockTerms } from "@flop-labs/tclk";
 import { verifyHashPreimage } from "@flop-labs/tclk";
 
 import { EVM_HASH_RAIL_ABI, EvmHashRail, type AddressBook, type AssetBook } from "../vendor/evm-hash-rail.js";
+import { CODE_HASH_SHAPE, describeCodeProblem, judgeRuntimeCode } from "./evm-code-pin.js";
 import { captureEvmLeg, evmEvidence, EVM_RAIL_ID, hashLockRefMismatch, type EvmAccounts, type EvmEvidenceResult } from "./evm-evidence.js";
 import { verifiedExchangeBytes, type CapturingRpc } from "./rpc-capture.js";
 
@@ -73,7 +74,35 @@ export interface EvmRailConfig {
    * `MAX_RECEIPT_TIMEOUT_MS`.
    */
   receiptTimeoutMs?: number;
+  /**
+   * P9-2 (rule 2): keccak256 of the escrow's deployed RUNTIME code, the bytes `eth_getCode` answers (`0x` and 64 hex digits;
+   * `bin/evm-code-hash.mjs <rpc-url> <address>` prints it for a deployed contract, and PROVENANCE.md records the value the
+   * vendored `EvmHashRail.sol` builds to). REQUIRED when `pin.chainId` is 84532 (a Base Sepolia config without it is refused);
+   * optional on anvil. When present, `EvmHtlcRail.connect` reads `eth_getCode(contract, "latest")` and refuses a contract whose
+   * code is empty or hashes differently (`EvmContractCodeError`, before any write), and the evidence reader captures the same
+   * read and reports `railVerified: null` for a lock at a contract whose code differs, so the board never folds on an unpinned
+   * contract. It is not part of `evmDeploymentId`: the contract address already names the deployment, the hash only proves
+   * what is at it.
+   */
+  contractCodeHash?: Hex;
+  /**
+   * P9-3 (rule 3): the most blocks any one `eth_getLogs` call may span (inclusive of both ends), the endpoint's own cap. Every
+   * log scan this build makes (the write-evidence lookup and `findClaimedPreimage`, including the resumed Seller's claim scan)
+   * is split into calls of at most this many blocks. Omitted: `BASE_SEPOLIA_MAX_LOG_RANGE` (500) when `pin.chainId` is 84532,
+   * no limit (one call to `latest`, as before) otherwise; see `effectiveMaxLogRange`. Any positive integer is accepted.
+   */
+  maxLogRange?: number;
 }
+
+/** P9-3: the public Base Sepolia endpoint refuses `eth_getLogs` over more than 500 blocks (measured 2026-10-05,
+ *  `handoff/G1-PREP-2026-10-05.md` section 2); the default `maxLogRange` for chain 84532. */
+export const BASE_SEPOLIA_MAX_LOG_RANGE = 500;
+
+/** P9-3: the hard bound on `eth_getLogs` calls one scan may make. At the Base Sepolia range that is 50,000 blocks (about 28 hours of
+ *  2-second blocks); a scan that would need more throws `EvmLogScanBoundError` instead of silently reading less. */
+export const MAX_LOG_SCAN_CHUNKS = 100;
+
+const BASE_SEPOLIA_CHAIN_ID = 84532;
 
 /** viem 2.56.8's default for `waitForTransactionReceipt`'s `timeout` (180 s); what an omitted `receiptTimeoutMs` means. */
 export const VIEM_RECEIPT_TIMEOUT_MS = 180_000;
@@ -168,6 +197,13 @@ export function validateEvmRailConfig(config: EvmRailConfig): void {
       `evm-htlc: chain id ${config.pin.chainId} must be pinned as "${canonicalName}", got "${config.pin.name}"`,
     );
   }
+  // P9-2 (rule 2): a Base Sepolia config trusts its escrow by code, never by address alone.
+  if (config.pin.chainId === BASE_SEPOLIA_CHAIN_ID && config.contractCodeHash === undefined) {
+    throw new Error(
+      `evm-htlc: a base-sepolia (${BASE_SEPOLIA_CHAIN_ID}) config must carry contractCodeHash, the keccak256 of the escrow's runtime code ` +
+        "(bin/evm-code-hash.mjs prints it for the deployed contract); refusing to trust a contract by its address alone",
+    );
+  }
   for (const [asset, address] of Object.entries(config.assets)) {
     if (isAddressEqual(address, BASE_MAINNET_USDC)) {
       throw new Error(
@@ -243,6 +279,12 @@ export function evmRailConfigShapeReason(value: unknown): string | null {
     ) {
       return `evm rail config: receiptTimeoutMs must be a positive integer of at most ${MAX_RECEIPT_TIMEOUT_MS}`;
     }
+  }
+  if (v.contractCodeHash !== undefined && (typeof v.contractCodeHash !== "string" || !CODE_HASH_SHAPE.test(v.contractCodeHash))) {
+    return "evm rail config: contractCodeHash must be 0x followed by 64 hex digits (the keccak256 of the escrow's runtime code)";
+  }
+  if (v.maxLogRange !== undefined && (typeof v.maxLogRange !== "number" || !Number.isSafeInteger(v.maxLogRange) || v.maxLogRange <= 0)) {
+    return "evm rail config: maxLogRange must be a positive integer";
   }
   return null;
 }
@@ -427,6 +469,67 @@ export class EvmReceiptTimeoutError extends Error {
   }
 }
 
+/**
+ * P9-2 (rule 2): the code at `config.contract` is not the pinned one. `connect()` throws this before any write when the contract's
+ * `eth_getCode` is empty (`problem: "empty"`), is not hex (`"malformed"`) or hashes to something other than `config.contractCodeHash`
+ * (`"mismatch"`). `expected` and `observed` (absent unless there was code to hash) are keccak256 hashes of public code, safe to print.
+ */
+export class EvmContractCodeError extends Error {
+  readonly problem: "empty" | "malformed" | "mismatch";
+  readonly contract: Address;
+  readonly expected: Hex;
+  readonly observed: Hex | undefined;
+  constructor(problem: "empty" | "malformed" | "mismatch", contract: Address, expected: Hex, observed: Hex | undefined, text: string) {
+    super(`evm-htlc: refusing to connect: ${text}`);
+    this.name = "EvmContractCodeError";
+    this.problem = problem;
+    this.contract = contract;
+    this.expected = expected;
+    this.observed = observed;
+  }
+}
+
+/**
+ * P9-3 (rule 3): a log scan could not be completed inside `MAX_LOG_SCAN_CHUNKS` calls of `maxLogRange` blocks each, so part of the
+ * range `[fromBlock, toBlock]` was NOT read (`unreadFrom`..`unreadTo` is that part). Nothing is ever truncated silently: a caller
+ * that gets this knows the scan is incomplete and must not read "no log" from it. `findClaimedPreimage` throws it only when no
+ * preimage was found in the part it did read (a found preimage is returned whatever lies below); the write-evidence lookup throws
+ * it before reading anything.
+ */
+export class EvmLogScanBoundError extends Error {
+  readonly fromBlock: bigint;
+  readonly toBlock: bigint;
+  readonly unreadFrom: bigint;
+  readonly unreadTo: bigint;
+  readonly maxLogRange: number;
+  readonly chunkBound: number;
+  constructor(fromBlock: bigint, toBlock: bigint, unreadFrom: bigint, unreadTo: bigint, maxLogRange: number, chunkBound: number) {
+    super(
+      `evm-htlc: the log scan from block ${fromBlock} to ${toBlock} needs more than ${chunkBound} eth_getLogs calls of at most ${maxLogRange} blocks; ` +
+        `blocks ${unreadFrom} to ${unreadTo} were not read, so the scan is incomplete`,
+    );
+    this.name = "EvmLogScanBoundError";
+    this.fromBlock = fromBlock;
+    this.toBlock = toBlock;
+    this.unreadFrom = unreadFrom;
+    this.unreadTo = unreadTo;
+    this.maxLogRange = maxLogRange;
+    this.chunkBound = chunkBound;
+  }
+}
+
+/** P9-3: the `maxLogRange` in force for `config`: the configured one, else 500 on Base Sepolia, else `undefined` (no limit: one call to `latest`). */
+export function effectiveMaxLogRange(config: EvmRailConfig): number | undefined {
+  if (config.maxLogRange !== undefined) return config.maxLogRange;
+  return config.pin.chainId === BASE_SEPOLIA_CHAIN_ID ? BASE_SEPOLIA_MAX_LOG_RANGE : undefined;
+}
+
+/** One `eth_getLogs` call of a scan: `to` is `"latest"` only for the unlimited single call. */
+interface LogRange {
+  from: bigint;
+  to: bigint | "latest";
+}
+
 /** Shared by the wrapped public client (which records a timeout) and the rail (which reads it back after a vendored write
  *  has re-wrapped the error as `tclk: ...`). One write runs at a time on one rail handle. */
 interface ReceiptWatch {
@@ -567,6 +670,23 @@ export class EvmHtlcRail {
           `(expected ${options.config.pin.chainId})` +
           (denyName !== undefined ? `; ${liveChainId} is deny-listed as ${denyName}` : ""),
       );
+    }
+
+    // P9-2 (rule 2): a pinned contract is trusted by its code. One `eth_getCode` read, before any client is handed back, so no write can
+    // happen against a different or empty contract. (Code at an address cannot change: the escrow has no upgrade path and no selfdestruct.)
+    const pinnedCodeHash = options.config.contractCodeHash;
+    if (pinnedCodeHash !== undefined) {
+      const code = await options.rpc.request({ method: "eth_getCode", params: [options.config.contract, "latest"] });
+      const verdict = judgeRuntimeCode(code, pinnedCodeHash);
+      if (!verdict.ok) {
+        throw new EvmContractCodeError(
+          verdict.problem,
+          options.config.contract,
+          pinnedCodeHash.toLowerCase() as Hex,
+          verdict.problem === "mismatch" ? verdict.observed : undefined,
+          describeCodeProblem(verdict, options.config.contract, pinnedCodeHash),
+        );
+      }
     }
 
     const rail = new EvmHashRail({

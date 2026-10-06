@@ -14,9 +14,9 @@
 
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
-import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunctionResult, getAddress, numberToHex, type Address, type Hex } from "viem";
+import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunctionResult, getAddress, keccak256, numberToHex, type Address, type Hex } from "viem";
 
-import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../../src/rails/evm-htlc.js";
+import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN, type EvmRailConfig } from "../../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../../src/rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../../src/vendor/evm-hash-rail.js";
 
@@ -93,13 +93,24 @@ export class EvmMockNode {
   blockNumber = 5n;
   /** When true `eth_getLogs` answers nothing (an evidence lookup that finds no event although the transaction mined). */
   hideLogs = false;
-  /** A public provider's cap (R1-13): `eth_getLogs` over more than this many blocks (from `fromBlock` to the latest block) is refused with
-   *  an error, as a range-capped RPC does. `undefined` = no cap. */
+  /** A public provider's cap (R1-13, P9-3): an `eth_getLogs` over more than this many blocks (`fromBlock` to `toBlock`, BOTH ends counted,
+   *  `toBlock` "latest" meaning the tip) is refused with an error, as a range-capped RPC does (the strictest reading of "limited to a 500
+   *  range": a 500-block call passes, a 501-block call is refused). `undefined` = no cap. */
   maxLogSpan: bigint | undefined;
   /** When true every `eth_getLogs` is refused with an error (a provider that is down for log queries). */
   refuseLogs = false;
   /** Every `fromBlock` an `eth_getLogs` was asked for, in order (a test reads where a scan started). */
   readonly logQueries: bigint[] = [];
+  /** Every `eth_getLogs` range that was asked for, in order, refused ones included (`to` is the tip for a "latest" call, `latest` says so). */
+  readonly logRanges: Array<{ from: bigint; to: bigint; latest: boolean }> = [];
+  /** The chain id `eth_chainId` answers (31337 anvil; 84532 makes `config()` a Base Sepolia pin with the code hash). */
+  chainId = ANVIL_LOCAL_PIN.chainId;
+  /** P9-2: the runtime code `eth_getCode` answers for the rail contract (any other address has none). A test sets another to play a different contract. */
+  contractCode: Hex = "0x6080604052348015600e575f5ffd5b50600436106100565760003560e01c8063ab12cd3414610059575b5f5ffd5b610061610063565b005b565bfea164736f6c6343000818000a";
+  /** Every address `eth_getCode` was asked about, in order. */
+  readonly codeReads: string[] = [];
+  /** Fields merged into `config()` (a test sets `maxLogRange`, `receiptTimeoutMs`, or turns the code pin off with `contractCodeHash: undefined`). */
+  configExtras: { [K in keyof EvmRailConfig]?: EvmRailConfig[K] | undefined } = {};
   /** See `SendHook`. */
   hook: SendHook | undefined;
   private readonly logs: StoredLog[] = [];
@@ -116,8 +127,15 @@ export class EvmMockNode {
     private readonly signers: readonly EvmSignerLike[],
   ) {}
 
+  /** The rail config for this node: the anvil pin by default (no code pin), the Base Sepolia pin with the contract's code hash when `chainId` is 84532. */
   config(): EvmRailConfig {
-    return { pin: ANVIL_LOCAL_PIN, endpoint: "http://mock-evm", contract: this.railContract, assets: { USDC: this.token } };
+    const base: EvmRailConfig =
+      this.chainId === BASE_SEPOLIA_PIN.chainId
+        ? { pin: BASE_SEPOLIA_PIN, endpoint: "http://mock-evm", contract: this.railContract, assets: { USDC: this.token }, contractCodeHash: keccak256(this.contractCode) }
+        : { pin: ANVIL_LOCAL_PIN, endpoint: "http://mock-evm", contract: this.railContract, assets: { USDC: this.token } };
+    const merged: Record<string, unknown> = { ...base, ...this.configExtras };
+    for (const key of Object.keys(merged)) if (merged[key] === undefined) delete merged[key];
+    return merged as unknown as EvmRailConfig;
   }
 
   rejectNextSend(fn: SendKind): void {
@@ -169,7 +187,12 @@ export class EvmMockNode {
   private handle(method: string, params: readonly unknown[]): Envelope {
     switch (method) {
       case "eth_chainId":
-        return { result: `0x${ANVIL_LOCAL_PIN.chainId.toString(16)}` };
+        return { result: `0x${this.chainId.toString(16)}` };
+      case "eth_getCode": {
+        const who = String(params[0]).toLowerCase();
+        this.codeReads.push(who);
+        return { result: who === this.railContract.toLowerCase() ? this.contractCode : "0x" };
+      }
       case "eth_blockNumber":
         return { result: numberToHex(this.blockNumber) };
       case "personal_sign": {
@@ -208,9 +231,12 @@ export class EvmMockNode {
       case "eth_getLogs": {
         const filter = params[0] as { topics?: Array<string | null>; fromBlock?: string; toBlock?: string };
         const from = filter.fromBlock !== undefined && filter.fromBlock.startsWith("0x") ? BigInt(filter.fromBlock) : 0n;
+        const toIsHex = filter.toBlock !== undefined && filter.toBlock.startsWith("0x");
+        const to = toIsHex ? BigInt(filter.toBlock as string) : this.blockNumber;
         this.logQueries.push(from);
+        this.logRanges.push({ from, to, latest: !toIsHex });
         if (this.refuseLogs) return { error: { code: -32000, message: "mock evm node: eth_getLogs refused (test)" } };
-        if (this.maxLogSpan !== undefined && this.blockNumber - from > this.maxLogSpan) {
+        if (this.maxLogSpan !== undefined && to - from + 1n > this.maxLogSpan) {
           return { error: { code: -32602, message: `mock evm node: query exceeds the block range limit of ${this.maxLogSpan} (test)` } };
         }
         return { result: this.getLogs(filter) };
@@ -226,10 +252,11 @@ export class EvmMockNode {
 
   private getLogs(filter: { topics?: Array<string | null>; fromBlock?: string; toBlock?: string }) {
     const from = filter.fromBlock !== undefined && filter.fromBlock.startsWith("0x") ? BigInt(filter.fromBlock) : 0n;
+    const to = filter.toBlock !== undefined && filter.toBlock.startsWith("0x") ? BigInt(filter.toBlock) : undefined;
     const [topic0, topic1] = filter.topics ?? [];
     if (this.hideLogs) return [];
     return this.logs
-      .filter((log) => log.blockNumber >= from)
+      .filter((log) => log.blockNumber >= from && (to === undefined || log.blockNumber <= to))
       .filter((log) => (log.raw.topics as string[])[0] === topic0)
       .filter((log) => topic1 === undefined || topic1 === null || (log.raw.topics as string[])[1] === topic1)
       .map((log) => log.raw);

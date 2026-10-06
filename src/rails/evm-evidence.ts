@@ -47,6 +47,7 @@ import {
 import type { LockTerms } from "@flop-labs/tclk";
 
 import { EVM_HASH_RAIL_ABI } from "../vendor/evm-hash-rail.js";
+import { describeCodeProblem, judgeRuntimeCode } from "./evm-code-pin.js";
 import { readCapture, type CapturingRpc, type Exchange } from "./rpc-capture.js";
 // D3 (P22-P24-EVM-FIXES-R2.md): a captured config is validated with the exact same
 // allow-list/D-09/shape rule every other rail-config entry point runs (A3) — `checkEvmRailConfig`
@@ -495,6 +496,30 @@ function validateLocksCallRequest(request: ParsedRequest, config: EvmRailConfig,
   return null;
 }
 
+/**
+ * P9-2 (rule 2): the code pin, judged purely from the capture. Only ever called when the AUDITOR's own config carries
+ * `contractCodeHash` (the trust anchor: a capture cannot opt itself out). The capture must have been taken under the same pin
+ * (its own frozen config names the same hash), must hold an `eth_getCode(config.contract, "latest")` exchange that binds to this
+ * capture like every other one (`bindExchange`), and the code that exchange returned must hash to the pinned value. `null` when it
+ * does; otherwise the fail-closed reason (the caller reports `railVerified: null` with it, so the board never folds on an
+ * unpinned contract).
+ */
+function codePinReason(capture: EvmCapture, capturedConfig: EvmRailConfig, config: EvmRailConfig, pinned: string): string | null {
+  if (typeof capturedConfig.contractCodeHash !== "string" || capturedConfig.contractCodeHash.toLowerCase() !== pinned.toLowerCase()) {
+    return "evm-htlc: capture was taken without the auditor's contractCodeHash pin (its own config carries none or another)";
+  }
+  const bound = bindExchange(capture, findByMethod(capture.index.exchanges, "eth_getCode"), "eth_getCode");
+  if (bound.kind === "missing") return bound.reason;
+  if (bound.outcome.kind === "error") return "rpc rejected eth_getCode";
+  const params = bound.request.params;
+  if (!Array.isArray(params) || params.length !== 2 || !isValidAddressShape(params[0]) || !isAddressEqual(params[0], config.contract) || params[1] !== "latest") {
+    return "evm-htlc: eth_getCode request does not read this deployment's contract at latest (tampered)";
+  }
+  const verdict = judgeRuntimeCode(bound.outcome.value, pinned);
+  if (verdict.ok) return null;
+  return `evm-htlc: ${describeCodeProblem(verdict, config.contract, pinned)}`;
+}
+
 function firstFieldMismatch(args: {
   onChainPayee: Address;
   onChainToken: Address;
@@ -639,6 +664,13 @@ export function evmEvidence(input: EvmEvidenceInput): EvmEvidenceResult {
   }
   if (!isAddressEqual(capture.index.contract, config.contract)) {
     return { lock: { ...base2, railVerified: null, reason: "capture index contract does not match config.contract" } };
+  }
+
+  // P9-2 (rule 2): before anything is decoded from the contract, the contract must be the pinned code. Checked against the
+  // AUDITOR's config, so a capture taken without the pin (or one that never read the code) fails closed here.
+  if (config.contractCodeHash !== undefined) {
+    const codeReason = codePinReason(capture, capturedConfig, config, config.contractCodeHash);
+    if (codeReason !== null) return { lock: { ...base2, railVerified: null, reason: codeReason } };
   }
 
   const finalized = resolveFinalizedBlock(capturedConfig, capture);
@@ -928,6 +960,13 @@ export async function captureEvmLeg(
       const parsedChainId = parseHexNumber(chainIdRaw);
       if (parsedChainId === null) return finish(declaredFinalityRecord, 0);
       chainId = parsedChainId;
+
+      // P9-2 (rule 2): a pinned config also reads the escrow's code (public data), so the verdict can be re-derived, and refused,
+      // from the capture alone. Recorded whatever it says: `evmEvidence` judges it, this function only reads. An error reply is
+      // recorded too and lands in the catch below (the capture then carries `error` and fails closed).
+      if (config.contractCodeHash !== undefined) {
+        await rpc.request({ method: "eth_getCode", params: [config.contract, "latest"] });
+      }
 
       let blockHash: Hex | null;
       let finalityRecord: EvmCaptureIndex["finality"] = declaredFinalityRecord;
