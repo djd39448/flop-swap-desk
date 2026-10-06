@@ -861,7 +861,7 @@ describe("runSweep", () => {
       technocore: (url: string) => FakeResponse;
       rpcEndpoint: string;
       rpcResult: (method: string, params: unknown) => RpcOutcome;
-      calls: Array<{ url: string; body?: string }>;
+      calls: Array<{ url: string; body?: string | undefined }>;
     }): typeof fetch {
       return (async (input: unknown, init?: unknown) => {
         const url = String(input);
@@ -1339,7 +1339,7 @@ describe("runSweep", () => {
       technocore: (url: string) => FakeResponse;
       rpcEndpoint: string;
       rpcResult: (method: string, params: unknown) => RpcOutcome;
-      calls: Array<{ url: string; body?: string; headers?: Record<string, string> }>;
+      calls: Array<{ url: string; body?: string | undefined; headers?: Record<string, string> | undefined }>;
     }): typeof fetch {
       return (async (input: unknown, init?: unknown) => {
         const url = String(input);
@@ -1688,7 +1688,7 @@ describe("runSweep", () => {
       technocore: (url: string) => { status: number; body: string };
       rpcEndpoint: string;
       rpcResult: (method: string, params: unknown) => RpcOutcome;
-      calls: Array<{ url: string; body?: string }>;
+      calls: Array<{ url: string; body?: string | undefined }>;
     }): typeof fetch {
       return (async (input: unknown, init?: unknown) => {
         const url = String(input);

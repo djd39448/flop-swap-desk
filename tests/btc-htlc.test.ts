@@ -1276,7 +1276,7 @@ describe("BtcHtlcRail.findMempoolSpend", () => {
         getrawtransaction: (params) =>
           params[0] === SPENDER_TXID
             ? { vin: [{ txid: FUND_TXID, vout: 1, txinwitness: ["aa", "bb"] }] }
-            : (baseHandlers().getrawtransaction(params, undefined) as unknown),
+            : (baseHandlers().getrawtransaction!(params, undefined) as unknown),
       }),
     );
     const result = await rail.findMempoolSpend(REF);

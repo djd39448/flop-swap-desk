@@ -125,7 +125,7 @@ export function scenario(options: ScenarioOptions): Scenario {
           wantAsset: "FLOP",
           wantAmount: options.wantAmount ?? "52070000",
           wantRail: "flop-htlc",
-          feeBps: options.feeBps,
+          ...(options.feeBps !== undefined ? { feeBps: options.feeBps } : {}),
         }),
     },
     nonce: options.offerANonce ?? "a001a001a001a001",

@@ -113,7 +113,7 @@ const RAIL_CONTRACT_ADDRESS = getAddress("0x000000000000000000000000000000000000
 const RAIL_ACCOUNT = { address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" as Address, type: "json-rpc" } as const;
 const RAIL_TX_HASH = ("0x" + "aa".repeat(32)) as `0x${string}`;
 
-type MockRpcCall = { method: string; params?: unknown[] };
+type MockRpcCall = { method: string; params?: unknown[] | undefined };
 
 function makeMockProvider(onSend: (tx: Record<string, unknown>) => `0x${string}`, receiptStatus: "0x0" | "0x1" = "0x1") {
   const calls: MockRpcCall[] = [];

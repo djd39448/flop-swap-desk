@@ -150,7 +150,7 @@ function buildCapture(opts: {
   config?: EvmRailConfig;
   nonce?: string;
   exchanges: ExchangeSpec[];
-}): EvmCapture {
+}): EvmCapture & { bytes: ReadonlyMap<string, Uint8Array> } {
   const nonce = opts.nonce ?? NONCE;
   const bySha = new Map<string, Uint8Array>();
   const exchanges: EvmCaptureIndexExchange[] = opts.exchanges.map((spec, i) => {

@@ -237,7 +237,7 @@ describe("examples/audit-export.mjs — committed near-sandbox client-flow fixtu
     for (const file of files) {
       const text = readFileSync(file, "utf8");
       for (const m of text.matchAll(ED25519_PUBLIC_KEY_FIELD)) {
-        const decoded = tryDecodeBase58(m[1]);
+        const decoded = tryDecodeBase58(m[1]!);
         if (decoded && decoded.length === 32) known.add(base58.encode(decoded));
       }
     }

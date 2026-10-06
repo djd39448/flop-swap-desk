@@ -456,7 +456,7 @@ describe("solEvidence - the program is the pinned, immutable one", () => {
     const pd = pubkeyToBase58(findProgramData());
     const account = w.chain.accounts.get(pd)!;
     const data = account.data.slice();
-    data[45] ^= 1;
+    data[45]! ^= 1;
     w.chain.put(pd, { ...account, data });
     const result = verdict(w, await takeCapture(w));
     expect(result.lock.railVerified).toBeNull();

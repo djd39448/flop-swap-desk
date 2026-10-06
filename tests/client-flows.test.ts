@@ -167,7 +167,7 @@ type Responder = (params: readonly unknown[]) => { result?: unknown; error?: { c
 function mockRpc(handlers: Record<string, Responder>): CapturingRpc {
   const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body)) as { id: number; method: string; params: readonly unknown[] };
-    const handler = handlers[body.method] ?? ((params: readonly unknown[]) => proofRpcResult(body.method, params) ?? (() => {
+    const handler: Responder = handlers[body.method] ?? ((params: readonly unknown[]) => proofRpcResult(body.method, params) ?? (() => {
       throw new Error(`mock rpc: unexpected method ${body.method}`);
     })());
     const response = handler(body.params);
@@ -454,7 +454,7 @@ describe("BuyerFlow.acceptLegB / lockLegA — C2 (paid what it asked for)", () =
       claimByMs: offerB.claimByMs,
       refundAfterMs: offerB.refundAfterMs,
       expiresMs: offerB.expiresMs,
-      job: offerB.job,
+      ...(offerB.job !== undefined ? { job: offerB.job } : {}),
     });
     const stingyRecord = await h.venue.post(OFFER_ROOM, encodeFrame(stingyOfferB), h.seller);
     await expect(h.buyerFlow.acceptLegB(stingyRecord, acceptARecord, T0)).rejects.toThrow(

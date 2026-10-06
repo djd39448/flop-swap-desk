@@ -105,7 +105,7 @@ function buildAttack(loaded: Loaded): Attack {
   const t = Math.max(...loaded.offers.map((r) => r.timestampMs)) + 1_000;
 
   const mirrorSwapId = computeSwapId(mirrorBuyer.did, "00000000000000e1");
-  const offerA = mirrorOffer(victimA.offer, mirrorBuyer.did, mirrorSwapId, victimA.offer.job!.context, "e1e1e1e1e1e1e1e1");
+  const offerA = mirrorOffer(victimA.offer, mirrorBuyer.did, mirrorSwapId, victimA.offer.job!.context!, "e1e1e1e1e1e1e1e1");
   const acceptA = makeAccept(offerA, { from: mirrorSeller.did, statement: victimA.accept.statement, nonce: "e2e2e2e2e2e2e2e2" });
   const offerB = mirrorOffer(victimB.offer, mirrorSeller.did, mirrorSwapId, legBContext(offerA.id), "e3e3e3e3e3e3e3e3");
   const acceptB = makeAccept(offerB, { from: mirrorBuyer.did, statement: victimA.accept.statement, nonce: "e4e4e4e4e4e4e4e4" });

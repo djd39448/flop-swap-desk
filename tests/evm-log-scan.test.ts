@@ -495,7 +495,9 @@ const LOCKED_EVENT = {
   ],
 } as const;
 
-function rawLog(topics: readonly Hex[], data: Hex, blockNumber: bigint) {
+/** `topics` is viem's own `encodeEventTopics` result type (an indexed argument may be a list or null); these events
+ *  have none of those, and the value is only serialised into the mock reply. */
+function rawLog(topics: readonly (Hex | readonly Hex[] | null)[], data: Hex, blockNumber: bigint) {
   return {
     address: RAIL_CONTRACT,
     topics,

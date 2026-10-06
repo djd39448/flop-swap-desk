@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { encodeFrame, generateHashLock, makeAccept, makeOffer, OFFER_ROOM } from "@flop-labs/tclk";
+import { encodeFrame, generateHashLock, makeAccept, makeOffer, OFFER_ROOM, type TranscriptRecord } from "@flop-labs/tclk";
 import { legAContext, legBContext, swapId as makeSwapId } from "../src/profile.js";
 import { foldCaptured } from "../src/replay.js";
 import { identity, record } from "./helpers/identity.js";
@@ -86,7 +86,7 @@ describe("loadArchivedOfferLines + loadOffers merge (mirrors examples/audit-expo
     // seq it is missing filled in from the swap archive.
     const archived = loadArchivedOfferLines(root);
     expect(archived.map((r: { seq: number }) => r.seq).sort((a: number, b: number) => a - b)).toEqual([1, 2]);
-    const bySeq = new Map(ringOffers.map((r: { seq: number }) => [r.seq, r]));
+    const bySeq = new Map<number, TranscriptRecord>(ringOffers.map((r: { seq: number }) => [r.seq, r]));
     for (const r of archived) if (!bySeq.has(r.seq)) bySeq.set(r.seq, r);
     const offers = [...bySeq.values()].sort((a: { seq: number }, b: { seq: number }) => a.seq - b.seq);
     expect(offers.map((r: { seq: number }) => r.seq)).toEqual([1, 2, 3, 4]);
