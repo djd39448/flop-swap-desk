@@ -20,6 +20,7 @@ import {
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import {
   BTC_REGTEST_PIN,
+  BTC_SIGNET_PIN,
   BtcHtlcRail,
   checkBtcRailConfig,
   keyFromAddressInfo,
@@ -185,6 +186,119 @@ describe("checkBtcRailConfig / validateBtcRailConfig", () => {
     expect(checkBtcRailConfig(null).ok).toBe(false);
     expect(checkBtcRailConfig({}).ok).toBe(false);
     expect(checkBtcRailConfig({ ...config(), pin: { ...BTC_REGTEST_PIN, finality: { confirmations: 0 } } }).ok).toBe(false);
+  });
+});
+
+// ── P9-5: the signet pin ─────────────────────────────────────────────────────────────────────
+
+// The real signet genesis block hash (64 lowercase hex), as published by signet's own parameters and read from a
+// public block explorer on 2026-10-05 (handoff/G1-PREP-2026-10-05.md section 4). It has NOT met a live node of this
+// build yet: that check is Dave's at G1 time, and the pin keeps its `-UNVERIFIED` name until it has.
+const SIGNET_GENESIS = "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6";
+// The 63-character value this constant held before P9-5 (one character short, with a different tail).
+const OLD_SIGNET_GENESIS = "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3628bea634";
+const MAINNET_GENESIS = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+
+function signetConfig(overrides: Partial<BtcRailConfig["pin"]> = {}): BtcRailConfig {
+  return { pin: { ...BTC_SIGNET_PIN, ...overrides }, endpoint: "http://127.0.0.1:38332" };
+}
+
+async function connectSignet(handlers: Handlers): Promise<{ rail: BtcHtlcRail; rpc: CapturingRpc; calls: RpcCallLog[] }> {
+  const { fetch: fetchImpl, calls } = mockBitcoind(handlers);
+  const rpc = new CapturingRpc({ endpoint: "http://127.0.0.1:38332", fetch: fetchImpl });
+  const rail = await BtcHtlcRail.connect({ config: signetConfig(), rpc });
+  return { rail, rpc, calls };
+}
+
+/** A healthy signet node: the signet chain name and the real signet genesis. */
+function signetHandlers(overrides: Partial<Handlers> = {}): Handlers {
+  return baseHandlers({
+    getblockchaininfo: () => ({ chain: "signet", blocks: 200, time: 1_690_000_000, mediantime: 1_690_000_000 }),
+    getblockhash: (params) => (params[0] === 0 ? SIGNET_GENESIS : `${"00".repeat(31)}ff`),
+    ...overrides,
+  });
+}
+
+describe("P9-5: BTC_SIGNET_PIN is the real signet genesis (rule: a pin is correct before it is trusted)", () => {
+  it("the genesis hash is 64 lowercase hex characters and is the real signet genesis", () => {
+    expect(BTC_SIGNET_PIN.genesisHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(BTC_SIGNET_PIN.genesisHash).toHaveLength(64);
+    expect(BTC_SIGNET_PIN.genesisHash).toBe(SIGNET_GENESIS);
+  });
+
+  // Offline derivation, no node involved: the genesis hash is the double sha256 of the 80-byte block header, shown
+  // byte-reversed. The signet header is version 1, no parent, the same coinbase merkle root as mainnet, time
+  // 1598918400, bits 0x1e0377ae, nonce 52613770 (Bitcoin Core's chainparams for signet). The same procedure over the
+  // mainnet header gives the mainnet genesis, which shows the helper itself is right. This proves the constant is
+  // the genesis of that header; it does not prove a live node agrees, which is why the pin keeps `-UNVERIFIED`.
+  function genesisHashOf(header: { time: number; bits: number; nonce: number }): string {
+    const merkleRoot = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+    const bytes = new Uint8Array(80);
+    const view = new DataView(bytes.buffer);
+    view.setUint32(0, 1, true); // version
+    // bytes 4..35: the parent hash, all zero for a genesis block
+    bytes.set(hexToBytes(merkleRoot).reverse(), 36);
+    view.setUint32(68, header.time, true);
+    view.setUint32(72, header.bits, true);
+    view.setUint32(76, header.nonce, true);
+    return bytesToHex(sha256(sha256(bytes)).reverse());
+  }
+
+  it("the genesis hash is the double sha256 of the real signet genesis header (derived offline; mainnet's header proves the helper)", () => {
+    expect(genesisHashOf({ time: 1231006505, bits: 0x1d00ffff, nonce: 2083236893 })).toBe(MAINNET_GENESIS);
+    expect(genesisHashOf({ time: 1598918400, bits: 0x1e0377ae, nonce: 52613770 })).toBe(BTC_SIGNET_PIN.genesisHash);
+  });
+
+  it("the caip2 is bip122: plus the first 32 hex characters of the genesis hash, and is itself 32 characters long", () => {
+    expect(BTC_SIGNET_PIN.caip2).toBe(`bip122:${SIGNET_GENESIS.slice(0, 32)}`);
+    expect(BTC_SIGNET_PIN.caip2).toBe("bip122:00000008819873e925422c1ff0f99f7c");
+    expect(BTC_SIGNET_PIN.caip2.slice("bip122:".length)).toHaveLength(32);
+  });
+
+  it("keeps its UNVERIFIED name, the signet network and one confirmation", () => {
+    expect(BTC_SIGNET_PIN.name).toBe("btc-signet-UNVERIFIED");
+    expect(BTC_SIGNET_PIN.network).toBe("signet");
+    expect(BTC_SIGNET_PIN.finality).toEqual({ confirmations: 1 });
+  });
+
+  it("checkBtcRailConfig({ pin: BTC_SIGNET_PIN, endpoint }) is ok (before P9-5 it failed the 64-character shape check)", () => {
+    const result = checkBtcRailConfig({ pin: BTC_SIGNET_PIN, endpoint: "http://127.0.0.1:38332" });
+    expect(result).toEqual({ ok: true, config: { pin: BTC_SIGNET_PIN, endpoint: "http://127.0.0.1:38332" } });
+    expect(() => validateBtcRailConfig(signetConfig())).not.toThrow();
+  });
+
+  it("the old 63-character value is still refused, by its length", () => {
+    const result = checkBtcRailConfig(signetConfig({ genesisHash: OLD_SIGNET_GENESIS, caip2: `bip122:${OLD_SIGNET_GENESIS.slice(0, 32)}` }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/64 lowercase hex/);
+  });
+
+  it("a signet pin renamed, or with another network's genesis, is not a known pin", () => {
+    expect(() => validateBtcRailConfig(signetConfig({ name: "btc-signet" }))).toThrow(/does not match the known pin's own name/);
+    // Mainnet's genesis under the signet network name: well-shaped, but nothing this build knows.
+    const mainnetUnderSignet = signetConfig({ genesisHash: MAINNET_GENESIS, caip2: `bip122:${MAINNET_GENESIS.slice(0, 32)}` });
+    expect(() => validateBtcRailConfig(mainnetUnderSignet)).toThrow(/does not match any known pin/);
+    // Regtest's genesis under the signet network name, and signet's under regtest.
+    const regtestUnderSignet = signetConfig({ genesisHash: BTC_REGTEST_PIN.genesisHash, caip2: BTC_REGTEST_PIN.caip2 });
+    expect(() => validateBtcRailConfig(regtestUnderSignet)).toThrow(/does not match any known pin/);
+    const signetUnderRegtest = { pin: { ...BTC_SIGNET_PIN, network: "regtest" as const }, endpoint: "http://127.0.0.1:19000" };
+    expect(() => validateBtcRailConfig(signetUnderRegtest)).toThrow(/does not match any known pin/);
+  });
+
+  it("connect() accepts a node that reports signet and the real signet genesis, and nothing else", async () => {
+    const { rail, rpc } = await connectSignet(signetHandlers());
+    expect(rail).toBeInstanceOf(BtcHtlcRail);
+    expect(rpc.exchanges()).toHaveLength(0);
+
+    // A regtest node answering a signet pin: wrong chain name.
+    const regtestNode = mockBitcoind(baseHandlers());
+    const rpc2 = new CapturingRpc({ endpoint: "http://x", fetch: regtestNode.fetch });
+    await expect(BtcHtlcRail.connect({ config: signetConfig(), rpc: rpc2 })).rejects.toThrow(/does not match pin "btc-signet-UNVERIFIED"/);
+
+    // A signet-named node with another genesis (a custom signet, or a lie): refused by the genesis check.
+    const other = mockBitcoind(signetHandlers({ getblockhash: () => "ff".repeat(32) }));
+    const rpc3 = new CapturingRpc({ endpoint: "http://x", fetch: other.fetch });
+    await expect(BtcHtlcRail.connect({ config: signetConfig(), rpc: rpc3 })).rejects.toThrow(/genesis hash .* does not match pin "btc-signet-UNVERIFIED"/);
   });
 });
 

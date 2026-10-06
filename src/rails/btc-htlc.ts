@@ -97,16 +97,26 @@ export const BTC_REGTEST_PIN: BtcChainPin = {
 };
 
 /** UNVERIFIED (P4-BTC-SPEC.md §4): this genesis hash is signet's well-known default value from
- *  public references, never confirmed by this build against a live signet node — that
- *  confirmation is Dave's own G1 step. Do not use this pin for a real deployment until it has
- *  been; `connect()`'s own genesis check will simply refuse a live signet node if this value
- *  turns out to be wrong, so using it by mistake fails closed rather than silently mispinning.
- */
+ *  public references (a public block explorer's signet API, 2026-10-05, G1-PREP section 4), never
+ *  confirmed by this build against a live signet node — that confirmation is Dave's own G1 step
+ *  (`bitcoin-cli -signet getblockhash 0` must print exactly `genesisHash` below), and the
+ *  `-UNVERIFIED` suffix stays on `name` until it has been. Do not use this pin for a real
+ *  deployment until it has; `connect()`'s own genesis check will simply refuse a live signet node
+ *  if this value turns out to be wrong, so using it by mistake fails closed rather than silently
+ *  mispinning. The value is also the double sha256 of signet's genesis header (time 1598918400,
+ *  bits 0x1e0377ae, nonce 52613770), derived offline in tests/btc-htlc.test.ts: that shows the
+ *  constant is the genesis of that header, not that a node agrees, so the suffix still waits for
+ *  the live check.
+ *
+ *  P9-5: before this fix the genesis hash was 63 characters with a different tail, and the CAIP-2
+ *  reference was 31 characters, so the pin failed this file's own shape check and no signet config
+ *  could pass any entry point. Both are now exact: 64 lowercase hex, and `caip2` is `bip122:` plus
+ *  the first 32 of them. */
 export const BTC_SIGNET_PIN: BtcChainPin = {
   name: "btc-signet-UNVERIFIED",
   network: "signet",
-  caip2: "bip122:00000008819873e925422c1ff0f99f7",
-  genesisHash: "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3628bea634",
+  caip2: "bip122:00000008819873e925422c1ff0f99f7c",
+  genesisHash: "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
   finality: { confirmations: 1 },
 };
 

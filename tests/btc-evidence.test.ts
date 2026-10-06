@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { BTC_REGTEST_NETWORK, buildHtlcScript } from "../src/rails/btc-script.js";
 import { CapturingRpc, readCapture, writeCapture } from "../src/rails/rpc-capture.js";
-import { DEFAULT_SCAN_WINDOW_BLOCKS, type BtcChainPin, type BtcRailConfig } from "../src/rails/btc-htlc.js";
+import { BTC_SIGNET_PIN, checkBtcRailConfig, DEFAULT_SCAN_WINDOW_BLOCKS, type BtcChainPin, type BtcRailConfig } from "../src/rails/btc-htlc.js";
 import {
   btcEvidence,
   btcLockRefInvalid,
@@ -522,13 +522,17 @@ describe("btcEvidence — claimed / refunded", () => {
 // ── config validation (A4/D3, mirrored from evm-evidence.ts) ────────────────────────────────
 
 describe("btcEvidence — config validation", () => {
-  // NOTE: a true "captured under the OTHER known pin" test (auditor=regtest, capture=signet,
-  // both individually valid) cannot be constructed today: `BTC_SIGNET_PIN.genesisHash` in
-  // src/rails/btc-htlc.ts is 63 hex characters, one short of a real 32-byte hash, so it already
-  // fails `checkBtcRailConfig`'s own pre-existing shape check regardless of H3. That pin is
-  // documented "UNVERIFIED" pending Dave's own signet G1 step, so this is flagged as a deviation
-  // rather than silently "fixed" with an invented genesis hash. The two tests below still prove
-  // H3's own two rules (unknown pin; renamed pin.name) directly.
+  // P9-5: the signet pin used to fail `checkBtcRailConfig`'s own shape check (a 63-character genesis hash), so a
+  // capture taken under the OTHER known pin could not be built; it can now (the first test below).
+
+  it("H3: null for a capture taken under the OTHER known pin (auditor regtest, capture signet, both individually valid)", () => {
+    const signetConfig: BtcRailConfig = { pin: BTC_SIGNET_PIN, endpoint: "http://127.0.0.1:38332" };
+    expect(checkBtcRailConfig(signetConfig).ok).toBe(true); // the capture's own config is valid, so only the pin mismatch can refuse it
+    const capture = buildCapture({ exchanges: unspentExchanges(3), config: signetConfig });
+    const result = btcEvidence({ terms: TERMS, config: CONFIG, accounts: ACCOUNTS, capture });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/capture was taken under a different rail config/);
+  });
 
   it("H3: null for a capture whose own (network, genesisHash) does not match any known pin", () => {
     const capture = buildCapture({ exchanges: unspentExchanges(3), config: { ...CONFIG, pin: { ...PIN, genesisHash: "ff".repeat(32), caip2: `bip122:${"ff".repeat(16)}` } } });
