@@ -291,13 +291,19 @@ written down instead of hidden.
 - **A lock whose evidence lookup fails is not announced.** If leg A's lock transaction mines but
   the adapter's bounded event lookup then fails, `BuyerFlow.lockLegA` throws before posting the
   `lock` frame. The funds stay safe (`refundLegA` works from the recorded hash lock and the chain
-  itself after `refundAfterMs`), but the board shows leg A as never funded.
+  itself after `refundAfterMs`), but the board shows leg A as never funded. With a `store`, the next
+  `lockLegA` call (or `reconcileLockA()`), in this process or after a restart, reads the lock by its hash
+  lock, records it and posts the lock frame, so the board catches up; without a store only
+  `reconcileLockA()` in the same process does.
 - **A claim's last guard still has two round trips after it.** viem's chain-id assertion and
   `eth_sendTransaction` follow the final deadline check, each a single attempt (transport retries
   are off) bounded by the RPC timeout (45 s by default), well inside the 5-minute
   claim-inclusion margin.
 - **The claim endpoint is trusted with the preimage** at the moment the claim is sent (see
   above).
+- **A restart costs gas at most.** After a crash a repeated `approve`, `lock`, `claim` or `refund` is refused by the
+  contract (a duplicate hash lock, a spent status), so a resumed EVM flow cannot lock or pay twice; the price of
+  the repeat is gas (see "Resume").
 
 ## Bitcoin leg (local, keyless)
 
@@ -423,14 +429,16 @@ party or reveal the secret without payment.
   enforced only by the Seller's own client, and none of this removes the underlying race after
   `T` — it only ensures each side's own client sees the same chain/mempool state the other one
   does, as early as its own next read.
-- **Two lost-reply cases end with the money right but the frames missing.** (1) If the Seller's
+- **Two lost-reply cases end with the money right but the frames missing (a flow without a store).** (1) If the Seller's
   claim broadcast reply is lost and the claim is mined before the retry, `claimLegA` refuses on the
   retry (the lock now reads `claimed`), so the Seller's reveal and receipt frames are never posted;
   the Seller already has the BTC and the Buyer still learns the secret from the chain. (2) If the
   Buyer's refund broadcast reply is lost and the refund is mined (and its output spent) before the
   retry, `refundLegA` fails with the node's raw rejection instead of posting its refund frames; the
   Buyer already has its BTC back. In both cases the watcher's evidence still shows the leg's real
-  state from the chain.
+  state from the chain. With a `store` both are closed: a resumed (or retried) `claimLegA` looks for its own
+  claim on chain, mempool first, from the block marker saved with the attempt and posts the reveal and receipt
+  frames, and `refundLegA` resolves its recorded refund by txid and posts the refund frames (see "Resume").
 - **The refund waits for median time past, which lags wall clock.** `T = refundAfterMs / 1000` is
   checked against the chain's median time of its last 11 blocks (BIP113), not the tip block's own
   timestamp or wall-clock "now" — so a refund's real, chain-observable availability lags
@@ -453,12 +461,20 @@ party or reveal the secret without payment.
   known before the write ever runs rather than only once it returns. A failure before
   `prepareLock` itself completes (nothing yet signed) leaves the board correctly showing leg A as
   never funded — fail closed, never fail silent.
+  With a `store` the flow itself re-sends the saved funding bytes once (identical bytes, same txid, never a second
+  outpoint) after its own guards, and never re-prepares.
 - **Fees are a fixed constant, not estimated.** `DEFAULT_FEE_SATS` (`src/rails/btc-htlc.ts`) is
   subtracted from every claim/refund's single output; real fee estimation is out of scope for
   this build (P4-BTC-SPEC.md §0).
 - **One node, one confirmation policy, no reorg handling.** This build's own regtest harness
   mines on demand and never reorgs; a real deployment choosing how many confirmations count as
   final for a given amount, and how to handle a reorg past that depth, is out of scope here.
+- **Crash recovery has two limits of its own.** A node that refuses to re-broadcast a saved funding (its inputs
+  spent, a conflicting transaction, a policy rejection) stops the flow with a typed error
+  (`rebroadcast-refused`), and a person checks the wallet before any new attempt, because a second funding is a
+  second outpoint. And the hermetic double-funding tests use a ledger fake that mines instantly and always picks
+  other inputs, which real Bitcoin Core coin selection does not promise, so they prove the flow logic, not the
+  node's behaviour (see "Resume").
 
 ## NEAR leg (local sandbox in WSL)
 
@@ -673,7 +689,8 @@ Each is written down instead of hidden, per the same discipline the EVM and Bitc
   `refundAfterMs` and to call `claimLegA` again before then. A per-flow `revealPosted` /
   `receiptPosted` latch means that retry (and the chain-already-agrees path) posts only the frame
   that is missing and never a second copy; a `NearPayoutFailedError` posts a reveal but no receipt.
-  The latches live in the flow instance: a new process re-posts. tclk's machine accepts a reveal
+  With a `store` the latches live in the saved record and a resumed flow posts only the frame still missing; without
+  one they live in the flow instance and a new process re-posts. tclk's machine accepts a reveal
   only while the contract is `locked`, so a leg that is claimed on chain after `refundAfterMs`
   through the revealed-lock rule (F4/H2), once the Buyer's refund frame has landed, cannot be
   recorded in the tclk transcript (no test here exercises what the board then reports for that
@@ -690,7 +707,7 @@ Each is written down instead of hidden, per the same discipline the EVM and Bitc
   itself fails, the lock stays in that state and no method moves it out. Reachable only with a
   non-standard token whose `ft_transfer` result is not empty or JSON unit; the evidence reader
   reports `Claiming`/`Refunding` as non-final, never as an outcome. Full account in
-  `contracts-near/README.md`.
+  `contracts-near/README.md`. Crash recovery cannot move such a lock either (see "Resume").
 - **A revealed lock cannot be refunded (F4), with consequences.** Once a claim has revealed the
   preimage, the contract refuses `refund` even after `refundAfterMs`, and the claim may be retried
   at any time. If the payee never becomes storage-registered, the payer's funds on that leg stay
@@ -698,6 +715,13 @@ Each is written down instead of hidden, per the same discipline the EVM and Bitc
   adapter mirrors this: a revealed-but-`Locked` lock is retried without the deadline guards (H2)
   but only after verifying the preimage opens the hash lock, and the evidence reader reports it as
   revealed rather than `locked` (E4).
+- **A lock or refund that was signed, saved and never sent is proven dead only by re-sending it.** The node does not
+  know such a transaction and nothing moves the access key's nonce, so the flow sends the identical saved bytes
+  once, after its own guards, and takes the node's `Expired` or invalid-nonce answer, plus a read of the lock row
+  three blocks later, as the proof (about 14 s of waiting at most, then `pending`). That path, and the node's
+  answer to a re-send of bytes that already executed, are tested against the RPC simulator and mocks with the error
+  shapes a real node gave; the live NEAR suite never ages a transaction past its validity. A node that stays
+  unreachable leaves it `pending`, and a person's three routes are written down in "Resume".
 - **The capture filename stamp is not bound.** `raw/near/<hashLock>/<legContract>/<stamp>.json`:
   the evidence reader sees only the parsed index, never the filename, so the stamp is a sort
   convention. It is not evidence of when a read was taken; the index's own fields are checked
@@ -893,7 +917,8 @@ does not mean the Seller was paid (the program refuses every claim at or after `
   locked; past the bound the end of the effort is `SolClaimStarvedError`, never a silent drop. A signature that is not decided yet (`SolPendingError`) or a transport error while
   resolving it stops the call with the record kept: no second claim is signed while an earlier one could still
   land. Proof of a public secret is always that one named finalized transaction, polled until it is readable,
-  never a scan.
+  never a scan. With a `store` the recorded signatures are saved with the swap before they are sent, and
+  `SellerFlow.resume` restores them and resolves each one before any new claim (see "Resume").
 - *The Seller never scans history.* A flow that never signed a claim has no leak of its own to find and does
   the ordinary guarded claim; its only chain read for this is the escrow itself (Claimed with its own
   preimage). No path lets `SolHistoryTooLongError` block a claim. The whole-history scan stays on
@@ -915,26 +940,10 @@ Before signing, the client rail checks who the escrow pays and its mint, amount 
 own terms, and refuses a claim with no resolved payee line. Both parties' proven `ed25519` lines are required,
 for the Seller's claim and for every evidence reader.
 
-**Restart: no flow can be resumed today.** A `SellerFlow` or `BuyerFlow` holds its swap state in memory only, and no
-constructor, method or file rebuilds it. A process that dies loses the flow, and a new flow object cannot continue
-that swap. What a crash costs at each step, and what a person must do (read the escrow by its ref with `getEscrow`
-and act by hand):
-
-| Crash after | What is lost | What a person must do |
-| --- | --- | --- |
-| The Seller accepted leg A (secret minted) | the preimage, so the claim is impossible | nothing is locked yet; start a new swap. Never reuse the offer |
-| The Seller locked leg B | the preimage (leg B can only be refunded) | after leg B's `refundAfterMs` the Seller refunds leg B by hand on the paper rail |
-| The Buyer prepared the lock, before it landed | the prepared ref and signature | read the escrow at the payer-keyed ref; if it exists, it is refundable by the Buyer after `refund_after_ms` |
-| The Buyer locked leg A | the flow state (accounts, ref, leg B pairing) | refund leg A by hand after `refund_after_ms` unless the escrow reads Claimed; never refund when leg B was claimed |
-| The Seller signed a claim, before it was recorded as landed | the signature and `lastValidBlockHeight` | read the escrow: Claimed means the Seller was paid (post the frames by hand); Locked means send a fresh claim before `refund_after_ms` |
-| The Seller claimed, before the reveal frame posted | the reveal and receipt latches | the Buyer reads the preimage off the Claimed escrow (`learnSecret` does not need the frame) and claims leg B |
-| The Buyer learned the secret, before it claimed leg B | the secret | read it from the Claimed escrow's stored preimage and claim leg B on the paper rail before leg B's `refundAfterMs` |
-
-The minimal persistence surface a future rehydrate API would need, per swap, is: the Seller's preimage, both
-accepted offers and accepts, every claim signature with its `lastValidBlockHeight` (what `onSigned` hands over),
-whether the leg B lock was attempted, and the reveal and receipt latches; for the Buyer, the prepared lock record
-(the payer-keyed ref and the prepared signature, recorded before `commitLock`), the resolved accounts, the leg B
-pairing and whether leg B was claimed. That is named future work; this round adds no rehydrate API.
+**Restart.** A `SellerFlow` or `BuyerFlow` built with a `store` can be resumed after a crash. Every lock, claim and
+refund signature above is written to the store (with its `lastValidBlockHeight`) before it is sent, and a fresh process
+resolves each one by its signature before it signs anything new. The "Resume" section below covers all four rails,
+what a person still does, and what a flow without a store costs.
 
 ### Known limits of the Solana leg
 
@@ -989,7 +998,9 @@ Only what the tests prove is claimed; the rest is written down.
 - **`simulateTransaction` receives the signed claim.** The claim is simulated first so a claim the
   runtime would refuse is never sent, but the simulation request carries the signed transaction and so
   the secret. Use an endpoint you trust for the Seller, as for the send path. A claim past its own
-  deadline is refused before it is signed or simulated (live test: no simulate exchange is made).
+  deadline is refused before it is signed or simulated (live test: no simulate exchange is made). A bundle
+  persists response bytes only, never that request, and the response that did hold the secret (reading a failed
+  claim transaction) is held back until the reveal is posted; see "Resume".
 - **A claim that lost a race is not a failure.** If another transaction (a relayer, a duplicate send from
   another fee payer) claimed first, the failed transaction is reported as evidence with
   `claimedByAnotherTransaction: true` when the escrow is Claimed with this claim's preimage (live test).
@@ -1036,14 +1047,281 @@ Only what the tests prove is claimed; the rest is written down.
   payee's token account and drain the Seller's SOL just before the claim is forwarded, with its preflight
   skipped, so the claim's own account creation fails (the claim creates the account itself, so closing it alone
   no longer makes a claim fail); nothing in the product does that.
-- **Not exercised end to end live:** a lost reply on a refund (hermetic: `tests/client-flows-sol.test.ts`;
-  the adapter's own recovery by signature is live in `tests-sol/sol-htlc.sol.test.ts`), a claim whose blockhash
-  expires (adapter live suite), and evidence capture under network latency (see the limit above). Timing
+- **Not exercised end to end live:** a lost reply on a refund of a flow with no store (hermetic:
+  `tests/client-flows-sol.test.ts`; the adapter's own recovery by signature is live in
+  `tests-sol/sol-htlc.sol.test.ts`), a claim whose blockhash expires (adapter live suite), and evidence capture
+  under network latency (see the limit above). With a store, a lost reply on a lock, a claim and a refund are each
+  run live by `tests-sol/resume.sol.test.ts` (the restart resolves the recorded signature and sends nothing
+  again). Timing
   measured: the client-flow file ran in 779 s on the first full run (11 tests including the 7-minute refund
   wait; one claim or lock is 15-30 s).
 - **The program is unaudited and localnet-only.** The devnet pin (`SOL_DEVNET_PIN`) has never met a real
   devnet and is marked UNVERIFIED; mainnet is refused by name and by genesis hash. Every write waits for
   FINALIZED (about 15-30 s here); a real cluster's timing was not measured.
+
+## Resume
+
+A flow built with a `store` writes its swap record down BEFORE anything the outside world can see: a venue post, a
+paper-note write, a chain broadcast. A process that dies at any instant can then be replaced. A fresh process, given
+the same store and the same objects the runner supplies (identity, venue, paper rail, counter-asset rail, clock),
+continues the same swap or stops with a typed error. Nothing on the wire changed for this: no frame, contract, program
+or paper-rail rule is different, `vendor/tclk` and `src/vendor/evm-hash-rail.ts` are byte-identical, and
+**`docs/PROFILE.md` is unchanged** for that reason. A flow built without a `store` behaves exactly as before, writes
+nothing and cannot be resumed (see "Without a store" at the end of this section).
+
+```ts
+// FileFlowStore lives in src/client/flow-store.ts; the default directory for a runner is .state/flows/ (gitignored)
+const store = new FileFlowStore(".state/flows");
+
+// the first run: the same options as before, plus the store
+const buyer = new BuyerFlow({ identity, venue, paperRail, rail, clock, store });
+
+// after a crash, in a new process: the same store, the same kind of objects, and the key of the swap
+const { flow, next } = await BuyerFlow.resume({ identity, venue, paperRail, rail, clock, store, swapId });
+const { flow, next } = await SellerFlow.resume({ identity, venue, paperRail, rail, clock, store, contractA });
+```
+
+`resume` reads the store only: it posts nothing and touches no chain. `next` is the name of the next safe step, taken
+from the record alone, and every step then recovers before it acts: an intent that was saved without a known outcome
+reads the chain and the venue first (see "What a resumed step does" below). `next` is advice, not a lock. The Buyer's
+names are `bid`, `acceptLegB`, `verifyLegBLocked`, `postAccountLineA`, `lockLegA`, `learnSecret`, `refundLegA` and
+`done`; the Seller's are `acceptLegA`, `postAccountLineA`, `lockLegB`, `claimLegA`, `refundLegB` and `done`.
+`learnSecret` is also the way back into `claimLegB`: the Buyer's record never holds the secret, so it is read again
+from the deal room or the chain. After leg A's `refundAfterMs` a Buyer may call `refundLegA` where `next` says
+`learnSecret`; after leg B's `refundAfterMs` a Seller may call `refundLegB` where `next` says `claimLegA`. Because the
+offers room is a short ring, the runner can pass the pair the record kept: `BuyerFlow.recordedPairing` (leg B's offer
+and leg A's accept as signed records, for `acceptLegB`) and `SellerFlow.recordedOfferA` (for `acceptLegA`).
+
+The Seller's record is keyed `seller:<contractA>` (leg A's tclk contract id), the Buyer's `buyer:<swapId>`; `store.list()`
+names every record. The swap id is chosen by the Buyer and nobody can authenticate it, so a stranger's offer that
+copies a swap id could otherwise take the Seller's slot; the contract id binds the Buyer's signed offer and the
+Seller's own accept and is known before accept A is posted. `SellerFlow.resume` therefore takes `contractA` and accepts
+`swapId` only as a cross-check. A second `acceptLegA` of one offer on one store is refused with `FlowRecordExistsError`
+before anything is minted or posted; resume that swap instead.
+
+`resume` fails closed. It stops with a typed error and never starts from an empty state: `FlowNotFoundError` (nothing
+was ever saved under the key), `FlowStoreCorruptError` (truncated, corrupted or not a record), `FlowRecordVersionError`
+(a version this build does not read) and `FlowRecordMismatchError` (the record names another DID, rail, chain, swap,
+contract or deployment than the runner supplied, or its own frames do not add up). The deployment is pinned: the rail
+gives a `deploymentId` derived from its config alone (EVM: the escrow contract and the token addresses; NEAR: the
+contract account, the token account and the contract's code hash; Solana: the program id and the mint; Bitcoin: the
+network name and the genesis hash prefix), the record stores it when the swap begins and `resume` compares it. A runner
+restarted against another contract is refused instead of reading "no lock there" as "never locked" and locking again
+while the first lock can still land.
+
+### What a resumed flow promises
+
+1. **Written before it is visible.** The Seller's secret and the exact bytes of accept A and leg B's offer are saved
+   before accept A is posted (the statement is public from that post). The Buyer's prepared lock (the reference plus
+   the rail's recovery handle) is saved before `commitLock`. Every claim or refund signature is saved before it is
+   sent. The exact text of every frame and account line is saved before `venue.post`.
+2. **Never twice where twice can lose funds.** A resumed flow never builds a second leg A lock while the first can
+   still land, never signs a second claim while an earlier one could still land (Solana), never builds a second
+   Bitcoin refund while the first may be pending, and keeps the Solana Buyer rule (leg B is claimed only once leg A
+   reads Claimed). It decides by reading the chain and the venue, never by assuming the crash came before the action.
+3. **Same bytes, once.** A frame or account line is re-posted only as the identical saved text, and only after a read
+   of the room shows it absent; an identical text already in the room is adopted; a line the record shows as landed is
+   never posted again. A party never posts a second, different account line, and never an account line once leg A's
+   lock frame is in the room.
+4. **Every guard still runs, for every new action.** How rule 4 is read: the deadline, leg-B note and chain-clock guards
+   gate every new lock action, meaning a fresh lock or a re-broadcast. Recognising a lock that already landed,
+   recording it and posting its frame is not a new lock and happens whatever the clock says; the Seller's own claim
+   guards decide whether the lock can still be claimed. So a Buyer that restarts long after its lock landed (and after
+   the Seller claimed it) is not stuck on a deadline error: `lockLegA` reads the chain first, records the lock and
+   posts its frame, and `next` points on to `learnSecret`, or to `refundLegA` once leg A's refund time has come.
+5. **The secret stays private.** It is written to exactly one place, the Seller's own record, and appears in no log,
+   frame (before the reveal), fixture, capture or bundle written by library code. The Seller keeps it in an ES
+   `#private` field, and `JSON.stringify` and `util.inspect` of both flows show public data only. The Buyer's record
+   never holds it (its reveal-b ledger entry is a sha256 digest of the text, not the text).
+6. **Fail closed on bad state.** See `resume` above.
+
+### The store and its directory
+
+`FlowStore` is three methods over opaque bytes: `load`, `save` and `list`. `MemoryFlowStore` is the test store (it can
+fail the n-th save on purpose). `FileFlowStore(dir)` keeps one file per swap, `<role>-<id>.json` (`buyer-0x...` and
+`seller-0x...`: a key's `:` is not legal in a Windows file name), and checks every key against its grammar so nothing
+outside `dir` is ever touched.
+
+- **A save is a compare-and-swap.** The caller passes the sha256 of the bytes it last loaded or wrote (`null` means
+  create, there must be nothing there yet), and the store refuses with a typed error when it holds something else
+  (`FlowRecordStaleError`; `FlowRecordExistsError` for a create over an existing record). `FileFlowStore` runs each
+  save inside a per-key critical section held by an `O_EXCL` lock file `<role>-<id>.lock` that carries the holder's
+  pid: compare, remove that key's stale `.tmp-` files, write a temp file in the same directory, fsync it, rename it
+  over the record, then fsync the directory (POSIX) or flush the renamed file (Windows). `save` resolves only once
+  the bytes are durable, and a flow adopts a record in memory only after its save resolved.
+- **A refused save makes the flow a crashed one.** Whatever the reason (stale, exists, locked, a disk error, a record
+  that would not encode), the flow keeps the last durable record and every later public step throws
+  `FlowStoreWriteFailedError` until the runner drops the flow and builds a new one with `resume()`. Whatever the flow
+  latched in memory behind the refused save (a prepared lock, a claim attempt) was never made durable and is never
+  acted on again. A retry in the same process therefore cannot fund twice behind a store that said no.
+- **Each file carries a header with its payload's length and sha256**, and the record carries its own checksum, so a
+  truncated or corrupted file is a `FlowStoreCorruptError` on load, never an empty answer. These checksums detect
+  truncation and corruption, not tampering: they are not keyed, so anyone who can write the store directory can
+  produce a record that loads cleanly. Decoding is strict: closed objects, no unknown fields, a Buyer record cannot
+  carry a secret, a Seller's secret must open its statement.
+- **The directory is secret-grade, exactly like a key file.** Before the reveal the Seller's record holds the swap
+  secret (and it keeps holding it afterwards). `FileFlowStore` creates the directory with mode `0o700` and the files
+  with `0o600` where the platform honours modes. On Windows those modes do nothing and each record inherits its
+  folder's permissions: put `.state/flows` in a folder that only the runner's account, plus SYSTEM and Administrators,
+  can read (check it with `icacls`). A drive root may grant Authenticated Users modify, and a sandbox group had modify
+  even under the profile's Temp folder on the development machine; do not assume a folder is private.
+- **Windows cannot sync the folder after a rename.** The store flushes the renamed file instead (best effort); that
+  narrows the window but is not proven to close it. A power cut just after a save can bring back the previous record,
+  and the resumed flow then reruns its recover path from that earlier point. On POSIX the directory is synced, only
+  `EINVAL` and `ENOTSUP` from that sync are tolerated (a file system that cannot do it), and any other failure fails
+  the save.
+
+### One process per swap
+
+Run one process per swap. The store has one writer per record: a second instance on the same record is refused at its
+first save with `FlowRecordStaleError`, so it cannot reset the first one's lock or fund leg A a second time. A runner
+that times out a step must still drop the old flow object, or kill its process, before it calls `resume`: a hung step
+that wakes up later is refused at its next save, but the rule stays one live flow per swap. The lock file
+`<role>-<id>.lock` exists only while a save runs (a few file operations). A save that finds it held by a live process waits up to five
+seconds (`lockWaitMs`), then fails with `FlowStoreLockedError`, which names the file and the holder's pid: another
+process is writing this record, so this one must not. A lock left behind by a process that is gone is broken
+automatically; one whose pid was reused by an unrelated live process looks live, and the operator removes the file the
+error names. The offer scan that stops two Seller instances from accepting one offer twice is serialised inside one
+process and one store object only; across processes the store's compare-and-swap is the fence.
+
+### What a resumed step does
+
+A saved transaction is asked about by its own handle, and the answer is one of four things. `landed`: it is on chain,
+the evidence is recorded and the frame is posted. `pending`: not decided yet; nothing new is signed, ask again later
+(`LockPendingError` for a lock; for a refund the message says it is signed but not yet confirmed and may never have
+been sent). `never-landed`: the rail can prove it can no longer land, so one fresh transaction may follow. `unknown`
+(Bitcoin and NEAR only): the node has never seen the transaction and cannot prove it dead, so the flow re-sends the
+IDENTICAL saved bytes once, after its own guards (identical bytes have one hash and one nonce, so this can never move
+funds twice; nothing is ever signed again). The read never sends anything on any rail; a re-send is a separate call.
+A transaction that landed and FAILED on chain (a NEAR refund whose payout failed, a Solana refund that failed) is
+resolved: it can never land again, and exactly one fresh refund follows once the lock reads Locked and final. A refund
+that lost the race to a claim says so, saves it, and `next` then says `learnSecret`.
+
+- **Leg B, the paper note (every rail).** A Seller's lock of leg B is a set-if-absent write; a repeat that finds a note
+  already there reads it, adopts it when it carries this swap's terms, then posts the saved lock frame if the deal
+  room lacks it (this also closes the old gap that `reconcileLegB` never re-posted the lock frame). When the note
+  already shows this party's own claim or refund, the missing frames are posted; the repeated paper write that used to
+  fail ("claim on a claimed record") is not reached.
+- **EVM.** The lock has no handle: the reference is the hash lock. A row under it, owned by this account, is `landed`
+  (whatever status it has since reached). No row means the lock may be sent again: `approve` is harmless to repeat and
+  a repeated `lock` is refused by the contract's duplicate hash-lock check, so a repeat can lock only once. A lock
+  under this hash lock owned by another payer is refused by name (`lock-conflict`). A repeated refund is recognised
+  from the lock's own state. The Seller looks for its own preimage in the contract's `Claimed` log from the block
+  marker saved with its claim attempt; found, it posts the reveal and receipt and signs nothing. After a restart a
+  repeated approve, lock, claim or refund is refused by the contract, so the only cost is gas.
+- **Bitcoin.** The funding transaction's id and its complete signed bytes are saved before the broadcast, and a
+  resumed flow never re-prepares (a second preparation could pick other inputs and make a second outpoint). The node is
+  asked about the txid, mempool included: known is `landed`, unknown is `unknown`, and after the guards the identical
+  bytes are re-sent once. A refund is saved the same way: known with a confirmation is `landed`, known without one is
+  `pending`, unknown while the funding output is still unspent means the identical refund bytes are re-sent, and unknown
+  because another transaction spent the output means it can no longer land (no second refund is built; the Buyer is
+  told to call `learnSecret()`). The Seller's claim is looked for on chain, mempool first, from the block marker saved
+  with the attempt; a claim whose reply was lost and which mined before the retry now gets its frames posted.
+- **NEAR.** A lock or refund is saved as its transaction hash plus its complete signed bytes before it is sent. The
+  read asks by hash, then by the lock row at a final block (a lock row in any state counts as a landed lock; for a
+  refund `Refunded` is landed and `Refunding` is pending), and answers `unknown` while the access key's nonce is still
+  below the transaction's. A transaction that was signed, saved and never sent is proven dead by sending the identical
+  bytes: the node's own `Expired` answer, or an invalid-nonce answer, gives `never-landed`, but only after the lock row
+  is read again at a final block three blocks later and still shows nothing (a chain that does not move in that wait
+  of about 14 seconds is `pending`). A refund is re-sent only while its lock still reads `Locked`. The Seller's claim
+  is recognised from its own preimage on the lock, `Claimed` and final.
+- **Solana.** A lock, a claim and a refund are each saved as their signature, blockhash, last valid block height and
+  signing slot before they are sent, and are resolved by that signature, never by a scan and never by signing again.
+  `landed` is finalized with the escrow holding this leg's terms (an escrow that has since been claimed or refunded
+  still counts as this payer's landed lock); `pending` is no status while the blockhash is still valid, a signature not
+  yet finalized, or a node whose ledger starts after the signing slot; `never-landed` is a blockhash that expired with
+  no status, no finalized transaction, and a ledger that reaches back to the signing slot. Solana never answers
+  `unknown` and nothing is re-sent. The Seller restores its recorded claim signatures and resolves each one before any
+  new claim; a never-landed claim is dropped and counted, and the next one is re-signed at a doubled priority fee.
+
+### What still needs a person
+
+A person can always call `learnSecret()`, `claimLegB()`, `reconcileLockA()` and `refundLegA()` by hand on a Buyer flow
+that is still usable, whatever `next` says; each one reads the chain before it acts. Beyond that, per rail:
+
+- **NEAR.** A refund or lock that was signed and saved but never sent shows `pending` while the node is unreachable, or
+  while the chain does not move. The flow settles it itself once the node answers (it sends the saved bytes, or sees
+  `Expired`); when it cannot, a person has three routes: wait until the node answers `Expired` for the saved bytes
+  (the node's transaction validity period, a genesis setting counted in blocks, runs out), broadcast the saved signed
+  bytes (`signedTxBase64` in the record's recovery handle) by hand while they are still valid, or call the HTLC
+  contract's refund directly. Also on NEAR, a lock stuck in `Claiming` or `Refunding` has no recovery method (a refund
+  of a lock that reads `Refunding` is reported `pending`); see "Known limits of the NEAR leg".
+- **Solana.** A starved claim, where the landing bound ran out: `SolClaimStarvedError` ("leg B exposed until
+  legB.refundAfterMs") leaves the secret possibly seen, and settling needs a person.
+- **Bitcoin.** If the node refuses to re-broadcast a saved funding (its inputs spent, a conflicting transaction, a
+  policy rejection), the flow stops with a typed error (`RailRecoveryRefusedError`, code `rebroadcast-refused`). Check
+  the wallet before any new attempt: a second funding is a second outpoint, and the flow never builds one by itself.
+- **EVM.** A lock under this hash lock that is not this account's (`lock-conflict`).
+- **Any rail.** A lock or funding created outside the record (for example by another instance that ran without a store,
+  or against a store since lost) is never refunded by the flow: find it on chain and refund it by hand after its
+  timelock. A record that is corrupt or missing is a `FlowStoreCorruptError` or `FlowNotFoundError`, and the by-hand
+  table below applies.
+
+### Limits of resume
+
+- **Paper notes are not bound to who wrote them.** Anyone who knows the secret can mark leg B's note `claimed`, and
+  anyone can post a reveal frame. The flow cannot tell the Buyer's own claim, after a lost reply, from someone else's,
+  so a paper note never blocks the Buyer's leg A refund: only a claim this flow made itself (the paper claim returned)
+  does, and a note found already claimed with the swap's secret is adopted (frames posted, note recorded once) and
+  leaves the refund available. By design, if this flow's own claim of leg B landed and its reply was lost, and nobody
+  claimed leg A, the Buyer may refund leg A after its refund time and end with both legs on the paper rail. On testnet
+  the paper leg moves no value. A guarantee of "never refund after a leg B claim" that survives a lost reply would need
+  claimant-bound notes, which the vendored paper rail does not have.
+- **A bundle written after a resume lacks the crashed process's RPC exchanges.** Those exchanges are evidence, not
+  state, and are not persisted. Board and watcher captures stay replayable.
+- **A Solana bundle written before the reveal.** A Solana claim's `simulateTransaction` request carries the signed
+  claim, and with it the secret, to the configured endpoint (see the Solana limits). A bundle persists response bytes
+  only, never request bodies. But after a claim that LANDED AND FAILED, reading the failed transaction
+  (`getTransaction`, used to prove the secret public before the retry) returns the signed claim, secret included.
+  Those exchanges used to go into the Seller's exchanges and so into a bundle written before the reveal; now the
+  exchanges of failed claim attempts are held back until the reveal frame is posted, and `tests/bundle-leak.test.ts`
+  scans every byte and file name of a real bundle for the secret in every common encoding. One window remains: a
+  claim that landed and then had its reveal post fail keeps its exchanges in the list at once, so a bundle written in
+  that window can hold the secret, which is already public on chain by then.
+- **A ring venue can repeat a line.** On a ring venue (the short offers room), a line whose landing was never confirmed
+  and which has already rolled off cannot be told apart from one that never landed, so the flow posts the identical
+  text again. Readers may then see a duplicate, which tclk's machine rejects when it sees the original first. A line
+  the record shows as landed is never posted again, so this applies only to lines whose landing reply was lost.
+- **After leg A's refund time `next` can name `refundLegA` for a lock that never reached the chain.** The record alone
+  cannot tell a lock that was prepared and never sent from one that landed. `refundLegA` then fails with the rail's own
+  error on every call and `next` does not change. Nothing is at risk (there is nothing to refund), but a runner driven
+  only by `next` must stop after repeated errors.
+- **The Bitcoin tests use a ledger fake.** The hermetic Bitcoin ledger fake mines instantly and always picks other
+  inputs for a second funding; real Bitcoin Core coin selection differs (on a real wallet that holds the coins, a second
+  preparation after the first broadcast would fund again; argued, not run). The double-funding tests therefore prove the
+  flow logic, not the node's behaviour. The funding and refund re-sends are also run against a real `bitcoind`
+  (`npm run test:regtest`).
+- **What the tests exercise.** `npm test` runs a crash matrix that cuts both roles at every outward boundary, three
+  ways (before the action, after it with the store write failing, after the store confirmed it), on five harnesses
+  (the EVM mock node, the Bitcoin and NEAR fake rails, the NEAR RPC-level simulator and the Solana stateful node), plus
+  the recovery itself being cut, time passing during the crash, a store that keeps refusing saves and two live
+  instances on one store. The live suites add: anvil, six crash cuts (after `commitLock`, after the claim, after the
+  refund, each cut two ways); regtest, four cuts around a funding and a refund (the saved bytes re-sent, or nothing
+  re-sent when the node already knows them); NEAR, one scenario (a claim that landed with its reply lost); Solana,
+  three scenarios (a lock, a claim and a refund whose replies were lost, each resolved by the recorded signature).
+  NEAR's `Expired` and invalid-nonce answers, and the re-send of bytes that already executed, were tested against the
+  simulator and mocks with the error shapes a real node gave; the live NEAR suite does not age a transaction past its
+  validity. The saved block marker of a Seller claim (EVM, Bitcoin) is tested on a mock node and the ledger fake, not
+  on a real node.
+- **First-party and unaudited.** `src/client/flow-store.ts`, `flow-record.ts`, `flow-resume.ts` and the resume tests are
+  first-party, unaudited and testnet-only (`PROVENANCE.md`).
+
+### Without a store
+
+A flow built without a `store` keeps its swap state in memory only; a process that dies loses it and nothing can rebuild
+it. The same holds when the store is lost. What a crash then costs, and what a person must do (the table is written for
+the Solana leg: read the escrow by its ref with `getEscrow` and act by hand; the other rails read their own lock by its
+ref the same way):
+
+| Crash after | What is lost | What a person must do |
+| --- | --- | --- |
+| The Seller accepted leg A (secret minted) | the preimage, so the claim is impossible | nothing is locked yet; start a new swap. Never reuse the offer |
+| The Seller locked leg B | the preimage (leg B can only be refunded) | after leg B's `refundAfterMs` the Seller refunds leg B by hand on the paper rail |
+| The Buyer prepared the lock, before it landed | the prepared ref and signature | read the escrow at the payer-keyed ref; if it exists, it is refundable by the Buyer after `refund_after_ms` |
+| The Buyer locked leg A | the flow state (accounts, ref, leg B pairing) | refund leg A by hand after `refund_after_ms` unless the escrow reads Claimed; never refund when leg B was claimed |
+| The Seller signed a claim, before it was recorded as landed | the signature and `lastValidBlockHeight` | read the escrow: Claimed means the Seller was paid (post the frames by hand); Locked means send a fresh claim before `refund_after_ms` |
+| The Seller claimed, before the reveal frame posted | the reveal and receipt latches | the Buyer reads the preimage off the Claimed escrow (`learnSecret` does not need the frame) and claims leg B |
+| The Buyer learned the secret, before it claimed leg B | the secret | read it from the Claimed escrow's stored preimage and claim leg B on the paper rail before leg B's `refundAfterMs` |
 
 ## What this is not
 
