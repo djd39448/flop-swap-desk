@@ -319,7 +319,8 @@ export type FlowRecord = SellerFlowRecord | BuyerFlowRecord;
 export function markerToJson(marker: RailBlockMarker): BlockMarkerJson {
   if (typeof marker === "bigint" && marker >= 0n) return { kind: "bigint", value: marker.toString() };
   if (typeof marker === "number" && Number.isSafeInteger(marker) && marker >= 0) return { kind: "number", value: String(marker) };
-  throw new FlowRecordError("flow record: a block marker must be a non-negative bigint or safe integer to be persisted");
+  // R2-09: a record this build may not save, so the journal that projects it fails (a plain FlowRecordError would not)
+  throw new FlowRecordInvalidError("<record>", "a block marker must be a non-negative bigint or safe integer to be persisted");
 }
 
 export function markerFromJson(json: BlockMarkerJson): RailBlockMarker {

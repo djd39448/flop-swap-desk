@@ -377,17 +377,27 @@ export class FlowJournal<R extends FlowRecord> {
 
   private async commit(derive: (record: R) => R | null, create: boolean): Promise<void> {
     this.assertUsable();
+    let derived: R | null;
+    try {
+      derived = derive(this.current);
+    } catch (error) {
+      if (error instanceof FlowRecordInvalidError) this.fail(error); // a record that cannot be saved: the flow is ahead of its store
+      throw error; // a refusal of the caller's own derive (a conflict between two texts, say): nothing was latched, the journal is fine
+    }
+    if (derived === null) return;
     let next: R;
     let bytes: Uint8Array;
     try {
-      const derived = derive(this.current);
-      if (derived === null) return;
       const projected = this.projector === undefined ? derived : this.projector(derived);
       next = create ? projected : bumped(projected, this.deps.clock());
       bytes = encodeFlowRecord(next);
     } catch (error) {
-      if (error instanceof FlowRecordInvalidError) this.fail(error); // a record that cannot be saved: the flow is ahead of its store
-      throw error; // a refusal of the caller's own (a conflict between two texts, say): nothing was latched, the journal is fine
+      // R2-09: the projector lays the flow's LIVE state (latches the flow already set in memory) over the record, and
+      // `bumped` and `encodeFlowRecord` finish it. Whatever goes wrong here, of any class, means the flow is ahead of its
+      // store: the journal fails, and no later step of this flow acts on that state again (a retry in the same process
+      // used to skip the save of an already-set latch and send). A refusal of the caller's own derive, above, is the
+      // only one that leaves the journal usable.
+      this.fail(error);
     }
     try {
       await this.deps.store.save(this.key, bytes, this.digest);

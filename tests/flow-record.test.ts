@@ -19,7 +19,6 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   FLOW_RECORD_VERSION,
   FlowRecordConflictError,
-  FlowRecordError,
   FlowRecordInvalidError,
   FlowRecordMismatchError,
   FlowRecordVersionError,
@@ -565,7 +564,7 @@ describe("values that are not plain JSON", () => {
     expect(markerFromJson(markerToJson(10n ** 30n))).toBe(10n ** 30n);
     expect(markerFromJson(markerToJson(200))).toBe(200);
     for (const bad of [-1n, -1, 1.5, Number.NaN, "5", null, undefined, {}, Number.MAX_SAFE_INTEGER + 2]) {
-      expect(() => markerToJson(bad), String(bad)).toThrow(FlowRecordError);
+      expect(() => markerToJson(bad), String(bad)).toThrow(FlowRecordInvalidError); // R2-09: the journal that projects a bad marker must fail
     }
   });
 

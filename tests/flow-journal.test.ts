@@ -22,6 +22,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   FlowRecordConflictError,
+  FlowRecordError,
   FlowRecordInvalidError,
   decodeFlowRecord,
   ledgerEntry,
@@ -511,6 +512,57 @@ describe("R2-08: a journal that failed while a re-post waited on its room read p
     expect(await outcome).toBeInstanceOf(FlowStoreWriteFailedError);
     expect(posts).toBe(1); // nothing more was posted
     expect((await inner.read(specAccount.room)).filter((rec) => rec.sender === me.did)).toHaveLength(0);
+  });
+});
+
+describe("R2-09: any error of the projection, the revision bump or the encoding fails the journal", () => {
+  it("a projector that throws a plain FlowRecordError (a bad block marker) fails the journal: the save is refused and every later write is FlowStoreWriteFailedError", async () => {
+    const store = new MemoryFlowStore();
+    const r = rig(store);
+    const journal = await FlowJournal.begin(r.deps, buyerRecord());
+    let bad = true;
+    journal.setProjector((record) => {
+      if (bad) throw new FlowRecordError("flow record: a block marker must be a non-negative bigint or safe integer to be persisted");
+      return record;
+    });
+    const first = await journal.update((record) => record).catch((e: unknown) => e);
+    expect(first).toBeInstanceOf(FlowStoreWriteFailedError);
+    expect((first as FlowStoreWriteFailedError).cause).toBeInstanceOf(FlowRecordError);
+    expect(journal.failed).toBe(true);
+    bad = false; // even once the projection would work, this flow acted on state the store never saw: it is a crashed flow
+    await refused(journal.update((record) => record));
+    expect(() => journal.assertUsable()).toThrow(FlowStoreWriteFailedError);
+    expect(store.saves.filter((save) => save.outcome === "ok")).toHaveLength(1); // the begin, nothing else
+  });
+
+  it("so does a projector that throws anything else, and a clock that makes the revision bump unencodable", async () => {
+    const a = rig(new MemoryFlowStore());
+    const first = await FlowJournal.begin(a.deps, buyerRecord());
+    first.setProjector(() => {
+      throw new TypeError("projector bug");
+    });
+    await refused(first.update((record) => record));
+    expect(first.failed).toBe(true);
+
+    const b = rig(new MemoryFlowStore());
+    const second = await FlowJournal.begin(b.deps, buyerRecord());
+    b.clock.ms = Number.NaN; // `bumped` stamps updatedAtMs from the clock; the record then does not encode
+    await refused(second.update((record) => record));
+    expect(second.failed).toBe(true);
+  });
+
+  it("only a refusal of the caller's OWN derive (a conflict between two texts) leaves the journal usable", async () => {
+    const store = new MemoryFlowStore();
+    const r = rig(store);
+    const journal = await FlowJournal.begin(r.deps, buyerRecord());
+    await expect(
+      journal.update(() => {
+        throw new FlowRecordConflictError("flow record: a party never posts a second, different frame");
+      }),
+    ).rejects.toBeInstanceOf(FlowRecordConflictError);
+    expect(journal.failed).toBe(false);
+    await journal.update((record) => ({ ...(record as BuyerFlowRecord), legBVerified: true })); // still works
+    expect(journal.record).toMatchObject({ legBVerified: true });
   });
 });
 
