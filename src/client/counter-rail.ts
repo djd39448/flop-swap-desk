@@ -351,6 +351,11 @@ export interface ConnectedCounterAssetRail {
    *  answer this than the strict reader already gives (`evm-htlc`, `btc-htlc`: no behaviour
    *  change for either) simply omits it. */
   lockRecorded?(ref: string): Promise<{ exists: boolean; reason?: string }>;
+  /** R2-17: wait a short while in the rail's OWN time base (its injected `sleep`, which a test harness moves its simulated chain with,
+   *  and a real deployment backs with a timer), so a lagging member of a load-balanced endpoint can catch up before the caller reads the
+   *  chain ONCE more. `BuyerFlow.recoverLockA` calls it between a `never-landed` answer and the read that decides whether a lock exists
+   *  after all. Optional: a rail with no injected sleep (`evm-htlc`, `btc-htlc`) omits it and the caller reads again at once. */
+  settleDelay?(): Promise<void>;
   /** How the Buyer learns `s` when the Seller claims on chain without ever posting a reveal
    *  frame — a bounded search from `fromMarker` (omitted: the adapter's own genesis default). */
   findClaimedPreimage(ref: string, fromMarker?: RailBlockMarker): Promise<string | null>;

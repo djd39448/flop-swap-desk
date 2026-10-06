@@ -40,6 +40,7 @@ import { nearEvidence, captureNearLeg, NEAR_RAIL_ID, type NearAccounts, type Nea
 import {
   NEAR_AMOUNT_FLOOR,
   NEAR_ASSET_ID,
+  NEAR_LOCK_REREAD_DELAY_MS,
   NearHtlcRail,
   type NearHtlcTerms,
   type NearRailConfig,
@@ -408,6 +409,13 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
    *  rails and for a later evidence reader that might want a "no earlier than" bound. */
   async currentBlockMarker(): Promise<RailBlockMarker> {
     return this.nearRail.currentBlockMarker();
+  }
+
+  /** R2-17: a short wait (`NEAR_LOCK_REREAD_DELAY_MS`, long enough for a later final block) on the injected `sleep`, so a lagging node
+   *  can catch up before the flow reads the lock by its ref once more. */
+  async settleDelay(): Promise<void> {
+    const sleep = this.options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    await sleep(NEAR_LOCK_REREAD_DELAY_MS);
   }
 
   /** G4: a permissive existence check, read directly against `get_lock` (never through

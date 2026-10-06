@@ -71,6 +71,10 @@ import {
 } from "./counter-rail.js";
 import { SOL_CHAIN_CLOCK_SKEW_MS, SOL_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
 
+/** R2-17: how long `settleDelay` waits before the flow reads the escrow by its ref once more after a `never-landed` answer (about
+ *  four slots: a lagging member of a load-balanced endpoint is usually a few slots behind). */
+export const SOL_RECHECK_DELAY_MS = 2_000;
+
 export interface SolCounterRailOptions {
   config: SolRailConfig;
   /** The transport every read and write goes through - also this rail's capture sink. */
@@ -335,6 +339,13 @@ class ConnectedSolCounterRail implements ConnectedCounterAssetRail {
    *  a bounded block scan). */
   async currentBlockMarker(): Promise<RailBlockMarker> {
     return this.solRail.currentBlockMarker();
+  }
+
+  /** R2-17: a short wait (`SOL_RECHECK_DELAY_MS`) on the injected `sleep`, so a lagging node can catch up before the flow reads the
+   *  escrow by its ref once more. */
+  async settleDelay(): Promise<void> {
+    const sleep = this.options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    await sleep(SOL_RECHECK_DELAY_MS);
   }
 
   /** A permissive existence check (G4), read directly from the escrow and never through the strict evidence

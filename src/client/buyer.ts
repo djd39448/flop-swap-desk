@@ -1195,7 +1195,8 @@ export class BuyerFlow {
    *     still follow; the Buyer is then routed to `learnSecret` (a claim) or `refundLegA` (after the refund time).
    *   - `pending`: `LockPendingError`; nothing was signed and nothing is sent.
    *   - `unknown` (Bitcoin: the node does not know the funding; NEAR: not known, no row, nonce not past) and `never-landed`
-   *     (the rail proved the transaction can no longer land): from here on a NEW outward action may follow, so EVERY guard of
+   *     (the rail proved the transaction can no longer land; R2-17: the lock is read by its ref once more first, after the rail's
+   *     short `settleDelay`, and a lock found then is recorded as landed instead): from here on a NEW outward action may follow, so EVERY guard of
    *     the original `lockLegA` runs first. `unknown` is then settled by `resendLock`, which sends the identical saved bytes
    *     once (never a second funding; a node that refuses them is a typed error for a person); `never-landed` leads to
    *     exactly one fresh `prepareLock`, which is saved, then sent, and whose ref must be the saved one (a different one is
@@ -1222,6 +1223,11 @@ export class BuyerFlow {
     let outcome: LockRecoveryOutcome = await connected.recoverLock(prepared);
     if (outcome === "landed") return this.recordLockLanded(prepared, hashLock, acceptA.contract);
     if (outcome === "pending") throw new LockPendingError(prepared.ref);
+    // R2-17: a `never-landed` answer is a proof only on a consistent node. Recognising a lock that exists is not a new action, so the
+    // lock is read by its ref once more, BEFORE any guard, and a lock found there is recorded as landed.
+    if (outcome === "never-landed" && (await this.lockFoundAfterNeverLanded(connected, termsA, prepared.ref, accounts))) {
+      return this.recordLockLanded(prepared, hashLock, acceptA.contract);
+    }
 
     // `unknown` or `never-landed`: the next thing this flow does is a NEW outward action. Every guard first (rule 4).
     await this.checkLockGuards(offerA, offerB, acceptB);
@@ -1238,6 +1244,9 @@ export class BuyerFlow {
       outcome = await connected.resendLock(prepared);
       if (outcome === "landed") return this.recordLockLanded(prepared, hashLock, acceptA.contract);
       if (outcome === "pending") throw new LockPendingError(prepared.ref);
+      if (outcome === "never-landed" && (await this.lockFoundAfterNeverLanded(connected, termsA, prepared.ref, accounts))) {
+        return this.recordLockLanded(prepared, hashLock, acceptA.contract); // R2-17, as above
+      }
     }
 
     // never-landed: the rail proved the first transaction can no longer land, so ONE fresh lock for the same terms is built
@@ -1254,6 +1263,31 @@ export class BuyerFlow {
     await this.persist();
     await this.announceLockA(acceptA.contract, writeEvidence.ref);
     return { hashLock, writeEvidence };
+  }
+
+  /**
+   * R2-17: after a `never-landed` answer and BEFORE the saved lock is replaced by a fresh `prepareLock`, the lock is read by its own ref
+   * once more, after the rail's short `settleDelay` where it has one. `never-landed` is proven only against a consistent node: NEAR's
+   * `Expired` is also nearcore's answer for a base block hash it does not know, and one member of a load-balanced Solana endpoint can
+   * lag behind the rest, so a lock that landed elsewhere can read as dead. A lock found by this read (the strict evidence reader, or the
+   * rail's permissive existence check) is the lock this flow made: it is recorded as landed instead and nothing new is signed. Not found
+   * is the unchanged path (one fresh lock, which a duplicate lock refuses if the original did land: a stall, never a double lock). A
+   * transport failure propagates: nothing was signed, call again later.
+   */
+  private async lockFoundAfterNeverLanded(
+    connected: ConnectedCounterAssetRail,
+    termsA: ReturnType<typeof offerAcceptLockTerms>,
+    ref: string,
+    accounts: RailAccounts,
+  ): Promise<boolean> {
+    await connected.settleDelay?.();
+    const evidence = await connected.verifyLockFinal(termsA, ref, accounts);
+    if (evidence.rail !== undefined) return true;
+    if (connected.lockRecorded !== undefined) {
+      const recorded = await connected.lockRecorded(ref);
+      if (recorded.exists) return true;
+    }
+    return false;
   }
 
   /** The chain showed this flow's lock (R1-01: no guard applies): its evidence is recorded and its frame is posted (R2-16: not at
