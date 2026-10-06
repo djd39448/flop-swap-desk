@@ -292,12 +292,17 @@ export function parseRehearsalConfig(value: unknown, baseDir: string, file = "")
 /** Reads and validates the config file at `path`. A file that is not JSON is refused without echoing any of its content. */
 export async function loadRehearsalConfig(path: string): Promise<RehearsalConfig> {
   const file = resolve(path);
-  let text: string;
+  let bytes: Buffer;
   try {
-    text = await readFile(file, "utf8");
+    bytes = await readFile(file);
   } catch {
     throw new RehearsalConfigError(`cannot read the config file ${file}`);
   }
+  // Windows PowerShell writes UTF-8 with a byte order mark (accepted) and UTF-16 by default for a redirect (named, not guessed at).
+  if ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff)) {
+    throw new RehearsalConfigError(`${file} is UTF-16 text; save it as UTF-8`);
+  }
+  const text = (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? bytes.subarray(3) : bytes).toString("utf8");
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);

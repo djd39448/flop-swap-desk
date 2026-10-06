@@ -13,7 +13,8 @@
 
 import { resolve } from "node:path";
 
-import { EXIT, runRehearsal } from "../dist/client/rehearsal-run.js";
+/** The exit code for bad arguments, config or state (`EXIT.config` of src/client/rehearsal-run.ts), known before the module is loaded. */
+const EXIT_CONFIG = 2;
 
 const USAGE = `Usage: node bin/swap-rehearsal-evm.mjs <config.json> [--state-dir DIR] [--yes [--stop-after lock] | --resume | --refund [--wait]]
 
@@ -95,7 +96,7 @@ function parse(argv) {
 const args = parse(process.argv.slice(2));
 if (args === null) {
   process.stderr.write(USAGE);
-  process.exit(EXIT.config);
+  process.exit(EXIT_CONFIG);
 }
 if (args.help) {
   process.stdout.write(USAGE);
@@ -103,7 +104,18 @@ if (args.help) {
 }
 if (args.config === null || (args.stopAfter !== null && args.mode !== "yes") || (args.wait && args.mode !== "refund")) {
   process.stderr.write(USAGE);
-  process.exit(EXIT.config);
+  process.exit(EXIT_CONFIG);
+}
+
+// Loaded only now, so that --help and a bad command line work without a build; a missing build is said in one line.
+let runRehearsal;
+try {
+  ({ runRehearsal } = await import("../dist/client/rehearsal-run.js"));
+} catch (error) {
+  if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
+  const firstLine = String(error.message).split("\n")[0];
+  process.stderr.write(`swap-rehearsal-evm: cannot load the runner (${firstLine}); run npm run build first (this CLI imports from ../dist/)\n`);
+  process.exit(EXIT_CONFIG);
 }
 
 const env = {

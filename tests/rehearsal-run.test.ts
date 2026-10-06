@@ -11,7 +11,7 @@
 import { execFile } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -507,9 +507,9 @@ interface BinResult {
   stderr: string;
 }
 
-function bin(args: string[]): Promise<BinResult> {
+function bin(args: string[], script = BIN): Promise<BinResult> {
   return new Promise((resolve) => {
-    execFile(process.execPath, [BIN, ...args], { cwd: REPO_ROOT, encoding: "utf8", timeout: 60_000 }, (error, stdout, stderr) => {
+    execFile(process.execPath, [script, ...args], { cwd: REPO_ROOT, encoding: "utf8", timeout: 60_000 }, (error, stdout, stderr) => {
       const code = error === null ? 0 : typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1;
       resolve({ code, stdout, stderr });
     });
@@ -545,6 +545,32 @@ describe("bin/swap-rehearsal-evm.mjs (needs a build: npm test builds first)", ()
       expect(result.code, args.join(" ")).toBe(EXIT.config);
       expect(result.stderr, args.join(" ")).toContain("Usage: node bin/swap-rehearsal-evm.mjs");
     }
+  });
+
+  it("answers --help and a bad command line without a build, and says what to do when a real run has none", async () => {
+    // A copy of the script with no ../dist beside it, as a checkout that was never built.
+    const dir = await mkdtemp(join(tmpdir(), "rh-nobuild-"));
+    dirs.push(dir);
+    await mkdir(join(dir, "bin"));
+    const script = join(dir, "bin", "swap-rehearsal-evm.mjs");
+    await copyFile(BIN, script);
+    const help = await bin(["--help"], script);
+    expect(help.code).toBe(0);
+    expect(help.stdout).toContain("Usage: node bin/swap-rehearsal-evm.mjs");
+    const bad = await bin(["a.json", "--wait"], script);
+    expect(bad.code).toBe(EXIT.config);
+    expect(bad.stderr).toContain("Usage: node bin/swap-rehearsal-evm.mjs");
+    const real = await bin([join(dir, "config.json")], script);
+    expect(real.code).toBe(EXIT.config);
+    expect(real.stderr).toContain("cannot load the runner");
+    expect(real.stderr).toContain("run npm run build first");
+    // A build that is there but broken is not "run the build": the real error comes through.
+    await mkdir(join(dir, "dist", "client"), { recursive: true });
+    await writeFile(join(dir, "dist", "client", "rehearsal-run.js"), "export const broken = ;\n");
+    const broken = await bin([join(dir, "config.json")], script);
+    expect(broken.code).not.toBe(0);
+    expect(broken.stderr).toContain("SyntaxError");
+    expect(broken.stderr).not.toContain("run npm run build first");
   });
 
   it("exits 2 on a config that is missing, naming the file", async () => {

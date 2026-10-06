@@ -238,6 +238,17 @@ describe("loadRehearsalConfig", () => {
     expect(config.out).toBe(join(dir, "bundle"));
   });
 
+  it("accepts UTF-8 with a byte order mark (Windows PowerShell writes one) and names UTF-16 instead of calling it invalid", async () => {
+    const dir = await temp();
+    const json = JSON.stringify(anvilConfig());
+    await writeFile(join(dir, "bom.json"), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(json, "utf8")]));
+    expect((await loadRehearsalConfig(join(dir, "bom.json"))).asset).toBe("USDC");
+    await writeFile(join(dir, "utf16le.json"), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(json, "utf16le")]));
+    await expect(loadRehearsalConfig(join(dir, "utf16le.json"))).rejects.toThrow(/is UTF-16 text; save it as UTF-8/);
+    await writeFile(join(dir, "utf16be.json"), Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(json, "utf16le").swap16()]));
+    await expect(loadRehearsalConfig(join(dir, "utf16be.json"))).rejects.toThrow(/is UTF-16 text; save it as UTF-8/);
+  });
+
   it("refuses a missing file and a file that is not JSON without echoing any content", async () => {
     const dir = await temp();
     await expect(loadRehearsalConfig(join(dir, "missing.json"))).rejects.toThrow(/cannot read the config file/);
