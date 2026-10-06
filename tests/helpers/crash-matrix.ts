@@ -317,6 +317,9 @@ export interface World {
   addresses: Record<Role, string>;
   /** The secret the Seller mints (injected, so the matrix knows it). */
   hashLock: HashLock;
+  /** Every 32-byte key seed this world derived a key from (the DID identities and the chain signers): none of them may ever show in
+   *  anything a flow persists. */
+  keySeeds: Uint8Array[];
   refundAt: { legA: number; legB: number };
   buyerOptions(): BuyerFlowOptions;
   sellerOptions(): SellerFlowOptions;

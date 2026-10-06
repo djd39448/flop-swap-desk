@@ -42,6 +42,15 @@ import { evmSigner } from "./proven-lines.js";
 import { BID, T0, legADeadlines, legBDeadlines, solHarness } from "./sol-flow-harness.js";
 
 const ident = (tag: number): Identity => identity(tag.toString(16).padStart(2, "0").repeat(32));
+/** The 32-byte seed `ident(tag)` derives its DID key from. */
+const seedOfTag = (tag: number): Uint8Array => Uint8Array.from(Buffer.from(tag.toString(16).padStart(2, "0").repeat(32), "hex"));
+/** The private key tests/helpers/proven-lines.ts's `evmSigner(tag)` derives (a throwaway test value). */
+function evmKeySeed(tag: number): Uint8Array {
+  const bytes = new Uint8Array(32).fill(1);
+  bytes[0] = tag & 0xff;
+  bytes[1] = (tag >> 8) & 0xff;
+  return bytes;
+}
 
 /** The deadlines every world but the EVM one uses: leg A's window is 6 h, leg B's 24 h (all inside every rail's policy). */
 const SIX_HOURS = 6 * 60 * 60_000;
@@ -109,6 +118,7 @@ export const evmWorld: WorldFactory = (ctl): World => {
     lockTimeMs: T0,
     addresses: { buyer: buyerKey.address, seller: sellerKey.address },
     hashLock,
+    keySeeds: [seedOfTag(0x21), seedOfTag(0x22), evmKeySeed(0x411), evmKeySeed(0x412)],
     refundAt: { legA: legA.refundAfterMs, legB: legB.refundAfterMs },
     buyerOptions: () => ({ ...options("buyer") }),
     sellerOptions: () => ({ ...options("seller"), mintHashLock: () => hashLock }),
@@ -151,6 +161,7 @@ export const solWorld: WorldFactory = (ctl): World => {
     lockTimeMs: legA.lockTimeMs,
     addresses: { buyer: h.buyerWallet.publicKey, seller: h.sellerWallet.publicKey },
     hashLock: h.sellerLock,
+    keySeeds: [seedOfTag(1), seedOfTag(2), new Uint8Array(32).fill(11), new Uint8Array(32).fill(12)],
     refundAt: { legA: legA.refundAfterMs, legB: legBDeadlines().refundAfterMs },
     buyerOptions: () => wrap("buyer"),
     sellerOptions: () => wrap("seller") as ReturnType<World["sellerOptions"]>,
@@ -226,6 +237,7 @@ export const nearWorld: WorldFactory = (ctl): World => {
     lockTimeMs: legA.lockTimeMs,
     addresses: { buyer: BUYER_ACCOUNT, seller: SELLER_ACCOUNT },
     hashLock,
+    keySeeds: [seedOfTag(1), seedOfTag(2), new Uint8Array(32).fill(11), new Uint8Array(32).fill(22)],
     refundAt: { legA: legA.refundAfterMs, legB: legBDeadlines().refundAfterMs },
     buyerOptions: () => ({ ...options("buyer") }),
     sellerOptions: () => ({ ...options("seller"), mintHashLock: () => hashLock }),
@@ -280,6 +292,7 @@ function ledgerWorld(flavour: LedgerFlavour): WorldFactory {
       lockTimeMs: legA.lockTimeMs,
       addresses,
       hashLock,
+      keySeeds: [seedOfTag(1), seedOfTag(2)],
       refundAt: { legA: legA.refundAfterMs, legB: legBDeadlines().refundAfterMs },
       buyerOptions: () => ({ ...options("buyer") }),
       sellerOptions: () => ({ ...options("seller"), mintHashLock: () => hashLock }),
