@@ -255,7 +255,9 @@ board never folds on an unpinned contract (a capture cannot opt itself out of th
 code, 4 on an endpoint that fails; it never prints the URL, which may carry a key): that is the value to put in `rails.json`.
 `PROVENANCE.md` records the value the vendored `EvmHashRail.sol` builds to with the pinned toolchain, which a contract deployed
 from this repository's source must report. The pin is not part of the deployment id (the address is), so adding it does not
-invalidate a saved flow.
+invalidate a saved flow. Each `connect()` (one per flow step) costs one more `eth_getCode` call on a pinned config; and a node
+that has not yet seen a fresh deployment (a load-balanced public endpoint a block or two behind) answers empty code, so the
+connect is refused as `empty` until the node catches up: nothing was sent, retry.
 
 **Log scans fit the endpoint's range cap (P9-3).** The public Base Sepolia endpoint refuses `eth_getLogs` over more than 500
 blocks. Every log scan this build makes is therefore split into calls of at most `EvmRailConfig.maxLogRange` blocks (both ends
