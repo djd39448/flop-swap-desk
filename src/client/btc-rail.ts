@@ -55,7 +55,7 @@ import {
   type RailRefundOptions,
   type RailWriteEvidence,
 } from "./counter-rail.js";
-import { BTC_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
+import { btcLocalPolicyFor, type RailLocalPolicy } from "./policy.js";
 
 export interface BtcCounterRailOptions {
   config: BtcRailConfig;
@@ -392,8 +392,12 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
 class BtcCounterRail implements CounterAssetRail {
   readonly railId: string = BTC_RAIL_ID;
   readonly caip2: string;
-  /** G5: frozen, never a constructor option — see `CounterAssetRail.policy`'s own doc. */
-  readonly policy: RailLocalPolicy = BTC_LOCAL_POLICY;
+  /** G5: frozen, never a constructor option - see `CounterAssetRail.policy`'s own doc. P9-5: chosen by the pin's
+   *  network name (`BTC_LOCAL_POLICY` for regtest, `BTC_SIGNET_POLICY` for signet). */
+  readonly policy: RailLocalPolicy;
+  /** P9-5: the fees this party's claims and refunds first used, shared by every `connect()` of this rail (each flow step
+   *  connects anew), so a retry rebuilds the identical transaction. Empty and unused on regtest. */
+  private readonly spendFees = new Map<string, bigint>();
   /** G6: the fixed fee plus the worst-case dust limit, with margin — see
    *  `BTC_MIN_LOCKABLE_SATS`'s own doc. */
   readonly minLockableAmount: string = BTC_MIN_LOCKABLE_SATS.toString();
@@ -407,6 +411,7 @@ class BtcCounterRail implements CounterAssetRail {
   constructor(options: BtcCounterRailOptions) {
     this.options = options;
     this.caip2 = options.config.pin.caip2;
+    this.policy = btcLocalPolicyFor(options.config.pin.network);
     this.assetId = assetIdFor(options.config);
     this.deploymentId = `btc-htlc:network=${options.config.pin.network}:genesis=${options.config.pin.genesisHash.toLowerCase().slice(0, 32)}`;
   }
@@ -451,7 +456,7 @@ class BtcCounterRail implements CounterAssetRail {
   }
 
   async connect(terms: LockTerms, accounts: RailAccounts): Promise<ConnectedCounterAssetRail> {
-    const btcRail = await BtcHtlcRail.connect({ config: this.options.config, rpc: this.options.rpc, clock: this.options.clock });
+    const btcRail = await BtcHtlcRail.connect({ config: this.options.config, rpc: this.options.rpc, clock: this.options.clock, spendFees: this.spendFees });
     return new ConnectedBtcCounterRail(btcRail, this.options, terms, accounts);
   }
 }

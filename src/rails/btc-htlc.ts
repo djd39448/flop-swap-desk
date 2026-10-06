@@ -27,9 +27,11 @@ import {
   buildHtlcScript,
   buildRefundPsbt,
   bytesEqual,
+  htlcSpendVsizeBound,
   locktimeFromRefundAfterMs,
   scriptPubKeyForAddress,
   type FundingUtxo,
+  type HtlcSpendBranch,
 } from "./btc-script.js";
 import { RpcCaptureError, type CapturingRpc } from "./rpc-capture.js";
 
@@ -350,8 +352,9 @@ export function keyFromAddressInfo(info: { pubkey: string; hdmasterfingerprint: 
 }
 
 /** A fixed fee, in satoshis, subtracted from a claim/refund's single output. Fee estimation is
- *  explicitly out of scope for this build (P4-BTC-SPEC.md §0 scope note: "Out of scope: …
- *  fees …"). */
+ *  out of scope for the regtest build (P4-BTC-SPEC.md section 0 scope note: "Out of scope: ... fees ..."),
+ *  and regtest keeps this constant byte for byte. On signet (P9-5) it is the FLOOR of the fee
+ *  rule below: the node's estimate may raise a claim's or refund's fee above it, never lower it. */
 export const DEFAULT_FEE_SATS = 1000n;
 
 /** Bitcoin's own standardness floor for a single output (BIP: any output below this is
@@ -370,6 +373,103 @@ export const MIN_LOCKABLE_MARGIN_SATS = 500n;
  *  margin"). The reviewer's 1,200-sat and 900-sat cases are both refused (this floor is 2,046
  *  sats). */
 export const BTC_MIN_LOCKABLE_SATS: bigint = DEFAULT_FEE_SATS + DUST_LIMIT_SATS + MIN_LOCKABLE_MARGIN_SATS;
+
+// -- P9-5: the signet fee rule ---------------------------------------------------------------
+
+/**
+ * How a network that prices its fee from the node (signet) chooses it. Plain integers on purpose: the rule sits in a
+ * frozen policy object (`BTC_SIGNET_POLICY`, src/client/policy.ts) and is printed or compared with no BigInt.
+ * Regtest has no rule (`btcFeeRuleFor("regtest")` is `null`): it keeps `DEFAULT_FEE_SATS` and makes no estimate call.
+ *
+ * What a build pays: the node's `estimatesmartfee` rate for `confTarget` blocks, clamped to
+ * [`floorSatPerKvB`, `capSatPerKvB`]. A claim or refund pays that rate times an upper bound for its own size
+ * (`htlcSpendVsizeBound`), never less than `floorFeeSats` in total and never so much that its output falls under the
+ * dust limit. The funding transaction asks the wallet for that rate (`fee_rate`), since only the wallet knows how many
+ * inputs it will spend.
+ */
+export interface BtcFeeRule {
+  /** `estimatesmartfee`'s `conf_target`, in blocks. */
+  readonly confTarget: number;
+  /** `estimatesmartfee`'s `estimate_mode`. */
+  readonly estimateMode: "conservative" | "economical";
+  /** The lowest fee rate this rule ever pays, in satoshis per 1000 virtual bytes. */
+  readonly floorSatPerKvB: number;
+  /** The highest fee rate this rule ever pays (the documented cap), in satoshis per 1000 virtual bytes. */
+  readonly capSatPerKvB: number;
+  /** The least a claim or refund ever pays in total, in satoshis: `DEFAULT_FEE_SATS`, the regtest fee. */
+  readonly floorFeeSats: number;
+}
+
+/** `estimatesmartfee`'s target on signet: 6 blocks. `BTC_SIGNET_POLICY.claimInclusionMarginMs` is 60 minutes and
+ *  signet's target block spacing is 10 minutes, so a claim priced for six blocks is expected to be mined inside the very
+ *  margin that guards it (the Seller stops claiming once less than that margin is left before `refundAfterMs`). */
+export const BTC_SIGNET_FEE_TARGET_BLOCKS = 6;
+
+/** The floor of a signet fee RATE: 8 sat/vB. The smallest claim or refund this build can make is 132 virtual bytes (a
+ *  P2WPKH destination), and 8 sat/vB over 132 bytes is 1,056 satoshis, so at this rate a claim or refund never pays
+ *  less than `DEFAULT_FEE_SATS` (1,000), the fee every regtest build pays; the funding transaction gets the same floor
+ *  as a rate. A test pins that relation. The node's estimate can only raise the rate above this. */
+export const BTC_SIGNET_FEE_FLOOR_SAT_PER_VB = 8;
+
+/** THE CAP on a signet fee RATE: 50 sat/vB, about six times the floor. It bounds an estimator that has gone wrong (a
+ *  node with sparse data, a mis-set mempool, a lying endpoint), not any real fee market: whatever the node answers, a
+ *  claim or refund pays at most 50 sat/vB over its own size (7,000 satoshis for a claim to a P2WPKH address, 7,600 to a
+ *  P2WSH one) and never more than its funding amount less the dust limit (the 1,000 satoshi floor aside). The cap is a
+ *  rate: a funding transaction that the wallet builds from very many inputs pays that rate on a larger transaction. */
+export const BTC_SIGNET_FEE_CAP_SAT_PER_VB = 50;
+
+/** The signet fee rule (`BTC_SIGNET_POLICY.fee` is this same object). `conservative` because a claim that waits
+ *  publishes the preimage in the mempool, where the Buyer can use it to take the other leg while its own refund is
+ *  still open: a few hundred satoshis too much on a test network is the cheap side of that risk. */
+export const BTC_SIGNET_FEE_RULE: BtcFeeRule = Object.freeze({
+  confTarget: BTC_SIGNET_FEE_TARGET_BLOCKS,
+  estimateMode: "conservative",
+  floorSatPerKvB: BTC_SIGNET_FEE_FLOOR_SAT_PER_VB * 1000,
+  capSatPerKvB: BTC_SIGNET_FEE_CAP_SAT_PER_VB * 1000,
+  floorFeeSats: Number(DEFAULT_FEE_SATS),
+});
+
+/** The fee rule of a pinned network by its name: never a constructor option. `null` for regtest (fixed fee, no
+ *  estimate call); throws for any name off the allow list. */
+export function btcFeeRuleFor(network: string): BtcFeeRule | null {
+  if (network === "regtest") return null;
+  if (network === "signet") return BTC_SIGNET_FEE_RULE;
+  throw new Error(`btc-htlc: no fee rule for network "${network}" (regtest, signet only)`);
+}
+
+/**
+ * The fee rate, in satoshis per 1000 virtual bytes, an `estimatesmartfee` answer gives under `rule`. Pure. The node
+ * answers `{ feerate: <BTC per 1000 vB>, blocks }`, or `{ errors: [...], blocks }` with no `feerate` when it lacks data.
+ * An answer without a usable rate (absent, not a number, not finite, zero or negative) is the floor: the estimate is
+ * advice and the floor is the fee every regtest build already pays, so a missing estimate never stops a swap step. A
+ * usable rate is rounded to a whole satoshi per 1000 bytes (the answer has eight decimals of a bitcoin, so this is
+ * exact) and clamped into [floor, cap]; one too large to be a safe integer is the cap.
+ */
+export function feeRateFromEstimate(rule: BtcFeeRule, answer: unknown): number {
+  const feerate = typeof answer === "object" && answer !== null ? (answer as { feerate?: unknown }).feerate : undefined;
+  if (typeof feerate !== "number" || !Number.isFinite(feerate) || feerate <= 0) return rule.floorSatPerKvB;
+  const satPerKvB = Math.round(feerate * 1e8);
+  if (!Number.isSafeInteger(satPerKvB)) return rule.capSatPerKvB;
+  return Math.min(Math.max(satPerKvB, rule.floorSatPerKvB), rule.capSatPerKvB);
+}
+
+/**
+ * The whole fee, in satoshis, of one claim or refund of `fundingAmountSats` that is `vsize` virtual bytes at
+ * `rateSatPerKvB` (clamped into the rule's range again here, so a caller cannot pass a rate outside it). Pure. At
+ * least `floorFeeSats`; at most the funding amount less the dust limit, except that the floor wins when the amount is
+ * too small to leave dust (the regtest rule: `BTC_MIN_LOCKABLE_SATS` keeps a real leg out of that case).
+ */
+export function spendFeeSatsFor(rule: BtcFeeRule, rateSatPerKvB: number, vsize: number, fundingAmountSats: bigint): bigint {
+  if (!Number.isSafeInteger(rateSatPerKvB) || rateSatPerKvB <= 0) throw new Error("btc-htlc: fee rate must be a positive integer (sat per 1000 vB)");
+  if (!Number.isSafeInteger(vsize) || vsize <= 0) throw new Error("btc-htlc: vsize must be a positive integer");
+  const rate = BigInt(Math.min(Math.max(rateSatPerKvB, rule.floorSatPerKvB), rule.capSatPerKvB));
+  let fee = (rate * BigInt(vsize) + 999n) / 1000n; // ceil(rate * vsize / 1000)
+  const floor = BigInt(rule.floorFeeSats);
+  if (fee < floor) fee = floor;
+  const roomAboveDust = fundingAmountSats - DUST_LIMIT_SATS;
+  const ceiling = roomAboveDust > floor ? roomAboveDust : floor;
+  return fee > ceiling ? ceiling : fee;
+}
 
 /** P4-BTC-FIXES.md H2: a funding transaction built and signed, but never yet broadcast — every
  *  field a caller needs to record BEFORE broadcasting (so a crash between `prepareFunding` and
@@ -441,6 +541,15 @@ export interface BtcHtlcRailOptions {
   config: BtcRailConfig;
   rpc: CapturingRpc;
   clock?: () => number;
+  /**
+   * P9-5 (signet only): the fee a claim or refund first used, kept for as long as this map lives, so a retry of the same
+   * spend rebuilds the IDENTICAL transaction (P4-BTC-FIXES-R3.md K2: a lost broadcast reply is recognised on retry as
+   * "already in the mempool" only when the bytes are the same, which a moved fee estimate would break). A flow's rail
+   * passes one map to every `connect()`, because each flow step connects anew; without one each `BtcHtlcRail` keeps its
+   * own. An entry is kept only while its transaction may have reached the node: a spend that fails before it is sent, or
+   * that `testmempoolaccept` refuses, forgets its fee and is priced afresh on the next attempt. Regtest never writes it.
+   */
+  spendFees?: Map<string, bigint>;
 }
 
 function base64FromBytes(bytes: Uint8Array): string {
@@ -457,12 +566,17 @@ export class BtcHtlcRail {
   private readonly rpc: CapturingRpc;
   private readonly clock: () => number;
   private readonly networkParams: ReturnType<typeof networkParamsFor>;
+  /** P9-5: `null` on regtest (the fixed fee, no estimate call), the signet rule on signet; chosen by the pin's network name. */
+  private readonly feeRule: BtcFeeRule | null;
+  private readonly spendFees: Map<string, bigint>;
 
-  private constructor(config: BtcRailConfig, rpc: CapturingRpc, clock: () => number) {
+  private constructor(config: BtcRailConfig, rpc: CapturingRpc, clock: () => number, spendFees: Map<string, bigint>) {
     this.config = config;
     this.rpc = rpc;
     this.clock = clock;
     this.networkParams = networkParamsFor(config.pin);
+    this.feeRule = btcFeeRuleFor(config.pin.network);
+    this.spendFees = spendFees;
   }
 
   /**
@@ -476,7 +590,7 @@ export class BtcHtlcRail {
     if (!configCheck.ok) {
       throw new Error(`btc-htlc: refusing to connect — ${configCheck.reason}`);
     }
-    const rail = new BtcHtlcRail(configCheck.config, options.rpc, options.clock ?? Date.now);
+    const rail = new BtcHtlcRail(configCheck.config, options.rpc, options.clock ?? Date.now, options.spendFees ?? new Map());
     await rail.assertPinnedChain();
     // A10-equivalent: connect's own exchanges never linger into a later write's own
     // snapshot-at-start (`before = this.rpc.exchanges().length`).
@@ -515,6 +629,52 @@ export class BtcHtlcRail {
         `btc-htlc: genesis hash ${genesisHash} does not match pin "${this.config.pin.name}" (expected ${this.config.pin.genesisHash})`,
       );
     }
+  }
+
+  /**
+   * P9-5 (signet): the fee rate this build pays, in satoshis per 1000 virtual bytes: the node's `estimatesmartfee` under
+   * the rule, clamped, or the floor when the node has no usable answer. ANY failure of the estimate call itself (an
+   * error reply, a timeout, a transport fault) is the floor too: the estimate is advice, and a claim must not miss its
+   * window because the node was slow to answer a question about fees. The call is a node-level read made before the
+   * build, so a claim's last deadline guard (which follows the build) still comes after it.
+   */
+  private async feeRateSatPerKvB(rule: BtcFeeRule): Promise<number> {
+    let answer: unknown;
+    try {
+      answer = await this.request<unknown>("estimatesmartfee", [rule.confTarget, rule.estimateMode]);
+    } catch {
+      return rule.floorSatPerKvB;
+    }
+    return feeRateFromEstimate(rule, answer);
+  }
+
+  /**
+   * P9-5: the fee of one claim or refund. Regtest (no rule): `DEFAULT_FEE_SATS`, no call, no memory, exactly as before.
+   * Signet: the fee this spend first used when there is one (`BtcHtlcRailOptions.spendFees`), else the estimate priced
+   * for the spend's own size. The caller reports back through `settle`: `true` once the transaction may have reached the
+   * node (the fee stays pinned for a retry), `false` when it failed before it was sent or `testmempoolaccept` refused it
+   * (the fee is forgotten, so the next attempt prices afresh).
+   */
+  private async priceSpend(
+    branch: HtlcSpendBranch,
+    ref: string,
+    fundingAmountSats: bigint,
+    witnessScriptLength: number,
+    destinationScriptPubKey: Uint8Array,
+  ): Promise<{ feeSats: bigint; settle: (mayHaveReachedTheNode: boolean) => void }> {
+    const rule = this.feeRule;
+    if (rule === null) return { feeSats: DEFAULT_FEE_SATS, settle: () => {} };
+    const key = `${branch}:${ref}:${bytesToHex(destinationScriptPubKey)}`;
+    const settle = (mayHaveReachedTheNode: boolean): void => {
+      if (!mayHaveReachedTheNode) this.spendFees.delete(key);
+    };
+    const pinned = this.spendFees.get(key);
+    if (pinned !== undefined) return { feeSats: pinned, settle };
+    const rate = await this.feeRateSatPerKvB(rule);
+    const vsize = htlcSpendVsizeBound(branch, witnessScriptLength, destinationScriptPubKey.length);
+    const feeSats = spendFeeSatsFor(rule, rate, vsize, fundingAmountSats);
+    this.spendFees.set(key, feeSats);
+    return { feeSats, settle };
   }
 
   /** Decode an on-chain output exactly (never Core's own float-BTC JSON amounts, which could
@@ -627,7 +787,11 @@ export class BtcHtlcRail {
     // terms.amountSats, coin-selected and change-handled by the wallet's own keyless logic) +
     // walletprocesspsbt (sign AND finalize in one call, exactly like claim/refund) — never
     // sendtoaddress, which broadcasts on its own with no testmempoolaccept in between.
-    const created = await this.walletRequest<{ psbt: string }>(buyer.wallet, "walletcreatefundedpsbt", [[], [{ [address]: amountBtc }], 0, {}, true]);
+    // P9-5: on signet the wallet is told the rate (`fee_rate`, sat/vB), so its own estimator, which a fresh signet node
+    // may have no data for, is never consulted; on regtest the options stay `{}`, byte for byte.
+    const fundingOptions: Record<string, unknown> = {};
+    if (this.feeRule !== null) fundingOptions.fee_rate = (await this.feeRateSatPerKvB(this.feeRule)) / 1000;
+    const created = await this.walletRequest<{ psbt: string }>(buyer.wallet, "walletcreatefundedpsbt", [[], [{ [address]: amountBtc }], 0, fundingOptions, true]);
     const processed = await this.walletRequest<{ complete: boolean; hex?: string }>(buyer.wallet, "walletprocesspsbt", [created.psbt]);
     if (!processed.complete || processed.hex === undefined) {
       throw new Error("btc-htlc: walletprocesspsbt did not produce a complete, finalized funding transaction");
@@ -868,36 +1032,47 @@ export class BtcHtlcRail {
     }
     const destinationScriptPubKey = scriptPubKeyForAddress(destinationAddress, this.networkParams);
 
-    const utxo: FundingUtxo = { txid: fundTxid, vout: fundVout, scriptPubKey: funding.scriptPubKey, amountSats: funding.amountSats };
-    const psbt = buildClaimPsbt({
-      utxo,
-      witnessScript,
-      hashLock: hashLockBytes,
-      preimage,
-      payeePubkey,
-      payeeDerivation: { fingerprint: seller.key.fingerprint, path: seller.key.path },
-      destinationScriptPubKey,
-      feeSats: DEFAULT_FEE_SATS,
-    });
+    // P9-5: regtest pays `DEFAULT_FEE_SATS` with no call; signet prices the claim from the node (before the build, so the
+    // deadline guard below is still the last read) and pins that fee for a retry of this same claim.
+    const price = await this.priceSpend("claim", ref, funding.amountSats, witnessScript.length, destinationScriptPubKey);
+    let mayHaveReachedTheNode = false;
+    try {
+      const utxo: FundingUtxo = { txid: fundTxid, vout: fundVout, scriptPubKey: funding.scriptPubKey, amountSats: funding.amountSats };
+      const psbt = buildClaimPsbt({
+        utxo,
+        witnessScript,
+        hashLock: hashLockBytes,
+        preimage,
+        payeePubkey,
+        payeeDerivation: { fingerprint: seller.key.fingerprint, path: seller.key.path },
+        destinationScriptPubKey,
+        feeSats: price.feeSats,
+      });
 
-    const processed = await this.walletRequest<{ complete: boolean; hex?: string }>(seller.wallet, "walletprocesspsbt", [base64FromBytes(psbt)]);
-    if (!processed.complete || processed.hex === undefined) {
-      throw new Error("btc-htlc: walletprocesspsbt did not produce a complete, finalized claim transaction");
+      const processed = await this.walletRequest<{ complete: boolean; hex?: string }>(seller.wallet, "walletprocesspsbt", [base64FromBytes(psbt)]);
+      if (!processed.complete || processed.hex === undefined) {
+        throw new Error("btc-htlc: walletprocesspsbt did not produce a complete, finalized claim transaction");
+      }
+
+      // The deadline guard is the LAST read before broadcast - nothing but testmempoolaccept and
+      // the broadcast itself follow.
+      await this.assertChainTimeBeforeOrThrow(notAfterMs);
+
+      // P4-BTC-FIXES-R3.md K2: "sign-and-record, then broadcast" - this transaction's own txid is
+      // already fully determined by its own signed bytes (a hash of them), knowable before ever
+      // broadcasting. Recording it here (a local decode, no RPC of its own) means a caller retrying
+      // after a lost broadcast reply reproduces the IDENTICAL bytes (deterministic signing) and this
+      // same txid, so `broadcastOrThrow` recognizes Core's own "already known" answer as success.
+      const claimTxid = Transaction.fromRaw(hexToBytes(processed.hex), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
+
+      mayHaveReachedTheNode = true;
+      const txid = await this.broadcastOrThrow(processed.hex, claimTxid);
+      return this.finishWriteEvidence(ref, txid, before);
+    } catch (error) {
+      // A `testmempoolaccept` refusal means the bytes provably never reached the network: the fee is forgotten.
+      price.settle(mayHaveReachedTheNode && !(error instanceof BtcBroadcastRefusedError));
+      throw error;
     }
-
-    // The deadline guard is the LAST read before broadcast — nothing but testmempoolaccept and
-    // the broadcast itself follow.
-    await this.assertChainTimeBeforeOrThrow(notAfterMs);
-
-    // P4-BTC-FIXES-R3.md K2: "sign-and-record, then broadcast" — this transaction's own txid is
-    // already fully determined by its own signed bytes (a hash of them), knowable before ever
-    // broadcasting. Recording it here (a local decode, no RPC of its own) means a caller retrying
-    // after a lost broadcast reply reproduces the IDENTICAL bytes (deterministic signing) and this
-    // same txid, so `broadcastOrThrow` recognizes Core's own "already known" answer as success.
-    const claimTxid = Transaction.fromRaw(hexToBytes(processed.hex), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
-
-    const txid = await this.broadcastOrThrow(processed.hex, claimTxid);
-    return this.finishWriteEvidence(ref, txid, before);
   }
 
   /**
@@ -938,41 +1113,54 @@ export class BtcHtlcRail {
     }
     const destinationScriptPubKey = scriptPubKeyForAddress(destinationAddress, this.networkParams);
 
-    const utxo: FundingUtxo = { txid: fundTxid, vout: fundVout, scriptPubKey: funding.scriptPubKey, amountSats: funding.amountSats };
-    const psbt = buildRefundPsbt({
-      utxo,
-      witnessScript,
-      locktime,
-      payerPubkey,
-      payerDerivation: { fingerprint: buyer.key.fingerprint, path: buyer.key.path },
-      destinationScriptPubKey,
-      feeSats: DEFAULT_FEE_SATS,
-    });
-
-    const processed = await this.walletRequest<{ complete: boolean; hex?: string }>(buyer.wallet, "walletprocesspsbt", [base64FromBytes(psbt)]);
-    if (!processed.complete || processed.hex === undefined) {
-      throw new Error("btc-htlc: walletprocesspsbt did not produce a complete, finalized refund transaction");
-    }
-
-    // P4-BTC-FIXES-R3.md K2: same "sign-and-record, then broadcast" rule as `claim()` above — the
-    // deterministic txid, known from the signed bytes alone, before ever broadcasting.
-    const refundTxid = Transaction.fromRaw(hexToBytes(processed.hex), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
-
-    // P8-RESUME-SPEC.md rule 1: the signed bytes are handed to the caller (awaited) BEFORE anything is sent, so a
-    // restart can find this one refund again instead of signing a second.
-    const signed = { txid: refundTxid, rawTx: processed.hex };
-    if (options.onSigned !== undefined) await options.onSigned(signed);
-    let txid: string;
+    // P9-5: as in `claim()`: `DEFAULT_FEE_SATS` on regtest, the node's estimate on signet, pinned for a retry.
+    const price = await this.priceSpend("refund", ref, funding.amountSats, witnessScript.length, destinationScriptPubKey);
+    let mayHaveReachedTheNode = false;
     try {
-      txid = await this.broadcastOrThrow(processed.hex, refundTxid);
+      const utxo: FundingUtxo = { txid: fundTxid, vout: fundVout, scriptPubKey: funding.scriptPubKey, amountSats: funding.amountSats };
+      const psbt = buildRefundPsbt({
+        utxo,
+        witnessScript,
+        locktime,
+        payerPubkey,
+        payerDerivation: { fingerprint: buyer.key.fingerprint, path: buyer.key.path },
+        destinationScriptPubKey,
+        feeSats: price.feeSats,
+      });
+
+      const processed = await this.walletRequest<{ complete: boolean; hex?: string }>(buyer.wallet, "walletprocesspsbt", [base64FromBytes(psbt)]);
+      if (!processed.complete || processed.hex === undefined) {
+        throw new Error("btc-htlc: walletprocesspsbt did not produce a complete, finalized refund transaction");
+      }
+
+      // P4-BTC-FIXES-R3.md K2: same "sign-and-record, then broadcast" rule as `claim()` above - the
+      // deterministic txid, known from the signed bytes alone, before ever broadcasting.
+      const refundTxid = Transaction.fromRaw(hexToBytes(processed.hex), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
+
+      // P8-RESUME-SPEC.md rule 1: the signed bytes are handed to the caller (awaited) BEFORE anything is sent, so a
+      // restart can find this one refund again instead of signing a second.
+      const signed = { txid: refundTxid, rawTx: processed.hex };
+      if (options.onSigned !== undefined) await options.onSigned(signed);
+      let txid: string;
+      try {
+        mayHaveReachedTheNode = true;
+        txid = await this.broadcastOrThrow(processed.hex, refundTxid);
+      } catch (error) {
+        // `testmempoolaccept` refused it: `sendrawtransaction` was never called, so these bytes never reached the network.
+        if (error instanceof BtcBroadcastRefusedError) {
+          mayHaveReachedTheNode = false;
+          if (options.onNotBroadcast !== undefined) await options.onNotBroadcast(signed);
+        }
+        throw error;
+      }
+      // R2-1: record the exact signed bytes broadcast, so a later retry can re-send the IDENTICAL
+      // transaction if it drops out of the mempool without confirming (`resendRefundIfDropped`).
+      return this.finishWriteEvidence(ref, txid, before, processed.hex);
     } catch (error) {
-      // `testmempoolaccept` refused it: `sendrawtransaction` was never called, so these bytes never reached the network.
-      if (error instanceof BtcBroadcastRefusedError && options.onNotBroadcast !== undefined) await options.onNotBroadcast(signed);
+      // A `testmempoolaccept` refusal means the bytes provably never reached the network: the fee is forgotten.
+      price.settle(mayHaveReachedTheNode && !(error instanceof BtcBroadcastRefusedError));
       throw error;
     }
-    // R2-1: record the exact signed bytes broadcast, so a later retry can re-send the IDENTICAL
-    // transaction if it drops out of the mempool without confirming (`resendRefundIfDropped`).
-    return this.finishWriteEvidence(ref, txid, before, processed.hex);
   }
 
   /**

@@ -22,11 +22,15 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js";
 
+import { Transaction } from "@scure/btc-signer";
+
 import { BTC_REGTEST_NETWORK, buildHtlcScript } from "../src/rails/btc-script.js";
 import {
   BTC_REGTEST_PIN,
+  BTC_SIGNET_FEE_RULE,
   BtcHtlcRail,
   DEFAULT_FEE_SATS,
+  feeRateFromEstimate,
   keyFromAddressInfo,
   type BtcHtlcTerms,
   type BtcRailConfig,
@@ -102,6 +106,25 @@ describe("btc-htlc (regtest)", () => {
     const seller = partyFrom(node.seller);
     const buyerRail = await connect();
     const sellerRail = await connect();
+
+    // P9-5: two facts about Bitcoin Core 31.1 that the signet fee rule (BTC_SIGNET_FEE_RULE) leans on, taken from the real
+    // node here because the rule itself only runs against a signet pin, which no regtest node can be. Nothing is sent.
+    //  (1) A node with no fee data answers estimatesmartfee with `errors` and no `feerate`, which the rule reads as the floor.
+    const estimate = await node.rpcCall<{ feerate?: number; errors?: string[]; blocks?: number }>("estimatesmartfee", [BTC_SIGNET_FEE_RULE.confTarget, BTC_SIGNET_FEE_RULE.estimateMode]);
+    expect(estimate.feerate).toBeUndefined();
+    expect(estimate.errors?.length).toBeGreaterThan(0);
+    expect(feeRateFromEstimate(BTC_SIGNET_FEE_RULE, estimate)).toBe(BTC_SIGNET_FEE_RULE.floorSatPerKvB);
+    //  (2) walletcreatefundedpsbt takes the funding rate as `fee_rate` in sat/vB: the finished transaction pays about that
+    //      rate per virtual byte (the wallet sizes inputs at their largest signature, so a little over, never far).
+    const probeDestination = await node.rpcCall<string>("getnewaddress", ["", "bech32"], "/wallet/seller");
+    const probeRate = 12.345;
+    const probe = await node.rpcCall<{ psbt: string; fee: number }>("walletcreatefundedpsbt", [[], [{ [probeDestination]: 0.001 }], 0, { fee_rate: probeRate }, true], "/wallet/buyer");
+    const probeSigned = await node.rpcCall<{ complete: boolean; hex: string }>("walletprocesspsbt", [probe.psbt], "/wallet/buyer");
+    expect(probeSigned.complete).toBe(true);
+    const probeVsize = Transaction.fromRaw(hexToBytes(probeSigned.hex), { allowUnknownInputs: true, allowUnknownOutputs: true }).vsize;
+    const probeEffectiveRate = Math.round(probe.fee * 1e8) / probeVsize;
+    expect(probeEffectiveRate).toBeGreaterThanOrEqual(probeRate * 0.99);
+    expect(probeEffectiveRate).toBeLessThanOrEqual(probeRate * 1.05);
 
     const preimage = randomBytes(32);
     const hashLock = sha256(preimage);

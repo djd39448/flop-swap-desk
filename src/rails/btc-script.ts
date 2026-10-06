@@ -294,6 +294,47 @@ export function buildRefundPsbt(params: RefundPsbtParams): Uint8Array {
   return tx.toPSBT();
 }
 
+/** P9-5: which branch of the HTLC a spend takes: the Seller's hash branch or the Buyer's timelock branch. */
+export type HtlcSpendBranch = "claim" | "refund";
+
+/** The longest signature item a wallet can put in a witness: the longest DER-encoded ECDSA signature (72 bytes) plus its
+ *  sighash byte. Core grinds the nonce for a short one, so real signatures are 71 bytes with the sighash byte, two
+ *  shorter than this, which keeps the bound within one virtual byte of a real transaction. */
+const MAX_WITNESS_SIGNATURE_BYTES = 73;
+
+/** Size of a Bitcoin compact-size integer (`n` is a length, never a value above 2^32). */
+function compactSizeBytes(n: number): number {
+  return n < 0xfd ? 1 : n <= 0xffff ? 3 : 5;
+}
+
+/**
+ * P9-5: an upper bound, in virtual bytes, for the finalized transaction a `buildClaimPsbt` or `buildRefundPsbt`
+ * result becomes once the wallet signs it, computed from the two lengths that vary: the witness script and the
+ * destination script. The transaction has one input (an outpoint, an empty scriptSig and a sequence), one output and
+ * a locktime; its witness is `[preimage, signature, script]` for a claim (the hash branch) and `[signature, empty,
+ * script]` for a refund (the timelock branch, with the payee's key dissatisfied by an empty item). Signet fees are
+ * priced per virtual byte, and the signing wallet only runs after the fee is chosen, so the size has to be known
+ * before the signature exists: the signature is counted at its longest. A real Core-signed claim and refund
+ * (P2WPKH destination) are 139 and 131 virtual bytes against this bound's 140 and 132 (tests/btc-signet-fee.test.ts
+ * replays them from the committed regtest fixtures).
+ */
+export function htlcSpendVsizeBound(branch: HtlcSpendBranch, witnessScriptLength: number, destinationScriptLength: number): number {
+  if (!Number.isSafeInteger(witnessScriptLength) || witnessScriptLength <= 0) {
+    throw new Error("btc-script: witnessScriptLength must be a positive integer");
+  }
+  if (!Number.isSafeInteger(destinationScriptLength) || destinationScriptLength <= 0) {
+    throw new Error("btc-script: destinationScriptLength must be a positive integer");
+  }
+  // Without witness data: version (4), input count (1), the input (outpoint 32 + 4, scriptSig length 1, sequence 4),
+  // output count (1), the output (amount 8, script length, script), locktime (4).
+  const baseBytes = 4 + 1 + (32 + 4 + 1 + 4) + 1 + (8 + compactSizeBytes(destinationScriptLength) + destinationScriptLength) + 4;
+  const itemBytes = (length: number): number => compactSizeBytes(length) + length;
+  const items = branch === "claim" ? [HASH_LENGTH, MAX_WITNESS_SIGNATURE_BYTES] : [MAX_WITNESS_SIGNATURE_BYTES, 0];
+  const witnessBytes = compactSizeBytes(items.length + 1) + items.reduce((sum, length) => sum + itemBytes(length), 0) + itemBytes(witnessScriptLength);
+  // weight = 4 * base + (segwit marker and flag: 2) + witness; a virtual byte is a quarter of a weight unit, rounded up.
+  return Math.ceil((4 * baseBytes + 2 + witnessBytes) / 4);
+}
+
 /** Constant-time-shaped (length-checked first; no early exit that would leak a byte count from
  *  timing on equal-length inputs beyond what a plain loop already does) byte comparison used
  *  wherever this build compares a candidate witness/preimage against a hash-lock statement. */

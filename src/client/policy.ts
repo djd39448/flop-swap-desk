@@ -23,6 +23,7 @@
 // Design source: flop-contrib/handoff/P22-P24-EVM-FIXES.md B2, B3.
 
 import { DEFAULT_POLICY_EXAMPLE } from "../deadlines.js";
+import { BTC_SIGNET_FEE_RULE, type BtcFeeRule } from "../rails/btc-htlc.js";
 import type { DeadlinePolicy } from "../types.js";
 
 /**
@@ -97,6 +98,41 @@ export const BTC_LOCAL_POLICY: BtcLocalPolicy = Object.freeze({
   finalityAMs: 3 * 60 * 60_000,
   claimInclusionMarginMs: 60 * 60_000,
 });
+
+// P9-5: the Bitcoin signet policy, selected by the pin's network name (`btcLocalPolicyFor`), never a constructor option
+// (the P9 spec asks the same of the Base Sepolia EVM policy, by chain id).
+//
+// The deadline numbers are `BTC_LOCAL_POLICY`'s, stated again here on purpose so that a later change to one cannot move
+// the other unseen (tests/btc-signet-fee.test.ts pins both). They were never regtest-only in substance: the comment
+// above derives them from a mined-block cadence (the ~1 h median-time-past lag of a refund plus ~2 h for its own
+// confirmation), which a regtest node that mines on demand sits comfortably inside and signet, at about 10 minutes a
+// block, is the real cadence of. The pin's confirmations stay 1 (`BTC_SIGNET_PIN.finality`): signet is a test network
+// with no value at stake, and 60 minutes of claim margin is six blocks.
+//
+// What is new is the fee. Regtest pays the fixed 1,000 satoshis; signet pays the node's `estimatesmartfee` answer for
+// 6 blocks (the claim margin above, in blocks), never below that 1,000 satoshi floor and never above a cap, for the
+// lock, the claim and the refund (`BTC_SIGNET_FEE_RULE`, src/rails/btc-htlc.ts, which states the constants). `fee` here is
+// that same rule object: the adapter applies it by the pin's network name, and this field is only where a reader of the
+// policy finds it, so the two cannot differ (a test pins the identity).
+export interface BtcSignetPolicy extends BtcLocalPolicy {
+  readonly fee: BtcFeeRule;
+}
+
+export const BTC_SIGNET_POLICY: BtcSignetPolicy = Object.freeze({
+  ...DEFAULT_POLICY_EXAMPLE,
+  minRevealWindowMs: 60 * 60_000,
+  finalityAMs: 3 * 60 * 60_000,
+  claimInclusionMarginMs: 60 * 60_000,
+  fee: BTC_SIGNET_FEE_RULE,
+});
+
+/** The Bitcoin policy of a pinned network, by its name: `BTC_LOCAL_POLICY` (the very same object) for regtest,
+ *  `BTC_SIGNET_POLICY` for signet. Throws for a name off the allow list rather than guess a policy for it. */
+export function btcLocalPolicyFor(network: string): BtcLocalPolicy {
+  if (network === "regtest") return BTC_LOCAL_POLICY;
+  if (network === "signet") return BTC_SIGNET_POLICY;
+  throw new Error(`btc policy: no policy for network "${network}" (regtest, signet only)`);
+}
 
 // P5-NEAR-DECISIONS-2026-09-29.md D-N8: the NEAR-local twin of `EVM_LOCAL_POLICY`/
 // `BTC_LOCAL_POLICY`, sized for this build's own sandbox pin (`NEAR_SANDBOX_PIN`, finality

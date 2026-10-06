@@ -9,20 +9,25 @@
 
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
-import { Transaction } from "@scure/btc-signer";
+import { Address, Transaction } from "@scure/btc-signer";
 import { describe, expect, it } from "vitest";
 
+import { createBtcCounterRail } from "../src/client/btc-rail.js";
 import {
   BTC_REGTEST_NETWORK,
+  BTC_SIGNET_NETWORK,
   buildHtlcScript,
   scriptPubKeyForAddress,
 } from "../src/rails/btc-script.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import {
+  BTC_MIN_LOCKABLE_SATS,
   BTC_REGTEST_PIN,
   BTC_SIGNET_PIN,
   BtcHtlcRail,
   checkBtcRailConfig,
+  DEFAULT_FEE_SATS,
+  DUST_LIMIT_SATS,
   keyFromAddressInfo,
   parseHdKeyPath,
   validateBtcRailConfig,
@@ -189,7 +194,7 @@ describe("checkBtcRailConfig / validateBtcRailConfig", () => {
   });
 });
 
-// ── P9-5: the signet pin ─────────────────────────────────────────────────────────────────────
+// -- P9-5: the signet pin ---------------------------------------------------------------------
 
 // The real signet genesis block hash (64 lowercase hex), as published by signet's own parameters and read from a
 // public block explorer on 2026-10-05 (handoff/G1-PREP-2026-10-05.md section 4). It has NOT met a live node of this
@@ -299,6 +304,446 @@ describe("P9-5: BTC_SIGNET_PIN is the real signet genesis (rule: a pin is correc
     const other = mockBitcoind(signetHandlers({ getblockhash: () => "ff".repeat(32) }));
     const rpc3 = new CapturingRpc({ endpoint: "http://x", fetch: other.fetch });
     await expect(BtcHtlcRail.connect({ config: signetConfig(), rpc: rpc3 })).rejects.toThrow(/genesis hash .* does not match pin "btc-signet-UNVERIFIED"/);
+  });
+});
+
+// -- P9-5: the signet fee, through the adapter ------------------------------------------------
+//
+// The pure rules (rate from an estimate, fee from a rate and a size, the size bound) are in tests/btc-signet-fee.test.ts.
+// Here the adapter drives them through a mocked bitcoind: which calls it makes and in what order, what the PSBT it hands
+// the wallet pays, what the wallet is asked for on a funding, and when a fee is kept for a retry.
+
+const SIGNET_SCRIPT = buildHtlcScript(
+  { hashLock: hexToBytes(HASH_LOCK.slice(2)), payeePubkey: hexToBytes(PAYEE_PUBKEY), payerPubkey: hexToBytes(PAYER_PUBKEY), locktime: 1_700_000_000 },
+  BTC_SIGNET_NETWORK,
+);
+/** A signet (tb1q...) P2WSH destination: 34-byte script, so a claim is 152 virtual bytes at most and a refund 144. */
+const SIGNET_DESTINATION = SIGNET_SCRIPT.address;
+const CLAIM_VBYTES = 152;
+const REFUND_VBYTES = 144;
+const SIGNET_NOT_AFTER_MS = 1_800_000_000_000;
+const SECRET = `0x${PREIMAGE_HEX}`;
+const FUNDING_AMOUNT = 100_000_000n;
+
+function feeHandlers(estimate: () => unknown, overrides: Partial<Handlers> = {}): Handlers {
+  return signetHandlers({ estimatesmartfee: estimate, ...overrides });
+}
+
+/** The satoshis the first (only) output of the PSBT handed to the wallet's `walletprocesspsbt` pays, i.e. amount minus fee. */
+function psbtOutputSats(calls: readonly RpcCallLog[], which: "first" | "last" = "last"): bigint {
+  const signs = calls.filter((c) => c.method === "walletprocesspsbt");
+  const call = which === "last" ? signs[signs.length - 1] : signs[0];
+  const base64 = call?.params[0];
+  if (typeof base64 !== "string") throw new Error("test: no walletprocesspsbt call with a PSBT");
+  const tx = Transaction.fromPSBT(Buffer.from(base64, "base64"), { allowUnknownInputs: true, allowUnknownOutputs: true });
+  const amount = tx.getOutput(0).amount;
+  if (amount === undefined) throw new Error("test: the PSBT output has no amount");
+  return amount;
+}
+
+function psbtParam(calls: readonly RpcCallLog[]): string {
+  const signs = calls.filter((c) => c.method === "walletprocesspsbt");
+  const value = signs[signs.length - 1]?.params[0];
+  if (typeof value !== "string") throw new Error("test: no walletprocesspsbt call with a PSBT");
+  return value;
+}
+
+const methodsOf = (calls: readonly RpcCallLog[]): string[] => calls.map((c) => c.method);
+
+async function signetRail(handlers: Handlers, spendFees?: Map<string, bigint>) {
+  const { fetch: fetchImpl, calls } = mockBitcoind(handlers);
+  const rpc = new CapturingRpc({ endpoint: "http://127.0.0.1:38332", fetch: fetchImpl });
+  const rail = await BtcHtlcRail.connect({ config: signetConfig(), rpc, ...(spendFees === undefined ? {} : { spendFees }) });
+  calls.length = 0; // the connect-time reads are not under test
+  return { rail, rpc, calls };
+}
+
+describe("P9-5: the signet funding asks the wallet for the node's fee rate", () => {
+  it.each([
+    ["an estimate between the floor and the cap", { feerate: 0.00012, blocks: 6 }, 12],
+    ["an estimate with a fraction of a sat/vB", { feerate: 0.00012345, blocks: 6 }, 12.345],
+    ["an estimate above the cap", { feerate: 0.5, blocks: 6 }, 50],
+    ["an estimate far above the cap", { feerate: 1e300, blocks: 6 }, 50],
+    ["an estimate below the floor", { feerate: 0.000001, blocks: 6 }, 8],
+    ["no feerate (the node has no data)", { errors: ["Insufficient data or no feerate found"], blocks: 6 }, 8],
+    ["an answer that is not an object", null, 8],
+    ["a zero feerate", { feerate: 0, blocks: 6 }, 8],
+  ])("fund() and prepareFunding() pass fee_rate for %s", async (_label, answer, expectedSatPerVb) => {
+    for (const build of ["fund", "prepareFunding"] as const) {
+      const { rail, calls } = await signetRail(feeHandlers(() => answer));
+      await (build === "fund" ? rail.fund(TERMS, BUYER) : rail.prepareFunding(TERMS, BUYER));
+      const estimateIndex = calls.findIndex((c) => c.method === "estimatesmartfee");
+      const createIndex = calls.findIndex((c) => c.method === "walletcreatefundedpsbt");
+      expect(estimateIndex, build).toBeGreaterThan(-1);
+      expect(createIndex, build).toBeGreaterThan(estimateIndex);
+      expect(calls[estimateIndex]?.params, build).toEqual([6, "conservative"]);
+      expect(calls[estimateIndex]?.path, "a node-level read, not a wallet call").toBeUndefined();
+      expect(calls[createIndex]?.params[3], build).toEqual({ fee_rate: expectedSatPerVb });
+      expect(calls[createIndex]?.path).toBe("/wallet/buyer");
+    }
+  });
+
+  it("is the floor when estimatesmartfee answers with an error", async () => {
+    const { rail, calls } = await signetRail(
+      feeHandlers(() => {
+        throw Object.assign(new Error("Fee estimation disabled"), { code: -32603 });
+      }),
+    );
+    await rail.fund(TERMS, BUYER);
+    expect(calls.find((c) => c.method === "walletcreatefundedpsbt")?.params[3]).toEqual({ fee_rate: 8 });
+  });
+
+  it("is the floor when the estimate call itself fails (a transport fault), and the swap step still goes ahead", async () => {
+    const node = mockBitcoind(feeHandlers(() => ({ feerate: 0.0004 })));
+    const failing = (async (url: unknown, init?: RequestInit) => {
+      if ((JSON.parse(String(init?.body)) as { method: string }).method === "estimatesmartfee") throw new TypeError("fetch failed");
+      return node.fetch(url as never, init);
+    }) as typeof fetch;
+    const rpc = new CapturingRpc({ endpoint: "http://127.0.0.1:38332", fetch: failing });
+    const rail = await BtcHtlcRail.connect({ config: signetConfig(), rpc });
+    node.calls.length = 0;
+    await rail.fund(TERMS, BUYER);
+    expect(node.calls.find((c) => c.method === "walletcreatefundedpsbt")?.params[3]).toEqual({ fee_rate: 8 });
+    expect(node.calls.some((c) => c.method === "sendrawtransaction")).toBe(true);
+  });
+
+  it("makes the same one estimate call per funding, ahead of the wallet", async () => {
+    const { rail, calls } = await signetRail(feeHandlers(() => ({ feerate: 0.0002 })));
+    await rail.fund(TERMS, BUYER);
+    expect(methodsOf(calls)).toEqual([
+      "getblockchaininfo",
+      "getblockhash",
+      "estimatesmartfee",
+      "walletcreatefundedpsbt",
+      "walletprocesspsbt",
+      "testmempoolaccept",
+      "sendrawtransaction",
+    ]);
+  });
+});
+
+describe("P9-5: a signet claim and refund pay the node's fee for their own size", () => {
+  it.each([
+    ["between the floor and the cap (12 sat/vB)", { feerate: 0.00012 }, 12_000],
+    ["a fraction (12.345 sat/vB)", { feerate: 0.00012345 }, 12_345],
+    ["above the cap (clamped to 50 sat/vB)", { feerate: 0.5 }, 50_000],
+    ["below the floor (clamped to 8 sat/vB)", { feerate: 0.000001 }, 8000],
+    ["no feerate (the floor)", { errors: ["Insufficient data or no feerate found"], blocks: 6 }, 8000],
+  ])("estimate %s", async (_label, answer, rateSatPerKvB) => {
+    const claimFee = BigInt(Math.ceil((rateSatPerKvB * CLAIM_VBYTES) / 1000));
+    const refundFee = BigInt(Math.ceil((rateSatPerKvB * REFUND_VBYTES) / 1000));
+
+    const claimNode = await signetRail(feeHandlers(() => answer));
+    await claimNode.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS);
+    expect(psbtOutputSats(claimNode.calls)).toBe(FUNDING_AMOUNT - claimFee);
+
+    const refundNode = await signetRail(feeHandlers(() => answer));
+    await refundNode.rail.refund(REF, TERMS, BUYER, SIGNET_DESTINATION);
+    expect(psbtOutputSats(refundNode.calls)).toBe(FUNDING_AMOUNT - refundFee);
+  });
+
+  it("asks for the six-block conservative estimate, once, before the build; the deadline guard is still the last read before broadcast", async () => {
+    const { rail, calls } = await signetRail(feeHandlers(() => ({ feerate: 0.0002 })));
+    await rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS);
+    expect(methodsOf(calls)).toEqual([
+      "getblockchaininfo",
+      "getblockhash",
+      "getrawtransaction",
+      "estimatesmartfee",
+      "walletprocesspsbt",
+      "getblockchaininfo", // the deadline guard
+      "testmempoolaccept",
+      "sendrawtransaction",
+    ]);
+    expect(calls.find((c) => c.method === "estimatesmartfee")?.params).toEqual([6, "conservative"]);
+  });
+
+  it("a refund makes its estimate before the wallet signs, and no other extra call", async () => {
+    const { rail, calls } = await signetRail(feeHandlers(() => ({ feerate: 0.0002 })));
+    await rail.refund(REF, TERMS, BUYER, SIGNET_DESTINATION);
+    expect(methodsOf(calls)).toEqual(["getblockchaininfo", "getblockhash", "getrawtransaction", "estimatesmartfee", "walletprocesspsbt", "testmempoolaccept", "sendrawtransaction"]);
+  });
+
+  it("a fee that would leave less than the dust limit is cut to what leaves it (a 2,046 satoshi leg pays at most 1,500)", async () => {
+    const small = BTC_MIN_LOCKABLE_SATS;
+    const smallFunding = (params: unknown[]) => (params[1] === true ? { vout: [{ n: 1, scriptPubKey: { hex: bytesToHex(SCRIPT.scriptPubKey) } }] } : fakeRawFundingTxHex(SCRIPT.scriptPubKey, small));
+    const claimNode = await signetRail(feeHandlers(() => ({ feerate: 0.5 }), { getrawtransaction: smallFunding }));
+    await claimNode.rail.claim(REF, { ...TERMS, amountSats: small.toString() }, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS);
+    expect(psbtOutputSats(claimNode.calls)).toBe(DUST_LIMIT_SATS);
+    const refundNode = await signetRail(feeHandlers(() => ({ feerate: 0.5 }), { getrawtransaction: smallFunding }));
+    await refundNode.rail.refund(REF, { ...TERMS, amountSats: small.toString() }, BUYER, SIGNET_DESTINATION);
+    expect(psbtOutputSats(refundNode.calls)).toBe(DUST_LIMIT_SATS);
+  });
+
+  it("a failing estimate never stops a claim or a refund: both go out at the floor", async () => {
+    const failing = () => {
+      throw Object.assign(new Error("Fee estimation disabled"), { code: -32603 });
+    };
+    const claimNode = await signetRail(feeHandlers(failing));
+    await claimNode.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS);
+    expect(psbtOutputSats(claimNode.calls)).toBe(FUNDING_AMOUNT - BigInt((8000 * CLAIM_VBYTES) / 1000));
+    expect(claimNode.calls.some((c) => c.method === "sendrawtransaction")).toBe(true);
+    const refundNode = await signetRail(feeHandlers(failing));
+    await refundNode.rail.refund(REF, TERMS, BUYER, SIGNET_DESTINATION);
+    expect(psbtOutputSats(refundNode.calls)).toBe(FUNDING_AMOUNT - BigInt((8000 * REFUND_VBYTES) / 1000));
+  });
+
+  it("the fee rule is chosen by the pin's network name: the same adapter on a regtest pin pays 1,000 with no estimate call", async () => {
+    // (the regtest golden sequences below pin this exactly; this is the one-line statement of it)
+    const { rail, calls } = await connectRail(baseHandlers());
+    calls.length = 0;
+    await rail.claim(REF, TERMS, SECRET, SELLER, DESTINATION_ADDRESS, SIGNET_NOT_AFTER_MS);
+    expect(calls.some((c) => c.method === "estimatesmartfee")).toBe(false);
+    expect(psbtOutputSats(calls)).toBe(FUNDING_AMOUNT - DEFAULT_FEE_SATS);
+  });
+});
+
+describe("P9-5: a retry of the same signet spend rebuilds the identical transaction (K2), while it may have reached the node", () => {
+  /** A signet node whose fee estimate the test can move between attempts, and whose broadcast it can break. */
+  function movingNode(overrides: Partial<Handlers> = {}) {
+    const state = { feerate: 0.00012 };
+    const handlers = feeHandlers(() => ({ feerate: state.feerate, blocks: 6 }), overrides);
+    return { state, handlers };
+  }
+
+  it("a claim whose broadcast reply was lost is rebuilt with the fee it first used, though the estimate has moved", async () => {
+    const { state, handlers } = movingNode({
+      sendrawtransaction: () => {
+        throw new Error("connection reset");
+      },
+    });
+    const spendFees = new Map<string, bigint>();
+    const first = await signetRail(handlers, spendFees);
+    await expect(first.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS)).rejects.toThrow(/connection reset/);
+    state.feerate = 0.0003; // the market moves before the retry
+    const second = await signetRail(handlers, spendFees);
+    await expect(second.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS)).rejects.toThrow(/connection reset/);
+
+    expect(psbtParam(second.calls)).toBe(psbtParam(first.calls)); // the very same PSBT, so the very same signed bytes
+    expect(psbtOutputSats(second.calls)).toBe(FUNDING_AMOUNT - BigInt((12_000 * CLAIM_VBYTES) / 1000));
+    expect(second.calls.some((c) => c.method === "estimatesmartfee"), "a pinned fee is not re-estimated").toBe(false);
+  });
+
+  it("without the shared memory the same retry is priced afresh and is a different transaction (the control)", async () => {
+    const { state, handlers } = movingNode({
+      sendrawtransaction: () => {
+        throw new Error("connection reset");
+      },
+    });
+    const first = await signetRail(handlers);
+    await expect(first.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS)).rejects.toThrow(/connection reset/);
+    state.feerate = 0.0003;
+    const second = await signetRail(handlers);
+    await expect(second.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS)).rejects.toThrow(/connection reset/);
+    expect(psbtParam(second.calls)).not.toBe(psbtParam(first.calls));
+    expect(psbtOutputSats(second.calls)).toBe(FUNDING_AMOUNT - BigInt((30_000 * CLAIM_VBYTES) / 1000));
+  });
+
+  it("a refund is held the same way", async () => {
+    const { state, handlers } = movingNode({
+      sendrawtransaction: () => {
+        throw new Error("connection reset");
+      },
+    });
+    const spendFees = new Map<string, bigint>();
+    const first = await signetRail(handlers, spendFees);
+    await expect(first.rail.refund(REF, TERMS, BUYER, SIGNET_DESTINATION)).rejects.toThrow(/connection reset/);
+    state.feerate = 0.0003;
+    const second = await signetRail(handlers, spendFees);
+    await expect(second.rail.refund(REF, TERMS, BUYER, SIGNET_DESTINATION)).rejects.toThrow(/connection reset/);
+    expect(psbtParam(second.calls)).toBe(psbtParam(first.calls));
+  });
+
+  it("a claim and a refund of the same outpoint, and a claim to another destination, are priced separately", async () => {
+    const { state, handlers } = movingNode();
+    const spendFees = new Map<string, bigint>();
+    const a = await signetRail(handlers, spendFees);
+    await a.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS);
+    state.feerate = 0.0003;
+    const b = await signetRail(handlers, spendFees);
+    await b.rail.refund(REF, TERMS, BUYER, SIGNET_DESTINATION);
+    expect(psbtOutputSats(b.calls)).toBe(FUNDING_AMOUNT - BigInt((30_000 * REFUND_VBYTES) / 1000)); // not the claim's 12 sat/vB
+    const c = await signetRail(handlers, spendFees);
+    const p2wpkh = Address(BTC_SIGNET_NETWORK).encode({ type: "wpkh", hash: new Uint8Array(20).fill(7) }); // a P2WPKH destination: a different size, so a different fee
+    await c.rail.claim(REF, TERMS, SECRET, SELLER, p2wpkh, SIGNET_NOT_AFTER_MS);
+    expect(psbtOutputSats(c.calls)).toBe(FUNDING_AMOUNT - BigInt((30_000 * 140) / 1000));
+    expect(spendFees.size).toBe(3);
+  });
+
+  it("a spend that testmempoolaccept refused provably never reached the network: its fee is forgotten", async () => {
+    const { state, handlers } = movingNode({ testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: false, "reject-reason": "min relay fee not met" }] });
+    const spendFees = new Map<string, bigint>();
+    const first = await signetRail(handlers, spendFees);
+    await expect(first.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS)).rejects.toThrow(/min relay fee not met/);
+    expect(spendFees.size).toBe(0);
+    state.feerate = 0.0003;
+    handlers.testmempoolaccept = () => [{ txid: "aa".repeat(32), allowed: true }];
+    const second = await signetRail(handlers, spendFees);
+    await second.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS);
+    expect(psbtOutputSats(second.calls)).toBe(FUNDING_AMOUNT - BigInt((30_000 * CLAIM_VBYTES) / 1000)); // priced afresh
+  });
+
+  it("a refund the node refused (non-final yet) is forgotten too, and priced afresh when the timelock has passed", async () => {
+    const { state, handlers } = movingNode({ testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: false, "reject-reason": "non-final" }] });
+    const spendFees = new Map<string, bigint>();
+    const first = await signetRail(handlers, spendFees);
+    await expect(first.rail.refund(REF, TERMS, BUYER, SIGNET_DESTINATION)).rejects.toThrow(/non-final/);
+    expect(spendFees.size).toBe(0);
+    state.feerate = 0.0003;
+    handlers.testmempoolaccept = () => [{ txid: "aa".repeat(32), allowed: true }];
+    const second = await signetRail(handlers, spendFees);
+    await second.rail.refund(REF, TERMS, BUYER, SIGNET_DESTINATION);
+    expect(psbtOutputSats(second.calls)).toBe(FUNDING_AMOUNT - BigInt((30_000 * REFUND_VBYTES) / 1000));
+  });
+
+  it("a refund the node refused is forgotten even when the caller's own onNotBroadcast then fails (the failure that surfaces is the caller's)", async () => {
+    const { handlers } = movingNode({ testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: false, "reject-reason": "non-final" }] });
+    const spendFees = new Map<string, bigint>();
+    const first = await signetRail(handlers, spendFees);
+    await expect(
+      first.rail.refund(REF, TERMS, BUYER, SIGNET_DESTINATION, {
+        onNotBroadcast: () => {
+          throw new Error("store refused the save");
+        },
+      }),
+    ).rejects.toThrow(/store refused the save/);
+    expect(first.calls.some((c) => c.method === "sendrawtransaction")).toBe(false);
+    expect(spendFees.size).toBe(0);
+  });
+
+  it("a claim refused by its deadline guard (nothing was sent) is forgotten", async () => {
+    const { state, handlers } = movingNode();
+    const spendFees = new Map<string, bigint>();
+    const first = await signetRail(handlers, spendFees);
+    await expect(first.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, 1_690_000_000_000)).rejects.toThrow(/refusing to broadcast claim/);
+    expect(spendFees.size).toBe(0);
+    state.feerate = 0.0003;
+    const second = await signetRail(handlers, spendFees);
+    await second.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS);
+    expect(psbtOutputSats(second.calls)).toBe(FUNDING_AMOUNT - BigInt((30_000 * CLAIM_VBYTES) / 1000));
+  });
+
+  it("a wallet that cannot sign (nothing was sent) forgets the fee; a refund whose bytes the caller could not save is forgotten too", async () => {
+    const { handlers } = movingNode({ walletprocesspsbt: () => ({ complete: false }) });
+    const spendFees = new Map<string, bigint>();
+    const first = await signetRail(handlers, spendFees);
+    await expect(first.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS)).rejects.toThrow(/complete, finalized/);
+    expect(spendFees.size).toBe(0);
+
+    handlers.walletprocesspsbt = () => ({ complete: true, hex: FUNDING_TX_HEX });
+    const second = await signetRail(handlers, spendFees);
+    await expect(
+      second.rail.refund(REF, TERMS, BUYER, SIGNET_DESTINATION, {
+        onSigned: () => {
+          throw new Error("store refused the save");
+        },
+      }),
+    ).rejects.toThrow(/store refused the save/);
+    expect(spendFees.size).toBe(0);
+    expect(second.calls.some((c) => c.method === "testmempoolaccept")).toBe(false);
+  });
+
+  it("a claim that landed (or was already in the mempool) keeps its fee, so a further retry is identical again", async () => {
+    const { state, handlers } = movingNode({ testmempoolaccept: () => [{ txid: "aa".repeat(32), allowed: false, "reject-reason": "txn-already-in-mempool" }] });
+    const spendFees = new Map<string, bigint>();
+    const first = await signetRail(handlers, spendFees);
+    await first.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS); // success: already known
+    state.feerate = 0.0003;
+    const second = await signetRail(handlers, spendFees);
+    await second.rail.claim(REF, TERMS, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS);
+    expect(psbtParam(second.calls)).toBe(psbtParam(first.calls));
+  });
+
+  it("the funding is not held: each build asks the node again (the wallet picks different inputs each time anyway)", async () => {
+    const { state, handlers } = movingNode();
+    const spendFees = new Map<string, bigint>();
+    const a = await signetRail(handlers, spendFees);
+    await a.rail.fund(TERMS, BUYER);
+    state.feerate = 0.0003;
+    const b = await signetRail(handlers, spendFees);
+    await b.rail.fund(TERMS, BUYER);
+    expect(b.calls.find((c) => c.method === "walletcreatefundedpsbt")?.params[3]).toEqual({ fee_rate: 30 });
+    expect(spendFees.size).toBe(0);
+  });
+});
+
+describe("P9-5: through the client rail, every connect() of one rail shares what a spend first paid", () => {
+  const LOCK_TERMS = {
+    contract: `0x${"11".repeat(32)}`,
+    lock: "hash" as const,
+    statement: HASH_LOCK,
+    amount: "100000000",
+    asset: "BTC",
+    payer: "did:key:zBuyer",
+    payee: "did:key:zSeller",
+    claimByMs: REFUND_AFTER_MS - 3_600_000,
+    refundAfterMs: REFUND_AFTER_MS,
+  };
+  const ACCOUNTS = { payee: PAYEE_PUBKEY, payer: PAYER_PUBKEY };
+
+  it("a Seller's claim retried through a second connect() is the same transaction; a second rail object prices on its own", async () => {
+    const state = { feerate: 0.00012 };
+    const handlers = feeHandlers(() => ({ feerate: state.feerate, blocks: 6 }), {
+      sendrawtransaction: () => {
+        throw new Error("connection reset");
+      },
+    });
+    const mkRail = () => {
+      const { fetch: fetchImpl, calls } = mockBitcoind(handlers);
+      const rpc = new CapturingRpc({ endpoint: "http://127.0.0.1:38332", fetch: fetchImpl });
+      const rail = createBtcCounterRail({ config: signetConfig(), rpc, wallet: "seller", key: SELLER.key, destinationAddress: SIGNET_DESTINATION, clock: () => 1_690_000_000_000 });
+      return { rail, calls };
+    };
+    const a = mkRail();
+    const firstConnect = await a.rail.connect(LOCK_TERMS, ACCOUNTS);
+    await expect(firstConnect.claim(REF, SECRET, SIGNET_NOT_AFTER_MS)).rejects.toThrow(/connection reset/);
+    state.feerate = 0.0003;
+    const secondConnect = await a.rail.connect(LOCK_TERMS, ACCOUNTS);
+    await expect(secondConnect.claim(REF, SECRET, SIGNET_NOT_AFTER_MS)).rejects.toThrow(/connection reset/);
+    const signs = a.calls.filter((c) => c.method === "walletprocesspsbt");
+    expect(signs).toHaveLength(2);
+    expect(signs[1]?.params[0]).toBe(signs[0]?.params[0]);
+
+    const other = mkRail(); // another party's rail object: its own memory
+    const otherConnect = await other.rail.connect(LOCK_TERMS, ACCOUNTS);
+    await expect(otherConnect.claim(REF, SECRET, SIGNET_NOT_AFTER_MS)).rejects.toThrow(/connection reset/);
+    expect(other.calls.filter((c) => c.method === "walletprocesspsbt")[0]?.params[0]).not.toBe(signs[0]?.params[0]);
+  });
+});
+
+describe("P9-5: regtest is unchanged: the fixed 1,000 satoshi fee, no estimate call, the same calls in the same order", () => {
+  it("fund(): options {}, the regtest call sequence, no estimatesmartfee", async () => {
+    const { rail, calls } = await connectRail(baseHandlers());
+    calls.length = 0;
+    await rail.fund(TERMS, BUYER);
+    expect(methodsOf(calls)).toEqual(["getblockchaininfo", "getblockhash", "walletcreatefundedpsbt", "walletprocesspsbt", "testmempoolaccept", "sendrawtransaction"]);
+    expect(calls.find((c) => c.method === "walletcreatefundedpsbt")?.params[3]).toEqual({});
+  });
+
+  it("claim(): 1,000 satoshis off the output, the regtest call sequence, no estimatesmartfee", async () => {
+    const { rail, calls } = await connectRail(baseHandlers());
+    calls.length = 0;
+    await rail.claim(REF, TERMS, SECRET, SELLER, DESTINATION_ADDRESS, SIGNET_NOT_AFTER_MS);
+    expect(methodsOf(calls)).toEqual(["getblockchaininfo", "getblockhash", "getrawtransaction", "walletprocesspsbt", "getblockchaininfo", "testmempoolaccept", "sendrawtransaction"]);
+    expect(psbtOutputSats(calls)).toBe(FUNDING_AMOUNT - 1000n);
+  });
+
+  it("refund(): 1,000 satoshis off the output, the regtest call sequence, no estimatesmartfee", async () => {
+    const { rail, calls } = await connectRail(baseHandlers());
+    calls.length = 0;
+    await rail.refund(REF, TERMS, BUYER, DESTINATION_ADDRESS);
+    expect(methodsOf(calls)).toEqual(["getblockchaininfo", "getblockhash", "getrawtransaction", "walletprocesspsbt", "testmempoolaccept", "sendrawtransaction"]);
+    expect(psbtOutputSats(calls)).toBe(FUNDING_AMOUNT - 1000n);
+  });
+
+  it("a regtest rail never writes to the memory it is given", async () => {
+    const spendFees = new Map<string, bigint>();
+    const { fetch: fetchImpl } = mockBitcoind(baseHandlers());
+    const rpc = new CapturingRpc({ endpoint: "http://127.0.0.1:19000", fetch: fetchImpl });
+    const rail = await BtcHtlcRail.connect({ config: config(), rpc, spendFees });
+    await rail.claim(REF, TERMS, SECRET, SELLER, DESTINATION_ADDRESS, SIGNET_NOT_AFTER_MS);
+    await rail.refund(REF, TERMS, BUYER, DESTINATION_ADDRESS);
+    expect(spendFees.size).toBe(0);
   });
 });
 
