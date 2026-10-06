@@ -426,7 +426,8 @@ export const STEPS = {
   legBRefundTime: { role: null, name: "time:legB", run: async (c) => c.w.setTime(c.w.refundAt.legB) },
 } satisfies Record<string, Step>;
 
-const PREFIX: Step[] = [
+/** The pairing and both account lines: everything before the Buyer locks leg A. */
+export const PREFIX: Step[] = [
   STEPS.bid,
   STEPS.acceptLegA,
   STEPS.acceptLegB,
@@ -489,7 +490,12 @@ export async function resumeRole(c: Ctx, role: Role): Promise<string> {
   return resumed.next;
 }
 
-export async function runScript(factory: WorldFactory, script: readonly Step[], targets: readonly Target[]): Promise<RunResult> {
+export interface RunHooks {
+  /** Runs right after a dead role was resumed and before its crashed step runs again: the place for a third party to act on the chain. */
+  afterResume?: (role: Role, next: string, w: World) => void | Promise<void>;
+}
+
+export async function runScript(factory: WorldFactory, script: readonly Step[], targets: readonly Target[], hooks: RunHooks = {}): Promise<RunResult> {
   const ctl = new Controller(targets);
   const w = factory(ctl);
   ctl.attachStore(w.stores.buyer, "buyer");
@@ -531,6 +537,7 @@ export async function runScript(factory: WorldFactory, script: readonly Step[], 
       result.deaths += 1;
       result.leaks.push(...(await secretLeaks(w)));
       const next = await resumeRole(c, step.role);
+      await hooks.afterResume?.(step.role, next, w);
       result.nexts.push({ role: step.role, next, crashedAt: step.name });
       skipBelow[step.role] = rankOf(script, step.role, next);
       continue; // run the same step again unless `next` is past it

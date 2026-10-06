@@ -98,6 +98,12 @@ export class LedgerChain {
   refuseRebroadcast = false;
   /** NEAR: a transaction that was never sent is provably dead (the access key's nonce moved past it). */
   nonceProof = true;
+  /** Bitcoin, a rail that does not exist: `recoverLock` answers "never landed" for a funding the node does not know (the real
+   *  adapter never does; this lets a test hand the flow a re-prepared lock with another outpoint). */
+  provesNeverLanded = false;
+  /** An output spent by a transaction the evidence reader and the pending-claim read do not show (a spend that is not a refund the
+   *  Buyer knows and not yet a claim anyone can read). */
+  hideSpends = false;
   height = 100;
   private serial = 0;
 
@@ -284,6 +290,7 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     if (this.options.flavour === "btc") {
       if (handle.chain !== "btc") throw new RailRecoveryRefusedError("handle-mismatch", prepared.ref, `a ${handle.chain} handle for the btc rail`);
       if (this.chain.knownTxs.has(handle.txid)) return "landed";
+      if (this.chain.provesNeverLanded) return "never-landed";
       if (this.chain.refuseRebroadcast) throw new RailRecoveryRefusedError("rebroadcast-refused", prepared.ref, "the node refuses the persisted funding (its inputs are gone)");
       // Identical bytes, again. The matrix keeps the facts of the funding on the chain object by txid.
       const funding = this.chain.builtFundings.get(handle.txid);
@@ -307,7 +314,8 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     if (output === undefined) throw new Error("ledger rail: no such output");
     if (output.status !== "locked") throw new Error(`ledger rail: claim refused, the output is ${output.status}`);
     if (!verifySecret("hash", output.hashLock, secret)) throw new Error("ledger rail: claim refused, the secret does not open the statement");
-    if (this.chain.nowMs() >= output.refundAfterMs) throw new Error("ledger rail: claim refused, too late");
+    // NEAR's contract refuses a claim at or after refundAfterMs; Bitcoin has no on-chain claim deadline (a claim and a refund race).
+    if (this.options.flavour === "near" && this.chain.nowMs() >= output.refundAfterMs) throw new Error("ledger rail: claim refused, too late");
     await this.options.hooks.act("claim.send", async () => {
       this.chain.counts.claimSent += 1;
       output.status = "claimed";
@@ -375,6 +383,7 @@ class LedgerConnected implements ConnectedCounterAssetRail {
 
   async checkPendingClaim(ref: string): Promise<string | null> {
     this.options.hooks.alive();
+    if (this.chain.hideSpends) return null;
     const output = this.chain.outputs.get(ref);
     return output?.status === "claimed" && output.preimage !== undefined ? output.preimage : null;
   }
@@ -392,6 +401,7 @@ class LedgerConnected implements ConnectedCounterAssetRail {
       output.refundAfterMs === terms.refundAfterMs &&
       (accounts.payee === undefined || output.payee === accounts.payee);
     if (!matches) return { lock: { ...base, railVerified: false, reason: "the output does not match the leg's terms" } };
+    if (this.chain.hideSpends && output.status !== "locked") return { lock: { ...base, railVerified: true } };
     return {
       lock: { ...base, railVerified: true },
       rail: { status: output.status, final: true, checkedAtMs, rail: this.railId, ref, contract: terms.contract, terms: { ...terms } },

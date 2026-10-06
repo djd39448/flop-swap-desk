@@ -250,11 +250,12 @@ export const nearWorld: WorldFactory = (ctl): World => {
 
 // --- the ledger worlds (btc and nearfake) ---------------------------------------------------------------------------------
 
-function ledgerWorld(flavour: LedgerFlavour): WorldFactory {
+function ledgerWorld(flavour: LedgerFlavour, configure?: (chain: LedgerChain) => void): WorldFactory {
   return (ctl): World => {
     const clockRef = { ms: T0 };
     const clock = (): number => clockRef.ms;
     const chain = new LedgerChain(clock);
+    configure?.(chain);
     const venue = new MemoryVenue(clock);
     const noteStore = new MemoryNoteStore();
     const base = common(ctl, clockRef, venue, noteStore);
@@ -307,6 +308,8 @@ function ledgerWorld(flavour: LedgerFlavour): WorldFactory {
 
 export const btcWorld: WorldFactory = ledgerWorld("btc");
 export const nearFakeWorld: WorldFactory = ledgerWorld("near");
+/** A ledger world whose chain a test reaches (to turn a knob or to act as a third party on it). */
+export const ledgerWorldWith = (flavour: LedgerFlavour, configure: (chain: LedgerChain) => void): WorldFactory => ledgerWorld(flavour, configure);
 
 export const WORLDS: Array<{ name: string; factory: WorldFactory }> = [
   { name: "evm", factory: evmWorld },
