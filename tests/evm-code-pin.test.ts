@@ -29,7 +29,7 @@ import {
 } from "../src/rails/evm-htlc.js";
 import { verifiedExchangeBytes, type CapturingRpc } from "../src/rails/rpc-capture.js";
 import type { AddressBook } from "../src/vendor/evm-hash-rail.js";
-import { Controller, PREFIX, type Ctx } from "./helpers/crash-matrix.js";
+import { Controller, PREFIX, STEPS, type Ctx } from "./helpers/crash-matrix.js";
 import { EvmMockNode } from "./helpers/evm-mock-node.js";
 import { evmWorldWith } from "./helpers/matrix-worlds.js";
 import { evmSigner } from "./helpers/proven-lines.js";
@@ -216,7 +216,7 @@ describe("P9-2 connect(): the contract's code is read and must hash to the pin",
 });
 
 describe("P9-2: a flow never writes against a contract whose code is not the pin", () => {
-  it("every step of a swap refuses at connect: no approve, lock or claim reaches the node", async () => {
+  it("the first step that touches the rail refuses at connect: no approve, lock or claim reaches the node", async () => {
     let node: EvmMockNode | undefined;
     const factory = evmWorldWith((n) => {
       node = n;
@@ -248,6 +248,22 @@ describe("P9-2: a flow never writes against a contract whose code is not the pin
     const c: Ctx = { w, buyer: new BuyerFlow(w.buyerOptions()), seller: new SellerFlow(w.sellerOptions()), history: [] };
     for (const step of PREFIX) await step.run(c);
     expect(node?.codeReads.length, "the pinned code was read").toBeGreaterThan(0);
+  });
+
+  it("other code at the address between two steps stops the Buyer's lock before its approve: nothing is sent", async () => {
+    let node: EvmMockNode | undefined;
+    const factory = evmWorldWith((n) => {
+      node = n;
+      n.configExtras = { contractCodeHash: keccak256(n.contractCode) };
+    });
+    const w = factory(new Controller([]));
+    const c: Ctx = { w, buyer: new BuyerFlow(w.buyerOptions()), seller: new SellerFlow(w.sellerOptions()), history: [] };
+    for (const step of PREFIX) await step.run(c);
+    expect(node?.sends).toEqual([]);
+    node!.contractCode = `${node!.contractCode}00`; // the address now holds another contract
+    await expect(STEPS.lockLegA.run(c)).rejects.toBeInstanceOf(EvmContractCodeError);
+    expect(node?.sends, "no approve and no lock was sent").toEqual([]);
+    expect(w.counts().locks).toBe(0);
   });
 });
 
