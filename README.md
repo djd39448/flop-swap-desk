@@ -1094,9 +1094,12 @@ that was saved without a known outcome reads the chain and the venue first (see 
 `next` is advice, not a lock. The Buyer's names are `bid`, `acceptLegB`, `verifyLegBLocked`, `postAccountLineA`,
 `lockLegA`, `learnSecret`, `refundLegA`, `done` and `abandoned`; the Seller's are `acceptLegA`, `postAccountLineA`,
 `lockLegB`, `claimLegA`, `refundLegB`, `done` and `abandoned`. `abandoned` means the swap can no longer proceed and has
-nothing at stake: an accept that never landed before the offer it answers expired (see "Offers that expired" under
-"What a resumed step does"). There is nothing to call; the runner drops the swap, and starts again from a fresh offer if
-it wants one. `learnSecret` is also the way back into `claimLegB`: the Buyer's record never holds the secret, so it is
+nothing at stake: an accept that never landed before the offer it answers expired, or an accept B that the venue stamped
+at or after leg B's offer expiry while nothing is locked (see "Offers that expired" under "What a resumed step does").
+There is nothing to call; the runner drops the swap, and starts again from a fresh offer if it wants one. Not every
+dead end is named `abandoned`: the states where a runner that obeys only `next` waits with nothing at stake are listed
+under "Limits of resume".
+`learnSecret` is also the way back into `claimLegB`: the Buyer's record never holds the secret, so it is
 read again from the deal room or the chain. After leg A's `refundAfterMs` a Buyer may call `refundLegA` where `next`
 says `learnSecret`; after leg B's `refundAfterMs` a Seller may call `refundLegB` where `next` says `claimLegA`. Because
 the offers room is a short ring, the runner can pass what the record kept: `BuyerFlow.recordedPairing` (leg B's offer
@@ -1163,13 +1166,15 @@ itself is not harmed.
    sha256 digest of the text, never the text; and no string anywhere in the record that holds a run of exactly 64 hex
    digits (with or without `0x`, either case) opening the lock's hash lock. Today's writers put the secret nowhere in a
    Buyer record, and that last check is the net under them: it does not see a secret glued into a longer run of hex
-   digits, nor a record whose lock has no hash lock yet.
+   digits, nor the secret in base64 or any other encoding, nor a record whose lock has no hash lock yet.
 6. **Fail closed on bad state.** See `resume` above.
 
 ### The store and its directory
 
-`FlowStore` is three methods over opaque bytes, `load`, `save` and `list`, plus two optional members that a store with
-real storage behind it offers for the Seller's begin (`scopeId` and `exclusive`, see "One process per swap").
+`FlowStore` is three methods over opaque bytes, `load`, `save` and `list`, plus three optional members that a store with
+real storage behind it offers: `scopeId` and `exclusive` for the Seller's begin (see "One process per swap") and
+`locationOf`, the file that holds a key's record, which an error message uses to name the record a person must act on
+(`FileFlowStore` only).
 `MemoryFlowStore` is the test store (it can fail the n-th save on purpose). `FileFlowStore(dir)` keeps one file per
 swap, `<role>-<id>.json` (`buyer-0x...` and `seller-0x...`: a key's `:` is not legal in a Windows file name), and
 checks every key against its grammar so nothing outside `dir` is ever touched.
@@ -1190,8 +1195,9 @@ checks every key against its grammar so nothing outside `dir` is ever touched.
 - **Each file carries a header with its payload's length and sha256**, and the record carries its own checksum, so a
   truncated or corrupted file is a `FlowStoreCorruptError` on load, never an empty answer. These checksums detect
   truncation and corruption, not tampering: they are not keyed, so anyone who can write the store directory can
-  produce a record that loads cleanly. Decoding is strict: closed objects, no unknown fields, a Buyer record cannot
-  carry a secret, a Seller's secret must open its statement.
+  produce a record that loads cleanly. Decoding is strict: closed objects, no unknown fields, and for a Buyer record
+  no preimage field, a reveal-b ledger entry that is a sha256 digest, and no standalone run of 64 hex digits that opens
+  the lock's hash lock (item 5 above says what that net does not see); a Seller's secret must open its statement.
 - **The directory is secret-grade, exactly like a key file.** Before the reveal the Seller's record holds the swap
   secret (and it keeps holding it afterwards). `FileFlowStore` creates the directory with mode `0o700` and the files
   with `0o600` where the platform honours modes. On Windows those modes do nothing and each record inherits its
@@ -1207,7 +1213,10 @@ checks every key against its grammar so nothing outside `dir` is ever touched.
 ### One process per swap
 
 Run one process per swap. The store has one writer per record: a second instance on the same record is refused at its
-first save with `FlowRecordStaleError`, so it cannot reset the first one's lock or fund leg A a second time. A runner
+first save with `FlowRecordStaleError`, so it cannot reset the first one's lock or fund leg A a second time. That
+refusal is reliable except in one narrow window: two live instances that both meet a leftover lock file (a dead
+process's, say) can interleave breaking it and taking it so that both of their saves pass (argued, not run). It needs
+the very misuse this section forbids, so the rule stays one live flow per swap. A runner
 that times out a step must still drop the old flow object, or kill its process, before it calls `resume`: a hung step
 that wakes up later is refused at its next save, but the rule stays one live flow per swap. Inside one flow,
 overlapping calls are refused as well: a second call of a step that is already in flight throws, and `claimLegB` and
@@ -1221,11 +1230,30 @@ leg A at the same time.
   names the runner's OWN pid after a restart: the process keeps a set of the lock files it holds right now, and a file
   with its own pid that is not in that set was left by a predecessor (killed inside a save, or a release that could not
   remove its file), so it is broken and the save goes on, with nothing for the desk operator to do. That is the common
-  case for node running as pid 1 in a container, where every restart has the same pid. The error does not say "another
-  instance" for the runner's own pid: when it reads "a save in this same process", a save of this very process is still
-  running (a hung write), and the answer is to wait for it or to drop the flow. A lock whose pid was reused by an
-  unrelated live process looks live: the operator removes the file the error names. The set of held locks belongs to
-  the process, not to a thread: use one thread per store directory.
+  case for node running as pid 1 in a container, where every restart has the same pid. `FlowStoreLockedError` carries
+  a `reason`, and its message says what a person can do about it; it never says "another instance" for the runner's
+  own pid, and nothing is written in any case:
+  - `held`, a live holder. "A save in this same process (pid N)" means a save of this very process is still running (a
+    hung write): wait for it or drop the flow. A live pid that is not this process's says that another instance owns
+    the swap. A pid that an unrelated process now has looks live as well (a recycled pid, or one that an early-boot
+    service took after a reboot that killed a save mid-write; there is no boot-time heuristic): the message says so,
+    and once no instance of the swap is running the operator removes the file it names.
+  - `stale`, a leftover that cannot be removed. A lock naming a dead pid, or this very pid without this process
+    holding it, is broken; if the file is still there after five attempts (a read-only attribute, a handle that
+    forbids deletion) the error reads "a stale lock file naming pid N could not be removed: remove <path>". Remove
+    that file by hand at the path the error names: no process is writing the record.
+  - `unreadable`, the save's own lock file stayed unreadable through the retries of a transient EPERM, EBUSY or EACCES
+    (a scanner or indexer holding it) when the save looked at it just before the rename: "the lock file could not be
+    read ... nothing was renamed". The flow fails like after any refused save and the runner resumes; no other instance
+    is involved.
+  - `lost`, the save's own lock file was removed or replaced while the save held it (nothing was renamed).
+- **One thread per store directory, a hard rule.** The set of held locks, and the begin queue below, belong to one
+  thread (each worker thread has its own), while a lock file names only the process's pid, which all of its threads
+  share. Two worker threads on one store directory therefore each take the other's live lock for a leftover of their
+  own pid and break it: they lose the single-writer guarantee and the begin fence, a save can be lost, and one offer
+  can be accepted twice (two secrets, two different accept A frames). Nothing detects it. A worker thread with a
+  directory of its own is fine, a respawned one included (it breaks its predecessor's leftover, as a restarted process
+  does). The store does not try to tell threads apart: worker thread ids are not stable across a respawn.
 - **Where the directory may live.** On a local file system, used from one host and one pid namespace: no network share
   and no directory shared between containers. Liveness is judged by pid, and a pid cannot be judged across hosts or pid
   namespaces: there a live holder's lock reads as a dead one and is broken, and the compare-and-swap can be lost
@@ -1233,21 +1261,31 @@ leg A at the same time.
 - **What fences two accepts of one offer.** Not the per-key compare-and-swap: two accepts of one offer mint two
   secrets and so name two different leg A contracts, hence two different record keys, and the swap never compares
   them. The Seller's begin (the scan for a record of this offer, the mint of the secret and the create of the record)
-  is one critical section instead. In one process, every store object on one directory shares one begin queue
+  is one critical section instead. In one thread, every store object on one directory shares one begin queue
   (`FlowStore.scopeId` is the resolved directory, lower-cased on Windows). Across processes,
   `FileFlowStore.exclusive("seller-begin")` runs the same three steps while it holds a lock file `seller-begin.lock`
   in the directory, taken exactly like a record's lock (a dead holder's file, or one naming the runner's own pid that
-  it does not hold, is broken; a live holder gives `FlowStoreLockedError` after `lockWaitMs`). The file is outside the
-  key grammar and `list()` never shows it, and, being a file, it also covers a second spelling of the directory (a
-  symlink or a junction) that the queue does not see. A store that offers neither (`MemoryFlowStore`, or a runner's
-  own `FlowStore` with no `scopeId` and no `exclusive`) is fenced per store object only: run one Seller process on it.
+  it does not hold, is broken; a live holder gives `FlowStoreLockedError` after `lockWaitMs`, and a leftover that
+  cannot be removed gives it with `reason` `stale`). The file is outside the key grammar and `list()` never shows it,
+  and, being a file, it also covers a second spelling of the directory (a symlink or a junction) that the queue does
+  not see. A store that offers neither (`MemoryFlowStore`, or a runner's own `FlowStore` with no `scopeId` and no
+  `exclusive`) is fenced per store object only: run one Seller process on it. A refused begin says "another Seller
+  begin is running (pid N)" ("in this same process" for the runner's own pid), not that another instance owns a swap,
+  and it has minted and posted nothing. A begin lock left behind by a live Seller process (its release could not read
+  or remove the file) blocks every other Seller process on that store, each accept being refused with that error,
+  until that process begins again (it then breaks its own leftover) or exits; remove `seller-begin.lock` by hand if it
+  persists. There is no background retry. A pid that an unrelated process now has looks live here as well, and the
+  message then says so and names the file to remove by hand.
 - **A Seller record that cannot be read blocks new accepts.** The begin scan reads every `seller:` record on the store.
   A record that fails its checksum or schema (`FlowStoreCorruptError`), carries a version this build does not read
   (`FlowRecordVersionError`), names another key or role (`FlowRecordMismatchError`) or cannot be loaded at all (a disk
   error) is never skipped: `acceptLegA` throws that error, whatever the offer, because an unreadable record cannot be
   shown not to be this offer's, and a second accept over it would mint a second secret and post a second, different
   accept A. A load error that was transient stops that one call; a damaged file stops every call until a person moves
-  it aside (it may hold a secret a swap still needs, so the flow never moves it). Never reuse the offer.
+  it aside (it may hold a secret a swap still needs, so the flow never moves it). Never reuse the offer. The error
+  names the record it stopped at, its store key and, for `FileFlowStore`, the file ("the begin scan stopped at the
+  stored record "seller:0x..." (file ...)"), so the person who moves it aside knows which one; it keeps the class and
+  the fields the load raised.
 
 ### What a resumed step does
 
@@ -1263,7 +1301,11 @@ FAILED on chain (a NEAR refund whose payout failed, a Solana refund that failed)
 and exactly one fresh refund follows once the lock reads Locked and final. A refund that lost the race to a claim says
 so, saves it, and `next` then says `learnSecret` (`done` once leg B's receipt is posted), whether or not a refund
 attempt was already saved: a claim that `refundLegA` saw, or this flow's own claim of leg B, also wins in `next` over
-the route for a lock that was attempted and not yet recognised. The Seller has the mirror: a `refundLegB` that leg B's
+the route for a lock that was attempted and not yet recognised. This flow's own claim of leg B also ends the refund
+route after a refund attempt was saved: a person who ran `learnSecret` and `claimLegB` by hand is not sent back to
+`refundLegA`, which refuses for ever once leg B is claimed, and `next` says `learnSecret` until leg B's receipt is
+posted, then `done`. The frames of a leg A refund that had landed and were not yet posted then stay unposted (the
+transcript only). The Seller has the mirror: a `refundLegB` that leg B's
 claim made impossible (the paper rail refused it, and leg B's note reads claimed with a secret that opens this swap's
 statement) clears the refund latch, saves `legBClaimSeen` and throws an error that names `claimLegA`; `next` then says
 `claimLegA` (`done` once leg A's receipt is posted), and a repeat of `refundLegB` throws the same error without
@@ -1280,24 +1322,49 @@ the refusal and the latch stay as they were.
   swap the venue never accepted. A resumed Seller (which re-posts its saved accept A after any downtime) therefore
   refuses to post, or re-post, an accept A that has not landed once its clock is within `SELLER_OFFER_EXPIRY_MARGIN_MS`
   (5 seconds) of offer A's `expiresMs`. The Buyer refuses an accept A record whose own timestamp is at or after offer
-  A's `expiresMs`, and refuses to post accept B at or after offer B's `expiresMs` by its clock. The refusal is a
-  `SwapExpiredError` (exported by `src/client/flow-resume.ts`, carrying `offerId` and `expiresMs`): nothing is minted,
-  saved, posted or locked, and nothing can be at stake, because no lock exists on either leg before accept B. An accept
-  that DID land and whose mark was lost is still adopted: the refusal applies only where the line has to be posted. A
-  flow without a store is held to the same refusals. Once the offer has expired, `next` says `abandoned` for a Seller
-  whose accept A is not recorded as landed (offer A, with the same margin) and for a Buyer whose saved pairing has no
-  landed accept B (offer B), so it never names a step that will refuse for ever; the swap starts again from a fresh
-  offer.
+  A's `expiresMs`, and refuses to post accept B at or after offer B's `expiresMs` by its clock (it keeps no margin: the
+  5 seconds belong to the Seller's accept A post). The venue stamps a post when it arrives, a moment after the poster
+  looked at its own clock, and its clock can run ahead, so a check of the clock alone is not enough for accept B. The
+  Seller therefore also refuses to lock leg B against an accept B record whose own stamp is at or after offer B's
+  `expiresMs` (no margin; nothing is saved, locked or posted, and the Seller's `next` stays `lockLegB`), and the Buyer,
+  with a store, throws the same refusal instead of returning an accept B that the venue stamped at or after that time,
+  whether it posted the line, adopted a copy from the room or is asked again on a resumed flow. The Seller's check runs
+  only while no leg B lock attempt is recorded: an attempt that was recorded is recovered whatever the stamp of its
+  accept B, because recognising a lock that may have landed is not a new action. The refusal is a `SwapExpiredError`
+  (exported by `src/client/flow-resume.ts`, carrying `offerId` and `expiresMs`): nothing is minted, saved, posted or
+  locked, and nothing can be at stake, because no lock exists on either leg before accept B. The one exception to
+  "posted" is the Buyer's refusal of an accept B stamped late: that accept was posted before its stamp was known, so it
+  is in the room and in the record, and the message says so; nothing is locked. An accept that DID land and whose mark
+  was lost is still adopted: the refusals of a clock apply only where the line has to be posted, while the checks of a
+  stamp read the landed record, adopted or not. A flow without a store is held to the same refusals, except that the
+  Buyer returns the accept B it got back whatever its stamp (the Seller refuses it all the same). Once the offer has
+  expired, `next` says `abandoned` for a Seller whose accept A is not recorded as landed (offer A, with the same margin)
+  and for a Buyer whose saved pairing has no landed accept B (offer B). A Buyer whose accept B landed with a stamp at or
+  after offer B's `expiresMs` is `abandoned` too, from the saved record whatever the clock says, while leg B is not
+  verified and no lock of leg A was attempted. So `next` never names a step that will refuse for ever in those cases;
+  the swap starts again from a fresh offer. The Seller has no mirror for the stamp (its record holds no accept B before
+  a lock attempt), so its `next` stays `lockLegB` once offer B has expired unanswered or answered late (see "Limits of
+  resume").
 - **EVM.** The lock has no handle: the reference is the hash lock. A row under it, owned by this account, is `landed`
   (whatever status it has since reached). No row means the lock may be sent again: `approve` is harmless to repeat and
   a repeated `lock` is refused by the contract's duplicate hash-lock check, so a repeat can lock only once. A lock
   under this hash lock owned by another payer is refused by name (`lock-conflict`). A repeated refund is recognised
   from the lock's own state. The Seller looks for its own preimage in the contract's `Claimed` log from the block
   marker saved with its claim attempt; found, it posts the reveal and receipt and signs nothing. The marker is the
-  chain tip when the attempt was saved minus a reorg margin (`CLAIM_MARKER_REORG_MARGIN_EVM`, 64 blocks, floored at
-  0), so a claim that a reorg mines below that tip is still inside the scan; the price is one `eth_getLogs` over 64
-  blocks more. After a restart a repeated approve, lock, claim or refund is refused by the contract, so the only cost
-  is gas.
+  chain tip when the attempt was saved minus a reorg margin (`CLAIM_MARKER_REORG_MARGIN_EVM`, 256 blocks, floored at 0),
+  so a claim that a reorg mines below that tip is still inside the scan. The margin is 256 because the Base Sepolia safe
+  head was measured 8 to 91 blocks behind its tip (92 samples on 2026-10-06, 90th percentile 79): an unsafe-head reorg
+  can re-include a claim well below the tip its attempt saw, and a resumed Seller that misses its own landed claim never
+  posts its reveal and receipt (liveness only, the Buyer still learns the secret from its own scan); the earlier 64 sat
+  inside that lag. The price is one `eth_getLogs` over about 256 blocks more, which stays under the 500-block window
+  recorded for the public Base Sepolia endpoint. That scan is one call from the marker to the tip and is not split into
+  chunks, so a `claimLegA` that comes more than about 244 blocks after the attempt was saved (about 8 minutes at Base's
+  2-second blocks) asks such an endpoint for more than its window: the call fails before anything is sent or posted, and
+  so does every retry, until the runner uses an endpoint with a wider window (argued from the window, not run against
+  that endpoint). The Buyer's lock marker keeps no margin; that is not a route under the default pin, which reads the
+  lock at the finalized tag, but a deployment that pins by confirmations below the chain's reorg depth needs one there
+  as well. After a restart a repeated approve, lock, claim or refund is refused by the contract, so the only cost is
+  gas.
 - **Bitcoin.** The funding transaction's id and its complete signed bytes are saved before the broadcast, and a
   resumed flow never re-prepares (a second preparation could pick other inputs and make a second outpoint). The node is
   asked about the txid, mempool included: known is `landed`, unknown is `unknown`, and after the guards the identical
@@ -1359,6 +1426,13 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
 - **Bitcoin.** If the node refuses to re-broadcast a saved funding (its inputs spent, a conflicting transaction, a
   policy rejection), the flow stops with a typed error (`RailRecoveryRefusedError`, code `rebroadcast-refused`). Check
   the wallet before any new attempt: a second funding is a second outpoint, and the flow never builds one by itself.
+  Also: a Seller's claim that was broadcast and then left the mempool without being mined (evicted or replaced) leaves
+  leg A unspent while the flows can read as finished. The Seller counts a broadcast claim as landed and posts its
+  reveal, a Buyer that saw the claim only in the mempool follows `next` to `learnSecret`, learns the secret from the
+  reveal and claims leg B, and the Seller's flow does not look at the claim again. A person re-broadcasts the Seller's
+  claim before leg A's `refundAfterMs`; after that time the claim races the Buyer's refund (see "Known limits of the
+  Bitcoin leg"). A runner that only follows `next` never does this. Recording the claim as landed only at one
+  confirmation is on the Bitcoin-leg backlog and is not built.
 - **EVM.** A lock under this hash lock that is not this account's (`lock-conflict`).
 - **Any rail.** A lock or funding created outside the record (for example by another instance that ran without a store,
   or against a store since lost) is never refunded by the flow: find it on chain and refund it by hand after its
@@ -1413,6 +1487,11 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
   `reveal-b` and `receipt-b`. They are posted only when `claimLegB` is called. Once the refund frames land, `next` says
   `done`, so a runner driven only by `next` never posts them. Frames only, with no effect on funds or on the secret: a
   runner that wants a complete leg B transcript calls `claimLegB`, and `next` does not ask for it.
+- **Leg A refund frames after the Buyer's own claim of leg B.** A refund of leg A can have landed with its refund and
+  receipt frames not yet posted (the process died between them). If a person then runs `learnSecret` and `claimLegB` by
+  hand (a Seller having posted its reveal without claiming leg A), `next` leaves the refund route for good and
+  `refundLegA` refuses, so those frames are never posted: leg A's transcript lacks its refund. The transcript only; the
+  refund itself landed.
 - **At most one Bitcoin refund is sent; one may be built twice.** A Bitcoin refund's signed bytes go to the flow's save
   (the `onSigned` recorder) before the rail broadcasts them. If that save is refused, the first signed bytes never left
   the process, and after the restart the flow builds the refund once more (usually the same transaction, with the same
@@ -1420,12 +1499,27 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
 - **`abandoned` comes from the record and the clock, not from the venue.** `next` does no I/O, so it says `abandoned`
   for an accept that is not recorded as landed even when the line did land in the room and only its mark was lost. A
   runner that obeys `next` then drops a swap that `acceptLegA` or `acceptLegB` would still have adopted. For a Seller
-  nothing is at stake (no lock on either leg, the statement never public), though a Buyer that already paired is left
-  waiting. For a Buyer nothing is at stake either (leg A is never locked before accept B), but the Seller's leg B,
-  locked on the strength of the landed accept B, stays locked until its refund time. Two edges of the expiry checks: the
-  Seller does not test an accept A it adopts against the offer's expiry by the record's own timestamp, so an accept A
-  that the venue stamped at or after `expiresMs` is adopted by the Seller and refused by the Buyer (`SwapExpiredError`),
-  and the swap stalls with nothing locked; and the Seller's refusal keeps a margin while the Buyer's has none.
+  nothing is at stake (no lock on either leg, the secret never revealed: its accept A may be public, its secret is
+  not), and no Buyer can have paired, because offer B is posted only after accept A's landed mark is saved. For a Buyer
+  nothing is at stake either (leg A is never locked before accept B), but the Seller's leg B, locked on the strength of
+  the landed accept B, stays locked until its refund time. Two edges of the expiry checks: the Seller does not test an
+  accept A it adopts against the offer's expiry by the record's own timestamp, so an accept A that the venue stamped at
+  or after `expiresMs` is adopted by the Seller and refused by the Buyer (`SwapExpiredError`), and the swap stalls with
+  nothing locked; a FRESH accept A ends the same way when the venue stamps it late although the Seller's own check
+  passed (the venue's clock more than 5 seconds ahead of the Seller's, or a post slower than that margin); and the
+  Seller's 5 seconds on the accept A post are the only margin, because the Buyer's checks and the Seller's check of
+  accept B's stamp have none. In both stalls the Seller's `next` keeps naming `lockLegB` (after its account line) for
+  ever, because its record holds no accept B before it attempts a lock and nothing tells it that the Buyer will never
+  answer.
+- **Waits with nothing at stake that `next` does not call `abandoned`.** A runner that obeys only `next` waits, or
+  retries a step that refuses, in these states, and in each of them no lock exists on the side that waits: a Buyer
+  whose offer A expired with no pairing saved (`next` stays `acceptLegB`); a pairing that `acceptLegB` refused by the
+  accept A stamp (nothing is saved, `next` stays `acceptLegB`); an accept B that landed in time and that the Seller
+  never answers with a lock (`verifyLegBLocked`); leg B verified, leg A not locked and the lock deadlines no longer safe
+  (`lockLegA` refuses and `next` stays `lockLegA`); and a Seller whose offer B expired unanswered, or was answered
+  late (`lockLegB`; the late accept A of the previous bullet is the same wait). Whatever was locked on the OTHER side
+  has its own doorway: the Seller refunds leg B after leg B's `refundAfterMs`, the Buyer refunds leg A after leg A's. A
+  runner driven only by `next` needs a time limit of its own, or a stop after repeated errors.
 - **The Bitcoin tests use a ledger fake.** The hermetic Bitcoin ledger fake mines instantly and always picks other
   inputs for a second funding; real Bitcoin Core coin selection differs (on a real wallet that holds the coins, a second
   preparation after the first broadcast would fund again; argued, not run). The double-funding tests therefore prove the
@@ -1448,7 +1542,12 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
   Solana, the Seller's refund that leg B's claim made impossible (the NEAR rail over the simulator), offers that
   expired, the claim marker under a reorg (the EVM mock node and the Bitcoin ledger fake), a NEAR lock whose lookup
   lagged (simulator only, like the `Expired` answers above), and a Solana refund that landed and failed because the
-  program's clock lagged the flow's (`tests/flow-resume-sol-refund.test.ts`).
+  program's clock lagged the flow's (`tests/flow-resume-sol-refund.test.ts`). Review round 3 added hermetic tests for
+  an accept B that the venue stamped at or after offer B's expiry (the Seller's refusal, the Buyer's refusal and its
+  `abandoned`, and a saved lock attempt that is still recovered), the Buyer's by-hand claim of leg B after a saved
+  refund attempt, a claim re-included 200 blocks below the tip (the 256-block margin), one failed read of the lock file
+  inside a save, the `reason` and wording of each lock refusal, the begin scan's error naming its record, and a Solana
+  lock whose first status read lags (the real rail over the stateful node, `tests/flow-resume-sol-lag.test.ts`).
 - **First-party and unaudited.** `src/client/flow-store.ts`, `flow-record.ts`, `flow-resume.ts` and the resume tests are
   first-party, unaudited and testnet-only (`PROVENANCE.md`).
 
@@ -1456,7 +1555,8 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
 
 A flow built without a `store` keeps its swap state in memory only; a process that dies loses it and nothing can rebuild
 it. The same holds when the store is lost. Two differences from the rest of this section: the offer-expiry refusals (see
-"Offers that expired") apply to a flow without a store as well, and a flow without a store still posts a lock frame at
+"Offers that expired") apply to a flow without a store as well (all but the Buyer's check of the stamp of the accept B
+it got back, which is on the store path only), and a flow without a store still posts a lock frame at
 or after leg A's refund time (only a flow with a store skips it). What a crash then costs, and what a person must do
 (the table is written for the Solana leg: read the escrow by its ref with `getEscrow` and act by hand; the other rails
 read their own lock by its ref the same way):
