@@ -373,13 +373,15 @@ export class SellerFlow {
   /** B5: every leg-A write's own raw `Exchange`s, in call order, so a bundle writer can persist
    *  them into `raw/rpc/` (every sha256 a `WriteEvidence.raw` names must resolve to real
    *  bytes). Paper-rail writes (`lockLegB`, `refundLegB`) never touch leg A's rail, so nothing
-   *  is added for them. */
-  private readonly writeExchanges: Exchange[] = [];
+   *  is added for them. R2-11: an ES `#private` field (with `#heldClaimExchanges`; `exchanges` is the one way in), like the secret. */
+  readonly #writeExchanges: Exchange[] = [];
   /** R1-22: the exchanges of claim attempts that FAILED. A failed claim published the secret on chain (the claim's instruction data), and
    *  the node answers later reads of it (`getTransaction`, a NEAR `tx_status`, a Bitcoin `getrawtransaction`) with the signed
    *  transaction, secret and all. They name no `WriteEvidence` (a failed claim has none), and a bundle persists exchange RESPONSES, so they
-   *  are held out of `exchanges` until the reveal frame is posted: a bundle written before then must not hold the preimage (rule 5). */
-  private heldClaimExchanges: Exchange[] = [];
+   *  are held out of `exchanges` until the reveal frame is posted: a bundle written before then must not hold the preimage (rule 5). A TypeScript
+   *  `private` field would still show up in `Object.entries(flow)` and in `util.inspect(flow, { customInspect: false })` while the secret is not
+   *  public (a claim the node refused before it reached the chain), so the hold is an ES `#private` field (R2-11). */
+  #heldClaimExchanges: Exchange[] = [];
 
   constructor(options: SellerFlowOptions) {
     this.identity = options.identity;
@@ -395,7 +397,7 @@ export class SellerFlow {
   /** B5: every leg-A write this flow has made so far, in call order. R1-22: the exchanges of FAILED claim attempts join this list only
    *  once the reveal frame is posted, so a bundle written from it earlier never holds the preimage. */
   get exchanges(): readonly Exchange[] {
-    return this.writeExchanges;
+    return this.#writeExchanges;
   }
 
   /** The hash statement this Seller minted for the swap, once `acceptLegA` has run — safe to
@@ -1533,13 +1535,13 @@ export class SellerFlow {
           : isSol
             ? await connected.claim(railRef, this.#hashLock.preimage, notAfterMs, solRecording)
             : await connected.claim(railRef, this.#hashLock.preimage, notAfterMs);
-        this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
+        this.#writeExchanges.push(...connected.exchanges.slice(before)); // B5
         if (writeEvidence.txHash !== undefined) this.dropClaimRecord(writeEvidence.txHash); // resolved: it landed
         this.claimOutcome = "landed";
         await this.persist();
         break;
       } catch (error) {
-        this.heldClaimExchanges.push(...connected.exchanges.slice(before)); // B5, held until the reveal (R1-22)
+        this.#heldClaimExchanges.push(...connected.exchanges.slice(before)); // B5, held until the reveal (R1-22)
         // R3-2: a claim that was broadcast and never landed (starved). The secret may have been seen; count it (the
         // next claim is priced higher) and sign again while the rail's landing bound still allows it. The bound ends
         // the effort with the starved error below, never a silent drop.
@@ -1673,7 +1675,12 @@ export class SellerFlow {
    *  a distinct `RevealNotPostedError` (never a silent skip). */
   private async postRevealLatched(contract: string, ref: string, refundAfterMs: number, detail: string): Promise<TranscriptRecord> {
     const key = `${contract}|${ref}`;
-    if (this.revealPosted?.key === key) return this.revealPosted.record;
+    if (this.revealPosted?.key === key) {
+      // R2-12: the reveal was posted by an earlier attempt of this flow, and a LATER claim attempt (a payout that failed again) held its own
+      // exchanges: the secret has been public since that post, so they join `exchanges` now, as the first attempt's did.
+      this.releaseHeldClaimExchanges();
+      return this.revealPosted.record;
+    }
     let last: unknown;
     const journal = this.#journal;
     const isSolRail = this.rail.railId === SOL_RAIL_ID;
@@ -1734,8 +1741,8 @@ export class SellerFlow {
   /** R1-22: the secret is public by design from the moment the reveal frame is posted, so the held exchanges of failed claims (response
    *  bytes a replay may read) join `exchanges` then. */
   private releaseHeldClaimExchanges(): void {
-    this.writeExchanges.push(...this.heldClaimExchanges);
-    this.heldClaimExchanges = [];
+    this.#writeExchanges.push(...this.#heldClaimExchanges);
+    this.#heldClaimExchanges = [];
   }
 
   /** S2-4: one venue call bounded by `revealPostTimeoutMs` (a real timer): a stalled venue rejects instead of hanging. */
