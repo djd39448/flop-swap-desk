@@ -465,6 +465,55 @@ describe("R2-04: the Seller begin queue is keyed by the store's scope id, not by
   });
 });
 
+describe("R2-08: a journal that failed while a re-post waited on its room read posts nothing", () => {
+  it("a durable, not-landed line with a slow room read, and another step's save refused meanwhile: the post count stays at the first attempt and the call is FlowStoreWriteFailedError", async () => {
+    const clock = { ms: T0 };
+    const inner = new MemoryVenue(() => clock.ms);
+    let posts = 0;
+    let failFirstPost = true;
+    let gate: Promise<void> | undefined; // while set, every room read waits for it
+    const venue: Venue = {
+      post: async (room, line, signer) => {
+        posts += 1;
+        if (failFirstPost) {
+          failFirstPost = false;
+          throw new Error("venue down");
+        }
+        return inner.post(room, line, signer);
+      },
+      read: async (room) => {
+        if (gate !== undefined) await gate;
+        return inner.read(room);
+      },
+    };
+    const store = new MemoryFlowStore();
+    const journal = await FlowJournal.begin({ store, venue, identity: me, clock: () => clock.ms }, buyerRecord());
+
+    await expect(journal.ensurePosted(specAccount)).rejects.toThrow("venue down"); // the intent is durable, the line is not landed
+    expect(posts).toBe(1);
+    expect(journal.isLanded("account-a")).toBe(false);
+
+    let open!: () => void;
+    gate = new Promise<void>((done) => {
+      open = done;
+    });
+    const repost = journal.ensurePosted(specAccount); // not new: it reads the room first, and the read is slow
+    const outcome = repost.then(
+      () => "resolved",
+      (error: unknown) => error,
+    );
+    await new Promise((done) => setTimeout(done, 5));
+    store.failSave(store.saveCount + 1, "reject"); // another step's save is refused while the read is pending
+    await expect(journal.update((record) => record)).rejects.toBeInstanceOf(FlowStoreFaultError);
+    expect(journal.failed).toBe(true);
+    open();
+
+    expect(await outcome).toBeInstanceOf(FlowStoreWriteFailedError);
+    expect(posts).toBe(1); // nothing more was posted
+    expect((await inner.read(specAccount.room)).filter((rec) => rec.sender === me.did)).toHaveLength(0);
+  });
+});
+
 describe("R1-12 (journal part): a line the ledger shows as landed is never posted again", () => {
   it("B1: a confirmed offers-room line (a slot kind) is returned as recorded after the ring rolled; nothing is posted, nothing is read, the seq stays", async () => {
     const r = rig(new MemoryFlowStore());

@@ -483,6 +483,10 @@ export class FlowJournal<R extends FlowRecord> {
         return next === current ? null : next;
       }, false);
     }
+    // R2-08: the journal may have failed while the room was being read (another step's save was refused meanwhile), and for a
+    // line whose intent was already durable nothing is saved above to notice it. A journal that no longer matches its
+    // store posts nothing: the check sits right before the post, after the guard and the intent save.
+    this.assertUsable();
     const posted = await (spec.post ?? ((room: string, line: string) => this.deps.venue.post(room, line, this.deps.identity)))(spec.room, spec.text);
     await this.markLanded(spec, text, posted, false);
     return posted;
