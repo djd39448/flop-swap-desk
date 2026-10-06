@@ -321,10 +321,11 @@ skip, and a retry of `claimLegA` posts only the frame still missing); `fromNearS
 comments at the two `refundedFold` call sites in `src/swap.ts` now describe the V4 rule. All
 first-party, covered by `tests/client-flows-near-rpc.test.ts` and `tests/near-signer-memory.test.ts`.
 
-## First-party crash-resume files (P8-RESUME-SPEC.md, P8-FIXES-R1.md, P8-FIXES-R2.md) - unaudited, testnet-only
+## First-party crash-resume files (P8-RESUME-SPEC.md, P8-FIXES-R1.md, P8-FIXES-R2.md, P8-FIXES-R3.md) - unaudited, testnet-only
 
 Not vendored: original to this repo, written for the crash-resume stage (`handoff/P8-RESUME-SPEC.md`, amended by the
-review round 1 and round 2 fix lists `handoff/P8-FIXES-R1.md` and `handoff/P8-FIXES-R2.md`). Listed per that spec's own
+review round 1, round 2 and round 3 fix lists `handoff/P8-FIXES-R1.md`, `handoff/P8-FIXES-R2.md` and
+`handoff/P8-FIXES-R3.md`). Listed per that spec's own
 instruction, not because anything below reuses outside code. **First-party, unaudited, testnet-only**: none of it has
 been reviewed for a real deployment, no deployment this repo drives carries mainnet value, and the store directory a
 real run writes holds the Seller's swap secret (the README's "Resume" section says how to treat it). No dependency was
@@ -333,9 +334,10 @@ added, and `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/`, `contract
 changed, so `docs/PROFILE.md` is unchanged, and no fixture was added or recaptured.
 
 - `src/client/flow-store.ts` - the `FlowStore` interface (a compare-and-swap `save`, plus the optional `scopeId` and
-  `exclusive` section the Seller's begin uses), `MemoryFlowStore` (with fault injection for tests) and `FileFlowStore`
-  (one checksummed file per swap, a per-key exclusive lock file and a store-wide `seller-begin.lock`, temp file, fsync
-  and rename).
+  `exclusive` section the Seller's begin uses and `locationOf`, which names a key's file in an error message),
+  `MemoryFlowStore` (with fault injection for tests) and `FileFlowStore` (one checksummed file per swap, a per-key
+  exclusive lock file and a store-wide `seller-begin.lock`, temp file, fsync and rename), and the typed lock refusal
+  `FlowStoreLockedError` with its `reason`.
 - `src/client/flow-record.ts` - the versioned, strictly validated, checksummed swap record (`v: 1`) for both roles, the
   frame ledger, the record key (`buyer:<swapId>`, `seller:<contractA>`) and the identity pins (DID, rail, chain,
   deployment, contracts).
@@ -352,7 +354,26 @@ changed, so `docs/PROFILE.md` is unchanged, and no fixture was added or recaptur
   `resume-matrix-{evm,btc,near,nearfake,sol}.test.ts` (the crash matrix), `rail-recovery-{evm,btc,near,near-sim,sol}.test.ts`,
   `deployment-id.test.ts`, `bundle-leak.test.ts`, and their helpers `tests/helpers/{crash-matrix,evm-mock-node,
   flow-record-samples,ledger-rail,live-resume,matrix-suite,matrix-worlds,near-stateful-rpc,near-swap-rig,resume-flows,
-  resume-sol-rig,resume-world,secret-scan,seller-key}.ts`.
+  resume-sol-rig,resume-world,secret-scan,seller-key}.ts`. Review round 3 added three more test files, all covered by
+  the `flow-resume-*.test.ts` pattern above and named here so that none is missing from this list:
+  `tests/flow-resume-detour.test.ts` (the Buyer's `next` after a saved refund attempt and a by-hand claim of leg B),
+  `tests/flow-resume-late.test.ts` (an accept B that the venue stamped at or after offer B's expiry, both roles) and
+  `tests/flow-resume-sol-lag.test.ts` (a lagging first status read of a Solana lock, the real rail over the stateful
+  node). It also extended `tests/flow-store.test.ts`, `flow-resume-begin.test.ts`, `flow-resume-reorg.test.ts`,
+  `flow-resume-sell.test.ts` and `flow-journal.test.ts`; `tests/helpers/ledger-rail.ts` and
+  `tests/helpers/sol-stateful-chain.ts` were retyped (types only) and `tests/helpers/sol-fake-chain.ts`, a helper that
+  predates the resume work, gained an opt-in read lag that is inert unless a test sets it. No helper file and no
+  fixture was added.
+- Type checking: `npm run typecheck` runs `tsc -p tsconfig.json`, whose `include` is `src` alone, so `tests/` and
+  `tests/helpers/` stay outside that gate (and outside `npm run build`); they run under vitest, which does not check
+  types. In review round 3 the P8 test files and the helpers they use (`tests/flow-resume-*.test.ts`,
+  `flow-store.test.ts`, `flow-record.test.ts`, `flow-journal.test.ts`, `helpers/ledger-rail.ts` and
+  `helpers/near-swap-rig.ts`, with their imports) were type-checked with a scratch tsconfig that extends the repo's
+  (`noEmit`, nothing committed): no diagnostics, exit 0. A scratch config over every file in `tests/` still reports 77
+  diagnostics in 14 older test files outside that set (`client-flows-near`, `client-flows-btc`, `evm-evidence` and
+  others; most are fake counter-asset rails without the `deploymentId` that the resume work made required, the rest
+  evidence fakes and strictness mismatches), which this pass did not touch. Whether `tests/` joins the typecheck gate
+  is a separate hygiene pass.
 - Live tests (each spawns its own throwaway local node and never touches a public network):
   `tests-anvil/resume.anvil.test.ts`, `tests-regtest/resume.regtest.test.ts`, `tests-near/resume.near.test.ts` and
   `tests-sol/resume.sol.test.ts`.
