@@ -4,7 +4,8 @@
 //
 //   R1-09  the refund note of a paper note that reads claimed is recorded ONCE, not once per call: 64 failed attempts used to
 //          fill the capped list and every later save failed before the refund was signed, in this process and after a restart
-//   R1-08  a recorded refund that LANDED AND FAILED (a NEAR payout, a Solana refund) is resolved, and exactly one fresh refund follows
+//   R1-08  (the NEAR flow tests are in tests/flow-resume-near.test.ts: a recorded refund that LANDED AND FAILED is resolved, and exactly
+//          one fresh refund follows)
 //   R1-15  a refund that lost the race to a claim persists a "claim seen" flag, so `next` says learnSecret, not refundLegA for ever
 //   R1-16  overlapping refundLegA calls are refused (at most one refund build)
 //
