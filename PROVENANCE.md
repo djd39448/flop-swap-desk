@@ -458,3 +458,25 @@ Not vendored: original to this repo. No key material in any of them.
   the stateful mock node (`tests/helpers/evm-mock-node.ts`) answers `eth_getCode`, a chain id, and refuses an `eth_getLogs` range
   over its cap exactly as the public endpoint does.
 - Live tests: `tests-anvil/code-pin.anvil.test.ts` and `tests-anvil/log-scan.anvil.test.ts`.
+
+## First-party Bitcoin signet pin, policy and fee files (P9-5, handoff/P9-G1-READINESS-SPEC.md) - unaudited, testnet-only
+
+Not vendored: original to this repo. No key material in any of them (the Bitcoin leg holds none; each party's bitcoind wallet
+signs). Nothing here has talked to a live signet node.
+
+- Extended first-party files: `src/rails/btc-htlc.ts` (the corrected `BTC_SIGNET_PIN`, still named `btc-signet-UNVERIFIED`; the
+  signet fee rule `BTC_SIGNET_FEE_RULE` with its target, floor and cap constants; `btcFeeRuleFor`, `feeRateFromEstimate`,
+  `spendFeeSatsFor`; the estimate call and the per-spend fee memory in `BtcHtlcRail`), `src/rails/btc-script.ts`
+  (`htlcSpendVsizeBound`, the size upper bound of a claim or refund), `src/client/policy.ts` (`BTC_SIGNET_POLICY`,
+  `btcLocalPolicyFor`) and `src/client/btc-rail.ts` (the policy chosen by the pin's network name; one fee memory shared by every
+  `connect()` of a rail). `BTC_LOCAL_POLICY` and every regtest request are unchanged. `vendor/tclk` and `src/vendor/` are untouched.
+- The signet genesis hash is the double sha256 of signet's genesis header (version 1, merkle root
+  `4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b`, time 1598918400, bits `0x1e0377ae`, nonce 52613770), derived
+  offline in `tests/btc-htlc.test.ts` (the same procedure over mainnet's header reproduces mainnet's genesis hash). It equals
+  the value G1-PREP section 4 read from a public block explorer. It has not been compared with a live node.
+- Hermetic tests: `tests/btc-signet-fee.test.ts` (new: the size bound against the two real Core-signed spends in
+  `fixtures/btc-regtest-2026-09-28/`, the rate and fee rules, the policy selection) and the P9-5 blocks of
+  `tests/btc-htlc.test.ts` and `tests/btc-evidence.test.ts` (the pin, the adapter against a mocked bitcoind, the retry rule).
+- Live test: `tests-regtest/btc-htlc.regtest.test.ts` gained assertions about the real Bitcoin Core 31.1 node (what
+  `estimatesmartfee` answers with no data; that `walletcreatefundedpsbt` takes the rate as `fee_rate` in sat/vB); the regtest
+  suite is still 29 tests and no regtest request changed.

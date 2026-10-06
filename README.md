@@ -500,10 +500,10 @@ reject) is refused with the node's own reject-reason and never sent.
 `tests/btc-regtest-fixtures.test.ts`) show a real P2WSH HTLC funded, claimed or refunded on a
 real Bitcoin Core 31.1 node, with every verdict re-derivable from the exact captured RPC bytes —
 but on `regtest`, an ephemeral node this repo itself starts and stops, never a real network, and
-never with mainnet value at any point in this build. The signet deploy is Dave's own G1 step and
-is not built here — `BTC_SIGNET_PIN` (`src/rails/btc-htlc.ts`) is present but named
-`"btc-signet-UNVERIFIED"` and refuses to match a live node until its genesis hash has actually
-been confirmed against one.
+never with mainnet value at any point in this build. The signet run is Dave's own G1 step and has
+not happened: `BTC_SIGNET_PIN` (`src/rails/btc-htlc.ts`) is named `"btc-signet-UNVERIFIED"`
+because it has never met a live signet node. "Bitcoin signet (P9-5)" below says what is built for
+it (the pin, the node flags, the policy, the fee) and what is still his.
 
 Re-deriving a verdict from the captured bytes (see "Audit replay" above, F3) detects the bytes
 being tampered with after the fact — damaged, truncated, spliced from another capture, answered
@@ -515,6 +515,85 @@ would. The independent check is each leg's own `finalizedRef`
 read from, so anyone with their own RPC access to that chain can re-query the same outpoint at
 that exact block hash and compare against what this build reported, independent of this
 repository entirely.
+
+### Bitcoin signet (P9-5)
+
+Built keyless and local (regtest and mocked nodes only); no part of it has talked to a real signet node.
+
+**The pin.** `BTC_SIGNET_PIN` is the real signet genesis block hash,
+`00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6` (64 lowercase hex characters), with
+the CAIP-2 reference `bip122:00000008819873e925422c1ff0f99f7c` (its first 32). Before P9-5 the
+constant held a 63-character value with a different tail and a 31-character reference, so it failed
+the build's own shape check and no signet config could pass any entry point (`checkBtcRailConfig`
+returned `ok: false`). A unit test now pins the value and the shape, and also derives the hash
+offline from signet's genesis header (version 1, the same coinbase merkle root as mainnet, time
+1598918400, bits `0x1e0377ae`, nonce 52613770: its double sha256, byte-reversed, is exactly this
+hash). That shows the constant is the genesis of that header; it does not show that a node agrees.
+So the pin keeps the name `btc-signet-UNVERIFIED` until it has met a live signet node, which is
+Dave's step at G1 time: `bitcoin-cli -signet getblockhash 0` must print exactly the value above.
+`BtcHtlcRail.connect` makes the same comparison and refuses a node that reports another chain name
+or another genesis, before any write.
+
+**The node.** A signet node for this client is started with `-signet -txindex=1`: the client reads
+arbitrary funding and spending transactions by txid (`getrawtransaction`), so the transaction index
+is required (and it excludes pruning). Each party's wallet is created with private keys enabled,
+because the wallet signs its own PSBTs and the client never holds a key. RPC authentication is the
+node's cookie file (`<datadir>/signet/.cookie`), turned into an HTTP Basic header by the caller's
+`CapturingRpc`; the watcher reads it with `--btc-rpc-cookie FILE`, and it is never written to a rail
+config, a capture or a bundle. Signet's default RPC port is 38332, so a rail config is
+`{ "btc": { "pin": <BTC_SIGNET_PIN>, "endpoint": "http://127.0.0.1:38332" } }`. No `-fallbackfee` is
+needed: on signet the client names the fee rate itself (below), so the wallet's own estimator, which
+a fresh node may have no data for, is never consulted.
+
+**The policy.** `BTC_SIGNET_POLICY` (`src/client/policy.ts`) is selected by the pin's network name,
+and never as a constructor option: a rail built for `regtest` takes `BTC_LOCAL_POLICY` (the same
+object as before, untouched) and one built for `signet` takes `BTC_SIGNET_POLICY`; a network off the
+allow list has no policy and the rail refuses to be built. Confirmations stay at one
+(`BTC_SIGNET_PIN.finality`): signet is a test network with no value at stake and its blocks come
+about every 10 minutes. The deadline numbers (60 minutes of reveal window, 3 hours of finality
+budget, 60 minutes of claim margin) were derived from a mined-block cadence in the first place, so
+they carry over unchanged; a test pins both policies.
+
+**The fee.** Regtest pays the fixed `DEFAULT_FEE_SATS` (1,000 satoshis) exactly as before: no
+estimate call, and the same requests in the same order (a test pins the sequence; the live regtest
+suite still passes its 29 tests and the committed fixtures still replay). On signet the lock, the
+claim and the refund price their fee from the node:
+
+- The rate is the node's `estimatesmartfee 6 conservative`. Six blocks (`BTC_SIGNET_FEE_TARGET_BLOCKS`)
+  is the 60 minute claim margin at 10 minutes a block, so a claim priced for it should be mined inside
+  the margin that guards it; `conservative` because a claim that waits has already published its
+  preimage. The rate is clamped to a floor of 8 sat/vB (`BTC_SIGNET_FEE_FLOOR_SAT_PER_VB`; the smallest
+  claim or refund is 132 virtual bytes, so this rate never pays less than the 1,000 satoshis a regtest
+  build pays) and to a cap of 50 sat/vB (`BTC_SIGNET_FEE_CAP_SAT_PER_VB`, the documented cap: it bounds
+  an estimator that has gone wrong, not any real fee market).
+- A claim or refund pays that rate times an upper bound for its own size (`htlcSpendVsizeBound`: 140
+  and 132 virtual bytes to a P2WPKH address, 152 and 144 to a P2WSH one; the real Core-signed claim
+  and refund in the committed regtest fixtures are 139 and 131, which a test checks), never less than
+  1,000 satoshis in total, and never so much that its output falls under the 546 satoshi dust limit (a
+  leg of the 2,046 satoshi minimum pays at most 1,500). At the cap a claim pays 7,000 satoshis to a
+  P2WPKH address and 7,600 to a P2WSH one.
+- The funding transaction asks the wallet for the same rate (`fee_rate`, in sat/vB, on
+  `walletcreatefundedpsbt`). The cap is a rate: a wallet that builds a funding from very many inputs
+  pays it on a larger transaction.
+- An answer with no usable rate (the node has no data: `errors` and no `feerate`; or a zero, negative
+  or non-numeric rate), an error reply, or a failure of the call itself, gives the floor. The
+  estimate is advice, and a claim must not miss its window because the node was slow to answer a
+  question about fees. It is asked before the transaction is built, so a claim's deadline guard is
+  still the last read before the broadcast.
+- A spend keeps the fee it first used for as long as its transaction may have reached the node, so a
+  retry after a lost broadcast reply rebuilds the identical transaction and Core's "already in the
+  mempool" answer still counts as success (P4-BTC-FIXES-R3.md K2). A claim or refund that the node
+  refused (`testmempoolaccept`), or that failed before it was sent, forgets its fee and is priced
+  afresh on the next attempt. One party's rail object keeps this memory across the flow's steps; a
+  restarted process prices afresh (with a `store`, the resume path first looks for its own spend on
+  chain, see "Resume").
+- Nothing re-prices a transaction that is already out: there is no fee bump (see the known limit
+  below).
+
+What is still Dave's at G1 time, and what has not been measured: the live check of the genesis hash
+above, a synced signet node with `-txindex=1` and funded wallets for both parties, and what
+`estimatesmartfee` actually answers on that node (a node that has just started answers with no data,
+which prices everything at the floor).
 
 ### Known limits of the Bitcoin leg
 
@@ -530,9 +609,9 @@ party or reveal the secret without payment.
   claim loses has already published the secret in the mempool, so the Buyer can take the FLOP leg
   as well as its refund. A Buyer whose refund is replaced by a later Seller claim loses the BTC
   unless it learns the secret from that claim and claims the FLOP leg before `B.claimByMs`. What
-  protects each side is timing, not fees (fees are a fixed constant and this build never
-  fee-bumps): the Seller's client claims only while `max(chain time, clock)` leaves at least 60
-  minutes before `A.refundAfterMs` (`BTC_LOCAL_POLICY.claimInclusionMarginMs`), re-checked as the
+  protects each side is timing, not fees (fees are a fixed constant on regtest, an estimate on
+  signet, and this build never fee-bumps): the Seller's client claims only while
+  `max(chain time, clock)` leaves at least 60 minutes before `A.refundAfterMs` (`BTC_LOCAL_POLICY.claimInclusionMarginMs`), re-checked as the
   last step before broadcast; the Buyer's rule-2 margin (`finalityAMs`, 3 h) keeps `B.claimBy`
   open long enough after `T` to learn the secret from a late claim — including one the Seller has
   only broadcast, not yet mined: `learnSecret` (via `findClaimedPreimage`) checks the mempool
@@ -580,9 +659,16 @@ party or reveal the secret without payment.
   never funded — fail closed, never fail silent.
   With a `store` the flow itself re-sends the saved funding bytes once (identical bytes, same txid, never a second
   outpoint) after its own guards, and never re-prepares.
-- **Fees are a fixed constant, not estimated.** `DEFAULT_FEE_SATS` (`src/rails/btc-htlc.ts`) is
-  subtracted from every claim/refund's single output; real fee estimation is out of scope for
-  this build (P4-BTC-SPEC.md §0).
+- **Fees: a fixed constant on regtest, the node's estimate on signet, and never bumped.**
+  `DEFAULT_FEE_SATS` (`src/rails/btc-htlc.ts`) is subtracted from every regtest claim/refund's single
+  output; on signet the fee follows the node's estimate between a floor and a cap (see "Bitcoin signet
+  (P9-5)"). Neither re-prices a transaction that is already out: there is no replace-by-fee and no
+  child-pays-for-parent, so a claim priced under a rising fee market can wait in the mempool with its
+  preimage public, and if it misses `A.refundAfterMs` the Buyer can claim the other leg and refund
+  this one. The 60 minute claim margin, the conservative six-block target and the claim's last
+  deadline guard are the bounds; a person speeding a stuck claim up would have to sign a higher-fee
+  spend of the same outpoint by hand. The claim and refund are not wallet transactions, so the node's
+  own `bumpfee` does not apply to them.
 - **One node, one confirmation policy, no reorg handling.** This build's own regtest harness
   mines on demand and never reorgs; a real deployment choosing how many confirmations count as
   final for a given amount, and how to handle a reorg past that depth, is out of scope here.
