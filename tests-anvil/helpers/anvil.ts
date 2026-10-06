@@ -99,6 +99,10 @@ export interface StartAnvilOptions {
   timestampSeconds?: number;
   /** Passed as `--chain-id` when set (anvil otherwise reports 31337). */
   chainId?: number;
+  /** P9-6: passed as `--block-time` when set, so a block is mined every this many seconds whether or not a transaction is pending (the
+   *  chain then moves on its own, which a runner that waits for the `finalized` block needs). Absent: anvil mines only on a transaction
+   *  (or a test's `anvil_mine`), as every earlier suite relies on. */
+  blockTimeSeconds?: number;
 }
 
 /** Spawn one anvil node on a free port, wait for it to answer, and hand back a handle whose
@@ -109,6 +113,7 @@ export async function startAnvil(options: StartAnvilOptions = {}): Promise<Anvil
   const timestampSeconds = options.timestampSeconds ?? 1_700_000_000;
   const args = ["--port", String(port), "--slots-in-an-epoch", "1", "--timestamp", String(timestampSeconds)];
   if (options.chainId !== undefined) args.push("--chain-id", String(options.chainId));
+  if (options.blockTimeSeconds !== undefined) args.push("--block-time", String(options.blockTimeSeconds));
 
   let child: ChildProcess;
   try {
