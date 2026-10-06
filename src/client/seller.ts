@@ -306,8 +306,8 @@ export const CLAIM_MARKER_REORG_MARGIN_BTC = 6;
  *  samples) to trail the unsafe tip by 8 to 91 blocks (median 56, p90 79), so the earlier 64 sat inside that lag and a claim re-included below
  *  the tip by an unsafe-head reorg could fall under the saved marker (the resumed Seller would then never find its own claim, never post its
  *  reveal and receipt: liveness only, the Buyer still learns the secret from its own older scan). 256 leaves headroom over the measured lag and
- *  stays under the public endpoint's 500-block `eth_getLogs` window, so the resumed scan (marker to tip) is still one answerable request.
- *  Anvil, the only EVM chain of the test suites, is unaffected. The Bitcoin margin and the Buyer's lock marker are unchanged. */
+ *  stays under the public endpoint's 500-block `eth_getLogs` window (a prompt resume scans about this margin plus the blocks mined since the
+ *  claim). Anvil, the only EVM chain of the test suites, is unaffected. The Bitcoin margin and the Buyer's lock marker are unchanged. */
 export const CLAIM_MARKER_REORG_MARGIN_EVM = 256;
 
 /** R2-13: `marker` (the chain tip read before the first claim send) minus the reorg margin of its kind (a bigint is an EVM block number, a number a

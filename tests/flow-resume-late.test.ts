@@ -213,6 +213,30 @@ describe("R3-01 (control): a lock attempt that was saved is recovered whatever t
     expect((await resumedSeller(s)).next).toBe("claimLegA");
   });
 
+  it("the attempt is saved but the note's outcome was never recorded: lockLegB() reads leg B's note from the paper rail, adopts it (no second write) and posts the frame, though accept B is stamped late", async () => {
+    const s = await lockAttemptedNoteWritten();
+    const offerB = (await readSwap(s.w)).offerB!;
+    const contractB = (await sellerRecordOf(s.w)).attemptedAcceptB!;
+    const noteBefore = await s.w.paper.read(contractB);
+    expect(noteBefore).toMatchObject({ status: "locked" });
+    // the record keeps the attempt but not that the lock landed (a save that never happened), and a late stamp on the saved accept B
+    const key = await sellerKeyOf(s.w.stores.seller);
+    const bytes = (await s.w.stores.seller.load(key))!;
+    const record = decodeFlowRecord(bytes, key) as SellerFlowRecord;
+    const slot = record.frames.acceptB;
+    if (slot?.record === undefined) throw new Error("test: the saved accept B has no signed record");
+    const { lockedLegBContract: _landed, ...rest } = record;
+    const edited: SellerFlowRecord = { ...rest, frames: { ...record.frames, acceptB: { ...slot, record: { ...slot.record, timestampMs: offerB.expiresMs + 5_000 } } } };
+    await s.w.stores.seller.save(key, encodeFlowRecord(edited), flowDigest(bytes));
+
+    const back = await resumedSeller(s);
+    expect(back.next).toBe("lockLegB");
+    await back.flow.lockLegB();
+    expect(await s.w.paper.read(contractB), "the note that was there is the note that is: nothing was written again").toEqual(noteBefore);
+    expect((await sellerRecordOf(s.w)).lockedLegBContract, "recognised and recorded").toBe(contractB);
+    expect((await s.w.venue.read(dealRoom(contractB))).filter((r) => tryDecodeFrame(r.line)?.type === "lock")).toHaveLength(1);
+  });
+
   it("a flow whose attempt is saved is also recovered when the runner hands in the late record itself", async () => {
     const s = await lockAttemptedNoteWritten();
     const view = await readSwap(s.w);
