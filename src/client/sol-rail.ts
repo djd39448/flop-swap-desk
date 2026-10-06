@@ -391,6 +391,8 @@ class SolCounterRail implements CounterAssetRail {
   readonly minLockableAmount: string = SOL_AMOUNT_FLOOR;
   /** The one asset id this configured rail ever settles. */
   readonly assetId: string = SOL_ASSET_ID;
+  /** R1-05: the program id and the mint. */
+  readonly deploymentId: string;
   /** This rail object's own registry (never process-global): the flows read the rail id through it. */
   readonly railRegistry: CustomRailRegistry = createSolRailRegistry();
   readonly maxChainClockSkewMs: number;
@@ -398,6 +400,7 @@ class SolCounterRail implements CounterAssetRail {
 
   constructor(options: SolCounterRailOptions) {
     this.options = options;
+    this.deploymentId = `sol-htlc:program=${options.config.programId}:mint=${options.config.assets.USDC}`;
     const skewMs = options.maxChainClockSkewMs ?? SOL_CHAIN_CLOCK_SKEW_MS;
     if (skewMs > SOL_CHAIN_CLOCK_SKEW_MS && options.unsafeAllowWideClockSkewForTests !== true) {
       throw new Error(

@@ -399,12 +399,16 @@ class BtcCounterRail implements CounterAssetRail {
   readonly minLockableAmount: string = BTC_MIN_LOCKABLE_SATS.toString();
   /** K3: the asset id this configured rail settles (`config.asset`, defaulted to `BTC_ASSET_ID`). */
   readonly assetId: string;
+  /** R1-05: the network name and the genesis hash prefix (the first 32 hex characters, the same prefix `caip2` carries). A
+   *  funding is found by its txid, which names no deployment, so this only separates one chain from another. */
+  readonly deploymentId: string;
   private readonly options: BtcCounterRailOptions;
 
   constructor(options: BtcCounterRailOptions) {
     this.options = options;
     this.caip2 = options.config.pin.caip2;
     this.assetId = assetIdFor(options.config);
+    this.deploymentId = `btc-htlc:network=${options.config.pin.network}:genesis=${options.config.pin.genesisHash.toLowerCase().slice(0, 32)}`;
   }
 
   /** D-08/§6: a `btc-htlc` leg posts a *pubkey* line, not an account/address line — the P2WSH

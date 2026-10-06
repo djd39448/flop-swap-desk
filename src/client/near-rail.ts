@@ -467,11 +467,14 @@ class NearCounterRail implements CounterAssetRail {
   readonly minLockableAmount: string = NEAR_AMOUNT_FLOOR;
   /** D-N8/K3: the one asset id this configured rail ever settles. */
   readonly assetId: string = NEAR_ASSET_ID;
+  /** R1-05: the HTLC contract account, the token account and the pinned contract code hash. */
+  readonly deploymentId: string;
   private readonly options: NearCounterRailOptions;
 
   constructor(options: NearCounterRailOptions) {
     this.options = options;
     this.caip2 = options.config.pin.caip2;
+    this.deploymentId = `near-htlc:contract=${options.config.contract}:token=${options.config.assets.USDC}:code=${options.config.htlcCodeHash ?? "unpinned"}`;
   }
 
   /** D-N5: a near-htlc leg posts an *account-id* line, not a pubkey line (mirrors

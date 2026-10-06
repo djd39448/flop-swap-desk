@@ -382,6 +382,16 @@ export interface CounterAssetRail {
   /** This rail's own pinned chain id, CAIP-2 form (e.g. `"eip155:31337"`) — embedded in every
    *  D-08 line this adapter's `formatAccountLine` builds. */
   readonly caip2: string;
+  /**
+   * R1-05: which deployment of this rail the leg runs on, as one stable ASCII string a record stores at its birth and
+   * `resume` compares. Two rails that talk to different deployments must differ, and one rail must give the same
+   * value every time it is built from the same config (it is derived from the config alone: no network call, no clock).
+   * EVM: the escrow contract and the token addresses. NEAR: the HTLC contract account, the token account and the
+   * contract code hash. Solana: the program id and the mint. Bitcoin: the network name and the genesis hash prefix.
+   * Why it matters: `evm-htlc` finds a lock by its hash lock at the configured contract, so a runner restarted against
+   * another contract would read "no row" as "never landed" and lock again, while the first lock can still be claimed.
+   */
+  readonly deploymentId: string;
 
   /** D-08: format this party's own line to post into the leg's deal room, WITHOUT a proof. Such a
    *  line never resolves (P7: every resolver requires a proof); the flows post

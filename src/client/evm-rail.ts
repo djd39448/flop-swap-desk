@@ -186,16 +186,30 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
   }
 }
 
+/** R1-05: the escrow contract and every configured token, lowercased and in a fixed order (assets sorted by name), so
+ *  the same config always gives the same string and another contract or token gives another one. */
+export function evmDeploymentId(config: EvmRailConfig): string {
+  const assets = Object.keys(config.assets)
+    .sort()
+    .map((name) => `${name}=${config.assets[name]?.toLowerCase() ?? ""}`)
+    .join(",");
+  return `evm-htlc:contract=${config.contract.toLowerCase()}:assets=${assets}`;
+}
+
 class EvmCounterRail implements CounterAssetRail {
   readonly railId: string = EVM_RAIL_ID;
   readonly caip2: string;
   /** G5: frozen, never a constructor option — see `CounterAssetRail.policy`'s own doc. */
   readonly policy: RailLocalPolicy = EVM_LOCAL_POLICY;
+  /** R1-05: the escrow contract and the token addresses. The lock is found by its hash lock AT this contract, so a
+   *  record resumed against another contract would read "no row" as "never landed" and lock again. */
+  readonly deploymentId: string;
   private readonly options: EvmCounterRailOptions;
 
   constructor(options: EvmCounterRailOptions) {
     this.options = options;
     this.caip2 = options.config.pin.caip2;
+    this.deploymentId = evmDeploymentId(options.config);
   }
 
   formatAccountLine(address: string): string {
