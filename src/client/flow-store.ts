@@ -250,6 +250,11 @@ export interface FlowStore {
    * processes leaves the method out, and the caller falls back to its in-process queue alone.
    */
   exclusive?<T>(name: FlowExclusiveName, work: () => Promise<T>): Promise<T>;
+  /**
+   * R3-07: where the record for `key` lives, for an error message a person acts on (`FileFlowStore`: the file's path).
+   * Absent for a store with no place a person could look (`MemoryFlowStore`). Never reads or writes anything.
+   */
+  locationOf?(key: string): string;
 }
 
 /** The named store-wide sections a `FlowStore.exclusive` offers. `seller-begin`: the Seller's scan of the stored
@@ -629,6 +634,11 @@ export class FileFlowStore implements FlowStore {
   async load(key: string): Promise<Uint8Array | null> {
     const payload = await this.readPayload(this.pathFor(key), key);
     return payload === null ? null : Uint8Array.from(payload);
+  }
+
+  /** R3-07: the file that holds (or would hold) the record for `key`. */
+  locationOf(key: string): string {
+    return this.pathFor(key);
   }
 
   async save(key: string, bytes: Uint8Array, expected: string | null): Promise<void> {

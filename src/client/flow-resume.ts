@@ -205,16 +205,49 @@ export function slotRecord(key: string, name: string, slot: FrameSlot | undefine
  *  an unreadable record cannot be told NOT to be the one for this offer, and passing over it would let a second accept
  *  mint another secret and post a second, different accept A for an offer whose first accept (and secret) the damaged
  *  record holds. A new Seller begin therefore stops on a store that holds an unreadable `seller:` record, until a person
- *  moves that file aside. A record listed and then gone (`load` answers `null`) is not unreadable and is passed over. */
+ *  moves that file aside. A record listed and then gone (`load` answers `null`) is not unreadable and is passed over.
+ *
+ *  R3-07: each of those errors is rethrown as the same object (same class, same fields) with the store key, and the file
+ *  where the store names it (`FlowStore.locationOf`), at the front of its message: a person who must move a record aside
+ *  is told which one. */
 export async function findStoredSellerOffer(store: FlowStore, offerAText: string): Promise<string | null> {
   for (const key of await store.list()) {
     if (!key.startsWith("seller:")) continue;
-    const bytes = await store.load(key);
-    if (bytes === null) continue;
-    const record: FlowRecord = decodeFlowRecord(bytes, key);
-    if (record.role === "seller" && record.frames.offerA?.text === offerAText) return key;
+    try {
+      const bytes = await store.load(key);
+      if (bytes === null) continue;
+      const record: FlowRecord = decodeFlowRecord(bytes, key);
+      if (record.role === "seller" && record.frames.offerA?.text === offerAText) return key;
+    } catch (error) {
+      throw namedInStoreKey(store, key, error);
+    }
   }
   return null;
+}
+
+/** R3-07: the error a begin scan met, with the record it stopped at (the store key and, where the store says it, the
+ *  file) in its message, so that a person who must move the record aside does not have to hunt for it. The error keeps its
+ *  class, its fields and its stack: it is the same object with a longer message, so `instanceof` checks and `code` reads
+ *  hold. An error that is not an `Error`, or whose message cannot be changed, is rethrown as it is. */
+function namedInStoreKey(store: FlowStore, key: string, error: unknown): unknown {
+  if (!(error instanceof Error)) return error;
+  let place = "";
+  try {
+    const location = store.locationOf?.(key);
+    if (location !== undefined) place = ` (file ${location})`;
+  } catch {
+    // a store that cannot say where a key lives: the key alone names the record
+  }
+  const prefix = `flow resume: the begin scan stopped at the stored record "${key}"${place}: `;
+  if (error.message.startsWith(prefix)) return error; // an error object a store hands out twice is named once
+  const before = error.message;
+  try {
+    error.message = `${prefix}${before}`;
+    if (typeof error.stack === "string" && before !== "") error.stack = error.stack.replace(before, () => error.message);
+  } catch {
+    return error;
+  }
+  return error;
 }
 
 /** In-process queues for the scan and the create of a Seller `begin`: they must not interleave with another `begin` on the

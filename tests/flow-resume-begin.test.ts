@@ -19,11 +19,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { OFFER_ROOM, generateHashLock } from "@flop-labs/tclk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { FlowRecordVersionError } from "../src/client/flow-record.js";
-import { FlowRecordExistsError, FlowStoreLockedError } from "../src/client/flow-resume.js";
-import { FileFlowStore, FlowStoreCorruptError, flowDigest, type FlowStore, type MemoryFlowStore } from "../src/client/flow-store.js";
+import { FlowRecordMismatchError, FlowRecordVersionError, encodeFlowRecord } from "../src/client/flow-record.js";
+import { FlowRecordExistsError, FlowStoreLockedError, findStoredSellerOffer } from "../src/client/flow-resume.js";
+import { FileFlowStore, FlowStoreCorruptError, MemoryFlowStore, flowDigest, flowKey, type FlowStore } from "../src/client/flow-store.js";
 import { SellerFlow } from "../src/client/seller.js";
 import { STEPS, readSwap } from "./helpers/crash-matrix.js";
+import { sampleBuyerRecord, sampleSellerRecord } from "./helpers/flow-record-samples.js";
 import { evmWorld } from "./helpers/matrix-worlds.js";
 import { started, type Started } from "./helpers/resume-world.js";
 import { sellerKeyOf } from "./helpers/seller-key.js";
@@ -259,5 +260,83 @@ describe("R2-05: an unreadable Seller record blocks every new accept on its stor
     await expect(flow.acceptLegA(offerA, s.w.legB, s.w.lockTimeMs)).rejects.toBeInstanceOf(FlowStoreCorruptError);
     expect(minted).toBe(0);
     expect(await sellerFrames(s)).toEqual({ accepts: 0, offers: 0 });
+  });
+});
+
+// --- R3-07: the begin scan's error names the record it stopped at ---------------------------------------------------------------------
+
+describe("R3-07: an error the begin scan meets names the store key (and the file, for a FileFlowStore) and keeps its class", () => {
+  const WRONG_ROLE_KEY = flowKey("seller", `0x${"77".repeat(32)}`);
+  const OTHER_ID_KEY = flowKey("seller", `0x${"88".repeat(32)}`);
+
+  it("a Buyer record stored under a seller key: FlowRecordMismatchError, same fields, and its message contains the key", async () => {
+    const store = new MemoryFlowStore();
+    await store.save(WRONG_ROLE_KEY, encodeFlowRecord(sampleBuyerRecord()), null);
+    const error = await findStoredSellerOffer(store, "any offer text").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(FlowRecordMismatchError);
+    expect((error as FlowRecordMismatchError).field).toBe("role");
+    expect((error as Error).message).toContain(WRONG_ROLE_KEY);
+    expect((error as Error).message).toContain("the stored record's role is buyer"); // the original text is kept
+  });
+
+  it("a Seller record whose contractA differs from its key: FlowRecordMismatchError, and its message contains the key it was stored under", async () => {
+    const store = new MemoryFlowStore();
+    await store.save(OTHER_ID_KEY, encodeFlowRecord(sampleSellerRecord()), null);
+    const error = await findStoredSellerOffer(store, "any offer text").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(FlowRecordMismatchError);
+    expect((error as FlowRecordMismatchError).field).toBe("contractA");
+    expect((error as Error).message).toContain(OTHER_ID_KEY);
+  });
+
+  it("a FileFlowStore adds the file a person moves aside, and a record that fails its checksum or carries another version is named too", async () => {
+    const dir = join(root, "flows");
+    const store = new FileFlowStore(dir);
+    await store.save(WRONG_ROLE_KEY, encodeFlowRecord(sampleBuyerRecord()), null);
+    const mismatch = await findStoredSellerOffer(store, "any offer text").catch((e: unknown) => e);
+    expect(mismatch).toBeInstanceOf(FlowRecordMismatchError);
+    expect((mismatch as Error).message).toContain(WRONG_ROLE_KEY);
+    expect((mismatch as Error).message).toContain(join(dir, `seller-0x${"77".repeat(32)}.json`));
+
+    const newer = new MemoryFlowStore();
+    const written = new TextDecoder().decode(encodeFlowRecord(sampleSellerRecord()));
+    await newer.save(flowKey("seller", sampleSellerRecord().contractA), new TextEncoder().encode(written.replace('{"v":1,', '{"v":2,')), null);
+    const version = await findStoredSellerOffer(newer, "any offer text").catch((e: unknown) => e);
+    expect(version).toBeInstanceOf(FlowRecordVersionError);
+    expect((version as Error).message).toContain(flowKey("seller", sampleSellerRecord().contractA));
+
+    const garbage = new MemoryFlowStore();
+    await garbage.save(OTHER_ID_KEY, new TextEncoder().encode("{garbage"), null);
+    const corrupt = await findStoredSellerOffer(garbage, "any offer text").catch((e: unknown) => e);
+    expect(corrupt).toBeInstanceOf(FlowStoreCorruptError);
+    expect((corrupt as FlowStoreCorruptError).key).toBe(OTHER_ID_KEY);
+    expect((corrupt as Error).message).toContain(`stopped at the stored record "${OTHER_ID_KEY}"`);
+  });
+
+  it("a load that fails with a disk error is named too, keeps its code, and an error object a store hands out twice is named once", async () => {
+    const shared = Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+    const flaky: FlowStore = {
+      list: async () => [WRONG_ROLE_KEY],
+      save: async () => undefined,
+      load: async () => {
+        throw shared;
+      },
+    };
+    const first = await findStoredSellerOffer(flaky, "any offer text").catch((e: unknown) => e);
+    const second = await findStoredSellerOffer(flaky, "any offer text").catch((e: unknown) => e);
+    expect((first as { code?: string }).code).toBe("EIO");
+    expect((first as Error).message).toContain(WRONG_ROLE_KEY);
+    expect((first as Error).message).toContain("EIO: i/o error, read");
+    expect((second as Error).message.split(WRONG_ROLE_KEY)).toHaveLength(2); // the key appears once, not twice
+  });
+
+  it("a record that is fine and a record that is listed and then gone are still passed over; the matching record is still found", async () => {
+    const store = new MemoryFlowStore();
+    const seller = sampleSellerRecord();
+    const key = flowKey("seller", seller.contractA);
+    await store.save(key, encodeFlowRecord(seller), null);
+    expect(await findStoredSellerOffer(store, seller.frames.offerA?.text ?? "none")).toBe(key);
+    expect(await findStoredSellerOffer(store, "an offer nobody accepted")).toBeNull();
+    const vanishing: FlowStore = { list: async () => [key], load: async () => null, save: async () => undefined };
+    expect(await findStoredSellerOffer(vanishing, "any offer text")).toBeNull();
   });
 });
