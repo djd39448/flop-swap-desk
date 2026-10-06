@@ -20,7 +20,7 @@
     "test:regtest": "npm run build && vitest run --config vitest.regtest.config.ts",
     "test:near": "npm run build && vitest run --config vitest.near.config.ts",
     "test:sol": "npm run build && vitest run --config vitest.sol.config.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json --noEmit",
     "watch": "node bin/watch.mjs"
   },
   "devDependencies": {

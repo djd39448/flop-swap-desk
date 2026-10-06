@@ -64,6 +64,10 @@ npm test
 commit `5cc4ab9`, because the npm release `0.1.0` predates the transcript fold this desk
 depends on. `npm test` builds it first. Clone with `--recurse-submodules`.
 
+`npm run typecheck` checks `src/` and, since P9, every file under `tests/` (with `tests/helpers/`) through
+`tsconfig.tests.json`, at the same strictness; the live suites' folders (`tests-anvil/`, `tests-regtest/`, `tests-near/`,
+`tests-sol/`) are not part of it.
+
 ## Audit replay
 
 `examples/audit-export.mjs --root DIR [--expect <swapId>=<status>] [--json]` reproduces a

@@ -377,7 +377,8 @@ changed, so `docs/PROFILE.md` is unchanged, and no fixture was added or recaptur
   diagnostics in 12 older test files and 2 helpers (`tests/helpers/scenario.ts` and `tests/helpers/fakeBoard.ts`)
   outside that set (`client-flows-near`, `client-flows-btc`, `evm-evidence` and others; most are fake counter-asset
   rails without the `deploymentId` that the resume work made required, the rest evidence fakes and strictness
-  mismatches), which this pass did not touch. Whether `tests/` joins the typecheck gate is a separate hygiene pass.
+  mismatches), which this pass did not touch. That separate hygiene pass is P9-7: `tests/` is inside the `typecheck` gate
+  now (see the P9-7 section at the end of this file).
 - Live tests (each spawns its own throwaway local node and never touches a public network):
   `tests-anvil/resume.anvil.test.ts`, `tests-regtest/resume.regtest.test.ts`, `tests-near/resume.near.test.ts` and
   `tests-sol/resume.sol.test.ts`.
@@ -402,8 +403,8 @@ keys at test time, and the loader reads a key only from a file an operator names
   proof, receipt timeouts, whole swaps with local accounts including a lost lock reply recovered through the P8 path, and a
   scan of every capture, venue line, store record and rendering for the key) and the helper `tests/helpers/evm-local.ts`
   (key generation into a temporary file loaded by the real loader, a key scanner that answers a boolean only, and a mock
-  node that also answers nonce, gas, fee and raw-send reads). Like the P8 tests they sit outside the `typecheck` gate (see
-  the P8 section's type-checking note).
+  node that also answers nonce, gas, fee and raw-send reads). They were outside the `typecheck` gate when written and are
+  inside it since P9-7 (see that section at the end of this file).
 - Live test: `tests-anvil/local-signer.anvil.test.ts` (a Buyer and a Seller with local accounts, funded by anvil's account 0,
   settle and refund end to end, bundles scanned for the keys and replayed through `examples/audit-export.mjs`).
 
@@ -502,3 +503,35 @@ the operator names and are never printed, stored or inspected; the tests generat
   the venue seeds) and the `blockTimeSeconds` option of `tests-anvil/helpers/anvil.ts`.
 - The gas ceilings of the pre-flight were measured on anvil with the mock token (approve 44,000, lock 214,000, claim 65,000 gas);
   a refund was not measured.
+
+## Test type gate (P9-7, handoff/P9-G1-READINESS-SPEC.md, checkpoint decision 5) - tests and configuration only
+
+Not vendored: original to this repo. No file under `src/`, `bin/`, `examples/`, `vendor/`, `contracts*` and no test body,
+assertion or skip changed; `tsconfig.json` is unchanged, so `npm run build` and `dist/` are what they were (the same 156
+files with the same hashes before and after, none of them from `tests/`).
+
+- `tsconfig.tests.json` (new, repo root): extends `tsconfig.json` with `noEmit`, `rootDir: "."` and `include: ["src", "tests"]`.
+  `npm run typecheck` is now `tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json --noEmit` (the only change to
+  `package.json`), so every file under `tests/` and `tests/helpers/` (142 files) is checked at the strictness `src` has
+  (`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`). It replaces the earlier arrangement in which `tests/`
+  ran under vitest alone, which does not check types; the P8 and P9-1 notes above point here.
+- The count fixed: a scratch config over `src` plus `tests/` reported 79 diagnostics in 13 test files and 2 helpers at the
+  start of P9-7 (the 77 in 12 files and 2 helpers recorded after P8, plus 2 in `tests/evm-log-scan.test.ts` from P9-3); it
+  reports 0 now. Of the 79: 36 fake counter-asset rails without the required `deploymentId` (2 classes, 34 call sites), 17
+  scripted `verifyLockFinal` replies without the observation's binding fields, 1 fake `claim` taking an optional ref, 1 fake
+  board view without `pairKey`, and 24 strictness mismatches (optional values passed as `undefined`, indexed reads, a missing
+  type import, `unknown` from an untyped `.mjs`). Fixing the first group exposed 34 further `exactOptionalPropertyTypes`
+  diagnostics at the fakes' call sites (two optional fields declared as `string | undefined`), fixed at the declaration.
+- What changed, by kind: `FakeCounterAssetRail` in `tests/client-flows-btc.test.ts` and `tests/client-flows-near.test.ts`
+  gains `deploymentId = "rail:<railId>"` (the value `railDeploymentId` derives for a rail that has none, as the P8 ledger
+  fake does), optional `minLockableAmount` and `assetId`, and its `verifyLockFinal` completes a scripted observation with
+  `railBinding(lock)` (the flows read only `status`, `final` and `finalizedRef`); the other fixes are conditional spreads
+  for optional values, `| undefined` on the tests' own recorded-call types, non-null assertions where a test already relies
+  on the entry, and narrower or wider local types (`buildCapture`'s bytes map, `rawLog`'s topics, the mock RPC's handler).
+- One fix is not a pure type change, stated here so it is not a surprise: `tests/helpers/fakeBoard.ts` now gives each
+  swap view `pairKey: null` (the field was absent, which the watcher read as the state key `pair:undefined`). No test on that
+  fake asserts a state key or a `pairKey`; its one multi-swap case asserts only which deal rooms are fetched.
+- The hermetic count is the one before the package: 114 files, 3517 passed, 7 skipped.
+- Not in the gate: `tests-anvil/`, `tests-regtest/`, `tests-near/` and `tests-sol/`. Under a scratch config the first has 2
+  diagnostics (`tests-anvil/client-flows.anvil.test.ts`, a `string` where a hex type is wanted), the third 3
+  (`tests-near/client-flows.near.test.ts`, `txHash` possibly undefined); `tests-regtest/` and `tests-sol/` report none.
