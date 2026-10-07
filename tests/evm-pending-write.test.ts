@@ -16,18 +16,20 @@
 // The pool is the mock node's `holdNextSend`: the raw transaction is accepted and its hash answered, nothing is mined; `releaseHeld()` mines it later.
 // Keys are generated at test time; none is printed.
 
-import { MemoryNoteStore, PaperRail, generateHashLock, verifyHashPreimage } from "@flop-labs/tclk";
+import { MemoryNoteStore, PaperRail, generateHashLock, verifyHashPreimage, type HashLock } from "@flop-labs/tclk";
 import { encodeFunctionResult, getAddress, type Address, type Hex } from "viem";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { BuyerFlow, LockPendingError, type BidParams } from "../src/client/buyer.js";
+import type { CounterAssetRail, RailWriteBroadcast } from "../src/client/counter-rail.js";
 import { createEvmCounterRail } from "../src/client/evm-rail.js";
 import { decodeFlowRecord, type BuyerFlowRecord, type SellerFlowRecord } from "../src/client/flow-record.js";
 import { MemoryFlowStore, flowKey } from "../src/client/flow-store.js";
+import { knownGoodDeadlinesFor } from "../src/client/policy.js";
 import { ClaimPendingError, SellerFlow } from "../src/client/seller.js";
 import { MemoryVenue } from "../src/client/venue.js";
 import { swapId as computeSwapId } from "../src/profile.js";
-import { EvmHtlcRail, EvmReceiptTimeoutError } from "../src/rails/evm-htlc.js";
+import { EVM_CLAIM_RECEIPT_WAIT_MS_BASE_SEPOLIA, EvmHtlcRail, EvmReceiptTimeoutError } from "../src/rails/evm-htlc.js";
 import { EVM_HASH_RAIL_ABI, type AddressBook } from "../src/vendor/evm-hash-rail.js";
 import { EvmMockNode } from "./helpers/evm-mock-node.js";
 import { makeLocalAccount, localSigningRpc, type LocalSigningRpc } from "./helpers/evm-local.js";
@@ -39,30 +41,54 @@ const RAIL = getAddress(`0x${Buffer.from("p94-rail", "utf8").toString("hex").pad
 const TOKEN = getAddress(`0x${Buffer.from("p94-usdc", "utf8").toString("hex").padEnd(40, "0")}`);
 const HASH = (n: number): Hex => `0x${n.toString(16).padStart(64, "0")}` as Hex;
 
-const BID = (swapId: string): BidParams => ({
+const MIN = 60_000;
+
+/** The known-good deadline set of the chain (anvil: leg A +60/+90, leg B +120/+180; Base Sepolia: +115/+135 and +225/+285), as ms from `T0`. */
+function deadlinesOf(chainId: 31337 | 84532) {
+  const set = knownGoodDeadlinesFor(chainId);
+  const at = (minutes: number): number => T0 + minutes * MIN;
+  return {
+    legA: { claimByMs: at(set.legA.claimByMin), refundAfterMs: at(set.legA.refundAfterMin), expiresMs: at(set.legA.expiresMin) },
+    legB: { claimByMs: at(set.legB.claimByMin), refundAfterMs: at(set.legB.refundAfterMin), expiresMs: at(set.legB.expiresMin) },
+  };
+}
+
+const BID = (swapId: string, legA: { claimByMs: number; refundAfterMs: number; expiresMs: number }): BidParams => ({
   swapId,
   wantAsset: "FLOP",
   wantAmount: "52070000",
   wantRail: "flop-htlc",
   amount: "1000000",
   asset: "USDC",
-  claimByMs: T0 + 60 * 60_000,
-  refundAfterMs: T0 + 90 * 60_000,
-  expiresMs: T0 + 30 * 60_000,
+  ...legA,
 });
-const LEG_B = { claimByMs: T0 + 120 * 60_000, refundAfterMs: T0 + 180 * 60_000, expiresMs: T0 + 40 * 60_000 };
 
 /** Both parties with local accounts and a store each, over one mock node, through the pairing, leg B's paper lock and both account lines; `receiptTimeoutMs` 150
- *  (or `options.receiptTimeoutMs`). `options.upperCaseHashes` makes both wires answer every send's hash in upper case (P94-PIN-01). */
-async function pairedSwap(options: { receiptTimeoutMs?: number; upperCaseHashes?: boolean } = {}) {
+ *  (or `options.receiptTimeoutMs`). `options.upperCaseHashes` makes both wires answer every send's hash in upper case (P94-PIN-01). `options.chainId` 84532 pins the node
+ *  and the rails to Base Sepolia (its deadline set, its policy, a `receiptTimeoutMs` of 10 s to 1 h); `options.onClaimSent` and `options.mintHashLock` go to the Seller
+ *  (P94-FUND-01); `options.wrapRail` wraps both parties' rail objects (a test that watches the connected handles). */
+async function pairedSwap(
+  options: {
+    receiptTimeoutMs?: number;
+    upperCaseHashes?: boolean;
+    chainId?: 31337 | 84532;
+    onClaimSent?: (txHash: string) => void;
+    mintHashLock?: () => HashLock;
+    wrapRail?: (rail: CounterAssetRail) => CounterAssetRail;
+  } = {},
+) {
+  const chainId = options.chainId ?? 31337;
+  const dead = deadlinesOf(chainId);
+  const wrapRail = options.wrapRail ?? ((rail: CounterAssetRail) => rail);
   const clockRef = { ms: T0 };
   const clock = (): number => clockRef.ms;
   const node = new EvmMockNode(clock, RAIL, TOKEN, []);
+  node.chainId = chainId;
   node.configExtras = { receiptTimeoutMs: options.receiptTimeoutMs ?? 150 };
   const buyerAccount = await makeLocalAccount();
   const sellerAccount = await makeLocalAccount();
-  const buyerWire = localSigningRpc(node);
-  const sellerWire = localSigningRpc(node);
+  const buyerWire = localSigningRpc(node, chainId);
+  const sellerWire = localSigningRpc(node, chainId);
   buyerWire.upperCaseHashes = options.upperCaseHashes ?? false;
   sellerWire.upperCaseHashes = options.upperCaseHashes ?? false;
   const buyerId = identity("61".repeat(32));
@@ -74,7 +100,7 @@ async function pairedSwap(options: { receiptTimeoutMs?: number; upperCaseHashes?
     identity: buyerId,
     venue,
     paperRail: new PaperRail(noteStore, clock),
-    rail: createEvmCounterRail({ config: node.config(), rpc: buyerWire.rpc, account: buyerAccount, clock }),
+    rail: wrapRail(createEvmCounterRail({ config: node.config(), rpc: buyerWire.rpc, account: buyerAccount, clock })),
     clock,
     store: stores.buyer,
   });
@@ -82,15 +108,17 @@ async function pairedSwap(options: { receiptTimeoutMs?: number; upperCaseHashes?
     identity: sellerId,
     venue,
     paperRail: new PaperRail(noteStore, clock),
-    rail: createEvmCounterRail({ config: node.config(), rpc: sellerWire.rpc, account: sellerAccount, clock }),
+    rail: wrapRail(createEvmCounterRail({ config: node.config(), rpc: sellerWire.rpc, account: sellerAccount, clock })),
     clock,
     store: stores.seller,
+    ...(options.onClaimSent === undefined ? {} : { onClaimSent: options.onClaimSent }),
+    ...(options.mintHashLock === undefined ? {} : { mintHashLock: options.mintHashLock }),
   });
   const buyer = new BuyerFlow(buyerOptions());
   const seller = new SellerFlow(sellerOptions());
   const swapId = computeSwapId(buyerId.did, "000000b4");
-  const offerA = await buyer.bid(BID(swapId));
-  const { acceptA, acceptARecord, offerBRecord } = await seller.acceptLegA(offerA, LEG_B, T0);
+  const offerA = await buyer.bid(BID(swapId, dead.legA));
+  const { acceptA, acceptARecord, offerBRecord } = await seller.acceptLegA(offerA, dead.legB, T0);
   const { acceptBRecord } = await buyer.acceptLegB(offerBRecord, acceptARecord, T0);
   await seller.lockLegB(acceptBRecord);
   await buyer.verifyLegBLocked();
@@ -102,7 +130,7 @@ async function pairedSwap(options: { receiptTimeoutMs?: number; upperCaseHashes?
     buyerWire.byHash = "node";
     sellerWire.byHash = "node";
   };
-  return { node, buyer, seller, buyerWire, sellerWire, stores, swapId, buyerOptions, sellerOptions, acceptA, exposeTxLookups, buyerAccount };
+  return { node, buyer, seller, buyerWire, sellerWire, stores, swapId, buyerOptions, sellerOptions, acceptA, exposeTxLookups, buyerAccount, clockRef };
 }
 
 const buyerRecord = async (stores: { buyer: MemoryFlowStore }, swapId: string): Promise<BuyerFlowRecord> => {
@@ -368,6 +396,260 @@ describe("P94-PIN-01: a node that answers an upper-case hash does not switch the
     expect(error.hash).toBe(`0x${"ab".repeat(32)}`);
     expect(error.message).toContain(`0x${"ab".repeat(32)}`);
     expect(error.message).not.toContain("AB");
+  });
+});
+
+describe("P94-FUND-01: the claim's hash is shown the moment it is broadcast, and its receipt wait is short on Base Sepolia", () => {
+  it("the review's case: 900 ms into the claim's receipt wait the Seller's record holds claimTxHash (saved before the runner's callback ran) and the callback has the hash, once", async () => {
+    const sent: string[] = [];
+    const snapshots: Array<Promise<Uint8Array | null>> = [];
+    let r!: Awaited<ReturnType<typeof pairedSwap>>;
+    r = await pairedSwap({
+      receiptTimeoutMs: 2_500,
+      onClaimSent: (hash) => {
+        sent.push(hash);
+        snapshots.push(r.stores.seller.load(flowKey("seller", r.acceptA.contract))); // what the store held at the moment the callback ran
+      },
+    });
+    const lockA = await r.buyer.lockLegA();
+    r.node.holdNextSend("claim"); // the raw claim is accepted into the pool and never mined: the receipt wait runs until it times out
+    let settled = false;
+    const claiming = caught(r.seller.claimLegA(lockA.hashLock)).then((error) => {
+      settled = true;
+      return error;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    expect(settled, "the receipt wait is still running").toBe(false);
+    const held = r.node.held[0]!.txHash;
+    expect(r.sellerWire.rawSends.length).toBe(1); // the claim, with its preimage, is out
+    const during = await sellerRecord(r.stores, r.acceptA.contract);
+    expect(during.claimAttempted).toBe(true);
+    expect(during.claimTxHash).toBe(held); // today: undefined until the wait ends
+    expect(sent).toEqual([held]); // the runner has it too
+    expect(r.seller.claimSentHash).toBe(held);
+    const atCallback = decodeFlowRecord((await snapshots[0]!)!, flowKey("seller", r.acceptA.contract)) as SellerFlowRecord;
+    expect(atCallback.claimTxHash, "saved before the callback ran").toBe(held);
+
+    const ended = await claiming;
+    expect(ended).toBeInstanceOf(EvmReceiptTimeoutError);
+    expect((ended as EvmReceiptTimeoutError).hash).toBe(held);
+    expect((ended as EvmReceiptTimeoutError).timeoutMs).toBe(2_500); // anvil: the configured value, unchanged
+    expect(sent, "told once, not again at the timeout").toEqual([held]);
+    expect((await sellerRecord(r.stores, r.acceptA.contract)).claimTxHash).toBe(held);
+  });
+
+  it("an upper-case answer is saved and shown in lower case from the broadcast on (the broadcast event lower-cases it too)", async () => {
+    const sent: string[] = [];
+    const r = await pairedSwap({ receiptTimeoutMs: 2_500, upperCaseHashes: true, onClaimSent: (hash) => void sent.push(hash) });
+    const lockA = await r.buyer.lockLegA();
+    r.node.holdNextSend("claim");
+    const claiming = caught(r.seller.claimLegA(lockA.hashLock));
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    const held = r.node.held[0]!.txHash;
+    expect(held).not.toBe(held.toUpperCase().replace("0X", "0x")); // the wire answered it in upper case
+    expect((await sellerRecord(r.stores, r.acceptA.contract)).claimTxHash).toBe(held);
+    expect(sent).toEqual([held]);
+    expect(await claiming).toBeInstanceOf(EvmReceiptTimeoutError);
+  });
+
+  it("a claim refused before it is sent (past claim-by) shows no hash and saves none", async () => {
+    const sent: string[] = [];
+    const r = await pairedSwap({ onClaimSent: (hash) => void sent.push(hash) });
+    const lockA = await r.buyer.lockLegA();
+    r.clockRef.ms = T0 + 61 * MIN; // anvil's leg A claim-by is +60
+    await expect(r.seller.claimLegA(lockA.hashLock)).rejects.toThrow(/claimByMs/);
+    expect(sent).toEqual([]);
+    expect(r.sellerWire.rawSends.length).toBe(0);
+    expect(r.seller.claimSentHash).toBeUndefined();
+    expect((await sellerRecord(r.stores, r.acceptA.contract)).claimTxHash).toBeUndefined();
+  });
+
+  it("a callback that throws changes nothing: the claim lands, its hash is in the record, and the frames are posted", async () => {
+    const r = await pairedSwap({
+      onClaimSent: () => {
+        throw new Error("the runner's printer broke");
+      },
+    });
+    const lockA = await r.buyer.lockLegA();
+    const claimed = await r.seller.claimLegA(lockA.hashLock);
+    expect(claimed.evidence.event).toBe("Claimed");
+    expect(claimed.reveal).toBeDefined();
+    expect(claimed.receipt).toBeDefined();
+    expect(r.node.count("claim")).toBe(1);
+    const record = await sellerRecord(r.stores, r.acceptA.contract);
+    expect(record.claimTxHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(record.claimOutcome).toBe("landed");
+  });
+
+  it("the connected rail tells every write's hash (approve, lock, claim) before its receipt wait, lower-cased, to every listener; a listener that throws or is slow changes nothing", async () => {
+    const events: Array<{ write: RailWriteBroadcast["write"]; hash: string; receiptReads: number }> = [];
+    let node!: EvmMockNode;
+    const wrap = (rail: CounterAssetRail): CounterAssetRail =>
+      Object.create(rail, {
+        connect: {
+          value: async (...args: Parameters<CounterAssetRail["connect"]>) => {
+            const connected = await rail.connect(...args);
+            connected.onWriteBroadcast?.((event) => {
+              events.push({ write: event.write, hash: event.hash, receiptReads: node.requests.filter((m) => m === "eth_getTransactionReceipt").length });
+            });
+            connected.onWriteBroadcast?.(() => {
+              throw new Error("a listener that breaks");
+            });
+            const off = connected.onWriteBroadcast?.(async () => {
+              events.push({ write: undefined, hash: "removed listener ran", receiptReads: -1 });
+            });
+            off?.(); // removed again at once: it must never run
+            connected.onWriteBroadcast?.(async () => {
+              await new Promise((resolve) => setTimeout(resolve, 20)); // a slow listener is awaited, the write is not skipped
+            });
+            return connected;
+          },
+        },
+      }) as CounterAssetRail;
+    const r = await pairedSwap({ upperCaseHashes: true, wrapRail: wrap });
+    node = r.node;
+    const lockA = await r.buyer.lockLegA();
+    await r.seller.claimLegA(lockA.hashLock);
+    expect(events.map((event) => event.write)).toEqual(["approve", "lock", "claim"]);
+    for (const event of events) expect(event.hash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(new Set(events.map((event) => event.hash)).size).toBe(3);
+    expect(events[0]!.receiptReads, "told before anything asked for a receipt").toBe(0);
+    expect(events[1]!.receiptReads).toBeGreaterThan(0); // the approve's wait ran between the first and the second
+    expect(events[2]!.receiptReads).toBeGreaterThan(events[1]!.receiptReads);
+    expect(events.some((event) => event.receiptReads === -1)).toBe(false);
+    expect(r.node.count("claim")).toBe(1);
+    expect(r.node.count("lock")).toBe(1);
+  });
+
+  describe("the pending claim's sentence (ClaimPendingError)", () => {
+    const refundMs = T0 + 90 * MIN;
+    const hash = `0x${"ab".repeat(32)}`;
+
+    it("through the resumed Seller: it names the hash, the minutes left before leg A's refund time, that time, and the by-hand step; it holds no preimage", async () => {
+      const secret = generateHashLock();
+      const r = await pairedSwap({ mintHashLock: () => secret });
+      const lockA = await r.buyer.lockLegA();
+      r.node.holdNextSend("claim");
+      expect(await caught(r.seller.claimLegA(lockA.hashLock))).toBeInstanceOf(EvmReceiptTimeoutError);
+      const held = r.node.held[0]!.txHash;
+      r.exposeTxLookups();
+      r.clockRef.ms = T0 + 30 * MIN; // 60 minutes before leg A's refund time (+90), still inside its claim window
+      const resumed = await SellerFlow.resume({ ...r.sellerOptions(), swapId: r.swapId, contractA: r.acceptA.contract });
+      const refused = await caught(resumed.flow.claimLegA(lockA.hashLock));
+      expect(refused).toBeInstanceOf(ClaimPendingError);
+      const text = (refused as ClaimPendingError).message;
+      expect(text).toContain(held);
+      expect(text).toContain("60 min left before leg A's refund time");
+      expect(text).toContain(`before leg A's refund time at ${new Date(refundMs).toISOString()}`);
+      expect(text).toContain("speed the claim up with the same nonce and a higher fee from a wallet that holds the key file's key");
+      expect(text).toContain("A stuck claim is not re-priced");
+      expect(text.includes(secret.preimage) || text.includes(secret.preimage.slice(2))).toBe(false);
+      expect((refused as ClaimPendingError).minutesLeft).toBe(60);
+      expect((refused as ClaimPendingError).refundAfterMs).toBe(refundMs);
+      expect(r.node.count("claim")).toBe(0); // nothing new was signed
+    });
+
+    it("past leg A's refund time it says the claim can no longer land and a speed-up cannot help (no instruction to send anything)", async () => {
+      const r = await pairedSwap();
+      const lockA = await r.buyer.lockLegA();
+      r.node.holdNextSend("claim");
+      expect(await caught(r.seller.claimLegA(lockA.hashLock))).toBeInstanceOf(EvmReceiptTimeoutError);
+      r.exposeTxLookups();
+      r.clockRef.ms = refundMs + MIN;
+      const resumed = await SellerFlow.resume({ ...r.sellerOptions(), swapId: r.swapId, contractA: r.acceptA.contract });
+      const refused = await caught(resumed.flow.claimLegA(lockA.hashLock));
+      expect(refused).toBeInstanceOf(ClaimPendingError);
+      const text = (refused as ClaimPendingError).message;
+      expect(text).toContain(`leg A's refund time (${new Date(refundMs).toISOString()}) has passed`);
+      expect(text).not.toMatch(/speed the claim up/);
+      expect((refused as ClaimPendingError).minutesLeft).toBe(0);
+    });
+
+    it("the sentence by cases: minutes, under a minute, passed, no timing (hash and remedy only), a bad timing is no timing, and a mined claim keeps the plain sentence", () => {
+      const at = (leftMs: number) => new ClaimPendingError(hash, "pending", { refundAfterMs: refundMs, nowMs: refundMs - leftMs }).message;
+      expect(at(5 * MIN + 59_000)).toContain("5 min left before leg A's refund time; speed the claim up with the same nonce");
+      expect(at(30_000)).toContain("under 1 min left before leg A's refund time; speed the claim up");
+      expect(at(0)).toContain("has passed, so it can no longer land");
+      expect(at(-MIN)).toContain("has passed, so it can no longer land");
+      for (const text of [at(5 * MIN), at(30_000)]) expect(text).toContain(hash);
+      const bare = new ClaimPendingError(hash, "pending");
+      expect(bare.message).toContain(hash);
+      expect(bare.message).toContain("speed the claim up with the same nonce and a higher fee from a wallet that holds the key file's key, before leg A's refund time (README");
+      expect(bare.message).not.toMatch(/min left|has passed/);
+      expect(bare.minutesLeft).toBeUndefined();
+      expect(bare.refundAfterMs).toBeUndefined();
+      for (const bad of [{ refundAfterMs: Number.NaN, nowMs: 1 }, { refundAfterMs: 1, nowMs: Number.POSITIVE_INFINITY }, { refundAfterMs: 9e15, nowMs: 1 }]) {
+        const odd = new ClaimPendingError(hash, "pending", bad);
+        expect(odd.message).not.toMatch(/min left|has passed|Invalid/);
+        expect(odd.minutesLeft).toBeUndefined();
+      }
+      const mined = new ClaimPendingError(hash, "success", { refundAfterMs: refundMs, nowMs: refundMs - 10 * MIN });
+      expect(mined.message).toContain("mined but not visible to the lock and log reads yet");
+      expect(mined.message).not.toMatch(/speed the claim up/);
+      expect(mined.message).toContain(hash);
+      expect(mined.name).toBe("ClaimPendingError");
+      expect(mined.txHash).toBe(hash);
+      expect(mined.status).toBe("success");
+    });
+  });
+
+  describe("Base Sepolia: the claim's own receipt wait is bounded to 180 s, the other writes keep receiptTimeoutMs", () => {
+    /** Runs `work` under fake timers, advancing one second at a time up to `limitMs`; the elapsed virtual time when it settled (`undefined` if it did not) and its value. */
+    async function settleWithin<T>(work: Promise<T>, limitMs: number): Promise<{ elapsedMs: number | undefined; value: T | undefined }> {
+      let elapsedMs: number | undefined;
+      let value: T | undefined;
+      let now = 0;
+      void work.then((v) => {
+        elapsedMs = now;
+        value = v;
+      });
+      while (elapsedMs === undefined && now < limitMs) {
+        await vi.advanceTimersByTimeAsync(1_000);
+        now += 1_000;
+      }
+      return { elapsedMs, value };
+    }
+
+    it("receiptTimeoutMs one hour: the claim's wait ends by 180 s with the typed timeout; a lock's wait is still running past 180 s and ends at the hour", async () => {
+      const claimSwap = await pairedSwap({ chainId: 84532, receiptTimeoutMs: 3_600_000 });
+      const lockA = await claimSwap.buyer.lockLegA();
+      claimSwap.node.holdNextSend("claim");
+      const lockSwap = await pairedSwap({ chainId: 84532, receiptTimeoutMs: 3_600_000 });
+      lockSwap.node.holdNextSend("lock");
+      vi.useFakeTimers();
+      try {
+        const claim = await settleWithin(caught(claimSwap.seller.claimLegA(lockA.hashLock)), 3_700_000);
+        expect(claim.elapsedMs, "the claim's wait ended").toBeDefined();
+        expect(claim.elapsedMs!).toBeLessThanOrEqual(EVM_CLAIM_RECEIPT_WAIT_MS_BASE_SEPOLIA + 2_000);
+        expect(claim.elapsedMs!).toBeGreaterThanOrEqual(EVM_CLAIM_RECEIPT_WAIT_MS_BASE_SEPOLIA - 5_000);
+        expect(claim.value).toBeInstanceOf(EvmReceiptTimeoutError);
+        expect((claim.value as EvmReceiptTimeoutError).write).toBe("claim");
+        expect((claim.value as EvmReceiptTimeoutError).timeoutMs).toBe(180_000);
+
+        const lock = await settleWithin(caught(lockSwap.buyer.lockLegA()), 3_700_000);
+        expect(lock.elapsedMs, "the lock's wait ended too").toBeDefined();
+        expect(lock.elapsedMs!).toBeGreaterThan(3_000_000); // far past the claim's 180 s: its configured hour
+        expect(lock.value).toBeInstanceOf(EvmReceiptTimeoutError);
+        expect((lock.value as EvmReceiptTimeoutError).write).toBe("lock");
+        expect((lock.value as EvmReceiptTimeoutError).timeoutMs).toBe(3_600_000);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a receiptTimeoutMs below 180 s is kept for the claim (the cap only lowers)", async () => {
+      const r = await pairedSwap({ chainId: 84532, receiptTimeoutMs: 20_000 });
+      const lockA = await r.buyer.lockLegA();
+      r.node.holdNextSend("claim");
+      vi.useFakeTimers();
+      try {
+        const claim = await settleWithin(caught(r.seller.claimLegA(lockA.hashLock)), 200_000);
+        expect(claim.elapsedMs!).toBeLessThanOrEqual(22_000);
+        expect((claim.value as EvmReceiptTimeoutError).timeoutMs).toBe(20_000);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 });
 

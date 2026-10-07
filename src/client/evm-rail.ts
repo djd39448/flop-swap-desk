@@ -31,6 +31,7 @@ import {
   type RailCommitOptions,
   type RailEvidenceResult,
   type RailRefundOptions,
+  type RailWriteBroadcast,
   type RailWriteEvidence,
 } from "./counter-rail.js";
 import { evmLocalPolicyFor, type EvmLocalPolicy } from "./policy.js";
@@ -220,6 +221,11 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
     }
     const status = await this.rail.transactionStatus(recovery.txHash as Hex);
     return status === "pending" || status === "success" ? "pending" : "never-landed";
+  }
+
+  /** P94-FUND-01: the hash of every write of this handle, told to `listener` before the receipt wait starts; see `EvmHtlcRail.onWriteBroadcast`. */
+  onWriteBroadcast(listener: (event: RailWriteBroadcast) => void | Promise<void>): () => void {
+    return this.rail.onWriteBroadcast(listener);
   }
 
   /** P9-4 decision 7: what the node says of a write this party sent and stopped waiting for; see `EvmHtlcRail.transactionStatus`. */

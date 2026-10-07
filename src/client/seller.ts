@@ -158,7 +158,7 @@ import { SOL_CLAIM_LANDING_MARGIN_MS, SolClaimFailedError, SolNotLandedError, So
 import type { Exchange } from "../rails/rpc-capture.js";
 import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
 import { offerAcceptLockTerms } from "../swap.js";
-import { belowMinLockable, type ConnectedCounterAssetRail, type CounterAssetRail, type RailAccounts, type RailBlockMarker, type RailClaimRecord, type RailWriteEvidence } from "./counter-rail.js";
+import { belowMinLockable, type ConnectedCounterAssetRail, type CounterAssetRail, type RailAccounts, type RailBlockMarker, type RailClaimRecord, type RailWriteBroadcast, type RailWriteEvidence } from "./counter-rail.js";
 import {
   FlowRecordConflictError,
   FlowRecordMismatchError,
@@ -190,6 +190,9 @@ import { chainClockProblem } from "./policy.js";
 export type { SellerNextStep } from "./flow-resume.js";
 import type { Signer, Venue } from "./venue.js";
 
+/** P94-FUND-01: the one shape of a transaction hash the flow's record keeps (`claimTxHash` decodes `0x` and 64 lower-case hex digits and nothing else). */
+const EVM_TX_HASH_SHAPE = /^0x[0-9a-f]{64}$/;
+
 export interface SellerFlowOptions {
   identity: Signer;
   venue: Venue;
@@ -213,6 +216,13 @@ export interface SellerFlowOptions {
   /** The source of the swap secret, injected like `clock`. Default: tclk's CSPRNG-backed `generateHashLock`. Only a
    *  test passes anything else (to know the secret it would otherwise never see); a production caller leaves it unset. */
   mintHashLock?: () => HashLock;
+  /**
+   * P94-FUND-01 (P9-FIXES-R4 decision 1): called with the transaction hash of the claim of leg A (`0x` and 64 lower-case hex digits, a PUBLIC value) the moment the node has
+   * accepted it and BEFORE the wait for its receipt starts (EVM only: it is the rail's broadcast event). With a store the hash is already saved in the record (`claimTxHash`)
+   * when this is called. A runner prints it from here, while the receipt wait runs, because a claim that sits unmined near leg A's refund time is sped up by hand from that
+   * hash. Not called for a claim that was refused or failed before it was sent. An error it throws is swallowed; it is handed nothing but the hash.
+   */
+  onClaimSent?: (txHash: string) => void;
 }
 
 /** `SellerFlow.resume` options: the constructor's, plus the store and the swap to continue. `contractA` /
@@ -275,14 +285,43 @@ export class RevealNotPostedError extends Error {
 export class ClaimPendingError extends Error {
   readonly txHash: string;
   readonly status: "pending" | "success";
-  constructor(txHash: string, status: "pending" | "success") {
-    super(
-      `seller: an earlier claim of leg A (transaction ${txHash}) is ${status === "pending" ? "still held by the node, not mined yet" : "mined but not visible to the lock and log reads yet"} - ` +
-        "call claimLegA() again later; nothing new was signed (P9-4)",
-    );
+  /** P94-FUND-01: leg A's refund time (ms) the caller passed, `undefined` when it passed no timing. */
+  readonly refundAfterMs: number | undefined;
+  /** P94-FUND-01: the whole minutes from the caller's `nowMs` to `refundAfterMs` (0 once it has passed), `undefined` when the caller passed no timing. */
+  readonly minutesLeft: number | undefined;
+  /**
+   * P94-FUND-01 (P9-FIXES-R4 decision 1, part 3): a `pending` claim (the node still holds it, it may sit there until leg A's refund time) names its public hash, the minutes
+   * left before leg A's refund time and the by-hand remedy (decision 6: speed it up with the same nonce and a higher fee from a wallet that holds the key file's key), not only
+   * "call claimLegA() again later". `timing` is computed by the caller (the flow passes its own clock and leg A's refund time; nothing here reads a clock); without it the sentence
+   * has the hash and the remedy but no minutes and no time. A `success` claim (mined, the reads lag) needs no speed-up: that sentence is the plain one. Nothing here is secret: a hash, a time.
+   */
+  constructor(txHash: string, status: "pending" | "success", timing?: { refundAfterMs: number; nowMs: number }) {
+    const known = timing !== undefined && Number.isSafeInteger(timing.refundAfterMs) && Number.isSafeInteger(timing.nowMs) && Math.abs(timing.refundAfterMs) <= 8.64e15;
+    const leftMs = known ? timing.refundAfterMs - timing.nowMs : undefined;
+    const minutes = leftMs === undefined ? undefined : Math.max(0, Math.floor(leftMs / 60_000));
+    const when = known ? new Date(timing.refundAfterMs).toISOString() : undefined;
+    let text: string;
+    if (status === "success") {
+      text =
+        `seller: an earlier claim of leg A (transaction ${txHash}) is mined but not visible to the lock and log reads yet - ` +
+        "call claimLegA() again later; nothing new was signed (P9-4)";
+    } else if (leftMs !== undefined && leftMs <= 0) {
+      text =
+        `seller: an earlier claim of leg A (transaction ${txHash}) is still held by the node, not mined yet, and leg A's refund time (${when}) has passed, so it can no longer land: ` +
+        "a speed-up cannot help now (README, \"A stuck claim is not re-priced\"); nothing new was signed (P9-4)";
+    } else {
+      const left = leftMs === undefined ? "" : `${minutes === 0 ? "under 1 min" : `${minutes} min`} left before leg A's refund time; `;
+      text =
+        `seller: an earlier claim of leg A (transaction ${txHash}) is still held by the node, not mined yet; ${left}` +
+        `speed the claim up with the same nonce and a higher fee from a wallet that holds the key file's key, before leg A's refund time${when === undefined ? "" : ` at ${when}`} ` +
+        "(README, \"A stuck claim is not re-priced\"), then call claimLegA() again; nothing new was signed (P9-4)";
+    }
+    super(text);
     this.name = "ClaimPendingError";
     this.txHash = txHash;
     this.status = status;
+    this.refundAfterMs = known ? timing.refundAfterMs : undefined;
+    this.minutesLeft = minutes;
   }
 }
 
@@ -403,6 +442,8 @@ export class SellerFlow {
   #journal?: FlowJournal<SellerFlowRecord>;
   private readonly store: FlowStore | undefined;
   private readonly mintHashLock: () => HashLock;
+  /** P94-FUND-01: see `SellerFlowOptions.onClaimSent`. */
+  private readonly onClaimSent: ((txHash: string) => void) | undefined;
   /** P8: the signed records leg B's offer and the Buyer's accept B arrived as (kept in the stored record's frame slots). */
   private offerBRecord?: TranscriptRecord;
   private acceptBRecord?: TranscriptRecord;
@@ -468,6 +509,7 @@ export class SellerFlow {
     this.revealPostTimeoutMs = options.revealPostTimeoutMs ?? SOL_REVEAL_POST_TIMEOUT_MS;
     this.store = options.store;
     this.mintHashLock = options.mintHashLock ?? generateHashLock;
+    this.onClaimSent = options.onClaimSent;
   }
 
   /** B5: every leg-A write this flow has made so far, in call order. R1-22: the exchanges of FAILED claim attempts join this list only
@@ -480,6 +522,15 @@ export class SellerFlow {
    *  publish (it is what `acceptA.statement` already carries); never the preimage. */
   get statement(): string | undefined {
     return this.#hashLock?.hash;
+  }
+
+  /**
+   * P94-FUND-01: the transaction hash of the claim of leg A this flow broadcast most recently (EVM only; `0x` and 64 lower-case hex digits, public), kept from the moment the node
+   * accepted it, `undefined` before one. With a store it is also the record's `claimTxHash`, saved before anything else happened. A runner that wants it as it happens passes
+   * `onClaimSent`; this field is for reading it afterwards.
+   */
+  get claimSentHash(): string | undefined {
+    return this.claimTxHash;
   }
 
   /** P8: the swap id this flow's record is stored under, once the record exists (public data). */
@@ -1513,7 +1564,7 @@ export class SellerFlow {
       } else if (lookedUpOnChain) {
         // P9-4 decision 7 (R1-FUND-04): no claim of this flow's own is on chain. An earlier claim whose receipt wait timed out may still be held by the node
         // (or be mined and not visible to these reads yet): ask before a second claim is signed.
-        await this.refuseWhileClaimPending(connected);
+        await this.refuseWhileClaimPending(connected, offerA.refundAfterMs);
       }
     }
 
@@ -1607,6 +1658,19 @@ export class SellerFlow {
       this.claimAttempted = true;
       await this.persist();
     }
+    // P94-FUND-01: a rail that tells of a broadcast before it waits for the receipt (EVM) gives this flow the claim's hash AT ONCE: it is saved in the record before anything else
+    // happens and handed to the runner's `onClaimSent`, so a claim that then sits unmined can be sped up by hand from a hash the operator already has (decision 6). `connected` is
+    // this call's own handle: nothing else writes through it, so the listener needs no removal.
+    connected.onWriteBroadcast?.(async (event: RailWriteBroadcast): Promise<void> => {
+      if (event.write !== "claim") return;
+      const sent = await this.noteClaimHash(event.hash);
+      if (sent === undefined || this.onClaimSent === undefined) return;
+      try {
+        this.onClaimSent(sent);
+      } catch {
+        // a runner's printer never changes the claim
+      }
+    });
     for (let retries = 0; ; retries += 1) {
       const before = connected.exchanges.length;
       try {
@@ -1644,14 +1708,9 @@ export class SellerFlow {
         this.#heldClaimExchanges.push(...connected.exchanges.slice(before)); // B5, held until the reveal (R1-22)
         // P9-4 decision 7 (R1-FUND-04): a claim whose receipt wait timed out WAS sent; its hash is saved so a resumed claim can ask the node about it
         // before it sends another. Only with a store (a flow without one is not resumed); a failed save leaves the flow failed, the timeout is still thrown.
-        if (error instanceof EvmReceiptTimeoutError && error.write === "claim" && this.#journal !== undefined) {
-          this.claimTxHash = error.hash.toLowerCase(); // P94-PIN-01: the record decodes a lower-case hash only
-          try {
-            await this.persist();
-          } catch {
-            // the journal is failed: the next call says so
-          }
-        }
+        // P94-FUND-01: the broadcast event above has already saved it (the helper sees the same hash and stops); this is the fallback for a rail handle without the event.
+        // P94-PIN-01: the record decodes a lower-case hash only, and the helper lower-cases and checks the shape.
+        if (error instanceof EvmReceiptTimeoutError && error.write === "claim") await this.noteClaimHash(error.hash);
         // R3-2: a claim that was broadcast and never landed (starved). The secret may have been seen; count it (the
         // next claim is priced higher) and sign again while the rail's landing bound still allows it. The bound ends
         // the effort with the starved error below, never a silent drop.
@@ -1744,11 +1803,33 @@ export class SellerFlow {
    * it: the endpoint's answers disagree) end the call with `ClaimPendingError`, nothing sent. `reverted` (the claim did nothing; the preimage is public in its call data
    * and the lock is still open) and `unknown` (the node does not know it) go on to the guarded claim exactly as before. A transport failure propagates.
    */
-  private async refuseWhileClaimPending(connected: ConnectedCounterAssetRail): Promise<void> {
+  private async refuseWhileClaimPending(connected: ConnectedCounterAssetRail, refundAfterMs: number): Promise<void> {
     const hash = this.claimTxHash;
     if (hash === undefined || connected.transactionStatus === undefined) return;
     const status = await connected.transactionStatus(hash);
-    if (status === "pending" || status === "success") throw new ClaimPendingError(hash, status);
+    // P94-FUND-01: the sentence names the hash and the minutes left before leg A's refund time (this flow's own clock; the error reads none).
+    if (status === "pending" || status === "success") throw new ClaimPendingError(hash, status, { refundAfterMs, nowMs: this.clock() });
+  }
+
+  /**
+   * P94-FUND-01: the claim's transaction hash, the moment it is known (the rail's broadcast event, or the receipt timeout's own hash as a fallback). Kept in memory and, with a store,
+   * saved in the record AT ONCE (`claimAttempted` is already true and saved before the first send), before anything else happens. Only a hash of the shape the record decodes
+   * (`0x` and 64 lower-case hex digits, after lower-casing: P94-PIN-01) is kept, saved or returned: a node's answer of any other shape would make every later save of the record fail, so
+   * it is ignored here. A save that fails leaves the flow failed as for any refused save (the next call says so) and does not touch the claim. Returns the kept hash, or `undefined`.
+   */
+  private async noteClaimHash(hash: string): Promise<string | undefined> {
+    const lower = typeof hash === "string" ? hash.toLowerCase() : "";
+    if (!EVM_TX_HASH_SHAPE.test(lower)) return undefined;
+    if (this.claimTxHash === lower) return lower;
+    this.claimTxHash = lower;
+    if (this.#journal !== undefined) {
+      try {
+        await this.persist();
+      } catch {
+        // the journal is failed: the next call says so
+      }
+    }
+    return lower;
   }
 
   private neverLandedField(): { neverLandedClaims?: number } {

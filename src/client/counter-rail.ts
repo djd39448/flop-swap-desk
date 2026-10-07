@@ -247,6 +247,16 @@ export interface RailRefundOptions {
   onNotBroadcast?: (recovery: LockRecovery) => void | Promise<void>;
 }
 
+/**
+ * P94-FUND-01 (P9-FIXES-R4 decision 1): a write of a connected rail was BROADCAST: the node accepted the signed transaction and answered `hash`, and the wait for its
+ * outcome is about to start. `write` names the write (`undefined` only for a wait made outside a rail method). The hash is a public value (a transaction hash: no key, no
+ * preimage). Only a rail that waits for a receipt after a send has this event (`evm-htlc`); see `ConnectedCounterAssetRail.onWriteBroadcast`.
+ */
+export interface RailWriteBroadcast {
+  readonly write: "approve" | "lock" | "claim" | "refund" | undefined;
+  readonly hash: string;
+}
+
 /** Why a recovery refused to proceed. `no-handle`: the rail needs a recovery handle and the record has none.
  *  `handle-mismatch`: the handle is for another rail, or does not belong to this ref or is internally inconsistent.
  *  `rebroadcast-refused` (Bitcoin, thrown by `resendLock`): the node refused the persisted signed bytes (inputs gone, a
@@ -324,6 +334,14 @@ export interface ConnectedCounterAssetRail {
    * already landed is not one.
    */
   recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome>;
+
+  /**
+   * P94-FUND-01 (EVM only, P9-FIXES-R4 decision 1, part 1), optional: `listener` is called, and awaited, with the hash of every write of this handle the moment the node has
+   * accepted it and BEFORE the wait for its receipt starts, so a flow can save the hash of a claim that may never be mined and a runner can show it while the wait runs, instead
+   * of only after the wait ends. The listener can never change what the write does (an error it throws is swallowed). Returns the function that removes it. A rail with no
+   * receipt wait after a send omits it.
+   */
+  onWriteBroadcast?(listener: (event: RailWriteBroadcast) => void | Promise<void>): () => void;
 
   /**
    * P9-4 decision 7 (EVM only, R1-FUND-04): what the node says of a transaction this party sent whose receipt wait timed out: `pending` (the node

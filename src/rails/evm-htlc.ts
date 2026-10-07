@@ -87,6 +87,8 @@ export interface EvmRailConfig {
    * `BASE_SEPOLIA_MIN_RECEIPT_TIMEOUT_MS` (10,000) and `BASE_SEPOLIA_MAX_RECEIPT_TIMEOUT_MS` (3,600,000), a floor under which a normal
    * 2-second-block inclusion would be reported as "no receipt" and a cap past which a stuck write holds a run for more than an hour;
    * anvil is unconstrained (the short timeout tests keep their values).
+   * P94-FUND-01: on 84532 the CLAIM's own receipt wait is bounded to `EVM_CLAIM_RECEIPT_WAIT_MS_BASE_SEPOLIA` (180,000 ms) whatever this says (a smaller value is
+   * kept); approve, lock and refund use this value.
    */
   receiptTimeoutMs?: number;
   /**
@@ -132,6 +134,15 @@ export const BASE_SEPOLIA_MIN_RECEIPT_TIMEOUT_MS = 10_000;
 
 /** P9-4 decision 8: the highest `receiptTimeoutMs` a Base Sepolia config may carry: one hour. */
 export const BASE_SEPOLIA_MAX_RECEIPT_TIMEOUT_MS = 3_600_000;
+
+/**
+ * P94-FUND-01 (P9-FIXES-R4 decision 1, part 2): on Base Sepolia the claim's OWN receipt wait ends after at most 180 seconds, whatever `receiptTimeoutMs` says
+ * (decision 8's hour-long cap still holds for approve, lock and refund). A claim carries the swap's preimage, which is public in the pool from the moment it is
+ * broadcast; if it sits unmined near leg A's refund time the only remedy is a by-hand same-nonce speed-up, and the operator reaches that only once this process stops
+ * waiting and says so. A configured `receiptTimeoutMs` of an hour would hold that first report for longer than the whole slack between the claim's last deadline
+ * guard and leg A's refund time (20 minutes between claim-by and refund on the known-good set). A configured value below 180 seconds is kept.
+ */
+export const EVM_CLAIM_RECEIPT_WAIT_MS_BASE_SEPOLIA = 180_000;
 
 /** P9-3: the public Base Sepolia endpoint refuses `eth_getLogs` over more than 500 blocks (measured 2026-10-05,
  *  `handoff/G1-PREP-2026-10-05.md` section 2); the default `maxLogRange` for chain 84532. */
@@ -625,6 +636,20 @@ export interface EvmLockRecord {
 export type EvmWriteKind = "approve" | "lock" | "claim" | "refund";
 
 /**
+ * P94-FUND-01 (P9-FIXES-R4 decision 1, part 1): one of this rail's writes was BROADCAST: the node accepted the signed transaction and answered `hash` (in lower case, a
+ * public value), and the wait for its receipt is about to start. Every write passes through it (the vendored rail's own waits included). `write` names which write it is;
+ * `undefined` only for a wait made outside a rail method. See `EvmHtlcRail.onWriteBroadcast`.
+ */
+export interface EvmWriteBroadcast {
+  readonly write: EvmWriteKind | undefined;
+  readonly hash: Hex;
+}
+
+/** A listener of `EvmHtlcRail.onWriteBroadcast`. It is awaited before the receipt wait starts (so a listener that saves the hash has it durable first) and it can never change
+ *  what the write does: an error it throws is swallowed. */
+export type EvmWriteBroadcastListener = (event: EvmWriteBroadcast) => void | Promise<void>;
+
+/**
  * P94-PIN-01: a transaction hash as this build keeps it, in LOWER case. A node may answer `eth_sendRawTransaction` with an upper- or mixed-case hash
  * (viem returns it verbatim), but the flow records decode a saved hash strictly (`0x` and 64 lower-case hex digits), so a hash saved as the node wrote it
  * would be refused by the save and the protection of decision 7 (ask the node about the hash before sending again) would silently be off for that write.
@@ -762,6 +787,10 @@ interface ReceiptWatch {
   timeout: EvmReceiptTimeoutError | undefined;
   /** F7: the block number of the last receipt a wait returned (the write's own block), so the evidence lookup never plans below it. */
   receiptBlock: bigint | undefined;
+  /** P94-FUND-01: which of the rail's writes the receipt wait now running belongs to (set by the rail method around the write, cleared after it); `undefined` outside one. */
+  write: EvmWriteKind | undefined;
+  /** P94-FUND-01: called, awaited, with the write's hash (lower case) and kind BEFORE every receipt wait starts. Its errors never reach the wait. */
+  onWaitStart: ((hash: Hex, write: EvmWriteKind | undefined) => void | Promise<void>) | undefined;
 }
 
 /** The viem `waitForTransactionReceipt` parameters, without naming a chain. */
@@ -772,11 +801,25 @@ type ReceiptWaitParameters = Parameters<PublicClient["waitForTransactionReceipt"
  * vendored rail's own, which cannot be edited, and `approve`'s) uses `receiptTimeoutMs` when one is configured (viem's own
  * default otherwise) and turns viem's timeout into `EvmReceiptTimeoutError`. The error is also recorded in `watch`, because
  * the vendored rail re-wraps whatever it catches as a plain `tclk: ...` Error.
+ *
+ * P94-FUND-01: (1) before the wait starts, `watch.onWaitStart` is told the write's hash (the write is already broadcast: its hash is the node's answer), so a flow can
+ * save it and a runner can show it while the wait runs; its errors are swallowed. (2) `claimWaitCapMs` (Base Sepolia only) bounds the wait of a CLAIM to at most that many
+ * milliseconds, whatever `receiptTimeoutMs` says; every other write keeps the configured value.
  */
-function withReceiptTimeout(client: PublicClient, receiptTimeoutMs: number | undefined, watch: ReceiptWatch): PublicClient {
+function withReceiptTimeout(client: PublicClient, receiptTimeoutMs: number | undefined, watch: ReceiptWatch, claimWaitCapMs: number | undefined): PublicClient {
   const extended = client.extend(() => ({
     async waitForTransactionReceipt(parameters: ReceiptWaitParameters) {
-      const withTimeout = parameters.timeout === undefined && receiptTimeoutMs !== undefined ? { ...parameters, timeout: receiptTimeoutMs } : parameters;
+      const write = watch.write;
+      const configured = parameters.timeout ?? receiptTimeoutMs;
+      const limit = write === "claim" && claimWaitCapMs !== undefined ? Math.min(configured ?? VIEM_RECEIPT_TIMEOUT_MS, claimWaitCapMs) : configured;
+      const withTimeout = limit !== undefined && limit !== parameters.timeout ? { ...parameters, timeout: limit } : parameters;
+      if (watch.onWaitStart !== undefined) {
+        try {
+          await watch.onWaitStart(lowerCaseHash(parameters.hash), write);
+        } catch {
+          // a listener (a flow saving the hash, a runner printing it) never changes what the wait does: the transaction is out either way
+        }
+      }
       try {
         const receipt = await client.waitForTransactionReceipt(withTimeout);
         watch.receiptBlock = receipt.blockNumber;
@@ -841,6 +884,8 @@ export class EvmHtlcRail {
   /** P9-4 decision 10: the pause before each re-plan of the write lookup (ms), and how it is made. */
   private readonly lookupPauseMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
+  /** P94-FUND-01: the listeners `onWriteBroadcast` registered (the same set the receipt watch's `onWaitStart` walks). */
+  private readonly broadcastListeners: Set<EvmWriteBroadcastListener>;
 
   private constructor(
     config: EvmRailConfig,
@@ -853,6 +898,7 @@ export class EvmHtlcRail {
     signerWatch: EvmSignerWatch,
     lookupPauseMs: number,
     sleep: (ms: number) => Promise<void>,
+    broadcastListeners: Set<EvmWriteBroadcastListener>,
   ) {
     this.config = config;
     this.rpc = rpc;
@@ -864,6 +910,7 @@ export class EvmHtlcRail {
     this.signerWatch = signerWatch;
     this.lookupPauseMs = lookupPauseMs;
     this.sleep = sleep;
+    this.broadcastListeners = broadcastListeners;
   }
 
   /**
@@ -913,9 +960,25 @@ export class EvmHtlcRail {
         throw new Error("evm-htlc: refusing to connect: account must be an address or a local account");
       }
     }
-    const receiptWatch: ReceiptWatch = { timeout: undefined, receiptBlock: undefined };
+    // P94-FUND-01: the listeners of `onWriteBroadcast`, told of every write's hash before its receipt wait starts (in order; an error of one never reaches the wait or the next).
+    const broadcastListeners = new Set<EvmWriteBroadcastListener>();
+    const receiptWatch: ReceiptWatch = {
+      timeout: undefined,
+      receiptBlock: undefined,
+      write: undefined,
+      onWaitStart: async (hash, write) => {
+        for (const listener of [...broadcastListeners]) {
+          try {
+            await listener({ write, hash });
+          } catch {
+            // see EvmWriteBroadcastListener
+          }
+        }
+      },
+    };
     const signerWatch: EvmSignerWatch = { refused: undefined };
-    const publicClient = withReceiptTimeout(createPublicClient({ chain, transport }), options.config.receiptTimeoutMs, receiptWatch);
+    const claimWaitCapMs = options.config.pin.chainId === BASE_SEPOLIA_CHAIN_ID ? EVM_CLAIM_RECEIPT_WAIT_MS_BASE_SEPOLIA : undefined;
+    const publicClient = withReceiptTimeout(createPublicClient({ chain, transport }), options.config.receiptTimeoutMs, receiptWatch, claimWaitCapMs);
     // R1-FUND-02: a LOCAL account signs what viem hands it, and viem fills the chain id, gas and fee caps from the endpoint's answers.
     // Its account is therefore the guarded wrapper (a refusal of any chain id but the pin's, of a gas limit above EVM_MAX_GAS_PER_WRITE
     // and of a fee cap above the configured ceiling), and its transport answers `eth_fillTransaction` itself, with method-not-found, so
@@ -989,7 +1052,20 @@ export class EvmHtlcRail {
       signerWatch,
       lookupPauseMs,
       options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+      broadcastListeners,
     );
+  }
+
+  /**
+   * P94-FUND-01 (P9-FIXES-R4 decision 1, part 1): `listener` is called, and awaited, with the hash of EVERY write of this handle (approve, lock, claim, refund; the vendored rail's waits
+   * included) the moment the node has accepted it and BEFORE the wait for its receipt starts, so the hash of a claim whose receipt never comes is already saved and shown while the wait
+   * runs, not only after it ends. A public value (no key, no preimage). The listener cannot change what the write does: an error it throws is swallowed. Returns the function that removes it.
+   */
+  onWriteBroadcast(listener: EvmWriteBroadcastListener): () => void {
+    this.broadcastListeners.add(listener);
+    return () => {
+      this.broadcastListeners.delete(listener);
+    };
   }
 
   /** Runs one write through the vendored rail, which re-wraps every failure as `tclk: <reason>`: a receipt timeout recorded
@@ -998,6 +1074,7 @@ export class EvmHtlcRail {
     this.receiptWatch.timeout = undefined;
     this.receiptWatch.receiptBlock = undefined;
     this.signerWatch.refused = undefined;
+    this.receiptWatch.write = kind; // P94-FUND-01: the wrapped public client reads it when the vendored write starts its receipt wait
     try {
       await write();
     } catch (error) {
@@ -1007,6 +1084,8 @@ export class EvmHtlcRail {
       const timeout = this.receiptWatch.timeout as EvmReceiptTimeoutError | undefined; // set by the wrapped public client while `write` ran (the reset above narrows it)
       if (timeout !== undefined) throw new EvmReceiptTimeoutError(timeout.hash, timeout.timeoutMs, kind);
       throw error;
+    } finally {
+      this.receiptWatch.write = undefined;
     }
   }
 
@@ -1065,11 +1144,14 @@ export class EvmHtlcRail {
       this.rpc.setIdNamespace(undefined);
     }
     let receipt: Awaited<ReturnType<PublicClient["waitForTransactionReceipt"]>>;
+    this.receiptWatch.write = "approve"; // P94-FUND-01
     try {
       receipt = await this.publicClient.waitForTransactionReceipt({ hash });
     } catch (error) {
       if (error instanceof EvmReceiptTimeoutError) throw new EvmReceiptTimeoutError(error.hash, error.timeoutMs, "approve");
       throw error;
+    } finally {
+      this.receiptWatch.write = undefined;
     }
     if (receipt.status !== "success") {
       throw new Error(`evm-htlc: approve transaction mined but reverted on-chain (hash: ${hash})`);
