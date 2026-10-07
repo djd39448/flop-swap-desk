@@ -6,3 +6,4 @@ vendor/tclk/node_modules/
 .state/
 out/
 cache/
+*.key

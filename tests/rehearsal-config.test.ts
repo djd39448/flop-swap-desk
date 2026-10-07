@@ -5,9 +5,10 @@
 // only, the endpoint may carry no credentials, a Base Sepolia config needs its code pin, and the chain clock exists for anvil only.
 // No chain, no key file, no network: data in, a validated config or a typed refusal out.
 
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { generatePrivateKey } from "viem/accounts";
 import { afterAll, describe, expect, it } from "vitest";
@@ -230,6 +231,15 @@ describe("parseRehearsalConfig", () => {
     expect(message).toContain("a phrase of 11 or more words");
   });
 
+  it("inherits the rail's maxLogRange floor: a cap below 257 blocks is refused by field name, 257 and the default are accepted (F1)", () => {
+    for (const low of [1, 10, 100, 256]) {
+      expect(refusal(baseSepoliaConfig({ maxLogRange: low })), String(low)).toMatch(/rails\.evm: .*maxLogRange must be at least 257/);
+    }
+    expect(parseRehearsalConfig(baseSepoliaConfig({ maxLogRange: 257 }), BASE).rails.evm.maxLogRange).toBe(257);
+    expect(parseRehearsalConfig(baseSepoliaConfig({ maxLogRange: 500 }), BASE).rails.evm.maxLogRange).toBe(500);
+    expect(parseRehearsalConfig(baseSepoliaConfig(), BASE).rails.evm.maxLogRange).toBeUndefined(); // the chain's default (500) applies
+  });
+
   it("checks the amount, the asset and the FLOP amount", () => {
     expect(refusal(anvilConfig({ amount: "0" }))).toContain("amount must be a positive decimal integer string");
     expect(refusal(anvilConfig({ amount: "1.5" }))).toContain("amount must be a positive decimal integer string");
@@ -327,5 +337,13 @@ describe("deadlines and the endpoint host", () => {
     expect(endpointHost("https://sepolia.base.org/v2/SECRETSECRET")).toBe("sepolia.base.org");
     expect(endpointHost("http://127.0.0.1:8545")).toBe("127.0.0.1:8545");
     expect(endpointHost("nonsense")).toBe("<invalid url>");
+  });
+});
+
+// K4 (P9 review round 1): `git check-ignore keys/buyer.key` printed nothing, so `git add -A` could stage a key file kept inside the repository.
+describe("key files are ignored by git", () => {
+  it(".gitignore names *.key", async () => {
+    const text = await readFile(fileURLToPath(new URL("../.gitignore", import.meta.url)), "utf8");
+    expect(text.split("\n").map((line) => line.trim())).toContain("*.key");
   });
 });
