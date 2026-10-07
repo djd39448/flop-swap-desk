@@ -33,7 +33,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { english } from "viem/accounts";
 
 import { ASSET_NAME_SHAPE, BASE_SEPOLIA_PIN, checkEvmRailConfig, PIN_TEXT_SHAPE, type EvmFinality, type EvmRailConfig } from "../rails/evm-htlc.js";
-import { evmLocalPolicyFor } from "./policy.js";
+import { evmLocalPolicyFor, KNOWN_GOOD_DEADLINES_BY_CHAIN, knownGoodDeadlinesFor } from "./policy.js";
 
 /** One leg's three deadlines, in minutes after the run's start (t0). */
 export interface LegDeadlineMinutes {
@@ -48,17 +48,16 @@ export interface DeadlineMinutes {
 }
 
 /**
- * The deadline set the anvil suites (tests-anvil/client-flows.anvil.test.ts) already run against `EVM_LOCAL_POLICY`, and the one
- * the README documents for the first rehearsals. Leg A is the Base Sepolia USDC leg: claim by +60 min, refund from +90 min;
- * leg B is the FLOP paper leg: claim by +120 min, refund from +180 min. The three rules of SPEC 3.5 hold for it at any lock time
- * up to 45 minutes after t0 (rule 1, a 45-minute reveal window, is the binding one; the pre-flight checks the rules with the real
- * numbers and `EVM_LOCAL_POLICY`, whatever the config says), and the pre-flight also compares the chain's measured `finalized` lag with leg A's claim-by (P9-4 sets the Base Sepolia
- * policy numbers from the 24-hour sample; this set is the one that works with today's policy).
+ * P9-4 decision 2: the known-good deadline set of each EVM chain, in minutes after the run's start, keyed by the pin's chain id (the table of
+ * `KNOWN_GOOD_DEADLINES_BY_CHAIN` in src/client/policy.ts, which pins them with their slack in tests/deadlines-policy.test.ts). `"deadlines": "known-good"`
+ * (and an absent `deadlines`) resolves to the entry of the config's own chain, whatever else the config says:
+ *   31337 (anvil): leg A claim by +60, refund from +90; leg B claim by +120, refund from +180: the set the anvil suites have always run against
+ *     `EVM_LOCAL_POLICY` (20-minute finality budget).
+ *   84532 (Base Sepolia): leg A claim by +115, refund from +135; leg B claim by +225, refund from +285 under `BASE_SEPOLIA_POLICY` (80-minute finality
+ *     budget): a refund rehearsal ends 285 minutes (4 h 45 min) after the start. The anvil set breaks SPEC 3.5 rule 2 (the leg-linking rule) there.
+ * The pre-flight checks the three rules of SPEC 3.5 and the claim margin with the REAL numbers and the rail's own policy, whatever the config says.
  */
-export const KNOWN_GOOD_DEADLINES: DeadlineMinutes = Object.freeze({
-  legA: Object.freeze({ claimByMin: 60, refundAfterMin: 90, expiresMin: 30 }),
-  legB: Object.freeze({ claimByMin: 120, refundAfterMin: 180, expiresMin: 40 }),
-});
+export const KNOWN_GOOD_DEADLINES: Readonly<Record<31337 | 84532, DeadlineMinutes>> = KNOWN_GOOD_DEADLINES_BY_CHAIN;
 
 /** Every leg-A lock is expected within this many minutes of the run's start; the rules of SPEC 3.5 are checked at that lock time. */
 export const LOCK_ESTIMATE_MS = 10 * 60_000;
@@ -325,8 +324,9 @@ function assertEndpoint(endpoint: string): void {
   }
 }
 
-function parseDeadlines(value: unknown): { deadlines: DeadlineMinutes; source: "known-good" | "explicit" } {
-  if (value === undefined || value === "known-good") return { deadlines: KNOWN_GOOD_DEADLINES, source: "known-good" };
+function parseDeadlines(value: unknown, chainId: number): { deadlines: DeadlineMinutes; source: "known-good" | "explicit" } {
+  // P9-4 decision 2: "known-good" is the set of the pin's own chain (the config check already refused any chain id but the two with a set).
+  if (value === undefined || value === "known-good") return { deadlines: knownGoodDeadlinesFor(chainId), source: "known-good" };
   const set = requireObject(value, 'deadlines (the string "known-good" or an object)');
   closed(set, DEADLINE_FIELDS, "deadlines");
   const leg = (raw: unknown, path: string): LegDeadlineMinutes => {
@@ -359,7 +359,7 @@ export function parseRehearsalConfig(value: unknown, baseDir: string, file = "")
   const samePath = process.platform === "win32" ? buyerKeyFile.toLowerCase() === sellerKeyFile.toLowerCase() : buyerKeyFile === sellerKeyFile;
   if (samePath) throw new RehearsalConfigError("buyerKeyFile and sellerKeyFile name the same file; a swap needs two different accounts");
 
-  const { deadlines, source } = parseDeadlines(top.deadlines);
+  const { deadlines, source } = parseDeadlines(top.deadlines, evm.pin.chainId);
 
   const amount = requireString(top.amount, "amount");
   refuseKeyLikeAmount(amount, "amount");

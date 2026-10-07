@@ -14,7 +14,7 @@ import { english, generateMnemonic, generatePrivateKey } from "viem/accounts";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
-import { BASE_SEPOLIA_POLICY } from "../src/client/policy.js";
+import { BASE_SEPOLIA_POLICY, KNOWN_GOOD_DEADLINES_BY_CHAIN } from "../src/client/policy.js";
 import {
   absoluteDeadlines,
   endpointHost,
@@ -74,7 +74,7 @@ describe("parseRehearsalConfig", () => {
     expect(config.pollMs).toBe(5_000);
     expect(config.waitLimitMs).toBe(2 * 60 * 60_000);
     expect(config.deadlinesSource).toBe("known-good");
-    expect(config.deadlines).toBe(KNOWN_GOOD_DEADLINES);
+    expect(config.deadlines).toBe(KNOWN_GOOD_DEADLINES[31337]); // an anvil pin resolves to the anvil set
     expect(config.rails.evm.contract).toBe(CONTRACT);
     expect(Object.isFrozen(config)).toBe(true);
   });
@@ -116,8 +116,8 @@ describe("parseRehearsalConfig", () => {
         { ...anvilConfig(), rails: { evm: { ...(anvilConfig().rails as { evm: object }).evm, pin: { ...ANVIL_LOCAL_PIN, finality: { mode: "tag", tag: "finalized", key: secret } } } } },
         "rails.evm.pin.finality.key",
       ],
-      ["deadlines.extra", anvilConfig({ deadlines: { ...KNOWN_GOOD_DEADLINES, extra: secret } }), "deadlines.extra"],
-      ["deadlines.legA.extra", anvilConfig({ deadlines: { legA: { ...KNOWN_GOOD_DEADLINES.legA, extra: secret }, legB: KNOWN_GOOD_DEADLINES.legB } }), "deadlines.legA.extra"],
+      ["deadlines.extra", anvilConfig({ deadlines: { ...KNOWN_GOOD_DEADLINES[31337], extra: secret } }), "deadlines.extra"],
+      ["deadlines.legA.extra", anvilConfig({ deadlines: { legA: { ...KNOWN_GOOD_DEADLINES[31337].legA, extra: secret }, legB: KNOWN_GOOD_DEADLINES[31337].legB } }), "deadlines.legA.extra"],
     ];
     for (const [label, value, field] of cases) {
       const message = refusal(value);
@@ -513,6 +513,31 @@ describe("parseRehearsalConfig", () => {
     expect(parseRehearsalConfig(anvilConfig({ pollMs: 250, waitLimitMs: 3_000 }), BASE).waitLimitMs).toBe(3_000);
   });
 
+  // P9-4 decision 2 (runner part): "known-good" (and an absent deadlines) resolves by the pin's chain id, to the set that satisfies every rule under THAT chain's policy.
+  it("P9-4 d2: known-good deadlines resolve by the pin's chain id: anvil +60/+90/+120/+180, Base Sepolia +115/+135/+225/+285; an explicit set is the person's own", () => {
+    expect(Object.keys(KNOWN_GOOD_DEADLINES).sort()).toEqual(["31337", "84532"]);
+    const anvil = parseRehearsalConfig(anvilConfig(), BASE);
+    expect(anvil.deadlinesSource).toBe("known-good");
+    expect(anvil.deadlines).toBe(KNOWN_GOOD_DEADLINES[31337]);
+    expect(anvil.deadlines).toEqual({ legA: { claimByMin: 60, refundAfterMin: 90, expiresMin: 30 }, legB: { claimByMin: 120, refundAfterMin: 180, expiresMin: 40 } });
+    for (const deadlines of [undefined, "known-good"]) {
+      const base = parseRehearsalConfig(baseSepoliaConfig({}, deadlines === undefined ? {} : { deadlines }), BASE);
+      expect(base.deadlinesSource, String(deadlines)).toBe("known-good");
+      expect(base.deadlines, String(deadlines)).toBe(KNOWN_GOOD_DEADLINES[84532]);
+      expect(base.deadlines, String(deadlines)).toEqual({ legA: { claimByMin: 115, refundAfterMin: 135, expiresMin: 30 }, legB: { claimByMin: 225, refundAfterMin: 285, expiresMin: 40 } });
+      expect(parseRehearsalConfig(anvilConfig(deadlines === undefined ? {} : { deadlines }), BASE).deadlines, String(deadlines)).toBe(KNOWN_GOOD_DEADLINES[31337]);
+    }
+    // The table the runner reads is the policy module's, so it cannot drift from the set the deadline tests pin.
+    expect(KNOWN_GOOD_DEADLINES).toBe(KNOWN_GOOD_DEADLINES_BY_CHAIN);
+    expect(Object.isFrozen(KNOWN_GOOD_DEADLINES)).toBe(true);
+    // An explicit set is used as given, on either chain (the pre-flight then judges it against the chain's policy).
+    const explicit = { legA: { claimByMin: 40, refundAfterMin: 50, expiresMin: 20 }, legB: { claimByMin: 70, refundAfterMin: 110, expiresMin: 30 } };
+    const given = parseRehearsalConfig(baseSepoliaConfig({}, { deadlines: explicit }), BASE);
+    expect(given.deadlinesSource).toBe("explicit");
+    expect(given.deadlines).toEqual(explicit);
+    expect(absoluteDeadlines(parseRehearsalConfig(baseSepoliaConfig(), BASE).deadlines, 0).legB.refundAfterMs).toBe(285 * 60_000);
+  });
+
   // P9-4 decision 3: Base Sepolia pins finality to the chain's `finalized` tag. The rail's own check refuses confirmations mode and a fallback there; the runner's config
   // names the field, and never a value.
   it("P9-4 d3: on Base Sepolia confirmations mode and any fallbackConfirmations are refused by field name (and never echoed); anvil keeps both", () => {
@@ -591,7 +616,7 @@ describe("loadRehearsalConfig", () => {
 
 describe("deadlines and the endpoint host", () => {
   it("lays the known-good minutes on the run's start", () => {
-    const abs = absoluteDeadlines(KNOWN_GOOD_DEADLINES, 1_000_000_000_000);
+    const abs = absoluteDeadlines(KNOWN_GOOD_DEADLINES[31337], 1_000_000_000_000);
     expect(abs.legA).toEqual({ claimByMs: 1_000_000_000_000 + 60 * 60_000, refundAfterMs: 1_000_000_000_000 + 90 * 60_000, expiresMs: 1_000_000_000_000 + 30 * 60_000 });
     expect(abs.legB).toEqual({ claimByMs: 1_000_000_000_000 + 120 * 60_000, refundAfterMs: 1_000_000_000_000 + 180 * 60_000, expiresMs: 1_000_000_000_000 + 40 * 60_000 });
     expect(LOCK_ESTIMATE_MS).toBe(10 * 60_000);

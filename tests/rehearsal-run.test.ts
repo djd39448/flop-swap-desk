@@ -59,8 +59,8 @@ interface Rig {
 }
 
 interface RigOptions {
-  /** F3 (P9 review round 1): Base Sepolia still runs under the anvil policy, so a NEW swap on it is refused until P9-4. The rigs that want every row of a healthy
-   *  dry run use the anvil pin (31337) on the same fake chain, with maxLogRange 500 so the log rows read the same. */
+  /** Use the anvil pin (31337) on the same fake chain, with maxLogRange 500 so the log rows read the same (the default rig is Base Sepolia, 84532, with its own policy
+   *  and known-good deadline set since P9-4). */
   anvil?: boolean;
   /** With `anvil`: the config's maxLogRange (default 500). */
   maxLogRange?: number;
@@ -181,12 +181,28 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     expect(rig.chain.methods).toContain("eth_getCode");
   });
 
-  // F3 with R1-FUND-06 (P9 review round 1), moved by P9-4 decision 1: the rail now selects BASE_SEPOLIA_POLICY by the pin's chain id, so the interim
-  // "no Base Sepolia policy yet" row can no longer fire through the runner (its code stays in rehearsal-preflight.ts, unit-tested there with an explicit
-  // anvil policy, for the runner builder to remove). The runner's default deadline set is still the anvil one, which breaks the leg-linking rule under the
-  // new 80-minute finality budget (rule 2): a NEW swap on 84532 with it is still refused at the deadlines row, now for the real numbers.
-  it("a dry run on Base Sepolia (chain 84532) with the known-good deadlines exits 3 on the deadlines row, and --yes refuses; --refund is not blocked by it (F3)", async () => {
-    const dry = await makeRig();
+  // P9-4 decisions 1 and 2 (runner part): the interim guard of review round 1 (F3) is gone and "known-good" is the set of the pin's own chain. A fresh dry run on Base
+  // Sepolia with the default deadlines passes every row, the deadlines row included; the anvil set on 84532 breaks the leg-linking rule (rule 2) under the 80-minute
+  // finality budget and is refused at that row, with the rule named.
+  it("a dry run on Base Sepolia (chain 84532) with the default deadlines passes every row and exits 0; the anvil set there exits 3 naming rule 2, --yes refuses it, --refund never reads the row", async () => {
+    const healthy = await makeRig();
+    const passed = await run(healthy);
+    expect(passed.code).toBe(EXIT.ok);
+    expect(passed.stderr).toBe("");
+    expect(passed.stdout).toMatch(/OK\s+deadlines\s+SPEC 3\.5 rules 1 to 3 and the claim margin hold/);
+    expect(passed.stdout).toMatch(/OK\s+chain id\s+84532 matches the pin base-sepolia/);
+    expect(passed.stdout).not.toContain("no Base Sepolia policy yet");
+    expect(passed.stdout).toContain("refund rehearsal (--yes --stop-after lock, then --refund): leg A is refundable 135 min after the start, leg B 285 min after the start");
+    expect(passed.stdout).toContain("This was a dry run: no transaction was sent, no file was written.");
+    expect(passed.stdout.match(/^ {2}FAIL {2}\S+/gm)).toBeNull();
+    expect(healthy.chain.methods.filter((m) => WRITES.includes(m))).toEqual([]);
+
+    // The anvil set (claim-by +60) on Base Sepolia, written out in the config: the rail's policy is the chain's own, so rule 2 binds.
+    const anvilSet = {
+      legA: { claimByMin: 60, refundAfterMin: 90, expiresMin: 30 },
+      legB: { claimByMin: 120, refundAfterMin: 180, expiresMin: 40 },
+    };
+    const dry = await makeRig({ configExtra: { deadlines: anvilSet } });
     const result = await run(dry);
     expect(result.code).toBe(EXIT.preflight);
     expect(result.stdout).toMatch(/FAIL\s+deadlines\s+rule 2: legB\.claimByMs \d+ < required \d+ ms \(legA\.refundAfterMs \d+ \+ finalityAMs 4800000\)/);
@@ -195,7 +211,7 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     expect(result.stdout).toMatch(/OK\s+chain id\s+84532 matches the pin base-sepolia/); // everything else about the chain is fine
     expect(result.stdout.match(/^ {2}FAIL {2}\S+/gm)).toEqual(["  FAIL  deadlines"]); // the deadlines row is the only failure
 
-    const yes = await makeRig();
+    const yes = await makeRig({ configExtra: { deadlines: anvilSet } });
     const refused = await run(yes, "yes");
     expect(refused.code).toBe(EXIT.preflight);
     expect(refused.stdout).toContain("--yes refuses to broadcast unless every needed check holds");
@@ -204,7 +220,7 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     expect(yes.chain.methods.filter((m) => WRITES.includes(m))).toEqual([]);
 
     // --refund (of a swap already begun) never reads the row: it is a fresh-run check.
-    const refund = await makeRig();
+    const refund = await makeRig({ configExtra: { deadlines: anvilSet } });
     await writeRun(refund, {}, true);
     const refunded = await run(refund, "refund");
     expect(refunded.stdout).not.toContain("rule 2: legB.claimByMs");
@@ -1192,7 +1208,7 @@ describe("bad configs and a failing endpoint", () => {
     const exact = await makeRig({ configExtra: { waitLimitMs: 4_800_000 } });
     const passed = await run(exact);
     expect(passed.stderr).not.toContain("waitLimitMs");
-    expect(passed.code).not.toBe(EXIT.config); // the config is accepted: whatever the pre-flight says next is another matter
+    expect(passed.code).toBe(EXIT.ok); // the config is accepted, and the Base Sepolia pair passes the pre-flight
     expect(exact.chain.methods.length).toBeGreaterThan(0); // and the chain was read
   });
 

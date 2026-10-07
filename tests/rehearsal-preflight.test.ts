@@ -9,7 +9,7 @@
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 
-import { EVM_LOCAL_POLICY } from "../src/client/policy.js";
+import { BASE_SEPOLIA_POLICY, EVM_LOCAL_POLICY, evmLocalPolicyFor, knownGoodDeadlinesFor } from "../src/client/policy.js";
 import {
   absoluteDeadlines,
   KNOWN_GOOD_DEADLINES,
@@ -40,12 +40,9 @@ const CONTRACT = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 const HEAD_SEC = 1_790_000_000;
 const NOW_MS = HEAD_SEC * 1000 + 2_000;
-/**
- * F3 (P9 review round 1): the pre-flight refuses a NEW swap on Base Sepolia while the rail's policy is `EVM_LOCAL_POLICY` itself (the interim guard,
- * until P9-4 selects BASE_SEPOLIA_POLICY by chain id). The rows under test here are the ordinary ones, so they run under an equal copy of the anvil
- * policy: another object, which is what P9-4's own policy will be.
- */
-const STAND_IN_POLICY = Object.freeze({ ...EVM_LOCAL_POLICY });
+/** The known-good deadline sets of the two chains (P9-4 decision 2), as the runner's config resolves them. */
+const ANVIL_SET = KNOWN_GOOD_DEADLINES[31337];
+const BASE_SET = KNOWN_GOOD_DEADLINES[84532];
 const buyerAddress = privateKeyToAccount(generatePrivateKey()).address;
 const sellerAddress = privateKeyToAccount(generatePrivateKey()).address;
 
@@ -74,7 +71,7 @@ async function preflight(
   chainOptions: FakeChainOptions = {},
   configuration: RehearsalConfig = config(),
   overrides: Partial<PreflightInput> = {},
-  minutes: DeadlineMinutes = KNOWN_GOOD_DEADLINES,
+  minutes?: DeadlineMinutes,
 ): Promise<Run> {
   const chain = fakeChain({
     headTimestampSec: HEAD_SEC,
@@ -82,7 +79,9 @@ async function preflight(
     ...chainOptions,
   });
   const { rpc } = scriptedRpc(chain.handlers);
-  const absolute = absoluteDeadlines(minutes, NOW_MS);
+  // P9-4 decisions 1 and 2: the rail's policy and the known-good set are the pin's chain's own, as the runner hands them over.
+  const chainId = configuration.rails.evm.pin.chainId;
+  const absolute = absoluteDeadlines(minutes ?? knownGoodDeadlinesFor(chainId), NOW_MS);
   const report = await runPreflight({
     config: configuration,
     rpc,
@@ -91,7 +90,7 @@ async function preflight(
     nowMs: NOW_MS,
     fresh: true,
     deadlines: { absolute, lockTimeMs: NOW_MS + LOCK_ESTIMATE_MS },
-    policy: STAND_IN_POLICY,
+    policy: evmLocalPolicyFor(chainId),
     redact: (text) => text.split("sepolia.base.org/secretpath").join("<rpc endpoint>"),
     ...overrides,
   });
@@ -222,18 +221,21 @@ describe("finality", () => {
     expect(run.report.ok).toBe(true);
   });
 
-  it("sets the measured lag against leg A's claim-by: 39 minutes fits a 60-minute claim-by, 55 minutes does not", async () => {
-    const fits = await preflight({ finalizedLagSec: 39 * 60 });
+  // On anvil (claim-by +60 min, a 20-minute finality budget): the measured lag is the larger of the two here, so these numbers are the lag's own. The Base Sepolia pair
+  // (an 80-minute budget, claim-by +115) is the subject of the "finality budget row" tests below (P9-4 decision 12).
+  it("sets the measured lag against leg A's claim-by (anvil, claim-by +60): 39 minutes fits, 55 minutes does not", async () => {
+    const anvil = config({ contractCodeHash: undefined }, {}, ANVIL_LOCAL_PIN);
+    const fits = await preflight({ chainId: 31337, finalizedLagSec: 39 * 60 }, anvil);
     expect(status(fits, "finality budget")).toBe("ok");
     expect(row(fits, "finality budget").detail).toContain("to spare");
-    const tooSlow = await preflight({ finalizedLagSec: 55 * 60 });
+    const tooSlow = await preflight({ chainId: 31337, finalizedLagSec: 55 * 60 }, anvil);
     expect(status(tooSlow, "finality budget")).toBe("fail");
     expect(row(tooSlow, "finality budget").detail).toContain("the Seller could not claim in time");
     expect(tooSlow.report.ok).toBe(false);
     // The allowance for landing the lock is part of the sum: a lag of exactly (claim-by - allowance) still fits.
-    const edge = await preflight({ finalizedLagSec: (60 * 60_000 - LOCK_SETTLE_ALLOWANCE_MS) / 1000 });
+    const edge = await preflight({ chainId: 31337, finalizedLagSec: (60 * 60_000 - LOCK_SETTLE_ALLOWANCE_MS) / 1000 }, anvil);
     expect(status(edge, "finality budget")).toBe("ok");
-    const over = await preflight({ finalizedLagSec: (60 * 60_000 - LOCK_SETTLE_ALLOWANCE_MS) / 1000 + 1 });
+    const over = await preflight({ chainId: 31337, finalizedLagSec: (60 * 60_000 - LOCK_SETTLE_ALLOWANCE_MS) / 1000 + 1 }, anvil);
     expect(status(over, "finality budget")).toBe("fail");
   });
 
@@ -340,8 +342,8 @@ describe("the accounts", () => {
       seller: { address: sellerAddress },
       nowMs: NOW_MS,
       fresh: true,
-      deadlines: { absolute: absoluteDeadlines(KNOWN_GOOD_DEADLINES, NOW_MS), lockTimeMs: NOW_MS + LOCK_ESTIMATE_MS },
-      policy: EVM_LOCAL_POLICY,
+      deadlines: { absolute: absoluteDeadlines(BASE_SET, NOW_MS), lockTimeMs: NOW_MS + LOCK_ESTIMATE_MS },
+      policy: BASE_SEPOLIA_POLICY,
       redact: (t) => t,
     });
     expect(report.rows.find((r) => r.check === "gas price")?.status).toBe("fail");
@@ -512,26 +514,55 @@ describe("the Seller's row is sized by what is left to send, and a refund's shor
   });
 });
 
-// F3 with R1-FUND-06 (P9 review round 1): until P9-4 selects BASE_SEPOLIA_POLICY by chain id, Base Sepolia runs under the anvil policy, whose 20-minute
-// finality budget was a median and not a bound (the sample's maximum lag is 39 minutes) and whose 5-minute claim margin is below the worst case
-// after the claim's last guard. The deadlines row of a new swap on that chain says so and fails; a refund and a resume never read the row.
-describe("the interim Base Sepolia guard (F3)", () => {
-  it("fails the deadlines row on chain 84532 while the rail's policy is the anvil policy itself, with the known-good deadlines, and says P9-4", async () => {
-    const run = await preflight({}, config(), { policy: EVM_LOCAL_POLICY });
+// P9-4 decision 1 (runner part): the interim guard of review round 1 (F3 with R1-FUND-06), which refused every NEW swap on Base Sepolia while the rail still ran
+// under the anvil policy, is gone. The rail selects its policy by the pin's chain id (BASE_SEPOLIA_POLICY on 84532: a finality budget of 80 minutes, a claim margin of
+// 10 minutes), so the deadlines row checks the real numbers, and the known-good set of each chain (decision 2) passes under that chain's own policy.
+describe("the deadlines row under each chain's own policy (P9-4 decisions 1 and 2)", () => {
+  it("a fresh Base Sepolia run under BASE_SEPOLIA_POLICY with the Base Sepolia known-good set passes the row, and says the rules hold", async () => {
+    const run = await preflight({}, config(), { policy: BASE_SEPOLIA_POLICY }, BASE_SET);
+    expect(status(run, "deadlines")).toBe("ok");
+    expect(row(run, "deadlines").detail).toContain("SPEC 3.5 rules 1 to 3 and the claim margin hold");
+    expect(run.report.ok).toBe(true);
+  });
+
+  it("the anvil set on Base Sepolia fails the row with the rule named: leg B's claim-by is not leg A's refund time plus the 80-minute finality budget (rule 2)", async () => {
+    const run = await preflight({}, config(), { policy: BASE_SEPOLIA_POLICY }, ANVIL_SET);
     expect(status(run, "deadlines")).toBe("fail");
-    expect(row(run, "deadlines").detail).toContain("no Base Sepolia policy yet (P9-4)");
-    expect(row(run, "deadlines").detail).toContain("--refund and --resume of a swap already begun are not affected");
+    const detail = row(run, "deadlines").detail;
+    expect(detail).toMatch(/rule 2: legB\.claimByMs \d+ < required \d+ ms \(legA\.refundAfterMs \d+ \+ finalityAMs 4800000\)/);
+    expect(detail).not.toContain("rule 1");
+    expect(detail).not.toContain("rule 3");
     expect(run.report.ok).toBe(false);
   });
 
-  it("keeps the other deadline violations beside it, and does not touch the anvil chain or a policy that is not the anvil policy", async () => {
-    const tooShort: DeadlineMinutes = { legA: { claimByMin: 30, refundAfterMin: 40, expiresMin: 20 }, legB: { claimByMin: 120, refundAfterMin: 180, expiresMin: 40 } };
-    const both = await preflight({}, config(), { policy: EVM_LOCAL_POLICY }, tooShort);
-    expect(row(both, "deadlines").detail).toContain("no Base Sepolia policy yet (P9-4)");
-    expect(row(both, "deadlines").detail).toContain("rule 1");
+  it("anvil keeps its own pair: the anvil set passes under EVM_LOCAL_POLICY (20-minute budget), and the Base Sepolia set passes there too", async () => {
     const anvil = config({ contractCodeHash: undefined }, {}, ANVIL_LOCAL_PIN);
-    expect(status(await preflight({ chainId: 31337 }, anvil, { policy: EVM_LOCAL_POLICY }), "deadlines")).toBe("ok");
-    expect(status(await preflight({}, config(), { policy: STAND_IN_POLICY }), "deadlines")).toBe("ok");
+    expect(status(await preflight({ chainId: 31337 }, anvil, { policy: EVM_LOCAL_POLICY }, ANVIL_SET), "deadlines")).toBe("ok");
+    expect(status(await preflight({ chainId: 31337 }, anvil, { policy: EVM_LOCAL_POLICY }, BASE_SET), "deadlines")).toBe("ok");
+    expect(status(await preflight({ chainId: 31337 }, anvil), "deadlines")).toBe("ok"); // the helper's own default is the anvil pair
+  });
+
+  it("the row judges the numbers and nothing else: no policy object, not even the anvil one on chain 84532, gets a refusal from a guard (the old text is gone)", async () => {
+    // The old guard fired on chain 84532 whenever the policy handed in was EVM_LOCAL_POLICY itself, whatever the deadlines said.
+    const handedTheAnvilPolicy = await preflight({}, config(), { policy: EVM_LOCAL_POLICY }, ANVIL_SET);
+    expect(status(handedTheAnvilPolicy, "deadlines")).toBe("ok"); // the anvil set passes the anvil policy's rules
+    expect(row(handedTheAnvilPolicy, "deadlines").detail).not.toContain("no Base Sepolia policy yet");
+    const tooShort: DeadlineMinutes = { legA: { claimByMin: 30, refundAfterMin: 40, expiresMin: 20 }, legB: { claimByMin: 120, refundAfterMin: 180, expiresMin: 40 } };
+    const broken = await preflight({}, config(), { policy: EVM_LOCAL_POLICY }, tooShort);
+    expect(row(broken, "deadlines").detail).toContain("rule 1");
+    expect(row(broken, "deadlines").detail).not.toContain("no Base Sepolia policy yet");
+  });
+
+  it("the claim margin is the chain's own: on Base Sepolia a 9-minute gap between leg A's claim-by and refund time fails and 10 minutes passes (anvil: 4 fails, 5 passes)", async () => {
+    const withGap = (gapMin: number, base: DeadlineMinutes): DeadlineMinutes => ({ ...base, legA: { ...base.legA, refundAfterMin: base.legA.claimByMin + gapMin } });
+    const nine = await preflight({}, config(), { policy: BASE_SEPOLIA_POLICY }, withGap(9, BASE_SET));
+    expect(status(nine, "deadlines")).toBe("fail");
+    expect(row(nine, "deadlines").detail).toContain("claim-inclusion margin (10.0 min)");
+    expect(status(await preflight({}, config(), { policy: BASE_SEPOLIA_POLICY }, withGap(10, BASE_SET)), "deadlines")).toBe("ok");
+    const anvil = config({ contractCodeHash: undefined }, {}, ANVIL_LOCAL_PIN);
+    const four = await preflight({ chainId: 31337 }, anvil, {}, withGap(4, ANVIL_SET));
+    expect(row(four, "deadlines").detail).toContain("claim-inclusion margin (5.0 min)");
+    expect(status(await preflight({ chainId: 31337 }, anvil, {}, withGap(5, ANVIL_SET)), "deadlines")).toBe("ok");
   });
 
   it("never blocks a refund or a resume: with fresh = false there is no deadlines row to fail, whatever the policy", async () => {
@@ -575,7 +606,7 @@ describe("the log scans' reach covers leg A's window (F1)", () => {
   const lockTimeMs = NOW_MS + LOCK_ESTIMATE_MS;
   /** Leg A's window as `hours` hours (plus `extraMs`) from the run's start to the refund time (R2-FUND-05), the rest of the set as the known-good one. */
   const window = (hours: number, extraMs = 0): NonNullable<PreflightInput["deadlines"]> => {
-    const absolute = absoluteDeadlines(KNOWN_GOOD_DEADLINES, NOW_MS);
+    const absolute = absoluteDeadlines(BASE_SET, NOW_MS);
     const refundAfterMs = NOW_MS + hours * 3_600_000 + extraMs;
     return { absolute: { ...absolute, legA: { ...absolute.legA, refundAfterMs } }, lockTimeMs };
   };
@@ -651,8 +682,8 @@ describe("the log scans' reach covers leg A's window (F1)", () => {
       seller: { address: sellerAddress },
       nowMs: NOW_MS,
       fresh: true,
-      deadlines: { absolute: absoluteDeadlines(KNOWN_GOOD_DEADLINES, NOW_MS), lockTimeMs },
-      policy: STAND_IN_POLICY,
+      deadlines: { absolute: absoluteDeadlines(BASE_SET, NOW_MS), lockTimeMs },
+      policy: BASE_SEPOLIA_POLICY,
       redact: (t) => t,
     });
     const unmeasured = report.rows.find((r) => r.check === "log scan reach");
@@ -678,23 +709,23 @@ describe("the deadlines", () => {
     const run = await preflight({}, config(), {}, tooShort);
     expect(status(run, "deadlines")).toBe("fail");
     expect(row(run, "deadlines").detail).toContain("rule 1");
-    const legBTooEarly: DeadlineMinutes = { legA: KNOWN_GOOD_DEADLINES.legA, legB: { claimByMin: 70, refundAfterMin: 100, expiresMin: 40 } };
+    const legBTooEarly: DeadlineMinutes = { legA: BASE_SET.legA, legB: { claimByMin: 70, refundAfterMin: 100, expiresMin: 40 } };
     const rule2 = await preflight({}, config(), {}, legBTooEarly);
     expect(row(rule2, "deadlines").detail).toContain("rule 2");
   });
 
   it("fails a leg A whose claim-by is too close to its refund time for the Seller's claim margin", async () => {
-    const tight: DeadlineMinutes = { legA: { claimByMin: 87, refundAfterMin: 90, expiresMin: 30 }, legB: KNOWN_GOOD_DEADLINES.legB };
+    const tight: DeadlineMinutes = { legA: { claimByMin: 87, refundAfterMin: 90, expiresMin: 30 }, legB: BASE_SET.legB };
     const run = await preflight({}, config(), {}, tight);
     expect(status(run, "deadlines")).toBe("fail");
     expect(row(run, "deadlines").detail).toContain("claim-inclusion margin");
   });
 
-  it("prints the absolute deadlines of the known-good set", async () => {
+  it("prints the absolute deadlines of the known-good set of the chain (Base Sepolia: leg A claim-by +115 min, leg B refundable from +285 min)", async () => {
     const run = await preflight();
     const detail = row(run, "deadlines").detail;
-    expect(detail).toContain(new Date(NOW_MS + 60 * 60_000).toISOString());
-    expect(detail).toContain(new Date(NOW_MS + 180 * 60_000).toISOString());
+    expect(detail).toContain(new Date(NOW_MS + 115 * 60_000).toISOString());
+    expect(detail).toContain(new Date(NOW_MS + 285 * 60_000).toISOString());
   });
 });
 

@@ -24,8 +24,7 @@
 //   buyer / seller the addresses (never a key), ETH against the gas still to be sent (generous per-call ceilings times twice the
 //                  node's gas price; both rows are sized by what is left to send, R1-FUND-01 and R2-FUND-04, and a refund's short Buyer row is
 //                  a warning; Base's L1 data fee is not counted), the Buyer's token balance and allowance against the amount
-//   deadlines      SPEC 3.5 rules 1 to 3 and the claim margin, with the rail's own policy and the real numbers; on Base Sepolia, while the
-//                  rail still runs under the anvil policy, a new swap is refused (F3, interim until P9-4)
+//   deadlines      SPEC 3.5 rules 1 to 3 and the claim margin, with the rail's own policy (selected by the pin's chain id: P9-4 decision 1) and the real numbers
 //
 // Output is addresses, amounts, hashes of public code and block numbers. It never contains a key, and the endpoint appears as its
 // host only; any transport error text goes through the caller's `redact` first (a transport's own error names its URL).
@@ -36,10 +35,10 @@ import type { OfferFrame } from "@flop-labs/tclk";
 import { checkSwapDeadlines } from "../deadlines.js";
 import { EVM_HASH_RAIL_ABI } from "../vendor/evm-hash-rail.js";
 import { describeCodeProblem, judgeRuntimeCode } from "../rails/evm-code-pin.js";
-import { BASE_SEPOLIA_PIN, effectiveMaxLogRange, EVM_MIN_LOG_RANGE, evmLogScanCoverage, MAX_LOG_SCAN_CHUNKS } from "../rails/evm-htlc.js";
+import { effectiveMaxLogRange, EVM_MIN_LOG_RANGE, evmLogScanCoverage, MAX_LOG_SCAN_CHUNKS } from "../rails/evm-htlc.js";
 import type { CapturingRpc } from "../rails/rpc-capture.js";
 import { endpointHost, type RehearsalConfig, type RunDeadlines } from "./rehearsal-config.js";
-import { EVM_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
+import type { RailLocalPolicy } from "./policy.js";
 import { CLAIM_MARKER_REORG_MARGIN_EVM } from "./seller.js";
 
 export type RowStatus = "ok" | "fail" | "warn" | "info";
@@ -310,8 +309,8 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     if (!answer.ok) add("state at finalized", "fail", `locks() at the finalized block by its hash failed (${answer.why}); the evidence reader needs exactly this read`);
     else if (answer.value === "0x") {
       // F9 (P9 review round 1): a node answers 0x (no data) for an eth_call at a block where the contract does not exist yet. That is the likely case
-      // within the finalized lag of a deploy (up to about 52 minutes on Base Sepolia: the sample's largest finalized lag so far is 51.4 minutes, 3,086 s, after a stand-still of
-      // 30 minutes or more; P9-4 sets the number from the full 24-hour sample), and "not an ABI-encoded row" would send a person looking in the wrong place.
+      // within the finalized lag of a deploy (up to about 52 minutes on Base Sepolia: the 24-hour sample's largest finalized lag is 51.4 minutes, 3,086 s, at the end of a
+      // stand-still of 35 to 45 minutes; the policy's finality budget is 80 minutes), and "not an ABI-encoded row" would send a person looking in the wrong place.
       add(
         "state at finalized",
         "fail",
@@ -481,15 +480,9 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     const asOffer = (leg: RunDeadlines["legA"]): OfferFrame => leg as unknown as OfferFrame; // checkSwapDeadlines reads only the three deadline fields
     const checked = checkSwapDeadlines(asOffer(absolute.legA), asOffer(absolute.legB), lockTimeMs, input.policy);
     const violations = [...checked.violations];
-    // F3 with R1-FUND-06 (P9 review round 1), an INTERIM guard until P9-4 selects BASE_SEPOLIA_POLICY by chain id: on Base Sepolia the rail still runs under
-    // the anvil policy, whose 20-minute finality budget was a median of the first samples and not a bound (the sample's largest finalized lag so far is 51.4 minutes, 3,086 s, after a
-    // stand-still of 30 minutes or more; the policy rule gives at least 80 minutes, and P9-4 sets the number from the full 24-hour sample) and whose
-    // 5-minute claim margin is below the worst case after the claim's last guard. A new swap there is refused (--refund and --resume never read this row).
-    if (evm.pin.chainId === BASE_SEPOLIA_PIN.chainId && input.policy === EVM_LOCAL_POLICY) {
-      violations.unshift(
-        "no Base Sepolia policy yet (P9-4): this chain's swaps still run under the anvil deadline policy (a 20-minute finality budget and a 5-minute claim margin that were not set from this chain's measured lag), so no new swap is started here until P9-4 replaces it; --refund and --resume of a swap already begun are not affected",
-      );
-    }
+    // P9-4 decision 1: the rail selects its policy by the pin's chain id (`BASE_SEPOLIA_POLICY` on 84532: an 80-minute finality budget and a 10-minute claim
+    // margin set from the 24-hour sample), so this row checks the REAL numbers. The interim guard of review round 1 (F3), which refused every new swap on
+    // Base Sepolia while the rail still ran under the anvil policy, is gone.
     const margin = input.policy.claimInclusionMarginMs;
     if (absolute.legA.refundAfterMs - absolute.legA.claimByMs < margin) {
       violations.push(`leg A: refundAfter - claimBy must be at least the claim-inclusion margin (${minutes(margin)}) or the Seller refuses to accept`);

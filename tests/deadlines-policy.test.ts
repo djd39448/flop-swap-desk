@@ -83,7 +83,8 @@ describe("P9-4 decision 2: the known-good sets are pinned", () => {
       legA: { claimByMin: 60, refundAfterMin: 90, expiresMin: 30 },
       legB: { claimByMin: 120, refundAfterMin: 180, expiresMin: 40 },
     });
-    expect(KNOWN_GOOD_DEADLINES).toEqual(ANVIL); // no drift between the per-chain table and the runner's default
+    expect(KNOWN_GOOD_DEADLINES[31337]).toEqual(ANVIL); // no drift between the per-chain table and the runner's config (per chain id since P9-4 decision 2)
+    expect(KNOWN_GOOD_DEADLINES[84532]).toEqual(BASE);
   });
 
   it("Base Sepolia (84532): leg A claim by +115 refund from +135, leg B claim by +225 refund from +285 (offers expire at +30 and +40)", () => {
