@@ -222,6 +222,13 @@ export class EvmMockNode {
     return new CapturingRpc({ endpoint: "http://mock-evm", fetch: fetchImpl });
   }
 
+  /** The next transaction hash: lower-case hex that carries LETTERS (a counter in the last four digits behind a fixed `c0ffee` filler), so a test that answers it in upper case
+   *  (`localSigningRpc(...).upperCaseHashes`, P94-PIN-01) really changes the text. */
+  private nextTxHash(): Hex {
+    this.txCounter += 1;
+    return `0x${"c0ffee".repeat(10)}${this.txCounter.toString(16).padStart(4, "0")}` as Hex;
+  }
+
   private blockHash(number: bigint): Hex {
     return `0x${number.toString(16).padStart(64, "0")}` as Hex;
   }
@@ -262,7 +269,8 @@ export class EvmMockNode {
         return { result: { number: numberToHex(number), hash: this.blockHash(number), timestamp: numberToHex(seconds) } };
       }
       case "eth_getTransactionReceipt": {
-        const receipt = this.receipts.get(String(params[0]));
+        // a node treats a hash as hex, whatever the case it is asked in (P94-PIN-01: a flow may ask with a hash a node answered in upper case)
+        const receipt = this.receipts.get(String(params[0]).toLowerCase());
         if (receipt === undefined) return { result: null };
         if (this.lagTipReads > 0) this.lagArmed = true;
         return {
@@ -304,10 +312,11 @@ export class EvmMockNode {
       case "eth_getTransactionByHash": {
         if (!this.answerTxByHash) return { error: { code: -32601, message: `mock evm node: unexpected method ${method}` } };
         const hash = String(params[0]);
-        const pooled = this.held.find((entry) => entry.txHash === hash);
+        const key = hash.toLowerCase();
+        const pooled = this.held.find((entry) => entry.txHash === key);
         const base = { hash, nonce: "0x0", gas: "0x5208", value: "0x0", type: "0x2" };
         if (pooled !== undefined) return { result: { ...base, blockNumber: null, blockHash: null, transactionIndex: null, from: pooled.tx.from, to: pooled.tx.to, input: pooled.tx.data } };
-        const mined = this.receipts.get(hash);
+        const mined = this.receipts.get(key);
         if (mined !== undefined) return { result: { ...base, blockNumber: numberToHex(mined.blockNumber), blockHash: this.blockHash(mined.blockNumber), transactionIndex: "0x0", from: mined.from, to: mined.to, input: "0x" } };
         return { result: null };
       }
@@ -393,13 +402,13 @@ export class EvmMockNode {
     }
     if (!released && this.rejectNext.delete(fn)) return { error: { code: -32000, message: `mock evm node: ${fn} not accepted (test)` } };
     if (!released && this.holdNext.delete(fn)) {
-      const pooledHash = `0x${(++this.txCounter).toString(16).padStart(64, "0")}` as Hex;
+      const pooledHash = this.nextTxHash();
       this.held.push({ fn, txHash: pooledHash, tx: { from, to: tx.to, data: tx.data } });
       return { result: pooledHash };
     }
     const hookToken = this.hook?.begin(fn, from);
 
-    const txHash = presetHash ?? (`0x${(++this.txCounter).toString(16).padStart(64, "0")}` as Hex);
+    const txHash = presetHash ?? this.nextTxHash();
     const blockNumber = this.mine();
     const now = BigInt(this.nowMs());
     let hashLock: Hex | undefined;

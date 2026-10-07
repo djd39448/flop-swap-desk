@@ -1645,7 +1645,7 @@ export class SellerFlow {
         // P9-4 decision 7 (R1-FUND-04): a claim whose receipt wait timed out WAS sent; its hash is saved so a resumed claim can ask the node about it
         // before it sends another. Only with a store (a flow without one is not resumed); a failed save leaves the flow failed, the timeout is still thrown.
         if (error instanceof EvmReceiptTimeoutError && error.write === "claim" && this.#journal !== undefined) {
-          this.claimTxHash = error.hash;
+          this.claimTxHash = error.hash.toLowerCase(); // P94-PIN-01: the record decodes a lower-case hash only
           try {
             await this.persist();
           } catch {

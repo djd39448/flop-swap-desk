@@ -52,16 +52,19 @@ const BID = (swapId: string): BidParams => ({
 });
 const LEG_B = { claimByMs: T0 + 120 * 60_000, refundAfterMs: T0 + 180 * 60_000, expiresMs: T0 + 40 * 60_000 };
 
-/** Both parties with local accounts and a store each, over one mock node, through the pairing, leg B's paper lock and both account lines; `receiptTimeoutMs` 150. */
-async function pairedSwap() {
+/** Both parties with local accounts and a store each, over one mock node, through the pairing, leg B's paper lock and both account lines; `receiptTimeoutMs` 150
+ *  (or `options.receiptTimeoutMs`). `options.upperCaseHashes` makes both wires answer every send's hash in upper case (P94-PIN-01). */
+async function pairedSwap(options: { receiptTimeoutMs?: number; upperCaseHashes?: boolean } = {}) {
   const clockRef = { ms: T0 };
   const clock = (): number => clockRef.ms;
   const node = new EvmMockNode(clock, RAIL, TOKEN, []);
-  node.configExtras = { receiptTimeoutMs: 150 };
+  node.configExtras = { receiptTimeoutMs: options.receiptTimeoutMs ?? 150 };
   const buyerAccount = await makeLocalAccount();
   const sellerAccount = await makeLocalAccount();
   const buyerWire = localSigningRpc(node);
   const sellerWire = localSigningRpc(node);
+  buyerWire.upperCaseHashes = options.upperCaseHashes ?? false;
+  sellerWire.upperCaseHashes = options.upperCaseHashes ?? false;
   const buyerId = identity("61".repeat(32));
   const sellerId = identity("62".repeat(32));
   const venue = new MemoryVenue(clock);
@@ -311,6 +314,60 @@ describe("P9-4 decision 7: the Seller's claim write that timed out is asked abou
     const resumed = await SellerFlow.resume({ ...r.sellerOptions(), swapId: r.swapId, contractA: r.acceptA.contract });
     expect((await resumed.flow.claimLegA(r.lockA.hashLock)).evidence.event).toBe("Claimed");
     expect(r.node.count("claim")).toBe(1);
+  });
+});
+
+describe("P94-PIN-01: a node that answers an upper-case hash does not switch the protection of decision 7 off", () => {
+  it("the Buyer's lock: the saved handle is the lower-case hash, and the resumed Buyer ends with LockPendingError, not a new approve and lock", async () => {
+    const r = await pairedSwap({ upperCaseHashes: true });
+    r.node.holdNextSend("lock");
+    const timeout = await caught(r.buyer.lockLegA());
+    expect(timeout).toBeInstanceOf(EvmReceiptTimeoutError);
+    const hash = (timeout as EvmReceiptTimeoutError).hash;
+    const held = r.node.held[0]!.txHash; // the node keys it in lower case: the very transaction it holds, which the wire answered in upper case
+    expect(held).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(held).not.toBe(held.toUpperCase().replace("0X", "0x")); // letters in it: the upper-case answer is a different text
+    expect((await buyerRecord(r.stores, r.swapId)).lock.prepared?.recovery).toEqual({ chain: "evm", txHash: held });
+
+    r.exposeTxLookups();
+    const sentBefore = r.buyerWire.rawSends.length;
+    const resumed = await BuyerFlow.resume({ ...r.buyerOptions(), swapId: r.swapId });
+    expect(await caught(resumed.flow.lockLegA())).toBeInstanceOf(LockPendingError);
+    expect(r.buyerWire.rawSends.length, "no second approve, no second lock").toBe(sentBefore);
+    expect(r.node.count("approve")).toBe(1);
+    expect(r.node.count("lock")).toBe(0);
+    expect(hash).toBe(held);
+  });
+
+  it("the Seller's claim: claimTxHash is saved in lower case, and the resumed claim ends with ClaimPendingError, not a second claim", async () => {
+    const r = await pairedSwap({ upperCaseHashes: true });
+    const lockA = await r.buyer.lockLegA();
+    r.node.holdNextSend("claim");
+    const timeout = await caught(r.seller.claimLegA(lockA.hashLock));
+    expect(timeout).toBeInstanceOf(EvmReceiptTimeoutError);
+    const hash = (timeout as EvmReceiptTimeoutError).hash;
+    const held = r.node.held[0]!.txHash;
+    expect(held).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(held).not.toBe(held.toUpperCase().replace("0X", "0x"));
+    expect((await sellerRecord(r.stores, r.acceptA.contract)).claimTxHash).toBe(held);
+
+    r.exposeTxLookups();
+    const sentBefore = r.sellerWire.rawSends.length;
+    const resumed = await SellerFlow.resume({ ...r.sellerOptions(), swapId: r.swapId, contractA: r.acceptA.contract });
+    const refused = await caught(resumed.flow.claimLegA(lockA.hashLock));
+    expect(refused).toBeInstanceOf(ClaimPendingError);
+    expect((refused as ClaimPendingError).txHash).toBe(held);
+    expect(r.sellerWire.rawSends.length, "no second claim was signed").toBe(sentBefore);
+    expect(r.node.count("claim")).toBe(0);
+    expect(hash).toBe(held);
+  });
+
+  it("EvmReceiptTimeoutError itself keeps the hash in lower case whatever case it was built with (and the message names that hash)", () => {
+    const upper = `0x${"AB".repeat(32)}` as Hex;
+    const error = new EvmReceiptTimeoutError(upper, 1_000, "lock");
+    expect(error.hash).toBe(`0x${"ab".repeat(32)}`);
+    expect(error.message).toContain(`0x${"ab".repeat(32)}`);
+    expect(error.message).not.toContain("AB");
   });
 });
 

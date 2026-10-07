@@ -1281,7 +1281,7 @@ export class BuyerFlow {
       return await connected.commitLock({ beforeFinalSend: () => this.checkLockDeadlines(offerA, offerB) });
     } catch (error) {
       if (error instanceof EvmReceiptTimeoutError && error.write === "lock" && this.#journal !== undefined && this.preparedLock !== undefined) {
-        this.preparedLock = { ref: this.preparedLock.ref, recovery: { chain: "evm", txHash: error.hash } };
+        this.preparedLock = { ref: this.preparedLock.ref, recovery: { chain: "evm", txHash: error.hash.toLowerCase() } };
         try {
           await this.persist();
         } catch {

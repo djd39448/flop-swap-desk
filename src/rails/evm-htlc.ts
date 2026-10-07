@@ -625,6 +625,16 @@ export interface EvmLockRecord {
 export type EvmWriteKind = "approve" | "lock" | "claim" | "refund";
 
 /**
+ * P94-PIN-01: a transaction hash as this build keeps it, in LOWER case. A node may answer `eth_sendRawTransaction` with an upper- or mixed-case hash
+ * (viem returns it verbatim), but the flow records decode a saved hash strictly (`0x` and 64 lower-case hex digits), so a hash saved as the node wrote it
+ * would be refused by the save and the protection of decision 7 (ask the node about the hash before sending again) would silently be off for that write.
+ * Only the letters change, never the digits; a value that is not a string is returned as it is (the decoders refuse it).
+ */
+function lowerCaseHash(hash: Hex): Hex {
+  return (typeof hash === "string" ? hash.toLowerCase() : hash) as Hex;
+}
+
+/**
  * P9-1: a receipt wait gave up (`EvmRailConfig.receiptTimeoutMs`, else viem's 180 s). The transaction named by `hash`
  * WAS broadcast (the node accepted it and returned the hash) and may still be mined; this error says only that this
  * process stopped waiting. It is what `approve`, `lock`, `claim` and `refund` throw when the wait times out (never a hang,
@@ -635,17 +645,19 @@ export type EvmWriteKind = "approve" | "lock" | "claim" | "refund";
  * before it sends the write again.
  */
 export class EvmReceiptTimeoutError extends Error {
+  /** The transaction hash in LOWER case (P94-PIN-01: a node may answer an upper- or mixed-case hash, which a flow's record would then refuse to save). */
   readonly hash: Hex;
   readonly timeoutMs: number;
   /** Which write timed out; `undefined` only for a wait made outside a rail method. */
   readonly write: EvmWriteKind | undefined;
   constructor(hash: Hex, timeoutMs: number, write?: EvmWriteKind) {
+    const lower = lowerCaseHash(hash);
     super(
-      `evm-htlc: no receipt for transaction ${hash} within ${timeoutMs} ms; it was broadcast and may still be mined, ` +
+      `evm-htlc: no receipt for transaction ${lower} within ${timeoutMs} ms; it was broadcast and may still be mined, ` +
         "so read the chain before sending anything again",
     );
     this.name = "EvmReceiptTimeoutError";
-    this.hash = hash;
+    this.hash = lower;
     this.timeoutMs = timeoutMs;
     this.write = write;
   }

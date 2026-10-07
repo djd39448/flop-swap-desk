@@ -112,6 +112,9 @@ export interface LocalSigningRpc {
   /** P9-4 decision 7: what `eth_getTransactionByHash` answers. "hidden" (the default, as always): null for every hash. "node": the stateful node's own answer
    *  (a pooled transaction has no block, a mined one has its block, an unknown hash is null), which the node serves only while its `answerTxByHash` is on. */
   byHash: "hidden" | "node";
+  /** P94-PIN-01: when true every `eth_sendRawTransaction` answers its hash in UPPER case (the digits are unchanged), as an endpoint that echoes hashes in another case does;
+   *  viem returns it verbatim. The node itself still keys everything in lower case and looks a hash up whatever its case. */
+  upperCaseHashes: boolean;
   /** Overrides what `eth_getTransactionCount` answers for an address (a node that is behind), once per entry. */
   countOverride: Map<string, number>;
   /** A hostile or odd endpoint: the result this wire answers for a method INSTEAD of its own answer (a value, or a function of the call's params).
@@ -134,6 +137,7 @@ export function localSigningRpc(node: EvmMockNode, expectedChainId = 31337): Loc
     rawSends: [],
     holdReceipts: false,
     byHash: "hidden",
+    upperCaseHashes: false,
     countOverride: new Map(),
     answers: new Map(),
   };
@@ -199,6 +203,7 @@ export function localSigningRpc(node: EvmMockNode, expectedChainId = 31337): Loc
         const applied = await delegate("eth_sendTransaction", [{ from, to: parsed.to, data: parsed.data }]);
         // a pooled send (P9-4 decision 7) counts too: the node holds it, so the account's pending nonce has moved
         if (node.sends.length > sendsBefore || node.held.length > heldBefore) counts.set(from.toLowerCase(), expected + 1);
+        if (state.upperCaseHashes && typeof applied.result === "string" && /^0x[0-9a-f]{64}$/.test(applied.result)) return { result: `0x${applied.result.slice(2).toUpperCase()}` };
         return applied;
       }
       default:
