@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { EXIT, FLOW_MESSAGE, parseRunRecord, refundTimeReached, runRehearsal, untilRefundTime, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { EXIT, FLOW_MESSAGE, loadRunnerAccount, parseRunRecord, refundTimeReached, runRehearsal, untilRefundTime, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
 import { loadOrCreateIdentity } from "../src/client/rehearsal-world.js";
 import { BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
 import { keyScanner } from "./helpers/evm-local.js";
@@ -139,6 +139,8 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     expect(result.stdout).not.toContain("SECRETPATHKEYPART");
     expect(result.stdout).not.toContain("http://127.0.0.1");
     expect(rig.leaks(result.stdout) || rig.leaks(result.stderr)).toBe(false);
+    // K1: no configured key-file path is printed anywhere, not even for a key file that loads (the plan names the accounts, not the files).
+    expect(result.stdout + result.stderr).not.toMatch(/buyer\.key|seller\.key/);
     // Nothing written (not even the state directory), nothing sent (reads only).
     expect(await exists(rig.stateDir)).toBe(false);
     expect(await exists(rig.outDir)).toBe(false);
@@ -164,11 +166,14 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     }
   });
 
-  it("shows a key file that does not load as a failed row with the loader's own text (a path and a problem, no key)", async () => {
+  it("shows a key file that does not load as a failed row with the field and the problem (no path, no key)", async () => {
     const rig = await makeRig({ skipSellerKey: true });
     const result = await run(rig);
     expect(result.code).toBe(EXIT.preflight);
-    expect(result.stdout).toMatch(/FAIL\s+seller account\s+evm key file .*seller\.key: no such file/);
+    // K1: the row names the field and the problem, never the configured path (nor the loader's own text, which carries it).
+    expect(result.stdout).toMatch(/FAIL\s+seller account\s+sellerKeyFile: no such file\n/);
+    expect(result.stdout).not.toContain("seller.key");
+    expect(result.stdout).not.toContain("evm key file");
     expect(result.stdout).toContain(rig.buyer); // the other account still shows
     expect(rig.leaks(result.stdout)).toBe(false);
   });
@@ -294,6 +299,141 @@ describe("--resume and --refund look at the run before they touch anything", () 
   });
 });
 
+// K1 (P9 review round 1, critical by the rubric): a private key an operator pastes into a key-file field with one slip used to be printed back by
+// the pre-flight ("FAIL buyer account evm key file <dir>\0x<63 hex>: no such file", 63 of 64 digits, in every mode). Two defences are pinned: the
+// config refuses any run of 32 or more hex digits (and any phrase of 11 or more words), and the runner never prints a configured key-file path
+// whatever the value is. Every key here is generated now and only ever scanned for (keyScanner answers a boolean).
+describe("K1: a key pasted into a key-file field is never printed back", () => {
+  /** The pasted key, and the values an operator could have typed for it: one slip (the config refuses these) and two or more (it cannot see these). */
+  function pastedForms(): { key: `0x${string}`; oneSlip: Array<[string, string]>; manySlips: Array<[string, string]> } {
+    const key = generatePrivateKey();
+    return {
+      key,
+      oneSlip: [
+        ["63 hex digits", key.slice(0, -1)],
+        ["a space after digit 32", `${key.slice(0, 34)} ${key.slice(34)}`],
+        ["a newline after digit 32", `${key.slice(0, 34)}\n${key.slice(34)}`],
+        ["a letter O for a zero", `${key.slice(0, 30)}O${key.slice(31)}`],
+      ],
+      // No unbroken run of 32 digits: the config's guard cannot know these hold a key, so only the runner's own rule keeps them off the screen.
+      manySlips: [
+        ["runs of 20 digits split by spaces", `${key.slice(0, 22)} ${key.slice(22, 42)} ${key.slice(42)}`],
+        ["runs of 20 digits split by newlines", `${key.slice(0, 22)}\n${key.slice(22, 42)}\n${key.slice(42)}`],
+        ["runs of 17 digits split by dots", key.slice(2).replace(/(.{17})/g, "$1.")],
+      ],
+    };
+  }
+
+  it("the four near-miss forms (a dropped digit, a space, a newline, an O for a zero) are refused by the config in a dry run: exit 2, by field name, nothing printed", async () => {
+    const { key, oneSlip } = pastedForms();
+    const scan = keyScanner(key);
+    for (const [label, value] of oneSlip) {
+      const rig = await makeRig({ configExtra: { buyerKeyFile: value } });
+      const result = await run(rig);
+      expect(result.code, label).toBe(EXIT.config);
+      expect(result.stderr, label).toContain("buyerKeyFile looks like key material");
+      expect(result.stdout, label).toBe("");
+      expect(scan(result.stdout) || scan(result.stderr), `${label}: no window of the pasted key may reach out or err`).toBe(false);
+      expect(rig.chain.methods, label).toEqual([]); // refused before the endpoint was touched
+    }
+  });
+
+  it("a key broken into runs the config cannot see is still never printed: dry run, --yes, --resume and --refund all say 'buyerKeyFile: <problem>' and nothing else", async () => {
+    const { key, manySlips } = pastedForms();
+    const scan = keyScanner(key);
+    for (const [label, value] of manySlips) {
+      expect(scan(value), `${label}: the value must hold windows of the key, or this test proves nothing`).toBe(true);
+      for (const mode of ["dry", "yes", "resume", "refund"] as const) {
+        const rig = await makeRig({ configExtra: { buyerKeyFile: value } });
+        if (mode === "resume" || mode === "refund") await writeRun(rig, {}, true);
+        const result = await run(rig, mode);
+        const where = `${label}, ${mode}`;
+        expect(result.code, where).toBe(EXIT.preflight);
+        expect(result.stdout, where).toMatch(/FAIL\s+buyer account\s+buyerKeyFile: (no such file|the file cannot be read)\n/);
+        expect(result.stdout, where).toContain("Nothing was sent");
+        expect(result.stdout, where).not.toContain("evm key file");
+        expect(scan(result.stdout) || scan(result.stderr), `${where}: no window of the pasted key may reach out or err`).toBe(false);
+        expect(result.stdout, where).toContain(rig.seller); // the other account still shows
+        expect(rig.chain.methods.filter((m) => WRITES.includes(m)), where).toEqual([]);
+      }
+    }
+  });
+
+  it("every refusal of a key file is '<field>: <fixed sentence>': no path, no content, whatever the file holds", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "rh-keyfile-"));
+    dirs.push(dir);
+    const pasted = generatePrivateKey();
+    const scan = keyScanner(pasted);
+    const sentence = async (name: string, content: string | null): Promise<string> => {
+      const path = join(dir, name);
+      if (content !== null) await writeFile(path, content, { mode: 0o600 });
+      const loaded = await loadRunnerAccount(path, "sellerKeyFile", () => undefined);
+      if (!("problem" in loaded)) throw new Error(`${name}: the key file loaded`);
+      expect(loaded.problem, name).not.toContain(dir);
+      expect(loaded.problem, name).not.toContain(name);
+      expect(scan(loaded.problem), name).toBe(false);
+      return loaded.problem;
+    };
+    // The file name carries the pasted key's digits: the case K1 is about (a key typed where a path belongs).
+    expect(await sentence(pasted.slice(2, 22), null)).toBe("sellerKeyFile: no such file");
+    expect(await sentence("empty.key", "")).toBe("sellerKeyFile: the file is empty");
+    expect(await sentence("phrase.key", "legal winner thank year wave sausage worth useful legal winner thank yellow\n")).toContain("sellerKeyFile: the key line contains whitespace");
+    expect(await sentence("short.key", `${pasted.slice(0, -1)}\n`)).toBe("sellerKeyFile: the key is not 0x followed by exactly 64 hex characters");
+    expect(await sentence("zero.key", `0x${"00".repeat(32)}\n`)).toBe("sellerKeyFile: the 32 bytes are not a valid secp256k1 private key");
+    await mkdir(join(dir, "dir.key"));
+    expect(await sentence("dir.key", null)).toBe("sellerKeyFile: the path is not a regular file (a directory or other special file)");
+  });
+
+  it("loads a good key file (no problem, the address) and shows the loader's group-or-other warning by field name, never with the path", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "rh-keyfile-"));
+    dirs.push(dir);
+    const key = generatePrivateKey();
+    const path = join(dir, "open.key");
+    await writeFile(path, `${key}\n`, { mode: 0o644 });
+    const lines: string[] = [];
+    const loaded = await loadRunnerAccount(path, "buyerKeyFile", (line) => void lines.push(line), "linux");
+    if (!("account" in loaded)) throw new Error("the key file did not load");
+    expect(loaded.account.address).toBe(privateKeyToAccount(key).address);
+    expect(lines).toEqual(["buyerKeyFile: the key file can be read by group or other users; run chmod 600 on it (the key was loaded anyway)"]);
+    expect(lines.join("\n")).not.toContain(dir);
+    // On Windows the mode bits mean nothing and there is never a warning.
+    const quiet: string[] = [];
+    expect("account" in (await loadRunnerAccount(path, "buyerKeyFile", (line) => void quiet.push(line), "win32"))).toBe(true);
+    expect(quiet).toEqual([]);
+  });
+});
+
+// K2 (P9 review round 1, critical by the rubric): the same 0x + 64 hex shape as a key made a key pasted into contractCodeHash pass the config and
+// print whole in the escrow-code row of the dry run. The pinned value is now shown as its first 10 characters only.
+describe("K2: a key pasted into contractCodeHash is never printed back", () => {
+  it("a dry run (and --yes) against a chain whose escrow does not hash to it fails the row without a single window of it", async () => {
+    for (const mode of ["dry", "yes"] as const) {
+      const pasted = generatePrivateKey();
+      const scan = keyScanner(pasted);
+      const rig = await makeRig({ codeHash: pasted });
+      const result = await run(rig, mode);
+      expect(result.code, mode).toBe(EXIT.preflight);
+      expect(result.stdout, mode).toMatch(/FAIL\s+escrow code\s+the \d+ bytes of code at 0x[0-9a-fA-F]{40} hash to 0x[0-9a-f]{64}, not the pinned contractCodeHash 0x[0-9a-f]{8}\.\.\.\n/);
+      expect(result.stdout, mode).toContain(FAKE_ESCROW_CODE_HASH.toLowerCase()); // the observed hash (public code) is printed in full
+      expect(scan(result.stdout) || scan(result.stderr), `${mode}: no window of the pasted key may reach out or err`).toBe(false);
+      expect(result.stdout, mode).not.toContain(pasted);
+      expect(rig.chain.methods.filter((m) => WRITES.includes(m)), mode).toEqual([]);
+    }
+  });
+
+  it("the empty-code and unreadable-code rows do not print it either", async () => {
+    for (const code of ["0x", "error"] as const) {
+      const pasted = generatePrivateKey();
+      const scan = keyScanner(pasted);
+      const rig = await makeRig({ codeHash: pasted, chain: { code } });
+      const result = await run(rig);
+      expect(result.code, code).toBe(EXIT.preflight);
+      expect(result.stdout, code).toMatch(/FAIL\s+escrow code/);
+      expect(scan(result.stdout) || scan(result.stderr), code).toBe(false);
+    }
+  });
+});
+
 describe("bad configs and a failing endpoint", () => {
   it("exits 2 on a config it refuses, naming the field and never echoing a pasted key", async () => {
     const key = generatePrivateKey();
@@ -364,6 +504,15 @@ describe("the runner reacts to the flows' own refusals by their text", () => {
     expect(FLOW_MESSAGE.refundUnconfirmed.test("buyer: leg A was never locked, nothing to refund")).toBe(false);
     expect(FLOW_MESSAGE.neverLocked.test("buyer: refund signed but not yet confirmed")).toBe(false);
     for (const pattern of Object.values(FLOW_MESSAGE)) expect(pattern.test("evm-htlc: connected chain id 1 does not match pin")).toBe(false);
+  });
+});
+
+describe("K3: every failure text the runner prints is redacted before it is cut", () => {
+  it("no describeFailure call in the runner is given an identity redactor (the claim, re-read and lock read-back messages use the endpoint redactor)", async () => {
+    const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
+    const calls = text.match(/describeFailure\([^\n]*\)/g) ?? [];
+    expect(calls.length).toBeGreaterThanOrEqual(5);
+    for (const call of calls) expect(call, call).not.toMatch(/\(t\) => t|\(text\) => text|\(x\) => x/);
   });
 });
 

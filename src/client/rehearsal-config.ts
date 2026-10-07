@@ -154,17 +154,22 @@ function resolvePath(base: string, value: unknown, path: string): string {
 }
 
 /**
- * A key-file field names a FILE. A person who pastes the key itself (or a mnemonic phrase) into it would otherwise see it printed back by the
- * first message that names the path ("evm key file <path>: no such file"), so a value that looks like key material is refused here, by field
- * name only, before any message could carry it.
+ * A key-file field names a FILE. A person who pastes the key itself (or a mnemonic phrase) into it, possibly with a slip (a dropped digit, a
+ * space or newline inside, a letter O for a zero), must not see it echoed by any later message that names the path (the runner prints
+ * `<field>: <problem>` and never the path, which is the FIRST defence; this check is the second), so a value that looks like key material is
+ * refused here, by field name only, before any message could carry it. K1 (P9 review round 1): the shapes are a run of 32 or more hex digits
+ * (a 64-digit key with ONE slip always leaves a run of at least 32, whichever way it is broken, in either letter case) and a phrase of 11 or more
+ * words made of letters only (a 12-word mnemonic with a dropped or doubled word), matched case-insensitively. An ordinary path has neither.
  */
 function refuseKeyLikePath(value: unknown, field: string): void {
   if (typeof value !== "string") return;
-  const looksLikeKey = /[0-9a-fA-F]{64}/.test(value);
+  const looksLikeKey = /[0-9a-fA-F]{32}/.test(value);
   const words = value.trim().split(/\s+/);
-  const looksLikePhrase = words.length >= 12 && words.every((word) => /^[a-z]{3,8}$/.test(word));
+  const looksLikePhrase = words.length >= 11 && words.every((word) => /^[a-z]+$/i.test(word));
   if (looksLikeKey || looksLikePhrase) {
-    throw new RehearsalConfigError(`${field} looks like key material (a run of 64 hex digits, or a phrase of words) and not a path: it must name the FILE that holds the key, never the key itself`);
+    throw new RehearsalConfigError(
+      `${field} looks like key material (a run of 32 or more hex digits, or a phrase of 11 or more words) and not a path: it must name the FILE that holds the key, never the key itself`,
+    );
   }
 }
 

@@ -122,13 +122,16 @@ function word(value: unknown): bigint | null {
   return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value) ? BigInt(value) : null;
 }
 
-/** The first line of an error's own short message, redacted and capped: never a stack, a cause chain or request arguments. */
+/**
+ * The first line of an error's own short message, redacted and capped: never a stack, a cause chain or request arguments. K3 (P9 review round
+ * 1): REDACT FIRST, then cut. Cutting first left the front part of an endpoint URL (an API key can sit in its path) that straddled the cut,
+ * and the whole-URL redaction no longer matched it.
+ */
 export function describeFailure(error: unknown, redact: (text: string) => string): string {
   const short = (error as { shortMessage?: unknown } | null)?.shortMessage;
   const text = typeof short === "string" ? short : error instanceof Error ? error.message : String(error);
-  const first = text.split("\n")[0] ?? "";
-  const capped = first.length > 300 ? `${first.slice(0, 297)}...` : first;
-  return redact(capped);
+  const redacted = redact(text.split("\n")[0] ?? "");
+  return redacted.length > 300 ? `${redacted.slice(0, 297)}...` : redacted;
 }
 
 function minutes(ms: number): string {

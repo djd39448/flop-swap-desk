@@ -299,10 +299,23 @@ async function tokenBalance(chain: Chain, who: Address): Promise<bigint> {
   return BigInt(await chain.anvil.rpcCall<Hex>("eth_call", [{ to: chain.token, data }, "latest"]));
 }
 
+/** K1: names (never contents) of every output and file under `dirs` that names a configured key file (its directory or either file name). */
+async function keyFilePathPlaces(rig: Rig, dirs: string[], outputs: Record<string, string>): Promise<string[]> {
+  const names = [rig.keysDir, "buyer.key", "seller.key"];
+  const named = (text: string): boolean => names.some((name) => text.includes(name) || text.includes(name.replaceAll("\\", "\\\\")));
+  const found: string[] = [];
+  for (const [name, text] of Object.entries(outputs)) if (named(text)) found.push(`output:${name}`);
+  for (const dir of dirs) {
+    for (const file of await filesUnder(dir)) if (named(await readFile(file, "latin1"))) found.push(relative(rig.dir, file));
+  }
+  return found;
+}
+
 /** The checks every finished run ends with: no key anywhere, the bundle replays, and (given the status) the runner's own replay said so. */
 async function expectCleanAndReplays(rig: Rig, result: RunResult, status: string): Promise<void> {
   const outputs = { stdout: result.stdout, stderr: result.stderr };
   expect(await leakingPlaces(rig, [rig.stateDir, rig.outDir], outputs)).toEqual([]);
+  expect(await keyFilePathPlaces(rig, [rig.stateDir, rig.outDir], outputs)).toEqual([]); // K1: no configured key-file path in any output, record or bundle file
   expect(await leakingSeeds(rig, outputs)).toEqual([]);
   const { swapId } = await readRun(rig);
   const replayed = await replay(rig.outDir, `${swapId}=${status}`);

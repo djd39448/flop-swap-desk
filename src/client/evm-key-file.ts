@@ -96,6 +96,14 @@ export class EvmKeyFileError extends Error {
   }
 }
 
+/**
+ * The fixed sentence for `problem` (the one the error message ends with): no path, no content. For a caller that must not print the
+ * configured path (the rehearsal runner prints `<field>: <this sentence>`, because a path that a person got wrong can hold the key).
+ */
+export function describeKeyFileProblem(problem: EvmKeyFileProblem): string {
+  return PROBLEM_TEXT[problem];
+}
+
 export interface LoadEvmLocalAccountOptions {
   /** Receives the one-line warning for a key file that group or other users can access (POSIX only). Default:
    *  `process.emitWarning(message, { type: "EvmKeyFileWarning", code: "EVM_KEY_FILE_MODE" })`. The text names the path and the

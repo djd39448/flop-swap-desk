@@ -46,7 +46,7 @@ import { CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import { writeBundle, type BundleEvidenceSummary } from "./bundle.js";
 import { BuyerFlow, type BuyerNextStep } from "./buyer.js";
 import type { CounterAssetRail, RailWriteEvidence } from "./counter-rail.js";
-import { loadEvmLocalAccount } from "./evm-key-file.js";
+import { describeKeyFileProblem, EvmKeyFileError, loadEvmLocalAccount } from "./evm-key-file.js";
 import { createEvmCounterRail } from "./evm-rail.js";
 import { FileFlowStore, flowKey, parseFlowKey } from "./flow-store.js";
 import {
@@ -332,15 +332,37 @@ interface Accounts {
   seller: { account: LocalAccount } | { problem: string };
 }
 
-async function loadAccounts(config: RehearsalConfig): Promise<Accounts> {
-  const load = async (path: string): Promise<{ account: LocalAccount } | { problem: string }> => {
-    try {
-      return { account: await loadEvmLocalAccount(path) };
-    } catch (error) {
-      return { problem: messageOf(error) }; // an EvmKeyFileError names the path and the problem, never any content
-    }
+type KeyFileField = "buyerKeyFile" | "sellerKeyFile";
+
+/**
+ * K1 (P9 review round 1): loads one key file for the runner. A refusal is `<field>: <the loader's fixed problem sentence>` and NEVER the
+ * configured path or the loader's own message (which names the path): a person who pasted a key into a key-file field with a slip the
+ * config's guard does not catch (a space, a dropped digit, a letter O for a zero) would otherwise see it printed back, in every mode.
+ * The loader's group-or-other mode warning (POSIX) is shown the same way, by field name, through `warn` and not through the process's own
+ * warning channel (which prints the path). Only an `EvmKeyFileError`'s `problem` is read; any other failure is a fixed sentence.
+ */
+export async function loadRunnerAccount(
+  path: string,
+  field: KeyFileField,
+  warn: (line: string) => void,
+  platform?: NodeJS.Platform,
+): Promise<{ account: LocalAccount } | { problem: string }> {
+  try {
+    const account = await loadEvmLocalAccount(path, {
+      warn: () => warn(`${field}: the key file can be read by group or other users; run chmod 600 on it (the key was loaded anyway)`),
+      ...(platform === undefined ? {} : { platform }),
+    });
+    return { account };
+  } catch (error) {
+    return { problem: `${field}: ${error instanceof EvmKeyFileError ? describeKeyFileProblem(error.problem) : "the key file could not be loaded"}` };
+  }
+}
+
+async function loadAccounts(config: RehearsalConfig, warn: (line: string) => void): Promise<Accounts> {
+  return {
+    buyer: await loadRunnerAccount(config.buyerKeyFile, "buyerKeyFile", warn),
+    seller: await loadRunnerAccount(config.sellerKeyFile, "sellerKeyFile", warn),
   };
-  return { buyer: await load(config.buyerKeyFile), seller: await load(config.sellerKeyFile) };
 }
 
 /** The runner's clock: the machine's, or (anvil only) the machine's shifted once to the chain's head. */
@@ -374,6 +396,8 @@ interface World {
   seller: Party;
   run: RunRecord;
   log: (line: string) => void;
+  /** Removes the endpoint from a text (K3: a failure text is redacted BEFORE it is cut, so every `describeFailure` call gets this one). */
+  redact: (text: string) => string;
   pollMs: number;
 }
 
@@ -650,11 +674,11 @@ async function driveSettle(w: World): Promise<number> {
       const message = messageOf(error);
       if (FLOW_MESSAGE.claimWindowClosed.test(message)) {
         throw new RunnerRefusal(
-          `${describeFailure(error, (t) => t)}; the Seller's claim window has closed, so leg A will go back to the Buyer: run --refund once leg A's refund time ${iso(run.deadlines.legA.refundAfterMs)} has come`,
+          `${describeFailure(error, w.redact)}; the Seller's claim window has closed, so leg A will go back to the Buyer: run --refund once leg A's refund time ${iso(run.deadlines.legA.refundAfterMs)} has come`,
         );
       }
       if (!FLOW_MESSAGE.lockNotFinal.test(message) || attempt >= CLAIM_REREAD_ATTEMPTS || w.env.now() - claimStartedMs > w.config.waitLimitMs) throw error;
-      log(`the lock does not read final to the evidence reader yet (${describeFailure(error, (t) => t)}); asking again (${attempt}/${CLAIM_REREAD_ATTEMPTS})`);
+      log(`the lock does not read final to the evidence reader yet (${describeFailure(error, w.redact)}); asking again (${attempt}/${CLAIM_REREAD_ATTEMPTS})`);
       await w.env.sleep(w.pollMs);
     }
   }
@@ -789,7 +813,7 @@ async function driveRefund(w: World, wait: boolean): Promise<number> {
     try {
       lockEvidence = (await buyer.lockLegA()).writeEvidence;
     } catch (error) {
-      log(`the lock's own evidence could not be read back (${describeFailure(error, (t) => t)}); the summary names its reference only`);
+      log(`the lock's own evidence could not be read back (${describeFailure(error, w.redact)}); the summary names its reference only`);
     }
     await waitFinalized(w, await blockNumberNow(w.rpc), "refund of leg A");
   }
@@ -853,7 +877,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
 
     if (mode !== "dry") release = await acquireRunLock(stateDir);
 
-    const accounts = await loadAccounts(config);
+    const accounts = await loadAccounts(config, errLine);
     const buyerProblem = "problem" in accounts.buyer ? accounts.buyer.problem : undefined;
     const sellerProblem = "problem" in accounts.seller ? accounts.seller.problem : undefined;
     const fresh = mode === "dry" || mode === "yes";
@@ -1000,6 +1024,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
       seller: { identity: sellerIdentity, account: accounts.seller.account, rail: sellerParty.rail, store: sellerParty.store },
       run,
       log,
+      redact,
       pollMs: config.pollMs,
     };
     log(`${mode === "yes" ? "run" : mode} started: swap ${run.swapId}; buyer ${buyerIdentity.did} account ${accounts.buyer.account.address}; seller ${sellerIdentity.did} account ${accounts.seller.account.address}`);

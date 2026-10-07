@@ -12,11 +12,13 @@
 import type { LockTerms } from "@flop-labs/tclk";
 import { generateHashLock } from "@flop-labs/tclk";
 import { getAddress, keccak256, type Address, type Hex } from "viem";
+import { generatePrivateKey } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
 import { createEvmCounterRail, evmDeploymentId } from "../src/client/evm-rail.js";
 import { SellerFlow } from "../src/client/seller.js";
+import { describeCodeProblem, judgeRuntimeCode } from "../src/rails/evm-code-pin.js";
 import { captureEvmLeg, evmEvidence, type EvmCapture, type EvmCaptureIndex } from "../src/rails/evm-evidence.js";
 import {
   ANVIL_LOCAL_PIN,
@@ -30,6 +32,7 @@ import {
 import { verifiedExchangeBytes, type CapturingRpc } from "../src/rails/rpc-capture.js";
 import type { AddressBook } from "../src/vendor/evm-hash-rail.js";
 import { Controller, PREFIX, STEPS, type Ctx } from "./helpers/crash-matrix.js";
+import { keyScanner } from "./helpers/evm-local.js";
 import { EvmMockNode } from "./helpers/evm-mock-node.js";
 import { evmWorldWith } from "./helpers/matrix-worlds.js";
 import { evmSigner } from "./helpers/proven-lines.js";
@@ -159,7 +162,9 @@ describe("P9-2 connect(): the contract's code is read and must hash to the pin",
     expect(typed.contract).toBe(RAIL_CONTRACT);
     expect(typed.expected).toBe(WRONG_HASH);
     expect(typed.observed).toBe(observed);
-    expect(typed.message).toContain(WRONG_HASH);
+    // K2: the observed hash is printed in full, the pinned value only as its first 10 characters (a pinned field may hold a pasted key).
+    expect(typed.message).toContain(`not the pinned contractCodeHash ${WRONG_HASH.slice(0, 10)}...`);
+    expect(typed.message).not.toContain(WRONG_HASH);
     expect(typed.message).toContain(observed);
     expect(typed.message).toMatch(/hash to .*not the pinned contractCodeHash/);
     expect(node.sends).toEqual([]);
@@ -331,7 +336,9 @@ describe("P9-2 evidence: the capture reads the code and fails closed when it is 
     const result = await rail.verifyLockFinal(terms, terms.statement, ACCOUNTS);
     expect(result.lock.railVerified).toBeNull();
     expect(result.rail).toBeUndefined();
-    expect(result.lock.reason).toContain(config.contractCodeHash);
+    const pinned = config.contractCodeHash as string;
+    expect(result.lock.reason).toContain(`not the pinned contractCodeHash ${pinned.slice(0, 10)}...`); // K2: a short prefix of the pin
+    expect(result.lock.reason).not.toContain(pinned);
     expect(result.lock.reason).toContain(keccak256(node.contractCode));
     expect(result.lock.reason).toMatch(/not the pinned contractCodeHash/);
   });
@@ -430,5 +437,71 @@ describe("P9-2: createEvmCounterRail connect, the first touch of every flow step
     const adapter = createEvmCounterRail({ config, rpc: node.rpc(), account: BUYER.address, clock: NOW });
     await expect(adapter.connect(termsFor(generateHashLock().hash), { payee: SELLER.address, payer: BUYER.address })).rejects.toBeInstanceOf(EvmContractCodeError);
     expect(node.sends).toEqual([]);
+  });
+});
+
+// K2 (P9 review round 1, critical by the rubric): a pinned contractCodeHash has the same 0x + 64 hex shape as a private key, so a key pasted into
+// that field by mistake was printed whole by the first mismatch ("... not the pinned contractCodeHash <key>"): by connect(), by the pre-flight's
+// escrow row and by audit-export. describeCodeProblem now prints the OBSERVED hash in full (the hash of public code) and the pinned value only as
+// its first 10 characters. A hash cannot be told from a key by its shape, so the fix is the same for every value. Keys here are generated now.
+describe("K2: a pinned value is never printed in full (a key pasted into contractCodeHash must not come back)", () => {
+  const CONTRACT = addr("k2-contract");
+
+  it("describeCodeProblem shows the pinned value as its first 10 characters and `...` for an empty, a malformed and a different code; the observed hash stays in full", () => {
+    const pinned = generatePrivateKey();
+    const scan = keyScanner(pinned);
+    const different = judgeRuntimeCode("0x6080604052", pinned);
+    const empty = judgeRuntimeCode("0x", pinned);
+    const malformed = judgeRuntimeCode("not hex", pinned);
+    for (const verdict of [different, empty, malformed]) {
+      if (verdict.ok) throw new Error("a code that hashes to a key was accepted");
+      const text = describeCodeProblem(verdict, CONTRACT, pinned);
+      expect(text).toContain(`${pinned.slice(0, 10)}...`);
+      expect(text).not.toContain(pinned);
+      expect(text).not.toContain(pinned.slice(2));
+      expect(text).not.toContain(pinned.slice(0, 11)); // the 11th character is not shown
+      expect(scan(text), "no 16-digit window of the pinned value may be in the text").toBe(false);
+    }
+    if (different.ok || different.problem !== "mismatch") throw new Error("expected a mismatch verdict");
+    expect(describeCodeProblem(different, CONTRACT, pinned)).toContain(different.observed.toLowerCase()); // the observed hash, in full
+    expect(describeCodeProblem(different, CONTRACT, pinned)).toContain(`${CONTRACT}`);
+  });
+
+  it("shows the prefix in lower case whatever case the pin was written in, and a short or odd pinned string without throwing", () => {
+    const verdict = judgeRuntimeCode("0x", "0x6AB36FA334036370445C22CA9F7999872AE56777D3C969438FB4B2414152DA27");
+    if (verdict.ok) throw new Error("accepted");
+    expect(describeCodeProblem(verdict, CONTRACT, "0x6AB36FA334036370445C22CA9F7999872AE56777D3C969438FB4B2414152DA27")).toContain("contractCodeHash 0x6ab36fa3...");
+    expect(describeCodeProblem(verdict, CONTRACT, "0xAB")).toContain("contractCodeHash 0xab...");
+    expect(describeCodeProblem(verdict, CONTRACT, "")).toContain("contractCodeHash ...");
+  });
+
+  const codeChanges: Array<[string, (node: EvmMockNode) => void]> = [
+    ["a different code", (node) => void (node.contractCode = `${node.contractCode}00`)],
+    ["no code", (node) => void (node.contractCode = "0x")],
+  ];
+  it.each(codeChanges)("connect() with a key pasted as the pin (%s): the typed error's text carries no part of it", async (_label, change) => {
+    const pasted = generatePrivateKey();
+    const scan = keyScanner(pasted);
+    const node = newNode();
+    change(node);
+    const error = (await connectBuyer(node, { ...node.config(), contractCodeHash: pasted }).catch((caught: unknown) => caught)) as EvmContractCodeError;
+    expect(error).toBeInstanceOf(EvmContractCodeError);
+    expect(scan(error.message)).toBe(false);
+    expect(error.message).toContain(`${pasted.slice(0, 10)}...`);
+    expect(node.sends).toEqual([]);
+  });
+
+  it("the evidence reader's reason (audit-export) carries no part of a key used as the pin", async () => {
+    const pasted = generatePrivateKey();
+    const scan = keyScanner(pasted);
+    const node = newNode();
+    const { capture, terms, config } = await lockedAndCaptured(node);
+    const captured = await capture();
+    // The capture was taken under the same (wrong) pin the auditor holds, so the reader judges the captured code against it: a mismatch.
+    const pinnedToKey: EvmCapture = { index: { ...captured.index, config: { ...captured.index.config, contractCodeHash: pasted } as EvmCaptureIndex["config"] }, bytes: captured.bytes };
+    const result = evmEvidence({ terms, config: { ...config, contractCodeHash: pasted }, accounts: ACCOUNTS, capture: pinnedToKey });
+    expect(result.lock.railVerified).toBeNull();
+    expect(result.lock.reason).toMatch(/not the pinned contractCodeHash 0x[0-9a-f]{8}\.\.\./);
+    expect(scan(result.lock.reason ?? "")).toBe(false);
   });
 });

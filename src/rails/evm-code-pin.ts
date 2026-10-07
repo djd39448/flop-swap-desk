@@ -34,9 +34,25 @@ export function judgeRuntimeCode(result: unknown, pinned: string): RuntimeCodeVe
   return { ok: true, observed, bytes };
 }
 
-/** The refusal text for a verdict that is not ok (shared by the connect error and the evidence reason; both add their own prefix). */
+/** How many characters of the pinned `contractCodeHash` a refusal text may show: `0x` and eight hex digits (`0x6ab36fa3...`). */
+const PINNED_HASH_SHOWN_CHARS = 10;
+
+/**
+ * K2 (P9 review round 1): the pinned value as a refusal text shows it, its first `PINNED_HASH_SHOWN_CHARS` characters and `...`. A pinned
+ * `contractCodeHash` has the same `0x` + 64 hex shape as a private key, so an operator who pastes a key into that field by mistake would
+ * otherwise see it printed whole by the very first mismatch. A hash cannot be told from a key by its shape, so no pinned value is ever
+ * printed in full; a person finds the observed hash (printed in full: it is the hash of public code) and the first characters enough to compare.
+ */
+function shortPinnedHash(pinned: string): string {
+  return `${pinned.toLowerCase().slice(0, PINNED_HASH_SHOWN_CHARS)}...`;
+}
+
+/**
+ * The refusal text for a verdict that is not ok (shared by the connect error and the evidence reason; both add their own prefix). It prints
+ * the observed hash in full and the pinned value only as `shortPinnedHash` (K2): one change that covers connect, the pre-flight row and audit-export.
+ */
 export function describeCodeProblem(verdict: Exclude<RuntimeCodeVerdict, { ok: true }>, contract: string, pinned: string): string {
-  const expected = pinned.toLowerCase();
+  const expected = shortPinnedHash(pinned);
   switch (verdict.problem) {
     case "empty":
       return `no code at ${contract} (eth_getCode returned 0x), so it cannot be the pinned contractCodeHash ${expected}`;

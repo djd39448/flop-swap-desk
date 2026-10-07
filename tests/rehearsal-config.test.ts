@@ -9,6 +9,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import { generatePrivateKey } from "viem/accounts";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
@@ -21,6 +22,7 @@ import {
   parseRehearsalConfig,
   RehearsalConfigError,
 } from "../src/client/rehearsal-config.js";
+import { keyScanner } from "./helpers/evm-local.js";
 
 const CONTRACT = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
@@ -173,7 +175,59 @@ describe("parseRehearsalConfig", () => {
     }
     // An ordinary path with spaces and digits is a path.
     expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: "C:/Program Files/keys/base-sepolia.buyer.key" }), BASE).buyerKeyFile).toContain("base-sepolia.buyer.key");
-    expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: "base keys here" }), BASE).buyerKeyFile).toContain("base keys here"); // a few plain words are a path; a phrase has twelve
+    expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: "base keys here" }), BASE).buyerKeyFile).toContain("base keys here"); // a few plain words are a path; a phrase has eleven or more
+  });
+
+  // K1 (P9 review round 1): a key pasted with ONE slip passed the old guard (an unbroken run of 64 hex digits) and the dry run printed 63 of its digits.
+  it("refuses a key pasted with one slip (a dropped digit, a space, a newline, an O for a zero) and a 32-digit run, by field name, without echoing any of it", () => {
+    const key = generatePrivateKey(); // generated now, never written anywhere
+    const scan = keyScanner(key);
+    const slipped: Array<[string, string]> = [
+      ["63 hex digits", key.slice(0, -1)],
+      ["a digit dropped at the front", `0x${key.slice(3)}`],
+      ["a space after digit 32", `${key.slice(0, 34)} ${key.slice(34)}`],
+      ["a newline after digit 32", `${key.slice(0, 34)}\n${key.slice(34)}`],
+      ["a tab after digit 40", `${key.slice(0, 42)}\t${key.slice(42)}`],
+      ["a letter O for a zero", `${key.slice(0, 30)}O${key.slice(31)}`],
+      ["a letter l for a one", `${key.slice(0, 50)}l${key.slice(51)}`],
+      ["no 0x, 63 digits", key.slice(3)],
+      ["upper case", key.toUpperCase().replace("0X", "0x")],
+      ["exactly 32 hex digits", key.slice(2, 34)],
+      ["32 hex digits inside a path", `keys/${key.slice(2, 34)}.key`],
+      ["32 upper-case hex digits", key.slice(2, 34).toUpperCase()],
+    ];
+    for (const field of ["buyerKeyFile", "sellerKeyFile"] as const) {
+      for (const [label, value] of slipped) {
+        expect(scan(value) || value.length >= 32, `${label}: the value must hold key material for this test to mean anything`).toBe(true);
+        const message = refusal(anvilConfig({ [field]: value }));
+        expect(message, `${field} ${label}`).toContain(`${field} looks like key material`);
+        expect(scan(message), `${field} ${label}: the refusal must not print any window of the key`).toBe(false);
+        expect(message, `${field} ${label}`).not.toContain(key.slice(2, 20));
+      }
+    }
+  });
+
+  it("refuses a phrase of eleven or more words in any letter case, and takes ten words, or words with other characters, for a path", () => {
+    const eleven = "legal winner thank year wave sausage worth useful legal winner thank";
+    const twelveUpper = "Legal Winner Thank Year Wave Sausage Worth Useful Legal Winner Thank Yellow";
+    const long = `${eleven} ${eleven} yellow`;
+    for (const phrase of [eleven, twelveUpper, eleven.toUpperCase(), long, `  ${eleven}  `, eleven.split(" ").join("\n"), "abandonxx ".repeat(11).trim()]) {
+      const message = refusal(anvilConfig({ buyerKeyFile: phrase }));
+      expect(message).toContain("buyerKeyFile looks like key material");
+      expect(message).not.toContain("winner");
+      expect(message).not.toContain("WINNER");
+    }
+    // Ten words, or eleven tokens that are not all words, are a path (a person's folder name), not a mnemonic.
+    expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: "legal winner thank year wave sausage worth useful legal winner" }), BASE).buyerKeyFile).toContain("sausage");
+    expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: `${eleven.replace("thank", "thank2")}.key` }), BASE).buyerKeyFile).toContain("thank2");
+    // A run of 31 hex digits is a path.
+    expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: `keys/${"ab".repeat(15)}c.key` }), BASE).buyerKeyFile).toContain("c.key");
+  });
+
+  it("names the 32-digit and 11-word rule in the refusal (and no longer says a run of 64)", () => {
+    const message = refusal(anvilConfig({ buyerKeyFile: "ab".repeat(16) }));
+    expect(message).toContain("a run of 32 or more hex digits");
+    expect(message).toContain("a phrase of 11 or more words");
   });
 
   it("checks the amount, the asset and the FLOP amount", () => {

@@ -433,6 +433,30 @@ describe("failure texts", () => {
     expect(describeFailure("a plain string", redact)).toBe("a plain string");
   });
 
+  // K3 (P9 review round 1): the first line was cut at 300 characters BEFORE the endpoint was redacted, so an endpoint URL straddling the cut was printed
+  // in part ("https://.../v2/PATHKEY..."), and the whole-URL redaction no longer matched it. A path can carry an API key on a keyed provider.
+  it("redact first and cut after: an endpoint that crosses character 300 is never printed in part (K3)", () => {
+    const endpoint = "https://base-sepolia.g.alchemy.com/v2/PATHKEYPATHKEYPATHKEYPATHKEY01";
+    const redact = (text: string): string => text.split(endpoint).join("<rpc endpoint>");
+    for (const prefixLength of [200, 220, 230, 233, 240, 280, 295]) {
+      const message = `${"x".repeat(prefixLength)} (endpoint ${endpoint}) and a tail that goes on and on and on and on and on and on and on and on and on and on`;
+      const shown = describeFailure(new Error(message), redact);
+      expect(shown, `prefix ${prefixLength}`).not.toContain("PATHKEY");
+      expect(shown, `prefix ${prefixLength}`).not.toContain("alchemy");
+      expect(shown, `prefix ${prefixLength}`).not.toContain("/v2/");
+      expect(shown.length, `prefix ${prefixLength}`).toBeLessThanOrEqual(300);
+    }
+    // The review's case: a 220-character prefix and the URL crossing the cut.
+    const crossing = describeFailure(new Error(`${"y".repeat(220)} (endpoint ${endpoint})`), redact);
+    expect(crossing).toContain("<rpc endpoint>");
+    expect(crossing).not.toMatch(/PATHKEY|alchemy|https:/);
+    // The cut itself still happens (after the redaction) and the shown text ends in "...".
+    const long = describeFailure(new Error(`${endpoint} ${"z".repeat(400)}`), redact);
+    expect(long.length).toBe(300);
+    expect(long.endsWith("...")).toBe(true);
+    expect(long.startsWith("<rpc endpoint> ")).toBe(true);
+  });
+
   it("redact a transport error that names the endpoint, in the table itself", async () => {
     const chain = fakeChain({ headTimestampSec: HEAD_SEC });
     const rpc = {
