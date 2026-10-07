@@ -24,7 +24,7 @@ import {
   parseRehearsalConfig,
   RehearsalConfigError,
 } from "../src/client/rehearsal-config.js";
-import { keyScanner } from "./helpers/evm-local.js";
+import { decimalKeyScanner, keyScanner } from "./helpers/evm-local.js";
 
 const CONTRACT = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
@@ -325,6 +325,39 @@ describe("parseRehearsalConfig", () => {
     expect(refusal(anvilConfig({ asset: "bad asset" }))).toContain("asset must be a short plain name");
     expect(refusal(anvilConfig({ flopAmount: "-3" }))).toContain("flopAmount must be a positive decimal integer string");
     expect(parseRehearsalConfig(anvilConfig({ flopAmount: "99" }), BASE).flopAmount).toBe("99");
+  });
+
+  // KR3-1 (P9 review round 3): a private key written in decimal fits the amount shape (up to 78 digits) and used to be printed by the plan and the terms
+  // row, and (flopAmount) written into run.json, both flow records, the venue and the bundle's offer transcript.
+  it("KR3-1: refuses a key written in decimal in amount and in flopAmount, by field name, without quoting any window of it; 31 digits still pass, 32 do not", () => {
+    for (const field of ["amount", "flopAmount"] as const) {
+      const key = generatePrivateKey();
+      const decimal = BigInt(key).toString(10);
+      const scan = decimalKeyScanner(key);
+      expect(scan(decimal), `${field}: the value must hold windows of the key, or this test proves nothing`).toBe(true);
+      expect(decimal.length, field).toBeGreaterThanOrEqual(32);
+      let error: unknown;
+      try {
+        parseRehearsalConfig(anvilConfig({ [field]: decimal }), BASE);
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error, `${field}: a key in decimal must be refused`).toBeInstanceOf(RehearsalConfigError);
+      const message = (error as Error).message;
+      expect(message, field).toContain(`${field} looks like key material`);
+      expect(scan(message), `${field}: no window of the pasted key may be quoted`).toBe(false);
+      expect(message, field).not.toContain(decimal.slice(0, 12));
+    }
+    // The edge is the rule's: 31 digits are an amount (as far as shape goes), 32 or more digits are a run of 32 hex digits.
+    for (const field of ["amount", "flopAmount"] as const) {
+      const thirtyOne = `1${"0".repeat(30)}`;
+      expect(parseRehearsalConfig(anvilConfig({ [field]: thirtyOne }), BASE)[field], field).toBe(thirtyOne);
+      expect(refusal(anvilConfig({ [field]: `1${"0".repeat(31)}` })), field).toContain(`${field} looks like key material`);
+      expect(refusal(anvilConfig({ [field]: `${"9".repeat(78)}` })), field).toContain(`${field} looks like key material`);
+    }
+    // The two fields' other refusals are unchanged (and still never quote the value).
+    expect(refusal(anvilConfig({ amount: "0" }))).toContain("amount must be a positive decimal integer string");
+    expect(refusal(anvilConfig({ flopAmount: "1.5" }))).toContain("flopAmount must be a positive decimal integer string");
   });
 
   it("accepts explicit deadlines and refuses malformed ones", () => {

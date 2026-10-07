@@ -188,6 +188,20 @@ function refuseKeyLikePath(value: unknown, field: string, expected = "a path: it
   }
 }
 
+/**
+ * KR3-1 (P9 review round 3): an amount is printed by the plan and the terms row, and `flopAmount` is written into run.json, both flow records, the
+ * venue and the bundle's offer transcript. A private key written in decimal (up to 78 digits) fits the amount shape, so the same rule as every other
+ * field refuses it by field name before anything can carry it: a decimal integer has a run of 32 or more hex digits exactly when it has 32 or more
+ * digits, so the runner's config takes at most 31 digits here (the rail itself keeps uint256). The value is never quoted.
+ */
+function refuseKeyLikeAmount(value: string, field: "amount" | "flopAmount"): void {
+  if (looksLikeKeyMaterial(value)) {
+    throw new RehearsalConfigError(
+      `${field} looks like key material (${KEY_LIKE_SHAPES}) and not an amount: it must be a positive decimal integer string of at most 31 digits`,
+    );
+  }
+}
+
 /** Rebuilds the EVM config from its known fields only, refusing any other field at every level. */
 function cleanEvmConfig(value: unknown): EvmRailConfig {
   const evm = requireObject(value, "rails.evm");
@@ -295,11 +309,13 @@ export function parseRehearsalConfig(value: unknown, baseDir: string, file = "")
   const { deadlines, source } = parseDeadlines(top.deadlines);
 
   const amount = requireString(top.amount, "amount");
+  refuseKeyLikeAmount(amount, "amount");
   if (!AMOUNT.test(amount)) throw new RehearsalConfigError("amount must be a positive decimal integer string in the token's minimal units");
   const asset = top.asset === undefined ? "USDC" : requireString(top.asset, "asset");
   if (!ASSET_NAME_SHAPE.test(asset) || looksLikeKeyMaterial(asset)) throw new RehearsalConfigError("asset must be a short plain name (letters, digits, - and _)");
   if (evm.assets[asset] === undefined) throw new RehearsalConfigError(`asset "${asset}" is not a key of rails.evm.assets`);
   const flopAmount = top.flopAmount === undefined ? DEFAULT_FLOP_AMOUNT : requireString(top.flopAmount, "flopAmount");
+  refuseKeyLikeAmount(flopAmount, "flopAmount");
   if (!AMOUNT.test(flopAmount)) throw new RehearsalConfigError("flopAmount must be a positive decimal integer string");
 
   refuseKeyLikePath(top.out, "out", "a directory path: it must name the bundle directory, never a key");

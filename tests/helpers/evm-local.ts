@@ -37,6 +37,17 @@ export function keyScanner(key: Hex): (text: string) => boolean {
 }
 
 /**
+ * KR3-1: the same for a key written in decimal (`BigInt(key).toString(10)`, 76 to 78 digits): `scan(text)` answers whether `text` holds any window of
+ * 20 consecutive digits of it. A boolean only, so an assertion built on it can never print the key.
+ */
+export function decimalKeyScanner(key: Hex): (text: string) => boolean {
+  const decimal = BigInt(key).toString(10);
+  const windows: string[] = [];
+  for (let i = 0; i + 20 <= decimal.length; i += 1) windows.push(decimal.slice(i, i + 20));
+  return (text) => windows.some((piece) => text.includes(piece));
+}
+
+/**
  * A fresh account whose key was generated now, written to a mode-0600 temp file, loaded by the real loader, and deleted.
  * `leaks(text)` is `keyScanner` for that key: the key itself never leaves this function, so a test can scan every capture, frame,
  * store record and rendering for it and can never print it.

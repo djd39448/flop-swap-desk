@@ -30,7 +30,7 @@ import { loadOrCreateIdentity } from "../src/client/rehearsal-world.js";
 import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
-import { keyScanner } from "./helpers/evm-local.js";
+import { decimalKeyScanner, keyScanner } from "./helpers/evm-local.js";
 import { fakeChain, FAKE_ESCROW_CODE_HASH, serveFakeChain, type FakeChain, type FakeChainOptions } from "./helpers/fake-chain.js";
 
 const REPO_ROOT = fileURLToPath(new URL("../", import.meta.url));
@@ -635,6 +635,23 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
       const rig = await makeRig({ anvil: true, endpoint: `http://${key}.invalid/v2/x` });
       const result = await run(rig, mode);
       await expectRefused(rig, result, scan, "rails.evm.endpoint's host looks like key material", `endpoint host, ${mode}`);
+    }
+  });
+
+  // KR3-1 (P9 review round 3): a key written in decimal fits the amount shape. amount used to exit 3 with the key in the terms row; flopAmount used to exit 0
+  // with the key in the plan, and --yes wrote it into run.json, both flow records and world/venue.json. Both are config refusals now.
+  it("KR3-1: a key written in decimal in amount or in flopAmount is refused by field name in a dry run and in --yes: exit 2, no 20-digit window of it anywhere, nothing written", async () => {
+    for (const field of ["amount", "flopAmount"] as const) {
+      for (const mode of ["dry", "yes"] as const) {
+        const key = generatePrivateKey();
+        const decimal = BigInt(key).toString(10);
+        const scan = decimalKeyScanner(key);
+        expect(scan(decimal), `${field}: the value must hold windows of the key, or this test proves nothing`).toBe(true);
+        const rig = await makeRig({ anvil: true, configExtra: { [field]: decimal } });
+        const result = await run(rig, mode);
+        await expectRefused(rig, result, scan, `${field} looks like key material`, `${field}, ${mode}`);
+        expect(await exists(rig.stateDir), `${field}, ${mode}`).toBe(false);
+      }
     }
   });
 
