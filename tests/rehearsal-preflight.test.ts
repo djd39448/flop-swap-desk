@@ -259,11 +259,11 @@ describe("the log range cap", () => {
   });
 
   it("probes exactly the configured maxLogRange when one is set", async () => {
-    const run = await preflight({ logCap: 100 }, config({ maxLogRange: 100 }));
+    const run = await preflight({ logCap: 300 }, config({ maxLogRange: 300 }));
     expect(status(run, "log range")).toBe("ok");
-    expect(row(run, "log range").detail).toContain("accepted 100 blocks and refused 101");
+    expect(row(run, "log range").detail).toContain("accepted 300 blocks and refused 301");
     const head = 40_000_000n;
-    expect(run.logRanges).toEqual([[head - 99n, head], [head - 100n, head]]);
+    expect(run.logRanges).toEqual([[head - 299n, head], [head - 300n, head]]);
   });
 
   it("only reports when the chain is too short to probe, and probes the whole chain when no limit applies (anvil)", async () => {

@@ -275,12 +275,16 @@ blocks. Every log scan this build makes is therefore split into calls of at most
 counted, so a 500-block call is `to - from + 1 = 500`): the lookup of a lock's, claim's or refund's own event after the write,
 and `findClaimedPreimage`, which is also the resumed Seller's scan for its own claim and the Buyer's discovery of the secret. The
 default is 500 when `pin.chainId` is 84532 and no limit on anvil (one call to `latest` with no extra read, exactly as before);
-any positive integer may be set on either. With a limit, the tip is read once (a fresh `eth_blockNumber`) and `[from, tip]` is
-cut into ranges. `findClaimedPreimage` reads the newest range first and stops at the first valid preimage, so the usual answer
-costs one call and a claim from a long wait costs one call per 500 blocks. Nothing is cut short silently: a scan makes at most
-`MAX_LOG_SCAN_CHUNKS` (100) calls, which is 50,000 blocks at 500 (about 28 hours of Base's 2-second blocks), and a range that
-does not fit throws `EvmLogScanBoundError` naming the blocks it did not read instead of answering "no claim". A preimage found
-inside the newest 100 ranges is still returned. The write-evidence lookup needs the whole range to prove there is exactly one
+any positive integer of at least 257 (`EVM_MIN_LOG_RANGE`: the resumed Seller's 256-block claim marker margin must fit in one call;
+a smaller value is refused by the config check) may be set on either. With a limit, the tip is read once (a fresh `eth_blockNumber`)
+and `[from, tip]` is cut into ranges from `from` upwards. `findClaimedPreimage` reads the OLDEST range first and stops at the first
+valid preimage: a claim can only land before the leg's refund time, so it lies in the first ranges above the marker however late the
+scan runs, and the usual answer costs one call. Nothing is cut short silently: a scan makes at most `MAX_LOG_SCAN_CHUNKS` (100)
+calls from the marker, which is 50,000 blocks at 500 (about 28 hours of Base's 2-second blocks) and 25,700 blocks at the smallest
+cap, and what does not fit is the NEWEST part, which throws `EvmLogScanBoundError` naming the blocks it did not read instead of
+answering "no claim". So the bound is a property of the leg's window (its refund time minus its lock time, plus the 256-block
+margin, must fit in `MAX_LOG_SCAN_CHUNKS x maxLogRange` blocks), never of how late a scan runs; a preimage found inside the first 100
+ranges is returned whatever lies above. The write-evidence lookup needs the whole range to prove there is exactly one
 log, so it throws before reading anything. A scan reads up to the tip it saw at its start; a claim mined after that is found by
 the next call (the flows' own retries and polls make it).
 
@@ -530,7 +534,7 @@ refused by name (never by value), so a key pasted under a wrong name cannot ride
 | `rails.evm.endpoint` | the JSON-RPC URL, one for the whole run (there is no nonce manager: a load balancer that answers some calls from a node a block behind can make a write fail with `nonce too low`, which costs liveness only). It may carry no credentials, query or fragment (refused); a key in its PATH cannot be told from a path, so use a keyless endpoint such as `https://sepolia.base.org`: the URL is written into the bundle |
 | `rails.evm.contract`, `assets.USDC` | the deployed escrow, and Circle's Base Sepolia USDC (an asset book entry is the token allow list) |
 | `rails.evm.contractCodeHash` | required on 84532 (see above) |
-| `rails.evm.maxLogRange` | the endpoint's `eth_getLogs` cap in blocks (500 on the public endpoint; the default on 84532); the dry run probes it |
+| `rails.evm.maxLogRange` | the endpoint's `eth_getLogs` cap in blocks (500 on the public endpoint; the default on 84532; at least 257, a smaller value is refused); the dry run probes it |
 | `rails.evm.receiptTimeoutMs` | how long one receipt wait lasts (default 180 s); a timeout is a typed error that says the transaction was sent and may still be mined, and `--resume` reads the chain before it sends anything |
 | `buyerKeyFile`, `sellerKeyFile` | the two key files, loaded by `loadEvmLocalAccount` (see "Key files"); they must be two different files, and a value that looks like key material (a run of 64 hex digits, a twelve-word phrase) is refused by field name before any message could print it |
 | `deadlines` | `"known-good"` (default, the set below) or `{ "legA": { "claimByMin", "refundAfterMin", "expiresMin" }, "legB": { ... } }` in whole minutes after the run's start; the dry run checks the rules with the numbers it is given |
@@ -1770,13 +1774,17 @@ the refusal and the latch stay as they were.
   posts its reveal and receipt (liveness only, the Buyer still learns the secret from its own scan); the earlier 64 sat
   inside that lag. The price is about 256 blocks more to scan, which stays under the 500-block window recorded
   for the public Base Sepolia endpoint, so a prompt resume is one `eth_getLogs` call. Since P9-3 that scan is chunked to the
-  window (`EvmRailConfig.maxLogRange`, 500 by default on Base Sepolia; newest range first, at most 100 calls; see "Log scans fit
-  the endpoint's range cap"), so the margin and the resume delay are no longer bounded by the endpoint's window: a
-  `claimLegA` that comes any time after the attempt was saved finds its claim in as many window-sized calls as the delay needs
-  (`tests/flow-resume-sell.test.ts` resumes 300, 600 and 1,000 blocks late against a mock that refuses a range over 500
-  blocks the way that endpoint does; not run against the real endpoint). Only a resume further behind than the bound (50,000
-  blocks) fails, with the typed `EvmLogScanBoundError` before anything is sent or posted, and so does every retry; it is
-  never read as "no claim". The Buyer's lock marker keeps no margin; that is not a route under the default pin, which reads the
+  window (`EvmRailConfig.maxLogRange`, 500 by default on Base Sepolia, at least 257; OLDEST range first from the marker, at most
+  100 calls; see "Log scans fit the endpoint's range cap"), so the margin and the resume delay are no longer bounded by the
+  endpoint's window: the claim lies in the first range above the marker, so a `claimLegA` that comes any time after the attempt
+  was saved finds it in one call (`tests/flow-resume-sell.test.ts` resumes 300, 600 and 1,000 blocks late, and a resume 60,000
+  blocks late, against a mock that refuses a range over 500 blocks the way that endpoint does; not run against the real
+  endpoint). The resumed Seller also reads the lock's own row first (`locks(hashLock)`: Claimed with its own account as payee
+  means it was paid) and scans only to recover the claim's evidence, so a scan that cannot finish never stalls a Seller that is
+  already paid: its reveal and receipt are posted and it never claims again. A Seller whose lock is NOT paid and whose scan
+  cannot finish (a tip more than 100 ranges past the marker, or an endpoint that refuses the range) fails with the typed
+  `EvmLogScanBoundError` or the endpoint's error before anything is sent or posted, and so does every retry; it is never read
+  as "no claim" (a claim that may still land is never followed by a second one). The Buyer's lock marker keeps no margin; that is not a route under the default pin, which reads the
   lock at the finalized tag, but a deployment that pins by confirmations below the chain's reorg depth needs one there
   as well. After a restart a repeated approve, lock, claim or refund is refused by the contract, so the only cost is
   gas.

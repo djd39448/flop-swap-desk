@@ -89,8 +89,8 @@ describe("parseRehearsalConfig", () => {
   });
 
   it("carries maxLogRange, receiptTimeoutMs and an explicit finality through to the EVM config it hands on", () => {
-    const config = parseRehearsalConfig(baseSepoliaConfig({ maxLogRange: 250, receiptTimeoutMs: 600_000 }), BASE);
-    expect(config.rails.evm.maxLogRange).toBe(250);
+    const config = parseRehearsalConfig(baseSepoliaConfig({ maxLogRange: 300, receiptTimeoutMs: 600_000 }), BASE);
+    expect(config.rails.evm.maxLogRange).toBe(300);
     expect(config.rails.evm.receiptTimeoutMs).toBe(600_000);
   });
 

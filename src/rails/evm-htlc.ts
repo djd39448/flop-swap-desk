@@ -99,7 +99,8 @@ export interface EvmRailConfig {
    * P9-3 (rule 3): the most blocks any one `eth_getLogs` call may span (inclusive of both ends), the endpoint's own cap. Every
    * log scan this build makes (the write-evidence lookup and `findClaimedPreimage`, including the resumed Seller's claim scan)
    * is split into calls of at most this many blocks. Omitted: `BASE_SEPOLIA_MAX_LOG_RANGE` (500) when `pin.chainId` is 84532,
-   * no limit (one call to `latest`, as before) otherwise; see `effectiveMaxLogRange`. Any positive integer is accepted.
+   * no limit (one call to `latest`, as before) otherwise; see `effectiveMaxLogRange`. A positive integer of at least
+   * `EVM_MIN_LOG_RANGE` (257): the resumed Seller's 256-block claim marker margin must fit in one call (R1-FUND-03).
    */
   maxLogRange?: number;
   /**
@@ -117,8 +118,14 @@ export interface EvmRailConfig {
 export const BASE_SEPOLIA_MAX_LOG_RANGE = 500;
 
 /** P9-3: the hard bound on `eth_getLogs` calls one scan may make. At the Base Sepolia range that is 50,000 blocks (about 28 hours of
- *  2-second blocks); a scan that would need more throws `EvmLogScanBoundError` instead of silently reading less. */
+ *  2-second blocks) counted from the scan's start marker; a scan that would need more throws `EvmLogScanBoundError` instead of silently
+ *  reading less. R1-FUND-03: scans read the OLDEST range first, from the marker, so the bound is a property of the leg's window (a claim
+ *  lies in the first ranges above the marker), never of how late the scan runs. */
 export const MAX_LOG_SCAN_CHUNKS = 100;
+
+/** R1-FUND-03: the smallest `maxLogRange` a config may carry: the resumed Seller's claim marker sits `CLAIM_MARKER_REORG_MARGIN_EVM` (256)
+ *  blocks below the tip it read, so a range of at least 257 blocks keeps that margin inside one call. */
+export const EVM_MIN_LOG_RANGE = 257;
 
 const BASE_SEPOLIA_CHAIN_ID = 84532;
 
@@ -303,6 +310,9 @@ export function evmRailConfigShapeReason(value: unknown): string | null {
   }
   if (v.maxLogRange !== undefined && (typeof v.maxLogRange !== "number" || !Number.isSafeInteger(v.maxLogRange) || v.maxLogRange <= 0)) {
     return "evm rail config: maxLogRange must be a positive integer";
+  }
+  if (typeof v.maxLogRange === "number" && v.maxLogRange < EVM_MIN_LOG_RANGE) {
+    return `evm rail config: maxLogRange must be at least ${EVM_MIN_LOG_RANGE} (the 256-block claim marker margin must fit in one eth_getLogs call), got ${v.maxLogRange}`;
   }
   if (v.maxFeePerGasWei !== undefined && maxFeePerGasWeiOf(v.maxFeePerGasWei) === undefined) {
     return "evm rail config: maxFeePerGasWei must be a positive integer (a number, or a string of decimal digits without leading zeros)";
@@ -528,10 +538,10 @@ export class EvmContractCodeError extends Error {
 
 /**
  * P9-3 (rule 3): a log scan could not be completed inside `MAX_LOG_SCAN_CHUNKS` calls of `maxLogRange` blocks each, so part of the
- * range `[fromBlock, toBlock]` was NOT read (`unreadFrom`..`unreadTo` is that part). Nothing is ever truncated silently: a caller
- * that gets this knows the scan is incomplete and must not read "no log" from it. `findClaimedPreimage` throws it only when no
- * preimage was found in the part it did read (a found preimage is returned whatever lies below); the write-evidence lookup throws
- * it before reading anything.
+ * range `[fromBlock, toBlock]` was NOT read (`unreadFrom`..`unreadTo` is that part: the NEWEST blocks, since R1-FUND-03 reads the
+ * oldest range first from the marker). Nothing is ever truncated silently: a caller that gets this knows the scan is incomplete and
+ * must not read "no log" from it. `findClaimedPreimage` throws it only when no preimage was found in the part it did read (a found
+ * preimage is returned whatever lies above); the write-evidence lookup throws it before reading anything.
  */
 export class EvmLogScanBoundError extends Error {
   readonly fromBlock: bigint;
@@ -567,8 +577,8 @@ interface LogRange {
   to: bigint | "latest";
 }
 
-/** `planLogScan`'s answer: the calls to make (newest first), the tip they were cut from (absent when unlimited), the older part that did
- *  not fit in `MAX_LOG_SCAN_CHUNKS` calls (absent when everything is covered) and the range limit in force. */
+/** `planLogScan`'s answer: the calls to make (OLDEST first, from the scan's start), the tip they were cut from (absent when unlimited), the
+ *  newer part that did not fit in `MAX_LOG_SCAN_CHUNKS` calls (absent when everything is covered) and the range limit in force. */
 interface LogScanPlan {
   ranges: LogRange[];
   tip: bigint | undefined;
@@ -1068,7 +1078,7 @@ export class EvmHtlcRail {
     const plan = await this.planLogScan(fromBlock);
     if (plan.unread !== undefined) throw this.logScanBoundError(fromBlock, plan);
     const logs = [];
-    for (const range of [...plan.ranges].reverse()) {
+    for (const range of plan.ranges) {
       logs.push(
         ...(await this.publicClient.getLogs({
           address: this.config.contract,
@@ -1174,9 +1184,11 @@ export class EvmHtlcRail {
    *  never trusts the log's shape alone. How the Buyer learns `s` when the Seller claims on
    *  chain before (or without) posting its reveal frame. */
   async findClaimedPreimage(hashLock: Hex, fromBlock: bigint): Promise<Hex | null> {
-    // P9-3: `[fromBlock, tip]` is read in ranges of at most the endpoint's cap, NEWEST range first (a claim is most likely a recent
-    // one, so the usual answer costs one call). A preimage found in any range is returned whatever lies below it. A range left
-    // unread when the bound runs out is never reported as "no claim": the typed error says the scan is incomplete.
+    // P9-3 + R1-FUND-03: `[fromBlock, tip]` is read in ranges of at most the endpoint's cap, OLDEST range first from `fromBlock`: a
+    // claim can only land before the leg's refund time, so it lies in the first ranges above the marker whenever the scan runs, and
+    // the 100-call bound is a property of the leg's window, not of how late the scan is (newest first made an old claim unfindable).
+    // A preimage found in any range is returned whatever lies above it. A range left unread when the bound runs out is never reported
+    // as "no claim": the typed error says the scan is incomplete.
     const plan = await this.planLogScan(fromBlock);
     for (const range of plan.ranges) {
       const logs = await this.publicClient.getLogs({
@@ -1196,12 +1208,12 @@ export class EvmHtlcRail {
   }
 
   /**
-   * P9-3 (rule 3): the `eth_getLogs` ranges that cover `[fromBlock, tip]`, newest first. With no limit in force (anvil's default) it is
-   * the one range `[fromBlock, "latest"]` as before and no tip is read. With a limit, the tip is read once, fresh (`eth_blockNumber`
-   * through the capturing transport, never viem's cached block number), and the span is cut into ranges of at most `maxLogRange`
-   * blocks (both ends counted, so a 500-block range is `to - from + 1 = 500`), at most `MAX_LOG_SCAN_CHUNKS` of them; whatever
-   * older part does not fit is returned as `unread`, for the caller to refuse or report, never silently dropped. A start above the tip
-   * has no range at all.
+   * P9-3 (rule 3): the `eth_getLogs` ranges that cover `[fromBlock, tip]`, OLDEST first (R1-FUND-03). With no limit in force (anvil's
+   * default) it is the one range `[fromBlock, "latest"]` as before and no tip is read. With a limit, the tip is read once, fresh
+   * (`eth_blockNumber` through the capturing transport, never viem's cached block number), and the span is cut from `fromBlock` upwards
+   * into ranges of at most `maxLogRange` blocks (both ends counted, so a 500-block range is `to - from + 1 = 500`), at most
+   * `MAX_LOG_SCAN_CHUNKS` of them; whatever newer part does not fit is returned as `unread`, for the caller to refuse or report, never
+   * silently dropped. A start above the tip has no range at all.
    */
   private async planLogScan(fromBlock: bigint): Promise<LogScanPlan> {
     const limit = effectiveMaxLogRange(this.config);
@@ -1213,13 +1225,13 @@ export class EvmHtlcRail {
     const tip = BigInt(raw);
     const width = BigInt(limit);
     const ranges: LogRange[] = [];
-    let high = tip;
-    while (high >= fromBlock && ranges.length < MAX_LOG_SCAN_CHUNKS) {
-      const low = high - width + 1n > fromBlock ? high - width + 1n : fromBlock;
+    let low = fromBlock;
+    while (low <= tip && ranges.length < MAX_LOG_SCAN_CHUNKS) {
+      const high = low + width - 1n < tip ? low + width - 1n : tip;
       ranges.push({ from: low, to: high });
-      high = low - 1n;
+      low = high + 1n;
     }
-    return { ranges, tip, unread: high >= fromBlock ? { from: fromBlock, to: high } : undefined, limit };
+    return { ranges, tip, unread: low <= tip ? { from: low, to: tip } : undefined, limit };
   }
 
   private logScanBoundError(fromBlock: bigint, plan: LogScanPlan): EvmLogScanBoundError {

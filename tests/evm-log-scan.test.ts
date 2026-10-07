@@ -3,7 +3,9 @@
 // tests/evm-log-scan.test.ts: P9-3 (rule 3, "every chain read stays bounded and works on the public endpoint"). The public Base Sepolia
 // endpoint refuses `eth_getLogs` over more than 500 blocks. Every log scan this build makes (the write-evidence lookup and
 // `findClaimedPreimage`) is therefore split into calls of at most `maxLogRange` blocks (default 500 on chain 84532, none on anvil),
-// the preimage scan newest range first, with a hard bound of MAX_LOG_SCAN_CHUNKS calls and a typed error when it is hit.
+// every scan OLDEST range first from its start marker (R1-FUND-03: a claim lies in the first ranges above the marker whenever the scan
+// runs, so the bound is a property of the leg's window, never of how late the scan is), with a hard bound of MAX_LOG_SCAN_CHUNKS calls
+// and a typed error when it is hit; a `maxLogRange` below EVM_MIN_LOG_RANGE (257) is refused by the config check.
 // The stateful mock node refuses a range over its cap exactly as the public endpoint does (both ends counted), so a scan that is not
 // chunked fails here the way it would there. The resumed Seller's claim scan has its own tests in tests/flow-resume-sell.test.ts.
 
@@ -15,6 +17,7 @@ import { describe, expect, it } from "vitest";
 import {
   ANVIL_LOCAL_PIN,
   BASE_SEPOLIA_MAX_LOG_RANGE,
+  EVM_MIN_LOG_RANGE,
   BASE_SEPOLIA_PIN,
   EvmHtlcRail,
   EvmLogScanBoundError,
@@ -67,14 +70,14 @@ function capped(chainId = 84532): EvmMockNode {
 const connect = (node: EvmMockNode, who: typeof BUYER, config: EvmRailConfig = node.config()): Promise<EvmHtlcRail> =>
   EvmHtlcRail.connect({ config, rpc: node.rpc(), account: who.address, addressBook: ADDRESS_BOOK, clock: NOW });
 
-/** `[from, tip]` as the newest-first partition into ranges of at most `size` blocks (both ends counted). */
-function newestFirst(from: bigint, tip: bigint, size: bigint): Array<{ from: bigint; to: bigint }> {
+/** `[from, tip]` as the oldest-first partition into ranges of at most `size` blocks (both ends counted), cut from `from` upwards. */
+function oldestFirst(from: bigint, tip: bigint, size: bigint): Array<{ from: bigint; to: bigint }> {
   const out: Array<{ from: bigint; to: bigint }> = [];
-  let hi = tip;
-  while (hi >= from) {
-    const lo = hi - size + 1n > from ? hi - size + 1n : from;
+  let lo = from;
+  while (lo <= tip) {
+    const hi = lo + size - 1n < tip ? lo + size - 1n : tip;
     out.push({ from: lo, to: hi });
-    hi = lo - 1n;
+    lo = hi + 1n;
   }
   return out;
 }
@@ -110,9 +113,20 @@ describe("P9-3 config: maxLogRange and its default per chain", () => {
     expect(MAX_LOG_SCAN_CHUNKS).toBe(100);
   });
 
-  it.each([1, 7, 500, 10_000, 1_000_000])("a positive integer (%i) is accepted", (value) => {
+  it.each([257, 258, 500, 10_000, 1_000_000])("a positive integer of at least 257 (%i) is accepted", (value) => {
     expect(checkEvmRailConfig({ ...sepolia, maxLogRange: value }).ok).toBe(true);
     expect(checkEvmRailConfig({ ...anvil, maxLogRange: value }).ok).toBe(true);
+  });
+
+  it("R1-FUND-03: the floor is 257 (the 256-block claim marker margin fits in one call); 1, 7, 10, 100 and 256 are refused by field name", () => {
+    expect(EVM_MIN_LOG_RANGE).toBe(257);
+    for (const value of [1, 7, 10, 100, 256]) {
+      for (const config of [sepolia, anvil]) {
+        const check = checkEvmRailConfig({ ...config, maxLogRange: value });
+        expect(check.ok, `maxLogRange ${value}`).toBe(false);
+        expect(!check.ok && check.reason).toMatch(/maxLogRange must be at least 257/);
+      }
+    }
   });
 
   it.each([[0], [-1], [1.5], [Number.NaN], [Number.POSITIVE_INFINITY], ["500"], [null], [true]])("%j is refused as maxLogRange", (value) => {
@@ -122,28 +136,30 @@ describe("P9-3 config: maxLogRange and its default per chain", () => {
   });
 });
 
-describe("P9-3 findClaimedPreimage: chunked, newest range first, on a 500-block endpoint", () => {
-  it("a scan over 1,300 blocks (the claim in the oldest range) succeeds in three calls, newest first, none over 500 blocks, covering every block once", async () => {
+describe("P9-3 + R1-FUND-03 findClaimedPreimage: chunked, oldest range first from the marker, on a 500-block endpoint", () => {
+  it("a scan over 1,300 blocks with the claim just above the marker succeeds in ONE call, the first range, none over 500 blocks, however far the tip is", async () => {
     const node = capped();
     const { lock, seller, marker } = await lockedAndClaimed(node);
     node.blockNumber = marker + 1299n; // tip: [marker, tip] is exactly 1,300 blocks
     node.logRanges.length = 0;
     const found = await seller.findClaimedPreimage(lock.hash as Hex, marker);
     expect(found).toBe(lock.preimage);
-    expect(node.logRanges.map(({ from, to }) => ({ from, to }))).toEqual(newestFirst(marker, node.blockNumber, CAP));
-    expect(node.logRanges).toHaveLength(3);
+    expect(node.logRanges.map(({ from, to }) => ({ from, to }))).toEqual(oldestFirst(marker, node.blockNumber, CAP).slice(0, 1));
+    expect(node.logRanges).toHaveLength(1);
     expect(node.logRanges.every((range) => !range.latest && range.to - range.from + 1n <= CAP)).toBe(true);
-    expect(node.logRanges[0]?.to).toBe(node.blockNumber);
-    expect(node.logRanges[2]?.from).toBe(marker);
+    expect(node.logRanges[0]?.from).toBe(marker);
   });
 
-  it("the same scan with the claim in the newest range stops after one call (newest first)", async () => {
+  it("the same scan with the claim in the newest range reads every older range first: three calls, oldest first, covering the blocks once", async () => {
     const node = capped();
     const { lock, seller, marker } = await lockedAndClaimed(node, 1200n); // the claim is mined 1,200 blocks after the lock
     node.blockNumber = marker + 1299n;
     node.logRanges.length = 0;
     expect(await seller.findClaimedPreimage(lock.hash as Hex, marker)).toBe(lock.preimage);
-    expect(node.logRanges).toHaveLength(1);
+    expect(node.logRanges.map(({ from, to }) => ({ from, to }))).toEqual(oldestFirst(marker, node.blockNumber, CAP));
+    expect(node.logRanges).toHaveLength(3);
+    expect(node.logRanges[0]?.from).toBe(marker);
+    expect(node.logRanges[2]?.to).toBe(node.blockNumber);
   });
 
   it("with the claim in the middle range it stops after two calls", async () => {
@@ -162,7 +178,7 @@ describe("P9-3 findClaimedPreimage: chunked, newest range first, on a 500-block 
     node.blockNumber = 1304n;
     node.logRanges.length = 0;
     expect(await seller.findClaimedPreimage(lock.hash as Hex, 5n)).toBeNull();
-    expect(node.logRanges.map(({ from, to }) => ({ from, to }))).toEqual(newestFirst(5n, 1304n, CAP));
+    expect(node.logRanges.map(({ from, to }) => ({ from, to }))).toEqual(oldestFirst(5n, 1304n, CAP));
     expect(node.logRanges).toHaveLength(3);
   });
 
@@ -196,9 +212,9 @@ describe("P9-3 findClaimedPreimage: chunked, newest range first, on a 500-block 
     expect(calls.map((call) => call.method)).toEqual(["eth_blockNumber", "eth_getLogs", "eth_getLogs", "eth_getLogs"]);
     const filters = calls.filter((call) => call.method === "eth_getLogs").map((call) => (call.params[0] as { fromBlock: string; toBlock: string }));
     expect(filters.map((filter) => [filter.fromBlock, filter.toBlock])).toEqual([
-      [numberToHex(805n), numberToHex(1304n)],
-      [numberToHex(305n), numberToHex(804n)],
-      [numberToHex(5n), numberToHex(304n)],
+      [numberToHex(5n), numberToHex(504n)],
+      [numberToHex(505n), numberToHex(1004n)],
+      [numberToHex(1005n), numberToHex(1304n)],
     ]);
   });
 
@@ -210,15 +226,20 @@ describe("P9-3 findClaimedPreimage: chunked, newest range first, on a 500-block 
     expect(node.logRanges).toEqual([]);
   });
 
-  it("maxLogRange 1 reads one block per call, newest first", async () => {
+  it("the smallest maxLogRange (257) reads 257 blocks per call, oldest first, the last range cut short at the tip", async () => {
     const node = capped();
-    node.configExtras = { maxLogRange: 1 };
+    node.configExtras = { maxLogRange: EVM_MIN_LOG_RANGE };
+    node.maxLogSpan = BigInt(EVM_MIN_LOG_RANGE);
     const lock = generateHashLock();
     const seller = await connect(node, SELLER);
-    node.blockNumber = 9n;
+    node.blockNumber = 600n;
     node.logRanges.length = 0;
     await seller.findClaimedPreimage(lock.hash as Hex, 5n);
-    expect(node.logRanges.map((range) => range.from)).toEqual([9n, 8n, 7n, 6n, 5n]);
+    expect(node.logRanges.map(({ from, to }) => ({ from, to }))).toEqual([
+      { from: 5n, to: 261n },
+      { from: 262n, to: 518n },
+      { from: 519n, to: 600n },
+    ]);
   });
 
   it("anvil (no default limit) keeps the single call to latest: no eth_blockNumber read, one range, exactly as before", async () => {
@@ -243,13 +264,16 @@ describe("P9-3 findClaimedPreimage: chunked, newest range first, on a 500-block 
     await expect(seller.findClaimedPreimage(lock.hash as Hex, 5n)).rejects.toThrow(/block range limit/);
   });
 
-  it("on anvil an explicit maxLogRange chunks the same way", async () => {
+  it("on anvil an explicit maxLogRange chunks the same way (the claim just above the marker: the first range, one call; no claim: all three)", async () => {
     const node = capped(31337);
     node.configExtras = { maxLogRange: 500 };
     const { lock, seller, marker } = await lockedAndClaimed(node);
     node.blockNumber = marker + 1299n;
     node.logRanges.length = 0;
     expect(await seller.findClaimedPreimage(lock.hash as Hex, marker)).toBe(lock.preimage);
+    expect(node.logRanges).toHaveLength(1);
+    node.logRanges.length = 0;
+    expect(await seller.findClaimedPreimage(generateHashLock().hash as Hex, marker)).toBeNull();
     expect(node.logRanges).toHaveLength(3);
   });
 
@@ -312,7 +336,7 @@ describe("P9-3 findClaimedPreimage: chunked, newest range first, on a 500-block 
   });
 });
 
-describe("P9-3 the hard bound: 100 calls, then a typed error, never a silent truncation", () => {
+describe("P9-3 + R1-FUND-03 the hard bound: 100 calls from the marker, then a typed error, never a silent truncation", () => {
   it("a scan needing exactly 100 calls (50,000 blocks) is read in full and answers null", async () => {
     const node = capped();
     const seller = await connect(node, SELLER);
@@ -322,49 +346,62 @@ describe("P9-3 the hard bound: 100 calls, then a typed error, never a silent tru
     expect(node.logRanges).toHaveLength(MAX_LOG_SCAN_CHUNKS);
   });
 
-  it("a scan needing 101 calls (50,001 blocks) makes 100 calls and throws EvmLogScanBoundError naming what was not read", async () => {
+  it("a scan needing 101 calls (50,001 blocks) makes 100 calls and throws EvmLogScanBoundError naming the newest block, which was not read", async () => {
     const node = capped();
     const seller = await connect(node, SELLER);
     node.blockNumber = 50_000n + 5n; // [5, 50005] = 50,001 blocks
     node.logRanges.length = 0;
     const error = (await seller.findClaimedPreimage(generateHashLock().hash as Hex, 5n).catch((caught: unknown) => caught)) as EvmLogScanBoundError;
     expect(error).toBeInstanceOf(EvmLogScanBoundError);
-    expect(node.logRanges, "100 newest ranges were read before the error").toHaveLength(MAX_LOG_SCAN_CHUNKS);
+    expect(node.logRanges, "the 100 oldest ranges were read before the error").toHaveLength(MAX_LOG_SCAN_CHUNKS);
+    expect(node.logRanges[0]?.from).toBe(5n);
     expect(error.fromBlock).toBe(5n);
     expect(error.toBlock).toBe(50_005n);
-    expect(error.unreadFrom).toBe(5n);
-    expect(error.unreadTo).toBe(5n); // one block (the oldest) was not read
+    expect(error.unreadFrom).toBe(50_005n);
+    expect(error.unreadTo).toBe(50_005n); // one block (the newest) was not read
     expect(error.maxLogRange).toBe(500);
     expect(error.chunkBound).toBe(MAX_LOG_SCAN_CHUNKS);
-    expect(error.message).toMatch(/blocks 5 to 5 were not read, so the scan is incomplete/);
+    expect(error.message).toMatch(/blocks 50005 to 50005 were not read, so the scan is incomplete/);
   });
 
-  it("a far older start is the same error, with the unread part named", async () => {
+  it("a far newer tip is the same error, with the unread (newest) part named", async () => {
     const node = capped();
     const seller = await connect(node, SELLER);
     node.blockNumber = 1_000_000n;
     const error = (await seller.findClaimedPreimage(generateHashLock().hash as Hex, 0n).catch((caught: unknown) => caught)) as EvmLogScanBoundError;
     expect(error).toBeInstanceOf(EvmLogScanBoundError);
-    expect(error.unreadFrom).toBe(0n);
-    expect(error.unreadTo).toBe(1_000_000n - 50_000n);
+    expect(error.unreadFrom).toBe(BigInt(MAX_LOG_SCAN_CHUNKS) * CAP); // the first 100 ranges cover [0, 49,999]
+    expect(error.unreadTo).toBe(1_000_000n);
   });
 
-  it("a preimage found inside the newest 100 ranges is returned even though older blocks lie beyond the bound", async () => {
+  it("R1-FUND-03: a claim 13 blocks above the marker is found in ONE call although the tip is 50,600 blocks past it (newest first used to throw after 100 calls)", async () => {
+    const node = capped();
+    const { lock, seller, marker, claimBlock } = await lockedAndClaimed(node, 10n); // the review's case: marker 5, the claim mined at block 18
+    expect(marker).toBe(5n);
+    expect(claimBlock).toBe(18n);
+    node.blockNumber = marker + 50_600n;
+    node.logRanges.length = 0;
+    expect(await seller.findClaimedPreimage(lock.hash as Hex, marker)).toBe(lock.preimage);
+    expect(node.logRanges.map(({ from, to }) => ({ from, to }))).toEqual([{ from: 5n, to: 504n }]);
+  });
+
+  it("R1-FUND-03: a preimage found inside the first 100 ranges is returned even though newer blocks lie beyond the bound", async () => {
     const node = capped();
     const { lock, seller, marker } = await lockedAndClaimed(node);
     node.blockNumber = 1_000_000n;
-    // the claim (block ~8) is far below; move it into the newest range with the mock's own reorg model
-    node.reorgLog("Claimed", lock.hash, 999_900n);
     node.logRanges.length = 0;
     expect(await seller.findClaimedPreimage(lock.hash as Hex, marker)).toBe(lock.preimage);
     expect(node.logRanges).toHaveLength(1);
   });
 
-  it("a claim older than the bound is NOT reported as no claim: the typed error says the scan is incomplete", async () => {
+  it("a claim newer than the bound is NOT reported as no claim: the typed error says the scan is incomplete", async () => {
     const node = capped();
     const { lock, seller, marker } = await lockedAndClaimed(node);
-    node.blockNumber = 1_000_000n; // the claim (block ~8) is 999,000 blocks down
+    node.blockNumber = 1_000_000n;
+    node.reorgLog("Claimed", lock.hash, 999_900n); // move the claim far above the marker, beyond the first 100 ranges
+    node.logRanges.length = 0;
     await expect(seller.findClaimedPreimage(lock.hash as Hex, marker)).rejects.toBeInstanceOf(EvmLogScanBoundError);
+    expect(node.logRanges).toHaveLength(MAX_LOG_SCAN_CHUNKS);
   });
 });
 

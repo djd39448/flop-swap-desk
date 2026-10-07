@@ -11,8 +11,11 @@
 //   R1-11  only the lock frame tclk's machine accepted for contract A stops the Seller's account line, never a stranger's
 //   R1-13  a resumed claim is looked for from the block marker saved with the attempt (never from genesis), and a claim recorded as landed
 //          is not searched for at all
-//   P9-3   that scan is chunked to the endpoint's 500-block `eth_getLogs` window (newest range first, 100 calls at most), so a resume of any
-//          delay finds its claim on a capped endpoint; past the bound it fails with a typed error, never with "no claim"
+//   P9-3   that scan is chunked to the endpoint's 500-block `eth_getLogs` window (OLDEST range first from the marker, 100 calls at most:
+//          R1-FUND-03), so a resume of any delay finds its claim on a capped endpoint; past the bound it fails with a typed error, never
+//          with "no claim"
+//   R1-FUND-03  the resumed Seller reads the lock's own state first (Claimed to its own account means paid): a scan that cannot finish
+//          (the bound, an endpoint that refuses the range) never stalls a paid Seller, and an unpaid one is never sent on to claim again
 //
 // The flows are the real ones, with stores, over the EVM mock node, the Solana node and the Bitcoin ledger fake of the crash matrix.
 
@@ -410,7 +413,7 @@ describe("R1-13 (EVM): a resumed claim is looked for from the saved block marker
   });
 });
 
-describe("P9-3 (EVM): the resumed claim scan is chunked, so the resume delay is no longer bounded by the 500-block window", () => {
+describe("P9-3 + R1-FUND-03 (EVM): the resumed claim scan is chunked and oldest range first, so the resume delay is bounded by nothing", () => {
   /** Base Sepolia (84532): the default `maxLogRange` of 500 is in force, and the node refuses any `eth_getLogs` over 500 blocks (both ends counted). */
   const sepolia = (node: EvmMockNode): void => {
     node.chainId = 84532;
@@ -432,27 +435,29 @@ describe("P9-3 (EVM): the resumed claim scan is chunked, so the resume delay is 
     return { s, node: node!, statement, marker, rawTip, resume: () => resumedSeller(s) };
   }
 
-  /** `[from, tip]` as the newest-first ranges of at most `size` blocks (both ends counted). */
-  function newestFirst(from: bigint, tip: bigint, size: bigint): Array<{ from: bigint; to: bigint }> {
+  /** `[from, tip]` as the oldest-first ranges of at most `size` blocks (both ends counted), cut from `from` upwards. */
+  function oldestFirst(from: bigint, tip: bigint, size: bigint): Array<{ from: bigint; to: bigint }> {
     const out: Array<{ from: bigint; to: bigint }> = [];
-    let hi = tip;
-    while (hi >= from) {
-      const lo = hi - size + 1n > from ? hi - size + 1n : from;
+    let lo = from;
+    while (lo <= tip) {
+      const hi = lo + size - 1n < tip ? lo + size - 1n : tip;
       out.push({ from: lo, to: hi });
-      hi = lo - 1n;
+      lo = hi + 1n;
     }
     return out;
   }
 
-  // The claim sits at the tip the attempt saw plus one block; the saved marker is 256 blocks below that tip. A resume `late` blocks after
-  // the send scans [marker, tip + late]: the newest range holds the claim while late < 500 (one call), then each further 500 blocks of
-  // delay costs one more call. Unchunked, every one of these is one call over 557 blocks or more, which the endpoint refuses.
+  // The claim sits at the tip the attempt saw plus one block; the saved marker is 256 blocks below that tip, so the claim is 257 blocks above
+  // the marker, inside the FIRST range of 500 blocks whatever the delay (R1-FUND-03: newest first made this cost one more call per 500 blocks
+  // of delay, 1, 2 and 3 calls at 300, 600 and 1000 blocks late, and an unbounded delay unreadable). The Seller reads the lock's own row first
+  // (one eth_call, no scan); the scan then costs ONE getLogs call at every delay. Unchunked, each is one call over 557 blocks or more, which
+  // the endpoint refuses.
   it.each([
     [300n, 1],
-    [600n, 2],
-    [1000n, 3],
+    [600n, 1],
+    [1000n, 1],
   ])(
-    "a resume %i blocks late finds its claim in %i getLogs calls on a 500-block endpoint: reveal and receipt are posted, nothing is claimed twice",
+    "a resume %i blocks late finds its claim in %i getLogs call on a 500-block endpoint: reveal and receipt are posted, nothing is claimed twice",
     async (late, calls) => {
       const { s, node, statement, marker, rawTip, resume } = await diedAfterClaim(late);
       const before = node.logRanges.length;
@@ -467,10 +472,10 @@ describe("P9-3 (EVM): the resumed claim scan is chunked, so the resume delay is 
 
       const scan = node.logRanges.slice(before).map(({ from, to }) => ({ from, to }));
       const claimBlock = rawTip + 1n;
-      const planned = newestFirst(marker, node.blockNumber, 500n);
+      const planned = oldestFirst(marker, node.blockNumber, 500n);
       const upToTheClaim = planned.slice(0, planned.findIndex((range) => range.from <= claimBlock && claimBlock <= range.to) + 1);
-      expect(planned.at(-1)?.from, "the planned scan still reaches the saved marker (the window is not shrunk)").toBe(marker);
-      expect(scan, "newest range first, stopping at the range that holds the claim").toEqual(upToTheClaim);
+      expect(planned[0]?.from, "the planned scan starts at the saved marker (the window is not shrunk)").toBe(marker);
+      expect(scan, "oldest range first, stopping at the range that holds the claim").toEqual(upToTheClaim);
       expect(scan).toHaveLength(calls);
       expect(node.logRanges.slice(before).every((range) => !range.latest && range.to - range.from + 1n <= 500n)).toBe(true);
     },
@@ -501,35 +506,92 @@ describe("P9-3 (EVM): the resumed claim scan is chunked, so the resume delay is 
     const before = node.logRanges.length;
     const back = await resume();
     await back.flow.claimLegA(statement);
-    expect(node.logRanges.length - before).toBe(3);
+    expect(node.logRanges.length - before, "oldest first: the claim is in the first range").toBe(1);
     expect(s.w.counts().claims).toBe(1);
   });
 
-  it("without chunking (anvil default, a capped endpoint) the same resume is refused before anything is posted: the pre-P9-3 failure, kept as the anchor", async () => {
-    const { s, statement, resume } = await diedAfterClaim(1000n, (n) => {
+  /** The Seller's claim never reaches the node: the process dies BEFORE the send (the attempt and its marker are saved, nothing is on chain). */
+  async function diedBeforeClaim(late: bigint, prepare: (node: EvmMockNode) => void = sepolia) {
+    let node: EvmMockNode | undefined;
+    const s = await started(evmWorldWith((n) => ((node = n), prepare(n))));
+    const statement = s.c.seller.statement!;
+    await resumedSeller(s, (o) => ({ rail: crashRail(o.rail, { before: ["claim"] }) }));
+    await expect(s.c.seller.claimLegA(statement)).rejects.toBeInstanceOf(ProcessDied);
+    expect(s.w.counts().claims).toBe(0);
+    const marker = markerFromJson((await sellerRecordOf(s.w)).claimFromBlock!) as bigint;
+    node!.blockNumber += late;
+    return { s, node: node!, statement, marker, resume: () => resumedSeller(s) };
+  }
+
+  it("without chunking (anvil default, a capped endpoint) a Seller whose claim is NOT on chain is refused before anything is sent or posted: the pre-P9-3 failure, kept as the anchor", async () => {
+    const { s, statement, resume } = await diedBeforeClaim(1000n, (n) => {
       n.blockNumber = 1000n;
       n.maxLogSpan = 500n;
     });
     const back = await resume();
     await expect(back.flow.claimLegA(statement)).rejects.toThrow(/block range limit/);
-    expect(s.w.counts().claims).toBe(1);
+    expect(s.w.counts().claims, "never a second claim while the first may land").toBe(0);
     const { contractA } = await contractsOf(s.w);
     expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(0);
   });
 
-  it("a resume further behind than the bound (more than 100 calls) fails with the typed error: it never reads 'no claim', sends nothing and posts nothing", async () => {
-    const { s, node, statement, marker, resume } = await diedAfterClaim(BigInt(MAX_LOG_SCAN_CHUNKS) * 500n + 10_000n);
+  it("a resume further behind than the bound (more than 100 calls) with no claim on chain fails with the typed error: it never reads 'no claim', sends nothing and posts nothing", async () => {
+    const { s, node, statement, marker, resume } = await diedBeforeClaim(BigInt(MAX_LOG_SCAN_CHUNKS) * 500n + 10_000n);
     const before = node.logRanges.length;
     const back = await resume();
     const error = (await back.flow.claimLegA(statement).catch((caught: unknown) => caught)) as EvmLogScanBoundError;
     expect(error).toBeInstanceOf(EvmLogScanBoundError);
     expect(error.fromBlock).toBe(marker);
-    expect(error.unreadFrom).toBe(marker);
-    expect(node.logRanges.length - before, "100 newest ranges were read before the error").toBe(MAX_LOG_SCAN_CHUNKS);
-    expect(s.w.counts().claims, "no second claim was sent").toBe(1);
+    expect(error.unreadFrom).toBe(marker + BigInt(MAX_LOG_SCAN_CHUNKS) * 500n); // the newest part is what was not read
+    expect(node.logRanges.length - before, "the 100 oldest ranges were read before the error").toBe(MAX_LOG_SCAN_CHUNKS);
+    expect(node.logRanges[before]?.from).toBe(marker);
+    expect(s.w.counts().claims, "no claim was sent").toBe(0);
     const { contractA } = await contractsOf(s.w);
     expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(0);
     expect(await framesOfType(s, dealRoom(contractA), "receipt")).toBe(0);
+  });
+
+  it("R1-FUND-03: a resume further behind than the bound whose claim LANDED finds it in the first range: no bound error, one scan call, reveal and receipt posted", async () => {
+    const { s, node, statement, marker, resume } = await diedAfterClaim(BigInt(MAX_LOG_SCAN_CHUNKS) * 500n + 10_000n);
+    const before = node.logRanges.length;
+    const back = await resume();
+    const result = await back.flow.claimLegA(statement);
+    expect(result.receipt).toBeDefined();
+    expect(node.logRanges.length - before, "oldest first: the claim is in the first range, however late the resume").toBe(1);
+    expect(node.logRanges[before]?.from).toBe(marker);
+    expect(s.w.counts().claims, "nothing is claimed twice").toBe(1);
+    const { contractA } = await contractsOf(s.w);
+    expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(1);
+    expect(await framesOfType(s, dealRoom(contractA), "receipt")).toBe(1);
+  });
+
+  it("R1-FUND-03: a Seller the lock's own row shows as paid is never stalled by a scan that cannot finish: the bound error does not stop its reveal and receipt, and nothing is claimed twice", async () => {
+    const { s, node, statement, marker, resume } = await diedAfterClaim(BigInt(MAX_LOG_SCAN_CHUNKS) * 500n + 10_000n);
+    // The claim's log sits beyond the first 100 ranges (a marker far below it): the scan alone cannot find it and ends in the bound error.
+    node.reorgLog("Claimed", statement, marker + BigInt(MAX_LOG_SCAN_CHUNKS) * 500n + 5_000n);
+    const before = node.logRanges.length;
+    const back = await resume();
+    const result = await back.flow.claimLegA(statement);
+    expect(result.receipt).toBeDefined();
+    expect(node.logRanges.length - before, "the scan ran to its bound without finding the claim").toBe(MAX_LOG_SCAN_CHUNKS);
+    expect(s.w.counts().claims, "nothing is claimed twice").toBe(1);
+    const { contractA } = await contractsOf(s.w);
+    expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(1);
+    expect(await framesOfType(s, dealRoom(contractA), "receipt")).toBe(1);
+  });
+
+  it("R1-FUND-03: a Seller that is paid still posts its reveal and receipt when the endpoint refuses the scan (no chunking on a capped endpoint)", async () => {
+    const { s, statement, resume } = await diedAfterClaim(1000n, (n) => {
+      n.blockNumber = 1000n;
+      n.maxLogSpan = 500n; // anvil pin, no maxLogRange: the one call to latest is refused by the cap
+    });
+    const back = await resume();
+    const result = await back.flow.claimLegA(statement);
+    expect(result.receipt).toBeDefined();
+    expect(s.w.counts().claims, "nothing is claimed twice").toBe(1);
+    const { contractA } = await contractsOf(s.w);
+    expect(await framesOfType(s, dealRoom(contractA), "reveal")).toBe(1);
+    expect(await framesOfType(s, dealRoom(contractA), "receipt")).toBe(1);
   });
 });
 

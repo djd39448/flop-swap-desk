@@ -199,11 +199,19 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
     return this.rail.verifyLockFinal(terms, ref, accounts as EvmAccounts);
   }
 
-  /** P9-3: chunked to the config's `maxLogRange` (500 on Base Sepolia), newest range first, at most `MAX_LOG_SCAN_CHUNKS` calls, a typed
-   *  `EvmLogScanBoundError` past that; this is the scan of the resumed Seller's own claim and of the Buyer's secret discovery alike. */
+  /** P9-3: chunked to the config's `maxLogRange` (500 on Base Sepolia), OLDEST range first from the marker (R1-FUND-03: a claim lies in the first
+   *  ranges above it), at most `MAX_LOG_SCAN_CHUNKS` calls, a typed `EvmLogScanBoundError` past that; this is the scan of the resumed Seller's own
+   *  claim and of the Buyer's secret discovery alike. */
   async findClaimedPreimage(ref: string, fromMarker?: RailBlockMarker): Promise<string | null> {
     const fromBlock = typeof fromMarker === "bigint" ? fromMarker : 0n;
     return this.rail.findClaimedPreimage(ref as Hex, fromBlock);
+  }
+
+  /** R1-FUND-03: the lock's own row at the latest block (`locks(hashLock)`): Claimed, with this account as its payee, is a claim that paid this party.
+   *  One read, no log scan; a transport failure propagates (never read as "not paid"). */
+  async claimPaidOut(ref: string): Promise<boolean> {
+    const row = await this.rail.readLock(ref as Hex);
+    return row !== null && row.status === "Claimed" && isAddressEqual(row.payee, this.account);
   }
 
   async chainTimeMs(): Promise<number> {

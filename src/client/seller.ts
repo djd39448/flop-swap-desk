@@ -116,8 +116,9 @@
 //    posted; tclk's machine rejects such an accept, so leg B would settle on a swap the venue never accepted). Only while no lock attempt is saved: an
 //    attempt that was saved is recovered whatever the stamp of its accept B, because recognising a lock that may have landed is not a new action.
 //  - R3-08: the EVM claim-marker margin is 256 blocks (the Base Sepolia safe head was measured up to 91 blocks behind the tip), under the public
-//    endpoint's 500-block `eth_getLogs` window. Since P9-3 the resumed scan itself is chunked to that window (newest range first, at most 100
-//    calls), so neither the margin nor the delay of a resume is bounded by it any more.
+//    endpoint's 500-block `eth_getLogs` window. Since P9-3 the resumed scan itself is chunked to that window (oldest range first from the marker, at
+//    most 100 calls: R1-FUND-03), so neither the margin nor the delay of a resume is bounded by it any more; and the resumed claim reads the lock's
+//    own row first (`claimPaidOut`), so a scan that cannot finish never stalls a Seller that is already paid.
 //
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
 // B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a;
@@ -1463,7 +1464,7 @@ export class SellerFlow {
     // Solana keep their finality rule below.
     const lookedUpOnChain = this.#journal !== undefined && this.claimAttempted && this.rail.railId !== NEAR_RAIL_ID && !isSol;
     if (this.rail.railId === NEAR_RAIL_ID || isSol || lookedUpOnChain) {
-      const priorPreimage = isSol && this.publicClaimSignature !== undefined ? this.#hashLock.preimage : await connected.findClaimedPreimage(railRef, this.claimFromBlock);
+      const priorPreimage = isSol && this.publicClaimSignature !== undefined ? this.#hashLock.preimage : await this.findPriorPreimage(connected, railRef, this.#hashLock.preimage);
       const revealedIsOwn = priorPreimage !== null && priorPreimage === this.#hashLock.preimage;
 
       if (revealedIsOwn) {
@@ -1705,6 +1706,26 @@ export class SellerFlow {
 
   private dropClaimRecord(signature: string): void {
     this.claimRecords = this.claimRecords.filter((record) => record.signature !== signature);
+  }
+
+  /**
+   * R1-FUND-03: the preimage an earlier claim of THIS flow put on chain, or `null` when the chain shows none. A rail that can say from its own
+   * state, in one cheap read, whether the lock was already paid out to this party (`claimPaidOut`: EVM reads `locks(hashLock)`) is asked FIRST:
+   * a paid-out lock is known to be paid before any log scan runs, and the scan then only recovers the claim's evidence (the preimage in the
+   * Claimed log). If that scan cannot finish (the 100-call bound, an endpoint that refuses the range) or reads no claim, the lock's own state
+   * stands in for it: the only way a lock under this flow's hash lock reaches Claimed is a claim that opened it, with this flow's secret.
+   * So a scan bound can never make a paid Seller stall before it posts its reveal and receipt, and a paid Seller never claims again. A lock
+   * that is NOT paid out is scanned exactly as before, and a scan that cannot finish then stops the step (nothing is sent: P8, never a
+   * second claim while the first can still land).
+   */
+  private async findPriorPreimage(connected: ConnectedCounterAssetRail, railRef: string, ownPreimage: string): Promise<string | null> {
+    const paidOut = connected.claimPaidOut === undefined ? false : await connected.claimPaidOut(railRef);
+    if (!paidOut) return connected.findClaimedPreimage(railRef, this.claimFromBlock);
+    try {
+      return (await connected.findClaimedPreimage(railRef, this.claimFromBlock)) ?? ownPreimage;
+    } catch {
+      return ownPreimage;
+    }
   }
 
   /** S2-2 (Solana): resolves every recorded claim by its signature, oldest first, before anything new is signed.

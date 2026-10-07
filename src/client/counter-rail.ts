@@ -359,6 +359,14 @@ export interface ConnectedCounterAssetRail {
   /** How the Buyer learns `s` when the Seller claims on chain without ever posting a reveal
    *  frame — a bounded search from `fromMarker` (omitted: the adapter's own genesis default). */
   findClaimedPreimage(ref: string, fromMarker?: RailBlockMarker): Promise<string | null>;
+  /**
+   * R1-FUND-03 (P9 fix pass), optional: has the lock under `ref` already been paid out to this handle's own account? Read from the rail's own
+   * state at the latest block in one cheap call, with no log scan: `evm-htlc` answers it from `locks(hashLock)` (status Claimed, this account the
+   * payee). A resumed Seller asks it BEFORE it looks for its earlier claim's evidence, so a log scan that cannot finish (the 100-call bound,
+   * an endpoint's refusal) never stops a Seller that is already paid from posting its reveal and receipt, and never makes it claim again.
+   * A rail without such a read omits it and the Seller scans as before.
+   */
+  claimPaidOut?(ref: string): Promise<boolean>;
   /** The chain's own current time (never wall-clock) — every `claimByMs`/margin guard in the
    *  shared flow judges against this, never `Date.now()` or an injected `clock()` alone. */
   chainTimeMs(): Promise<number>;
