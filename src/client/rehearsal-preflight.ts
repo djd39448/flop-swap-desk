@@ -458,7 +458,7 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
           add(
             "fee ceiling",
             level,
-            `${shown}: the ceiling is below it, so the signer would refuse to sign a write at this fee (nothing would be sent); raise rails.evm.maxFeePerGasWei to at least ${cushioned} (${gwei(cushioned)}), or run when the fee is lower`,
+            `${shown}: the ceiling is below the cushioned fee, so the signer may refuse to sign a write once the fee rises as far as the cushion allows (a refused write sends nothing); raise rails.evm.maxFeePerGasWei to at least ${cushioned} (${gwei(cushioned)}), or run when the fee is lower`,
           );
         } else {
           add("fee ceiling", "ok", `${shown}: the ceiling holds`);

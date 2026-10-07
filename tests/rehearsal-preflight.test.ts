@@ -530,7 +530,7 @@ describe("the fee ceiling row (P9-4 decision 5)", () => {
     const detail = row(run, "fee ceiling").detail;
     expect(detail).toContain("the fee viem would sign for now is 121 gwei (base fee 100 gwei x 1.2 + priority fee 1 gwei), 242 gwei with the 2x cushion");
     expect(detail).toContain("the effective ceiling is 50 gwei (the default of this chain)");
-    expect(detail).toContain("the ceiling is below it, so the signer would refuse to sign a write at this fee (nothing would be sent)");
+    expect(detail).toContain("the ceiling is below the cushioned fee, so the signer may refuse to sign a write once the fee rises as far as the cushion allows (a refused write sends nothing)");
     expect(detail).toContain("raise rails.evm.maxFeePerGasWei to at least 242000000000 (242 gwei)");
     expect(run.report.ok).toBe(false);
   });
