@@ -212,13 +212,13 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     const refused = await run(low);
     expect(refused.code).toBe(EXIT.preflight);
     expect(refused.stdout.match(/^ {2}FAIL {2}.{1,20}?(?= {2})/gm)).toEqual(["  FAIL  log scan reach"]); // the only failure
-    expect(refused.stdout).toMatch(/FAIL\s+log scan reach\s+100 calls of maxLogRange 300 read 30000 blocks above a marker .*; leg A's window needs 47056 blocks \(1560\.0 min from the lock to the refund time at 2\.0 s a block, plus 256 of marker margin\)/);
-    expect(refused.stdout).toContain("raise maxLogRange (to at least 471) if the endpoint allows it, or shorten leg A's window");
+    expect(refused.stdout).toMatch(/FAIL\s+log scan reach\s+100 calls of maxLogRange 300 read 30000 blocks above a marker .*; leg A's window needs 47356 blocks \(1570\.0 min from the run's start to leg A's refund time at 2\.0 s a block, plus 256 of marker margin\)/);
+    expect(refused.stdout).toContain("raise maxLogRange (to at least 474) if the endpoint allows it, or shorten leg A's window");
     expect(refused.stdout).toContain("Nothing was sent. Fix the failed checks");
     const wide = await makeRig({ anvil: true, maxLogRange: 500, chain: { logCap: 500 }, configExtra: { deadlines } });
     const passed = await run(wide);
     expect(passed.code).toBe(EXIT.ok);
-    expect(passed.stdout).toMatch(/OK\s+log scan reach\s+100 calls of maxLogRange 500 read 50000 blocks above a marker .*needs 47056 blocks/);
+    expect(passed.stdout).toMatch(/OK\s+log scan reach\s+100 calls of maxLogRange 500 read 50000 blocks above a marker .*needs 47356 blocks/);
   });
 
   it("exits 3 and says nothing was sent when a check fails (a wrong code pin, a Buyer short of tokens, no finalized tag)", async () => {
@@ -941,6 +941,80 @@ describe("R1-FUND-04: the runner's own texts do not promise that a resume sends 
     expect(reaction).toMatch(/--refund/);
     expect(reaction).toMatch(/--resume/);
     expect(reaction).not.toMatch(/leg A will go back to the Buyer:/);
+  });
+});
+
+// P2R2-PIN-06 (P9 review round 2): the reach row runs for a fresh run only, but `maxLogRange` and the endpoint may change between invocations, so a run that
+// started with a cap of 500 and passed a 26-hour window could be resumed through a cap of 300 and never be checked again: a late claim then lies past the
+// scan's bound. The fresh start records the effective cap in run.json; --resume refuses a smaller one by field name. (The fresh start's own recording is
+// proven on a real node: tests-anvil/rehearsal-runner.anvil.test.ts.)
+describe("P2R2-PIN-06: --resume refuses a smaller maxLogRange than the run started with", () => {
+  it("a run that started with 500 and is resumed with 300 is refused naming maxLogRange, before the chain is read; --refund is not affected (it reads no logs)", async () => {
+    const small = await makeRig({ anvil: true, maxLogRange: 300, chain: { logCap: 300 } });
+    await writeRun(small, { chainId: 31337, maxLogRange: 500 }, true);
+    const refused = await run(small, "resume");
+    expect(refused.code).toBe(EXIT.refused);
+    expect(refused.stderr).toContain("the config no longer matches this run: maxLogRange is 300 in the config, smaller than the 500 this run started with");
+    expect(refused.stderr).toContain("resume with maxLogRange 500 or more");
+    expect(refused.stdout).toBe(""); // refused before the pre-flight printed anything
+    expect(small.chain.methods).toEqual([]); // and before the endpoint was touched
+    expect((await readdir(small.stateDir)).sort()).toEqual(["buyer", "run.json", "seller"]); // only what writeRun made (the identities' seeds): nothing new
+
+    const refund = await run(small, "refund");
+    expect(refund.stderr).not.toContain("maxLogRange");
+    expect(refund.stderr).toContain("holds no record"); // past the check, at the Buyer's empty store
+  });
+
+  it("the same cap, a larger one, no cap at all, and a run.json without the field are all let through (the pre-flight then stops them on a failing row, so nothing is started)", async () => {
+    // `pending: "error"` makes the --resume pre-flight fail on its own row: proof that the run got past the maxLogRange check, with nothing written.
+    for (const [label, rigMax, runMax] of [
+      ["the same cap", 500, 500],
+      ["a larger cap", 800, 500],
+      ["a run.json without the field", 500, undefined],
+    ] as const) {
+      const rig = await makeRig({ anvil: true, maxLogRange: rigMax, chain: { logCap: rigMax, pending: "error" } });
+      await writeRun(rig, { chainId: 31337, ...(runMax === undefined ? {} : { maxLogRange: runMax }) }, true);
+      const result = await run(rig, "resume");
+      expect(result.stderr, label).not.toContain("maxLogRange");
+      expect(result.code, label).toBe(EXIT.preflight);
+      expect(result.stdout, label).toMatch(/FAIL\s+pending/);
+    }
+    // No cap in the config at all (anvil without maxLogRange): unlimited, so never smaller.
+    const unlimited = await makeRig({ anvil: true, evmExtra: { maxLogRange: undefined }, chain: { pending: "error", logCap: null } });
+    await writeRun(unlimited, { chainId: 31337, maxLogRange: 500 }, true);
+    const result = await run(unlimited, "resume");
+    expect(result.stderr).not.toContain("maxLogRange");
+    expect(result.code).toBe(EXIT.preflight);
+  });
+
+  it("a fresh --yes writes the effective cap into run.json before it sends anything: the configured one, and nothing where no cap is in force", async () => {
+    for (const [label, options, expected] of [
+      ["a configured cap of 600", { anvil: true, maxLogRange: 600, chain: { logCap: 600 } }, 600],
+      ["no cap (anvil without maxLogRange)", { anvil: true, evmExtra: { maxLogRange: undefined }, chain: { logCap: null } }, undefined],
+    ] as const) {
+      const rig = await makeRig(options);
+      const result = await run(rig, "yes");
+      // The fake chain is read-only: the run begins (run.json is written, the paper legs go through) and the first write is refused, so it ends at exit 4.
+      expect(result.code, label).toBe(EXIT.refused);
+      expect(rig.chain.methods.filter((m) => WRITES.includes(m)), label).toEqual([]);
+      const record = parseRunRecord(await readFile(join(rig.stateDir, "run.json"), "utf8"), "run.json");
+      expect(record.maxLogRange, label).toBe(expected);
+      expect("maxLogRange" in record, label).toBe(expected !== undefined);
+    }
+  });
+
+  it("run.json's maxLogRange is read strictly: a positive safe integer or absent; any other field is still refused", () => {
+    const base = {
+      v: 1, swapId: `0x${"11".repeat(32)}`, nonce: "0123456789abcdef", t0Ms: 1_790_000_000_000, lockTimeMs: 1_790_000_600_000, chainId: 84532, contract: CONTRACT, asset: "USDC", amount: "1000000", flopAmount: "52070000",
+      deadlines: { legA: { claimByMs: 1_790_003_600_000, refundAfterMs: 1_790_005_400_000, expiresMs: 1_790_001_800_000 }, legB: { claimByMs: 1_790_007_200_000, refundAfterMs: 1_790_010_800_000, expiresMs: 1_790_002_400_000 } },
+      stopAfter: null, buyerDid: "did:key:z6Mkbuyer", sellerDid: "did:key:z6Mkseller", buyerAccount: `0x${"b1".repeat(20)}`, sellerAccount: `0x${"5e".repeat(20)}`,
+    };
+    expect(parseRunRecord(JSON.stringify({ ...base, maxLogRange: 500 }), "p").maxLogRange).toBe(500);
+    expect("maxLogRange" in parseRunRecord(JSON.stringify(base), "p")).toBe(false);
+    for (const bad of [0, -1, 1.5, "500", null, 2 ** 60]) {
+      expect(() => parseRunRecord(JSON.stringify({ ...base, maxLogRange: bad }), "p"), String(bad)).toThrow(/maxLogRange/);
+    }
+    expect(() => parseRunRecord(JSON.stringify({ ...base, maxLogRange: 500, other: 1 }), "p")).toThrow(/its fields are not the known ones/);
   });
 });
 

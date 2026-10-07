@@ -44,6 +44,7 @@ import type { Address } from "viem";
 import type { LocalAccount } from "viem/accounts";
 
 import { swapId as computeSwapId } from "../profile.js";
+import { effectiveMaxLogRange } from "../rails/evm-htlc.js";
 import { CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import { writeBundle, type BundleEvidenceSummary } from "./bundle.js";
 import { BuyerFlow, type BuyerNextStep } from "./buyer.js";
@@ -117,9 +118,16 @@ export interface RunRecord {
   /** The two EVM accounts (public addresses, lower case): a resume or a refund with key files that name other accounts is refused. */
   buyerAccount: string;
   sellerAccount: string;
+  /**
+   * P2R2-PIN-06 (P9 review round 2): the effective `maxLogRange` of the config the run STARTED with (the configured value, else the chain's default; absent where no
+   * cap is in force, and in a run.json written before this field existed). The claim-log scan and the pre-flight's reach row were sized for it, so `--resume` with
+   * a smaller cap is refused by field name (a larger one, or none, is fine).
+   */
+  maxLogRange?: number;
 }
 
 const RUN_FIELDS = ["v", "swapId", "nonce", "t0Ms", "lockTimeMs", "chainId", "contract", "asset", "amount", "flopAmount", "deadlines", "stopAfter", "buyerDid", "sellerDid", "buyerAccount", "sellerAccount"];
+const RUN_OPTIONAL_FIELDS = ["maxLogRange"];
 const LEG_RUN_FIELDS = ["claimByMs", "refundAfterMs", "expiresMs"];
 
 function isSafeMs(value: unknown): value is number {
@@ -147,7 +155,10 @@ export function parseRunRecord(text: string, path: string): RunRecord {
   };
   if (value === null || typeof value !== "object" || Array.isArray(value)) return bad("not an object");
   const v = value as Record<string, unknown>;
-  if (Object.keys(v).sort().join(",") !== [...RUN_FIELDS].sort().join(",")) return bad("its fields are not the known ones");
+  const present = Object.keys(v).filter((key) => !RUN_OPTIONAL_FIELDS.includes(key));
+  if (present.sort().join(",") !== [...RUN_FIELDS].sort().join(",") || Object.keys(v).some((key) => !RUN_FIELDS.includes(key) && !RUN_OPTIONAL_FIELDS.includes(key))) {
+    return bad("its fields are not the known ones");
+  }
   if (v.v !== 1) return bad("version");
   if (typeof v.swapId !== "string" || !/^0x[0-9a-f]{64}$/.test(v.swapId)) return bad("swapId");
   if (typeof v.nonce !== "string" || !/^[0-9a-f]{8,64}$/.test(v.nonce)) return bad("nonce");
@@ -166,6 +177,7 @@ export function parseRunRecord(text: string, path: string): RunRecord {
   if (typeof v.buyerDid !== "string" || typeof v.sellerDid !== "string") return bad("DIDs");
   if (typeof v.buyerAccount !== "string" || !/^0x[0-9a-f]{40}$/.test(v.buyerAccount)) return bad("buyerAccount");
   if (typeof v.sellerAccount !== "string" || !/^0x[0-9a-f]{40}$/.test(v.sellerAccount)) return bad("sellerAccount");
+  if (v.maxLogRange !== undefined && (typeof v.maxLogRange !== "number" || !Number.isSafeInteger(v.maxLogRange) || v.maxLogRange <= 0)) return bad("maxLogRange");
   return {
     v: 1,
     swapId: v.swapId,
@@ -183,6 +195,7 @@ export function parseRunRecord(text: string, path: string): RunRecord {
     sellerDid: v.sellerDid,
     buyerAccount: v.buyerAccount,
     sellerAccount: v.sellerAccount,
+    ...(v.maxLogRange === undefined ? {} : { maxLogRange: v.maxLogRange }),
   };
 }
 
@@ -247,6 +260,19 @@ function runMatchesConfig(run: RunRecord, config: RehearsalConfig): string | nul
   if (run.amount !== config.amount) return "the run's amount is not the config's amount";
   if (run.flopAmount !== config.flopAmount) return "the run's flopAmount is not the config's flopAmount";
   return null;
+}
+
+/**
+ * P2R2-PIN-06: a `--resume` through a smaller `maxLogRange` than the run started with. The run's claim-log scan reads at most MAX_LOG_SCAN_CHUNKS calls of that
+ * cap, and the reach row of the pre-flight checked leg A's window against the cap the run began with, so a smaller one could leave a late claim beyond the scan's
+ * bound (the Buyer could then not learn the secret from the chain). Refused by field name; the way on is to resume with the original cap (or a larger one). A run.json
+ * without the field (older, or a chain with no cap) is not checked, and neither is a config with no cap at all.
+ */
+function logRangeShrank(run: RunRecord, config: RehearsalConfig): string | null {
+  if (run.maxLogRange === undefined) return null;
+  const now = effectiveMaxLogRange(config.rails.evm);
+  if (now === undefined || now >= run.maxLogRange) return null;
+  return `maxLogRange is ${now} in the config, smaller than the ${run.maxLogRange} this run started with: the run's log scans and its pre-flight were sized for ${run.maxLogRange}, so resume with maxLogRange ${run.maxLogRange} or more`;
 }
 
 // --- small helpers --------------------------------------------------------------------------------------------------------------
@@ -985,7 +1011,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
 
     if (!fresh) {
       if (existingRun === null) throw new RunnerRefusal(`${stateDir} holds no run (no ${RUN_FILE}); there is nothing to ${mode === "resume" ? "resume" : "refund"} here`);
-      const mismatch = runMatchesConfig(existingRun, config);
+      const mismatch = runMatchesConfig(existingRun, config) ?? (mode === "resume" ? logRangeShrank(existingRun, config) : null);
       if (mismatch !== null) throw new RunnerRefusal(`the config no longer matches this run: ${mismatch}`);
       // A finished run is only reported: nothing on the chain or in the state directory is touched again.
       const finished = await readOutcome(stateDir);
@@ -1081,6 +1107,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
         sellerDid: sellerIdentity.did,
         buyerAccount: accounts.buyer.account.address.toLowerCase(),
         sellerAccount: sellerAddress.toLowerCase(),
+        ...(effectiveMaxLogRange(evm) === undefined ? {} : { maxLogRange: effectiveMaxLogRange(evm) as number }),
       };
       await writeFileDurable(join(stateDir, RUN_FILE), `${JSON.stringify(run, null, 2)}\n`);
     } else {

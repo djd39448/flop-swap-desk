@@ -18,8 +18,8 @@
 //   log range      the endpoint's `eth_getLogs` cap against the config's `maxLogRange` (one probe of that many blocks must be
 //                  accepted and one of one more refused, or what the endpoint does is reported)
 //   log scan reach (a new swap, when maxLogRange is set) MAX_LOG_SCAN_CHUNKS calls of maxLogRange blocks must reach as far as leg A's window is
-//                  long (lock to refund time at the block time measured from the last 100 blocks, plus the 256-block marker margin), or a
-//                  claim that lands late could not be found by the Buyer's scan (F1)
+//                  long (the run's start to leg A's refund time at the block time measured from the last 100 blocks, plus the 256-block marker
+//                  margin; R2-FUND-05), or a claim that lands late could not be found by the Buyer's scan (F1)
 //   clock          the local clock against the chain's head
 //   buyer / seller the addresses (never a key), ETH against the gas still to be sent (generous per-call ceilings times twice the
 //                  node's gas price; the Buyer's row is sized by what is left to send, R1-FUND-01; Base's L1 data fee is not counted),
@@ -343,12 +343,13 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
   // -- the log scans' reach (F1 with R1-FUND-03, P9 review round 1) ----------------------------------------------------------------------------
   // A claim can land at any time between leg A's lock and its refund time, and the Buyer's scan for it starts at its lock marker (the Seller's, 256
   // blocks below its claim attempt) and reads OLDEST range first, at most MAX_LOG_SCAN_CHUNKS calls of maxLogRange blocks. A scan that cannot reach
-  // as far as a claim can land would leave the Buyer unable to learn the secret, so the window in blocks (leg A's refund time less its lock time, at
-  // the block time measured from the last 100 blocks, plus the marker margin) must fit in what one scan reads. A fresh run only: a resume or a
-  // refund has no new window.
+  // as far as a claim can land would leave the Buyer unable to learn the secret, so the window in blocks (at the block time measured from the last 100
+  // blocks, plus the marker margin) must fit in what one scan reads. R2-FUND-05 (P9 review round 2): the window is measured from the RUN'S START
+  // (`input.nowMs`: the marker is read seconds after it, and never before it) to leg A's refund time, not from the lock estimate ten minutes later,
+  // which let a boundary config pass 44 blocks short. A fresh run only: a resume or a refund has no new window.
   const reach = evmLogScanCoverage(evm);
   if (input.fresh && input.deadlines !== undefined && reach !== undefined) {
-    const windowMs = Math.max(0, input.deadlines.absolute.legA.refundAfterMs - input.deadlines.lockTimeMs);
+    const windowMs = Math.max(0, input.deadlines.absolute.legA.refundAfterMs - input.nowMs);
     if (!("block" in head)) {
       add("log scan reach", "fail", "the head is unknown, so the block time, and with it leg A's window in blocks, cannot be measured");
     } else {
@@ -360,7 +361,7 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
         // Timestamps are whole seconds and a block's must be later than its parent's: a measured time under one second is a rounding artefact, not a faster chain.
         const blockMs = Math.max(1_000, (head.block.timestampMs - older.block.timestampMs) / Number(back));
         const needBlocks = Math.ceil(windowMs / blockMs) + CLAIM_MARKER_REORG_MARGIN_EVM;
-        const numbers = `${MAX_LOG_SCAN_CHUNKS} calls of maxLogRange ${limit ?? "?"} read ${reach} blocks above a marker (about ${minutes(reach * blockMs)}); leg A's window needs ${needBlocks} blocks (${minutes(windowMs)} from the lock to the refund time at ${(blockMs / 1000).toFixed(1)} s a block, plus ${CLAIM_MARKER_REORG_MARGIN_EVM} of marker margin)`;
+        const numbers = `${MAX_LOG_SCAN_CHUNKS} calls of maxLogRange ${limit ?? "?"} read ${reach} blocks above a marker (about ${minutes(reach * blockMs)}); leg A's window needs ${needBlocks} blocks (${minutes(windowMs)} from the run's start to leg A's refund time at ${(blockMs / 1000).toFixed(1)} s a block, plus ${CLAIM_MARKER_REORG_MARGIN_EVM} of marker margin)`;
         if (needBlocks > reach) {
           add(
             "log scan reach",

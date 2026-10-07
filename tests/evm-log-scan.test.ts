@@ -412,6 +412,26 @@ describe("P9-3 + R1-FUND-03 the hard bound: 100 calls from the marker, then a ty
     await expect(seller.findClaimedPreimage(lock.hash as Hex, marker)).rejects.toBeInstanceOf(EvmLogScanBoundError);
     expect(node.logRanges).toHaveLength(MAX_LOG_SCAN_CHUNKS);
   });
+  // R2-FUND-05 (P9 review round 2): the bound the reach row checks, pinned on the mock. The row measures leg A's window from the run's start, because a
+  // Buyer's marker is read about then and a claim may land in any block before leg A's refund time: with the default cap the scan reads 50,000 blocks
+  // above the marker, so a claim in block marker + 50,000 is the first one it cannot reach, and one a few dozen blocks inside the window's end (the
+  // review's 50,040-block window: marker + 50,039) is unreachable too; the pre-flight must therefore FAIL a window that long (tests/rehearsal-preflight.test.ts).
+  it("R2-FUND-05: a claim at marker + 50,039 (the last block of a 50,040-block window) is beyond the 100-call bound: the typed error, never 'no claim'; marker + 49,999 is found", async () => {
+    const inside = capped();
+    const a = await lockedAndClaimed(inside);
+    inside.reorgLog("Claimed", a.lock.hash, a.marker + 49_999n);
+    inside.blockNumber = a.marker + 50_040n;
+    expect(await a.seller.findClaimedPreimage(a.lock.hash as Hex, a.marker)).toBe(a.lock.preimage);
+
+    const node = capped();
+    const { lock, seller, marker } = await lockedAndClaimed(node);
+    node.reorgLog("Claimed", lock.hash, marker + 50_039n);
+    node.blockNumber = marker + 50_040n;
+    node.logRanges.length = 0;
+    await expect(seller.findClaimedPreimage(lock.hash as Hex, marker)).rejects.toBeInstanceOf(EvmLogScanBoundError);
+    expect(node.logRanges).toHaveLength(MAX_LOG_SCAN_CHUNKS);
+  });
+
 });
 
 describe("P9-3 the write-evidence lookup: paged the same way, one log required across all pages", () => {

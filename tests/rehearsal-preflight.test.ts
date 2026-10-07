@@ -508,10 +508,10 @@ describe("the state read at the finalized block (F9)", () => {
 // measured from the last blocks, plus the 256-block marker margin), or the Buyer could not learn the secret from the chain.
 describe("the log scans' reach covers leg A's window (F1)", () => {
   const lockTimeMs = NOW_MS + LOCK_ESTIMATE_MS;
-  /** Leg A's window as `hours` hours (plus `extraMs`) from the lock to the refund time, the rest of the set as the known-good one. */
+  /** Leg A's window as `hours` hours (plus `extraMs`) from the run's start to the refund time (R2-FUND-05), the rest of the set as the known-good one. */
   const window = (hours: number, extraMs = 0): NonNullable<PreflightInput["deadlines"]> => {
     const absolute = absoluteDeadlines(KNOWN_GOOD_DEADLINES, NOW_MS);
-    const refundAfterMs = lockTimeMs + hours * 3_600_000 + extraMs;
+    const refundAfterMs = NOW_MS + hours * 3_600_000 + extraMs;
     return { absolute: { ...absolute, legA: { ...absolute.legA, refundAfterMs } }, lockTimeMs };
   };
 
@@ -522,7 +522,7 @@ describe("the log scans' reach covers leg A's window (F1)", () => {
     const need = 26 * 1800 + CLAIM_MARKER_REORG_MARGIN_EVM; // 46,800 blocks of 2 s, plus the margin
     expect(detail).toContain(`${MAX_LOG_SCAN_CHUNKS} calls of maxLogRange 300 read 30000 blocks`);
     expect(detail).toContain(`needs ${need} blocks`);
-    expect(detail).toContain("1560.0 min from the lock to the refund time");
+    expect(detail).toContain("1560.0 min from the run's start to leg A's refund time");
     expect(detail).toContain("2.0 s a block");
     expect(detail).toContain(`raise maxLogRange (to at least ${Math.ceil(need / MAX_LOG_SCAN_CHUNKS)})`);
     expect(low.report.ok).toBe(false);
@@ -542,6 +542,24 @@ describe("the log scans' reach covers leg A's window (F1)", () => {
     const over = await preflight({}, config(), { deadlines: window(0, 99_488_000 + 2_000) }); // one more block
     expect(status(over, "log scan reach")).toBe("fail");
     expect(row(over, "log scan reach").detail).toContain("needs 50001 blocks");
+  });
+
+  // R2-FUND-05 (P9 review round 2): the row measured the window from the lock ESTIMATE (the run's start plus 10 minutes), but the Buyer's marker is read seconds
+  // after the run's start. At the boundary it passed a config whose real window exceeded the reach by 44 blocks.
+  it("measures the window from the run's start: leg A 1,600/1,668 min on 84532 at a cap of 500 and 2-second blocks needs 50,296 blocks and FAILS (from the lock estimate it needed 49,996 and passed)", async () => {
+    const minutes: DeadlineMinutes = { legA: { claimByMin: 1600, refundAfterMin: 1668, expiresMin: 30 }, legB: { claimByMin: 3400, refundAfterMin: 6000, expiresMin: 40 } };
+    const run = await preflight({}, config(), {}, minutes);
+    expect(status(run, "log scan reach")).toBe("fail");
+    const detail = row(run, "log scan reach").detail;
+    expect(detail).toContain(`needs ${1668 * 30 + CLAIM_MARKER_REORG_MARGIN_EVM} blocks`); // 50,040 blocks of 2 s from the start, plus the 256 margin
+    expect(detail).toContain("needs 50296 blocks");
+    expect(detail).not.toContain("49996");
+    expect(detail).toContain("1668.0 min from the run's start to leg A's refund time");
+    expect(detail).toContain("raise maxLogRange (to at least 503)"); // ceil(50,296 / 100)
+    expect(run.report.ok).toBe(false);
+    // One block less of window from the start fits exactly (49,744 blocks of window and 256 of margin make the 50,000 the scan reads).
+    const edge = await preflight({}, config(), { deadlines: window(0, 99_488_000) });
+    expect(status(edge, "log scan reach")).toBe("ok");
   });
 
   it("measures the block time from the chain (12-second blocks make the same window short), never below one second a block", async () => {
