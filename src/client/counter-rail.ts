@@ -221,6 +221,14 @@ export type LockRecoveryOutcome = "landed" | "never-landed" | "pending" | "unkno
 export type LockResendOutcome = "landed" | "never-landed" | "pending";
 
 /**
+ * R2-FUND-01 (EVM only): what `lockAbsence` found for a lock attempt that has no evidence. `landed`: a lock exists under the ref (the
+ * caller records it and refunds as it always did). `never-locked`: no lock, and the chain has FINALIZED a block at or past the refund
+ * time, after which the rail's own contract refuses every lock, so the attempt can never land. `not-final`: no lock yet, but the chain
+ * has not finalized a block at or past the refund time, so one cannot be ruled out: ask again later and record nothing.
+ */
+export type LockAbsence = "landed" | "never-locked" | "not-final";
+
+/**
  * P8-RESUME-SPEC.md: the recorder a refund accepts, the twin of the Solana claim's `onSigned` / `onNotBroadcast`
  * (`RailClaimOptions`). `onSigned` receives the signed refund's recovery handle once it is signed and BEFORE it is
  * sent (awaited), so a caller can persist it and resolve it later with `recoverRefund`; `onNotBroadcast` receives
@@ -378,6 +386,16 @@ export interface ConnectedCounterAssetRail {
    * A rail without such a read omits it and the Seller scans as before.
    */
   claimPaidOut?(ref: string): Promise<boolean>;
+  /**
+   * R2-FUND-01 (P9 review round 2), optional: the Buyer's `refundLegA`, when its lock attempt has no evidence, asks what became of that attempt
+   * BEFORE it sends anything. A lock attempt that never landed (the lock guard refused it after the approve, the signer refused it, a lock
+   * dropped after a receipt timeout, a kill between the approve and the lock) leaves no lock to refund, and a refund of an unknown lock
+   * reverts for ever. `evm-htlc` answers from `locks(hashLock)` and the finalized block (see `EvmHtlcRail.readLockAbsence`): the contract
+   * refuses a lock in any block at or past the offer's `refundAfterMs`, so once a finalized block is that late and no row exists none can
+   * appear. Read-only. A rail that does not implement it (Bitcoin, NEAR, Solana: their `recoverLock` outcomes and their own refund paths
+   * decide, unchanged) omits it and `refundLegA` behaves as before.
+   */
+  lockAbsence?(ref: string, refundAfterMs: number): Promise<LockAbsence>;
   /** The chain's own current time (never wall-clock) — every `claimByMs`/margin guard in the
    *  shared flow judges against this, never `Date.now()` or an injected `clock()` alone. */
   chainTimeMs(): Promise<number>;

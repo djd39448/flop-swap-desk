@@ -291,6 +291,12 @@ export interface BuyerFlowState {
     hashLock?: string;
     evidence?: WriteEvidenceJson;
     framePosted: boolean;
+    /** R2-FUND-01: the Buyer's verdict that the lock attempt NEVER LANDED and now never can: `refundLegA` read the chain, found no lock at the
+     *  latest block or at the finalized one, and the finalized block was at or past leg A's `refundAfterMs`, after which the escrow refuses
+     *  every lock. From then on `next` says `done` (the Buyer has nothing to refund) and `refundLegA` says "never locked" without reading
+     *  anything. `true` or absent; it needs `attempted`, and never goes with lock evidence, refund evidence, an own leg B claim or a seen
+     *  claim of leg A. */
+    neverLanded?: true;
   };
   /** Set BEFORE the paper-note claim of leg B is written; cleared again only when leg B's note proves the attempt did not land
    *  (the note is refunded or missing, or leg B's refund time has come: R1-07). */
@@ -1043,7 +1049,7 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
     },
     path,
   );
-  const lockObject = r.object(o.lock, `${path}.lock`, ["attempted", "framePosted"], ["prepared", "fromBlock", "accounts", "hashLock", "evidence"]);
+  const lockObject = r.object(o.lock, `${path}.lock`, ["attempted", "framePosted"], ["prepared", "fromBlock", "accounts", "hashLock", "evidence", "neverLanded"]);
   const prepared = r.optional(
     lockObject,
     "prepared",
@@ -1060,6 +1066,17 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
   const evidence = r.optional(lockObject, "evidence", (v, p) => r.evidence(v, p), `${path}.lock`);
   const attempted = r.bool(lockObject.attempted, `${path}.lock.attempted`);
   if (!attempted && (prepared !== undefined || evidence !== undefined)) r.fail(`${path}.lock.attempted`, "must be true once a lock was prepared or has evidence");
+  const neverLanded = r.optional(
+    lockObject,
+    "neverLanded",
+    (v, p) => {
+      if (r.bool(v, p) !== true) r.fail(p, "must be true when present");
+      return true as const;
+    },
+    `${path}.lock`,
+  );
+  if (neverLanded !== undefined && !attempted) r.fail(`${path}.lock.neverLanded`, "needs a lock attempt");
+  if (neverLanded !== undefined && evidence !== undefined) r.fail(`${path}.lock.neverLanded`, "a lock that never landed has no evidence");
 
   const refundObject = r.object(o.refund, `${path}.refund`, ["attempted", "framesPosted"], ["recovery", "evidence", "claimSeen"]);
   const refundClaimSeen = r.optional(
@@ -1076,9 +1093,13 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
   const refundAttempted = r.bool(refundObject.attempted, `${path}.refund.attempted`);
   if (!refundAttempted && (refundRecovery !== undefined || refundEvidence !== undefined)) r.fail(`${path}.refund.attempted`, "must be true once a refund was signed or has evidence");
 
+  if (neverLanded !== undefined && refundEvidence !== undefined) r.fail(`${path}.lock.neverLanded`, "a lock that never landed has no refund evidence");
+  if (neverLanded !== undefined && refundClaimSeen !== undefined) r.fail(`${path}.lock.neverLanded`, "a lock that never landed was never claimed");
+
   const legBClaimAttempted = r.bool(o.legBClaimAttempted, `${path}.legBClaimAttempted`);
   const legBClaimed = r.bool(o.legBClaimed, `${path}.legBClaimed`);
   if (legBClaimed && !legBClaimAttempted) r.fail(`${path}.legBClaimed`, "needs legBClaimAttempted");
+  if (neverLanded !== undefined && legBClaimed) r.fail(`${path}.lock.neverLanded`, "a lock that never landed cannot have this flow's own leg B claim");
   const legBClaimAdopted = r.optional(
     o,
     "legBClaimAdopted",
@@ -1104,6 +1125,7 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
       ...(hashLock === undefined ? {} : { hashLock }),
       ...(evidence === undefined ? {} : { evidence }),
       framePosted: r.bool(lockObject.framePosted, `${path}.lock.framePosted`),
+      ...(neverLanded === undefined ? {} : { neverLanded }),
     },
     legBClaimAttempted,
     legBClaimed,

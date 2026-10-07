@@ -23,6 +23,7 @@ import {
   RailRecoveryRefusedError,
   type ConnectedCounterAssetRail,
   type CounterAssetRail,
+  type LockAbsence,
   type LockRecoveryOutcome,
   type PreparedLock,
   type RailAccounts,
@@ -216,6 +217,26 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
   async claimPaidOut(ref: string): Promise<boolean> {
     const row = await this.rail.readLock(ref as Hex);
     return row !== null && row.status === "Claimed" && isAddressEqual(row.payee, this.account);
+  }
+
+  /**
+   * R2-FUND-01: what became of a lock attempt that has no evidence, read BEFORE `BuyerFlow.refundLegA` sends anything (see
+   * `EvmHtlcRail.readLockAbsence`). A row owned by this account is `landed` (the flow records it and refunds as before); a row owned by
+   * another payer is the same `lock-conflict` refusal `recoverLock` gives, never "landed" and never "never locked"; no row with a finalized
+   * block at or past `refundAfterMs` is `never-locked` (the contract refuses a lock in any later block); no row otherwise is `not-final`.
+   */
+  async lockAbsence(ref: string, refundAfterMs: number): Promise<LockAbsence> {
+    const found = await this.rail.readLockAbsence(ref as Hex, refundAfterMs);
+    if (found.kind === "not-final") return "not-final";
+    if (found.kind === "never-locked") return "never-locked";
+    if (!isAddressEqual(found.row.payer, this.account)) {
+      throw new RailRecoveryRefusedError(
+        "lock-conflict",
+        ref,
+        `a lock already exists under this hash lock with payer ${found.row.payer}, not this account ${this.account}`,
+      );
+    }
+    return "landed";
   }
 
   async chainTimeMs(): Promise<number> {

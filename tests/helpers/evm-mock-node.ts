@@ -109,6 +109,11 @@ export class EvmMockNode {
   readonly logQueries: bigint[] = [];
   /** Every `eth_getLogs` range that was asked for, in order, refused ones included (`to` is the tip for a "latest" call, `latest` says so). */
   readonly logRanges: Array<{ from: bigint; to: bigint; latest: boolean }> = [];
+  /** R2-FUND-01: how far the FINALIZED block's timestamp lags the chain's time, in ms (a finalized tag read answers `now - finalizedLagMs`); 0 = no lag,
+   *  the default, so every other test sees the finalized block as current as the latest. */
+  finalizedLagMs = 0;
+  /** R2-FUND-01: every JSON-RPC method this node was asked, in order (a test counts the reads a step made, or that it made none). */
+  readonly requests: string[] = [];
   /** The chain id `eth_chainId` answers (31337 anvil; 84532 makes `config()` a Base Sepolia pin with the code hash). */
   chainId = ANVIL_LOCAL_PIN.chainId;
   /** P9-2: the runtime code `eth_getCode` answers for the rail contract (any other address has none). A test sets another to play a different contract. */
@@ -191,6 +196,7 @@ export class EvmMockNode {
   }
 
   private handle(method: string, params: readonly unknown[]): Envelope {
+    this.requests.push(method);
     switch (method) {
       case "eth_chainId":
         return { result: `0x${this.chainId.toString(16)}` };
@@ -216,7 +222,7 @@ export class EvmMockNode {
       case "eth_getBlockByNumber": {
         const tag = params[0];
         const number = this.blockNumber;
-        const seconds = Math.floor(this.nowMs() / 1000) + (tag === "pending" ? 1 : 0);
+        const seconds = Math.floor((this.nowMs() - (tag === "finalized" ? this.finalizedLagMs : 0)) / 1000) + (tag === "pending" ? 1 : 0);
         return { result: { number: numberToHex(number), hash: this.blockHash(number), timestamp: numberToHex(seconds) } };
       }
       case "eth_getTransactionReceipt": {

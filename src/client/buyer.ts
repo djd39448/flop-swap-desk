@@ -100,6 +100,16 @@
 //    of leg A does: `next` says learnSecret until leg B's receipt landed, then done, never refundLegA (which refuses for ever once leg B is
 //    claimed). The frames of a leg A refund that had landed then stay unposted (the transcript only).
 //
+// P9 review round 2 (P9-FIXES-R2.md), what a runner can rely on (the Buyer's item):
+//  - R2-FUND-01: a lock attempt that never landed (the lock guard refused it after the approve, the signer refused it, a lock dropped after a
+//    receipt timeout, a kill between the approve and the lock) leaves nothing to refund, and a refund of an unknown lock reverts for ever. On a
+//    rail that implements `lockAbsence` (evm-htlc only), `refundLegA` reads the chain BEFORE it sends anything when a lock was attempted and has
+//    no evidence: a lock found is recorded as landed and the refund goes ahead as always; no lock and a FINALIZED block at or past leg A's
+//    refund time throws the existing "never locked, nothing to refund" text and RECORDS the verdict (`lock.neverLanded`), so `next` says `done`
+//    (the Buyer has nothing to refund; the Seller refunds its own leg B) and `lockLegA` refuses for good; the verdict is safe because the escrow
+//    refuses a lock in any block at or past the refund time; no lock and no such finalized block yet throws `RefundNotFinalYetError` (its text
+//    says "not final yet"), records nothing and sends nothing: call again later. Other rails keep their own refund paths unchanged.
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
 // P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3; P4-BTC-SPEC.md §7a;
 // P6-SOL-SPEC.md sections 3-5; P8-RESUME-SPEC.md.
@@ -238,6 +248,28 @@ export class LockPendingError extends Error {
   }
 }
 
+/** The text `refundLegA` throws when leg A was never locked (the runner recognises it: `FLOW_MESSAGE.neverLocked`). */
+const NEVER_LOCKED = "buyer: leg A was never locked, nothing to refund";
+
+/**
+ * R2-FUND-01: `refundLegA` found no lock for a lock attempt that has no evidence, but the chain's finalized block is not yet at or past leg A's
+ * refund time, so a lock cannot be ruled out (the escrow refuses a lock only from that time on). Nothing was sent and nothing was recorded; a
+ * runner waits for the finalized block to pass the refund time and calls `refundLegA()` again. The text says "not final yet".
+ */
+export class RefundNotFinalYetError extends Error {
+  readonly ref: string;
+  readonly refundAfterMs: number;
+  constructor(ref: string, refundAfterMs: number) {
+    super(
+      `buyer: the lock attempt for ${ref} is not on chain, and the chain's finalized block is not yet at or past leg A's refund time (${refundAfterMs} ms), ` +
+        "so a lock that has not been seen cannot be ruled out; the lock read is not final yet; call refundLegA() again later; nothing was sent or recorded (R2-FUND-01)",
+    );
+    this.name = "RefundNotFinalYetError";
+    this.ref = ref;
+    this.refundAfterMs = refundAfterMs;
+  }
+}
+
 /** R1-10: what a refund that was signed and saved but is not seen on chain yet says. It may never have been sent (the process may
  *  have died between signing and sending), which is why this is not "broadcast". */
 const REFUND_UNCONFIRMED =
@@ -320,6 +352,8 @@ export class BuyerFlow {
   private refundAttempted = false;
   /** R1-15: `refundLegA` found leg A claimed (the refund lost the race to a claim) and routed the Buyer to `learnSecret`. */
   private refundClaimSeen = false;
+  /** R2-FUND-01: the verdict that the lock attempt NEVER LANDED and now never can (see `refundLegA`); saved with the record, never cleared. */
+  private lockNeverLanded = false;
   /** R1-16: set synchronously at the start of `postAccountLineA`, `claimLegB` and `refundLegA` and cleared when the call ends,
    *  the same re-entry pattern `lockLegA` and `acceptLegB` use: two overlapping calls of one step can never both reach the
    *  rail or the venue (two refund builds, two account lines for two addresses, two claims). */
@@ -393,7 +427,8 @@ export class BuyerFlow {
    *  `claimLegB` (the secret is never stored here, it is read again); after leg A's `refundAfterMs` a runner may call
    *  `refundLegA` where this says `learnSecret`. A lock that was attempted but is not recognised yet is `"lockLegA"` (it reads
    *  the chain first and records a lock that landed, at any time) until leg A's refund time, then `"refundLegA"` (R1-01), unless a claim of
-   *  leg A was seen or this flow claimed leg B, which is `"learnSecret"` or `"done"` (R2-02, R3-03). `"abandoned"` (R2-06): a saved pairing whose
+   *  leg A was seen or this flow claimed leg B, which is `"learnSecret"` or `"done"` (R2-02, R3-03); `"done"` too for a lock attempt that was recorded
+   *  as never landed (R2-FUND-01). `"abandoned"` (R2-06): a saved pairing whose
    *  accept B never landed before leg B's offer expired; (R3-01) or whose accept B landed stamped at or after that expiry while leg B is unverified
    *  and no lock of leg A was attempted. */
   private nextStep(): BuyerNextStep {
@@ -412,6 +447,9 @@ export class BuyerFlow {
     // unverified and no leg A lock was attempted nothing is at stake (leg A is locked only after leg B verified): the swap is abandoned.
     // Derived from the record alone, no I/O.
     if (!this.legBVerified && !this.legALockAttempted && this.acceptBStampedLate()) return "abandoned";
+    // R2-FUND-01: the lock attempt never landed and never can (leg A's refund time was final without it): the Buyer has nothing to refund and
+    // nothing to claim, so its part of the swap is finished (the Seller refunds its own leg B). Never `refundLegA`, which would only say so again.
+    if (this.lockNeverLanded) return "done";
     if (this.refundAttempted) {
       if (journal.isLanded("receipt-refund-a")) return "done";
       // R1-15: the refund lost the race to a claim: `refundLegA` only throws its routing error from here on, and the way on is
@@ -574,6 +612,7 @@ export class BuyerFlow {
       throw new FlowRecordMismatchError("lock.hashLock", acceptA.statement, lock.hashLock);
     }
     this.legALockAttempted = lock.attempted;
+    this.lockNeverLanded = lock.neverLanded === true;
     if (lock.prepared !== undefined) {
       this.preparedLock = lock.prepared.recovery === undefined ? { ref: lock.prepared.ref } : { ref: lock.prepared.ref, recovery: lock.prepared.recovery };
       this.lockedRailRef = lock.prepared.ref;
@@ -611,6 +650,7 @@ export class BuyerFlow {
         ...(this.lockedHashLock === undefined ? {} : { hashLock: this.lockedHashLock }),
         ...(this.lockEvidence === undefined ? {} : { evidence: evidenceToJson(this.lockEvidence) }),
         framePosted: this.lockFramePosted || ledgerLanded(r, "lock-a"),
+        ...(this.lockNeverLanded ? { neverLanded: true as const } : {}),
       },
       legBClaimAttempted: this.legBClaimAttempted,
       legBClaimed: this.legBClaimed,
@@ -1090,6 +1130,10 @@ export class BuyerFlow {
   }
 
   private async lockLegAUnlatched(): Promise<{ hashLock: string; writeEvidence: RailWriteEvidence }> {
+    // R2-FUND-01: leg A's refund time was final with no lock on chain, and the escrow refuses every lock from then on: nothing can land.
+    if (this.lockNeverLanded) {
+      throw new Error("buyer: refusing to lock leg A - this lock attempt was recorded as never landed once leg A's refund time was final, and the escrow refuses every lock from then on (R2-FUND-01)");
+    }
     if (!this.legBVerified) {
       throw new Error("buyer: refusing to lock leg A before leg B verifies");
     }
@@ -1693,7 +1737,8 @@ export class BuyerFlow {
 
   private async refundLegAUnlatched(): Promise<RailWriteEvidence> {
     const { offerA, acceptA } = this.requirePaired();
-    if (this.lockedHashLock === undefined) throw new Error("buyer: leg A was never locked, nothing to refund");
+    // R2-FUND-01: a recorded verdict ends it for good, with no read: the same text every time.
+    if (this.lockedHashLock === undefined || this.lockNeverLanded) throw new Error(NEVER_LOCKED);
     if (this.clock() < offerA.refundAfterMs) {
       throw new Error("buyer: refusing to refund leg A before its refundAfterMs");
     }
@@ -1735,6 +1780,23 @@ export class BuyerFlow {
           "buyer: refusing to refund leg A — the lock has been claimed (on chain or already broadcast); " +
             "call learnSecret() then claimLegB() instead of refundLegA() (K2)",
         );
+      }
+    }
+    // R2-FUND-01: a lock attempt with no evidence may never have landed (the lock guard refused it after the approve, a signer refusal, a dropped
+    // lock, a kill between the approve and the lock), and a refund of an unknown lock reverts for ever. On a rail that can say (evm-htlc), the chain
+    // is read BEFORE anything is sent: a lock found is recorded as landed and the refund goes ahead; no lock and a FINALIZED block at or past leg A's
+    // refund time is the verdict "never locked" (the escrow refuses a lock in any block at or past that time, so none can appear later), recorded so
+    // `next` stops naming this step; no lock and no such block yet is a typed "not final yet", recording nothing.
+    if (this.legALockAttempted && this.lockEvidence === undefined && this.legARefundEvidence === undefined && connected.lockAbsence !== undefined) {
+      const absence = await connected.lockAbsence(railRef, offerA.refundAfterMs);
+      if (absence === "landed") {
+        await this.recordLockSeen(railRef);
+      } else if (absence === "never-locked") {
+        this.lockNeverLanded = true;
+        await this.persist();
+        throw new Error(NEVER_LOCKED);
+      } else {
+        throw new RefundNotFinalYetError(railRef, offerA.refundAfterMs);
       }
     }
     // R3-6 / R4-1 / RR4-1 (Solana): leg B's own record is read next, and only before this flow's first refund

@@ -838,3 +838,58 @@ describe("R1-02 (record part): saveFlowRecord and loadFlowRecordWithDigest are a
     await expect(saveFlowRecord(store, bumped(first, first.updatedAtMs + 2), digest)).rejects.toBeInstanceOf(FlowRecordStaleError);
   });
 });
+
+// R2-FUND-01 (record part): the Buyer's verdict that its lock attempt never landed is one strictly decoded optional field, `lock.neverLanded`
+// (true or absent). It needs a lock attempt and never goes with lock evidence, refund evidence or recovery, a seen claim of leg A, or this flow's own
+// leg B claim: each of those says a lock exists or was claimed, and a record that says both would send the Buyer nowhere.
+describe("R2-FUND-01 (record part): lock.neverLanded", () => {
+  const at = (record: Record<string, unknown>, ...path: string[]): Record<string, unknown> => path.reduce((o, k) => o[k] as Record<string, unknown>, record);
+  /** The sample Buyer record cut down to a lock attempt that never landed: no lock evidence, no refund of any kind, no seen claim, no own leg B claim. */
+  function neverLandedRecord(): Record<string, unknown> {
+    const r = plain(sampleBuyerRecord());
+    delete at(r, "lock").evidence;
+    at(r, "lock").neverLanded = true;
+    r.refund = { attempted: false, framesPosted: false };
+    delete r.legBClaimAdopted;
+    r.legBClaimAttempted = false;
+    r.legBClaimed = false;
+    return r;
+  }
+
+  it("a record with the verdict decodes, keeps the field, and encodes to the same bytes again", () => {
+    const record = neverLandedRecord();
+    const decoded = decodeFlowRecord(envelope(record));
+    if (decoded.role !== "buyer") throw new Error("expected a Buyer record");
+    expect(decoded.lock.neverLanded).toBe(true);
+    expect(decoded.lock.attempted).toBe(true);
+    expect(text(encodeFlowRecord(decoded))).toBe(text(envelope(record)));
+  });
+
+  it("the cut-down sample is valid without the field, and the field is absent from every other sample", () => {
+    const record = neverLandedRecord();
+    delete at(record, "lock").neverLanded;
+    expect(() => decodeFlowRecord(envelope(record))).not.toThrow();
+    for (const sample of sampleRecords()) expect(JSON.stringify(sample)).not.toContain('"neverLanded"');
+  });
+
+  const refused: Array<[label: string, edit: (record: Record<string, unknown>) => void]> = [
+    ["a neverLanded of false (it is true or absent)", (r) => void (at(r, "lock").neverLanded = false)],
+    ["a neverLanded that is not a boolean", (r) => void (at(r, "lock").neverLanded = "yes")],
+    ["a neverLanded on a lock that was never attempted", (r) => void ((at(r, "lock").attempted = false), delete at(r, "lock").prepared)],
+    ["a neverLanded together with lock evidence", (r) => void (at(r, "lock").evidence = { ref: `${"ab".repeat(32)}:1`, raw: [], txid: "ab".repeat(32), blockHeight: null, blockHash: null })],
+    ["a neverLanded together with refund evidence", (r) => void ((r.refund = { attempted: true, framesPosted: false, evidence: { ref: `${"ab".repeat(32)}:1`, raw: [], txid: "cd".repeat(32), blockHeight: 205, blockHash: "ee".repeat(32), rawTx: "02000000000102cafebabe" } }))],
+    ["a neverLanded together with a seen claim of leg A", (r) => void (r.refund = { attempted: false, framesPosted: false, claimSeen: true })],
+    ["a neverLanded together with this flow's own leg B claim", (r) => void ((r.legBClaimAttempted = true), (r.legBClaimed = true))],
+  ];
+  it.each(refused)("%s is refused", (_label, edit) => {
+    const record = neverLandedRecord();
+    edit(record);
+    expect(() => decodeFlowRecord(envelope(record))).toThrow(FlowStoreCorruptError);
+  });
+
+  it("a Seller record never carries it (the lock object is the Buyer's)", () => {
+    const record = plain(sampleSellerRecord());
+    record.lock = { attempted: true, framePosted: false, neverLanded: true };
+    expect(() => decodeFlowRecord(envelope(record))).toThrow(FlowStoreCorruptError);
+  });
+});
