@@ -17,6 +17,7 @@
 //                          (the local clock AND the chain's head must be past it), the Seller refunds leg B (the paper note) once
 //                          its refund time has come, then the bundle and `--expect <swapId>=refunded` (or `refunded-b` when leg A
 //                          was never locked). Without `--wait` a refund time not yet reached is reported (exit 5) and the run can be repeated.
+//                          It needs no key file of the Seller's (a refund moves nothing of the Seller's on the chain): a missing one is a warning.
 //
 // The only network the runner speaks to is `rails.evm.endpoint`. It posts to no HTTP venue and never opens any other socket;
 // the venue and the paper notes are two local files. The one thing it launches is `examples/audit-export.mjs`, offline.
@@ -48,6 +49,7 @@ import { BuyerFlow, type BuyerNextStep } from "./buyer.js";
 import type { CounterAssetRail, RailWriteEvidence } from "./counter-rail.js";
 import { describeKeyFileProblem, EvmKeyFileError, loadEvmLocalAccount } from "./evm-key-file.js";
 import { createEvmCounterRail } from "./evm-rail.js";
+import { decodeFlowRecord } from "./flow-record.js";
 import { FileFlowStore, flowKey, parseFlowKey } from "./flow-store.js";
 import {
   absoluteDeadlines,
@@ -57,7 +59,7 @@ import {
   type RehearsalConfig,
   type RunDeadlines,
 } from "./rehearsal-config.js";
-import { describeFailure, renderPreflight, runPreflight, type PreflightReport, type PreflightRow } from "./rehearsal-preflight.js";
+import { describeFailure, renderPreflight, runPreflight, type BuyerSends, type PreflightReport, type PreflightRow } from "./rehearsal-preflight.js";
 import { acquireRunLock, DurableNoteStore, DurableVenue, loadOrCreateIdentity, RehearsalWorldError, RunLockedError, writeFileDurable, type RehearsalIdentity } from "./rehearsal-world.js";
 import { SellerFlow, type SellerNextStep } from "./seller.js";
 
@@ -270,8 +272,12 @@ const CLAIM_REREAD_ATTEMPTS = 20;
 
 const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 
-/** The pre-flight rows a refund does not depend on (the claim's `pending` read, the log scans, the Seller's gas: leg B refunds on paper). */
-const REFUND_NOT_NEEDED: ReadonlySet<string> = new Set(["pending", "log range", "seller ETH"]);
+/**
+ * The pre-flight rows a refund does not depend on (the claim's `pending` read, the log scans, the Seller's gas: leg B refunds on paper; and, R1-FUND-01
+ * with F2, the Seller's account: the Buyer's refund of leg A and the Seller's refund of leg B (a paper note) use no EVM key of the Seller's, so a Seller
+ * key file that is gone or unreadable must not stand between an honest Buyer and its refund).
+ */
+const REFUND_NOT_NEEDED: ReadonlySet<string> = new Set(["pending", "log range", "seller ETH", "seller account"]);
 
 /**
  * The flows' own refusals that the runner reacts to, by the text each carries. They are coupled by text on purpose (the flows have no
@@ -332,6 +338,23 @@ interface Accounts {
   seller: { account: LocalAccount } | { problem: string };
 }
 
+/**
+ * R1-FUND-01: whether the Buyer's flow record in `stateDir` holds a lock that landed (its write evidence is recorded). Reads the record only
+ * (no seed, no directory, nothing is written). A record that is missing, damaged or without that evidence reads false, so the Buyer's ETH
+ * row keeps its full size: the smaller sizing is only ever taken for a lock the record proves.
+ */
+export async function buyerLockOnRecord(stateDir: string, swapId: string): Promise<boolean> {
+  try {
+    const key = flowKey("buyer", swapId);
+    const bytes = await new FileFlowStore(join(stateDir, "buyer", "flows")).load(key);
+    if (bytes === null) return false;
+    const record = decodeFlowRecord(bytes, key);
+    return record.role === "buyer" && record.lock.evidence !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 type KeyFileField = "buyerKeyFile" | "sellerKeyFile";
 
 /**
@@ -377,7 +400,8 @@ async function makeClock(config: RehearsalConfig, env: RehearsalEnv, rpc: Captur
 
 interface Party {
   identity: RehearsalIdentity;
-  account: LocalAccount;
+  /** The party's EVM account (public). A `--refund` run whose Seller key file does not load still has the address the run recorded. */
+  address: Address;
   rail: CounterAssetRail;
   store: FileFlowStore;
 }
@@ -442,8 +466,31 @@ async function latestBlockMs(rpc: CapturingRpc): Promise<number> {
   return Number(BigInt(block.timestamp)) * 1000;
 }
 
+/** What a wait for finality reads of the world: the config (the pin), the runner's own reads, its clock and sleep, and its log. */
+export interface FinalityWorld {
+  config: RehearsalConfig;
+  env: RehearsalEnv;
+  rpc: CapturingRpc;
+  log: (line: string) => void;
+  pollMs: number;
+}
+
+/**
+ * R1-FUND-07 (P9 review round 1): the wait for leg A's lock to be final before the Seller's claim. A lock recovered from the chain (a lock receipt
+ * timeout, a kill between the broadcast and the save, a lagging lookup) has no block number on record; the wait used to return at once then, and
+ * the claim loop gave up after 20 re-reads (about 100 s at the default poll), so a finalized lag of 15 to 39 minutes needed many manual --resume
+ * runs. Without a block number the lock landed at or below the head, so the wait is for the finalized block to pass the head read now (as the
+ * refund path does), which is a real wait on the real finalized lag, bounded by `waitLimitMs` like every other.
+ */
+export async function waitLockFinal(w: FinalityWorld, blockNumber: bigint | undefined): Promise<void> {
+  if (blockNumber !== undefined) return waitFinalized(w, blockNumber, "lock of leg A");
+  const head = await blockNumberNow(w.rpc);
+  w.log(`the lock of leg A has no block number on record (it was recovered from the chain); it landed at or below the head, block ${head}, so waiting until the finalized block passes that`);
+  return waitFinalized(w, head, "lock of leg A (recovered: its block is not on record, so the head read now)");
+}
+
 /** Waits (real polling) until the finalized block is at least `minBlock`: the transaction mined at or below it is then final. */
-async function waitFinalized(w: World, minBlock: bigint | undefined, what: string): Promise<void> {
+async function waitFinalized(w: FinalityWorld, minBlock: bigint | undefined, what: string): Promise<void> {
   if (minBlock === undefined) return;
   const startedMs = w.env.now();
   let lastLogMs = 0;
@@ -614,8 +661,8 @@ async function driveSettle(w: World): Promise<number> {
   if (sellerOpen?.next === "refundLegB") throw new RunnerRefusal("leg B's refund has begun; use --refund");
   const buyer = buyerOpen.flow;
   const seller = sellerOpen === null ? newSeller(w) : sellerOpen.flow;
-  const buyerAddress = w.buyer.account.address;
-  const sellerAddress = w.seller.account.address;
+  const buyerAddress = w.buyer.address;
+  const sellerAddress = w.seller.address;
   const step = (who: string, what: string, detail = ""): void => log(`step ${who}.${what} done${detail === "" ? "" : `: ${detail}`}`);
 
   log(`${bRank === 0 && sRank === 0 ? "starting" : "continuing"} swap ${run.swapId} (buyer next: ${buyerOpen.next}, seller next: ${sellerOpen === null ? "acceptLegA" : sellerOpen.next})`);
@@ -660,7 +707,7 @@ async function driveSettle(w: World): Promise<number> {
     return EXIT.ok;
   }
 
-  await waitFinalized(w, lockA.writeEvidence.blockNumber, "lock of leg A");
+  await waitLockFinal(w, lockA.writeEvidence.blockNumber);
   let claimed: Awaited<ReturnType<SellerFlow["claimLegA"]>> | undefined;
   const claimStartedMs = w.env.now();
   for (let attempt = 1; ; attempt += 1) {
@@ -901,7 +948,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
     // Rails (no network at construction) give the pre-flight the policy and the continue-mode steps their transports.
     const buildParty = async (
       role: "buyer" | "seller",
-      account: LocalAccount,
+      account: LocalAccount | Address,
     ): Promise<{ rail: CounterAssetRail; store: FileFlowStore; identity: Promise<RehearsalIdentity> }> => ({
       rail: createEvmCounterRail({ config: evm, rpc: new CapturingRpc({ endpoint: evm.endpoint, clock }), account, clock }),
       store: new FileFlowStore(join(stateDir, role, "flows")),
@@ -929,6 +976,12 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
       }
     }
 
+    // R1-FUND-01 (P9 review round 1): what the Buyer still has to send sizes its ETH row. Once its approve and lock are spent (--refund, or --resume
+    // with a lock on record: the refund is then its only possible write) only the refund is reserved; asking again for the gas already spent
+    // could refuse a refund the Buyer can pay, and a resume the delay of which then costs a settle.
+    const buyerSends: BuyerSends =
+      mode === "refund" || (mode === "resume" && existingRun !== null && (await buyerLockOnRecord(stateDir, existingRun.swapId))) ? "refund" : "approve-lock-refund";
+
     const report: PreflightReport = await runPreflight({
       config,
       rpc,
@@ -939,6 +992,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
       ...(fresh ? { deadlines: { absolute, lockTimeMs } } : {}),
       policy: policyRail.policy,
       redact,
+      buyerSends,
       // A refund needs the chain, the escrow, the finalized read, the clock and the Buyer's gas: a diagnostic that only a claim or a log
       // scan uses must never stand between an honest party and its refund (it still shows, as a warning).
       ...(mode === "refund" ? { notNeeded: REFUND_NOT_NEEDED } : {}),
@@ -967,16 +1021,22 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
       return EXIT.ok;
     }
 
-    // From here the runner may write and send. Both accounts are loaded (the pre-flight checked it).
-    if (!("account" in accounts.buyer) || !("account" in accounts.seller)) throw new RunnerRefusal("a key file did not load");
+    // From here the runner may write and send. The Buyer's key file loaded (the pre-flight checked it), and so did the Seller's, except in --refund
+    // (R1-FUND-01 with F2): a refund uses no EVM key of the Seller's (the Buyer refunds leg A, the Seller refunds leg B, a paper note), so a Seller key
+    // file that is gone does not stand between the Buyer and its refund. The Seller's rail is then built on the placeholder address, through which
+    // nothing is ever sent (a refund drives no Seller write on the chain), and the address the run recorded stands in for the key file's.
+    if (!("account" in accounts.buyer)) throw new RunnerRefusal("a key file did not load");
+    const sellerKey = "account" in accounts.seller ? accounts.seller.account : undefined;
+    const sellerAddress: Address | undefined = sellerKey !== undefined ? sellerKey.address : existingRun !== null ? (existingRun.sellerAccount as Address) : undefined;
+    if (sellerAddress === undefined || (sellerKey === undefined && mode !== "refund")) throw new RunnerRefusal("a key file did not load");
     if (
       existingRun !== null &&
-      (existingRun.buyerAccount !== accounts.buyer.account.address.toLowerCase() || existingRun.sellerAccount !== accounts.seller.account.address.toLowerCase())
+      (existingRun.buyerAccount !== accounts.buyer.account.address.toLowerCase() || (sellerKey !== undefined && existingRun.sellerAccount !== sellerKey.address.toLowerCase()))
     ) {
       throw new RunnerRefusal("the key files now name other accounts than the ones this run started with (the config's buyerKeyFile and sellerKeyFile must be the same two accounts)");
     }
     const buyerParty = await buildParty("buyer", accounts.buyer.account);
-    const sellerParty = await buildParty("seller", accounts.seller.account);
+    const sellerParty = await buildParty("seller", sellerKey ?? ZERO_ADDRESS);
     const buyerIdentity = await buyerParty.identity;
     const sellerIdentity = await sellerParty.identity;
 
@@ -999,7 +1059,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
         buyerDid: buyerIdentity.did,
         sellerDid: sellerIdentity.did,
         buyerAccount: accounts.buyer.account.address.toLowerCase(),
-        sellerAccount: accounts.seller.account.address.toLowerCase(),
+        sellerAccount: sellerAddress.toLowerCase(),
       };
       await writeFileDurable(join(stateDir, RUN_FILE), `${JSON.stringify(run, null, 2)}\n`);
     } else {
@@ -1020,14 +1080,14 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
       venue,
       notes,
       paper: () => new PaperRail(notes, clock),
-      buyer: { identity: buyerIdentity, account: accounts.buyer.account, rail: buyerParty.rail, store: buyerParty.store },
-      seller: { identity: sellerIdentity, account: accounts.seller.account, rail: sellerParty.rail, store: sellerParty.store },
+      buyer: { identity: buyerIdentity, address: accounts.buyer.account.address, rail: buyerParty.rail, store: buyerParty.store },
+      seller: { identity: sellerIdentity, address: sellerAddress, rail: sellerParty.rail, store: sellerParty.store },
       run,
       log,
       redact,
       pollMs: config.pollMs,
     };
-    log(`${mode === "yes" ? "run" : mode} started: swap ${run.swapId}; buyer ${buyerIdentity.did} account ${accounts.buyer.account.address}; seller ${sellerIdentity.did} account ${accounts.seller.account.address}`);
+    log(`${mode === "yes" ? "run" : mode} started: swap ${run.swapId}; buyer ${buyerIdentity.did} account ${accounts.buyer.account.address}; seller ${sellerIdentity.did} account ${sellerAddress}`);
     return mode === "refund" ? await driveRefund(world, options.wait === true) : await driveSettle(world);
   } catch (error) {
     if (error instanceof RunLockedError || error instanceof RehearsalWorldError) {

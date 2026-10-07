@@ -19,9 +19,13 @@ import { fileURLToPath } from "node:url";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { EXIT, FLOW_MESSAGE, loadRunnerAccount, parseRunRecord, refundTimeReached, runRehearsal, untilRefundTime, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { buyerLockOnRecord, EXIT, FLOW_MESSAGE, loadRunnerAccount, parseRunRecord, refundTimeReached, runRehearsal, untilRefundTime, waitLockFinal, type FinalityWorld, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { encodeFlowRecord, newBuyerRecord } from "../src/client/flow-record.js";
+import { FileFlowStore, flowKey } from "../src/client/flow-store.js";
+import { parseRehearsalConfig } from "../src/client/rehearsal-config.js";
 import { loadOrCreateIdentity } from "../src/client/rehearsal-world.js";
-import { BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
+import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
+import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { keyScanner } from "./helpers/evm-local.js";
 import { fakeChain, FAKE_ESCROW_CODE_HASH, serveFakeChain, type FakeChain, type FakeChainOptions } from "./helpers/fake-chain.js";
 
@@ -51,6 +55,9 @@ interface Rig {
 }
 
 interface RigOptions {
+  /** F3 (P9 review round 1): Base Sepolia still runs under the anvil policy, so a NEW swap on it is refused until P9-4. The rigs that want every row of a healthy
+   *  dry run use the anvil pin (31337) on the same fake chain, with maxLogRange 500 so the log rows read the same. */
+  anvil?: boolean;
   chain?: FakeChainOptions;
   codeHash?: string;
   skipSellerKey?: boolean;
@@ -71,12 +78,22 @@ async function makeRig(options: RigOptions = {}): Promise<Rig> {
   const chain = fakeChain({
     headTimestampSec: Math.floor(Date.now() / 1000),
     tokenBalances: { [buyer.toLowerCase()]: 100_000_000n },
+    ...(options.anvil === true ? { chainId: 31337 } : {}),
     ...options.chain,
   });
   const served = await serveFakeChain(chain, SECRET_PATH);
   closers.push(served.close);
   const config = {
-    rails: { evm: { pin: BASE_SEPOLIA_PIN, endpoint: options.endpoint ?? served.url, contract: CONTRACT, assets: { USDC: TOKEN }, contractCodeHash: options.codeHash ?? FAKE_ESCROW_CODE_HASH } },
+    rails: {
+      evm: {
+        pin: options.anvil === true ? ANVIL_LOCAL_PIN : BASE_SEPOLIA_PIN,
+        endpoint: options.endpoint ?? served.url,
+        contract: CONTRACT,
+        assets: { USDC: TOKEN },
+        contractCodeHash: options.codeHash ?? FAKE_ESCROW_CODE_HASH,
+        ...(options.anvil === true ? { maxLogRange: 500 } : {}),
+      },
+    },
     buyerKeyFile: "keys/buyer.key",
     sellerKeyFile: "keys/seller.key",
     amount: "1000000",
@@ -121,7 +138,7 @@ const WRITES = ["eth_sendRawTransaction", "eth_sendTransaction"];
 
 describe("the dry run (the default mode) against a fake read-only chain", () => {
   it("prints the table with both addresses, no key and no URL, writes nothing, sends nothing, exits 0", async () => {
-    const rig = await makeRig();
+    const rig = await makeRig({ anvil: true });
     const result = await run(rig);
     expect(result.code).toBe(EXIT.ok);
     expect(result.stderr).toBe("");
@@ -129,9 +146,11 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     expect(result.stdout).toContain(rig.buyer);
     expect(result.stdout).toContain(rig.seller);
     expect(result.stdout).toContain("RESULT: every check that is needed holds");
-    expect(result.stdout).toMatch(/OK\s+chain id\s+84532 matches the pin base-sepolia/);
+    expect(result.stdout).toMatch(/OK\s+chain id\s+31337 matches the pin anvil-local/);
     expect(result.stdout).toMatch(/OK\s+escrow code\s+\d+ bytes, keccak 0x[0-9a-f]{64} is the pinned contractCodeHash/);
     expect(result.stdout).toMatch(/OK\s+log range\s+maxLogRange 500: the endpoint accepted 500 blocks and refused 501/);
+    // F1: the scans' reach (100 calls of 500 blocks) is set against leg A's window at the block time measured from the chain (2 s here).
+    expect(result.stdout).toMatch(/OK\s+log scan reach\s+100 calls of maxLogRange 500 read 50000 blocks above a marker .*; leg A's window needs \d+ blocks .* at 2\.0 s a block, plus 256 of marker margin\): it fits/);
     expect(result.stdout).toContain("Plan (nothing below has happened");
     expect(result.stdout).toContain("This was a dry run: no transaction was sent, no file was written.");
     // Not the endpoint: the host appears, the URL and its path never.
@@ -146,6 +165,36 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     expect(await exists(rig.outDir)).toBe(false);
     expect(rig.chain.methods.filter((m) => WRITES.includes(m))).toEqual([]);
     expect(rig.chain.methods).toContain("eth_getCode");
+  });
+
+  // F3 with R1-FUND-06 (P9 review round 1): Base Sepolia still runs under the anvil deadline policy, so a NEW swap there is refused until P9-4.
+  it("a dry run on Base Sepolia (chain 84532) with the known-good deadlines exits 3 on the deadlines row, and --yes refuses; --refund is not blocked by it (F3)", async () => {
+    const dry = await makeRig();
+    const result = await run(dry);
+    expect(result.code).toBe(EXIT.preflight);
+    expect(result.stdout).toMatch(/FAIL\s+deadlines\s+no Base Sepolia policy yet \(P9-4\)/);
+    expect(result.stdout).toContain("Nothing was sent. Fix the failed checks");
+    expect(result.stdout).not.toContain("This was a dry run");
+    expect(result.stdout).toMatch(/OK\s+chain id\s+84532 matches the pin base-sepolia/); // everything else about the chain is fine
+    expect(result.stdout.match(/^ {2}FAIL {2}\S+/gm)).toEqual(["  FAIL  deadlines"]); // the deadlines row is the only failure
+
+    const yes = await makeRig();
+    const refused = await run(yes, "yes");
+    expect(refused.code).toBe(EXIT.preflight);
+    expect(refused.stdout).toContain("--yes refuses to broadcast unless every needed check holds");
+    expect(refused.stdout).toMatch(/FAIL\s+deadlines\s+no Base Sepolia policy yet/);
+    expect(await exists(join(yes.stateDir, "run.json"))).toBe(false);
+    expect(yes.chain.methods.filter((m) => WRITES.includes(m))).toEqual([]);
+
+    // --refund (of a swap already begun) never reads the row: it is a fresh-run check.
+    const refund = await makeRig();
+    await writeRun(refund, {}, true);
+    const refunded = await run(refund, "refund");
+    expect(refunded.stdout).not.toContain("no Base Sepolia policy yet");
+    expect(refunded.stdout).not.toMatch(/deadlines/);
+    expect(refunded.stdout).not.toContain("a check it needs failed");
+    expect(refunded.code).toBe(EXIT.refused); // past the pre-flight, it stops at the Buyer's empty store: nothing to refund
+    expect(refunded.stderr).toContain("holds no record");
   });
 
   it("exits 3 and says nothing was sent when a check fails (a wrong code pin, a Buyer short of tokens, no finalized tag)", async () => {
@@ -281,8 +330,10 @@ describe("--resume and --refund look at the run before they touch anything", () 
     const chainOptions: FakeChainOptions = { pending: "error", logCap: 100, ethBalances: {} };
     const rig = await makeRig({ chain: chainOptions });
     await writeRun(rig, {}, true);
-    // A seller with no ETH is also fine for a refund: leg B refunds on paper.
-    rig.chain.handlers.eth_getBalance = (params) => ({ result: String(params[0]).toLowerCase() === rig.seller.toLowerCase() ? "0x0" : "0xde0b6b3a7640000" });
+    // A seller with no ETH is also fine for a refund: leg B refunds on paper. The Buyer holds what is left after the approve and the lock (R1-FUND-01:
+    // the dry run's need, 1.44e12 wei at the fake chain's gas price, less the 258,000 gas they spent), not a whole ETH.
+    const left = 1_182_000_000_000n;
+    rig.chain.handlers.eth_getBalance = (params) => ({ result: String(params[0]).toLowerCase() === rig.seller.toLowerCase() ? "0x0" : `0x${left.toString(16)}` });
 
     const refund = await run(rig, "refund");
     expect(refund.stdout).toMatch(/WARN\s+pending\s+\(not needed for this mode\)/);
@@ -434,6 +485,128 @@ describe("K2: a key pasted into contractCodeHash is never printed back", () => {
   });
 });
 
+// R1-FUND-01 with F2 (P9 review round 1): --refund and --resume asked again for the Buyer's approve and lock gas after it was spent, and --refund
+// needed the Seller's key file too. A Buyer left with the dry run's need minus what the approve and the lock spent (1.44e12 - 258,000 x 1e6 wei, at a
+// gas price of 1e6) is 2.9 times over what a refund can cost, and an honest refund must go ahead.
+describe("R1-FUND-01: --refund and --resume size the Buyer's ETH row by what is left to send", () => {
+  const LEFT = 1_182_000_000_000n; // the dry run's need (1.44e12) minus the approve and the lock (258,000 gas at 1e6 wei)
+
+  /** The Buyer holds `buyerWei`; the Seller holds `sellerWei` (a refund does not need its gas: leg B refunds on paper; a resume does: it may claim). */
+  function fund(rig: Rig, buyerWei: bigint, sellerWei = 10n ** 18n): void {
+    rig.chain.handlers.eth_getBalance = (params) => ({ result: `0x${(String(params[0]).toLowerCase() === rig.buyer.toLowerCase() ? buyerWei : sellerWei).toString(16)}` });
+  }
+
+  /** What a Buyer that locked leg A leaves in the store: a record whose lock carries its write evidence (a landed lock). */
+  async function writeBuyerRecord(rig: Rig, withLock: boolean, swapId = `0x${"11".repeat(32)}`): Promise<void> {
+    const record = newBuyerRecord({ swapId, did: "did:key:z6Mkbuyer", railId: "evm-htlc", caip2: "eip155:84532", deploymentId: "evm:test", nowMs: Date.now() });
+    const stored = withLock ? { ...record, lock: { attempted: true, evidence: { ref: `0x${"ab".repeat(32)}`, raw: [] }, framePosted: false } } : { ...record, lock: { attempted: true, framePosted: false } };
+    await new FileFlowStore(join(rig.stateDir, "buyer", "flows")).save(flowKey("buyer", swapId), encodeFlowRecord(stored), null);
+  }
+
+  it("--refund goes past the pre-flight for a Buyer left with the need minus the approve and the lock, and says what the row reserves", async () => {
+    const rig = await makeRig({ chain: { gasPriceWei: 1_000_000n } });
+    fund(rig, LEFT, 0n); // the Seller holds nothing: a refund does not need it
+    await writeRun(rig, {}, true);
+    const result = await run(rig, "refund");
+    expect(result.stdout).toMatch(/OK\s+buyer ETH\s+0x[0-9a-fA-F]{40}: 0\.000001182 ETH, needs 0\.0000004 ETH for the refund \(the approve and the lock are already sent\) \(200000 gas ceiling; Base's L1 data fee is not included\)/);
+    expect(result.stdout).not.toContain("a check it needs failed");
+    expect(result.stdout).not.toMatch(/FAIL\s+buyer ETH/);
+    expect(result.code).toBe(EXIT.refused); // past the pre-flight, it stops at the Buyer's empty store: nothing to refund
+    expect(result.stderr).toContain("holds no record");
+    expect(rig.chain.methods.filter((m) => WRITES.includes(m))).toEqual([]);
+  });
+
+  it("--refund still stops for a Buyer who cannot pay the refund itself (one wei short of its own need)", async () => {
+    const rig = await makeRig({ chain: { gasPriceWei: 1_000_000n } });
+    fund(rig, 400_000_000_000n - 1n); // 200,000 gas x 1e6 x 2, less one wei
+    await writeRun(rig, {}, true);
+    const result = await run(rig, "refund");
+    expect(result.code).toBe(EXIT.preflight);
+    expect(result.stdout).toMatch(/FAIL\s+buyer ETH\s+.*fund it first/);
+    expect(result.stdout).toContain("--refund did nothing because a check it needs failed");
+  });
+
+  it("--resume reserves only the refund once a lock is on record, and the whole need before one is", async () => {
+    const withLock = await makeRig({ chain: { gasPriceWei: 1_000_000n } });
+    fund(withLock, LEFT);
+    await writeRun(withLock, {}, true);
+    await writeBuyerRecord(withLock, true);
+    const resumed = await run(withLock, "resume");
+    expect(resumed.stdout).toMatch(/OK\s+buyer ETH\s+.*for the refund \(the approve and the lock are already sent\)/);
+    expect(resumed.stdout).not.toContain("--resume did nothing because a check it needs failed");
+    expect(withLock.chain.methods.filter((m) => WRITES.includes(m))).toEqual([]);
+
+    // The lock was attempted but nothing proves it landed: the Buyer may still have to approve and lock, so the full need stays.
+    const attempted = await makeRig({ chain: { gasPriceWei: 1_000_000n } });
+    fund(attempted, LEFT);
+    await writeRun(attempted, {}, true);
+    await writeBuyerRecord(attempted, false);
+    const refused = await run(attempted, "resume");
+    expect(refused.code).toBe(EXIT.preflight);
+    expect(refused.stdout).toMatch(/FAIL\s+buyer ETH\s+.*for approve, lock and a refund/);
+
+    // No Buyer record at all: the same.
+    const none = await makeRig({ chain: { gasPriceWei: 1_000_000n } });
+    fund(none, LEFT);
+    await writeRun(none, {}, true);
+    const nothing = await run(none, "resume");
+    expect(nothing.code).toBe(EXIT.preflight);
+    expect(nothing.stdout).toMatch(/FAIL\s+buyer ETH\s+.*for approve, lock and a refund/);
+  });
+
+  it("a fresh run (dry run and --yes) keeps the full need: the same Buyer is short", async () => {
+    for (const mode of ["dry", "yes"] as const) {
+      const rig = await makeRig({ chain: { gasPriceWei: 1_000_000n } });
+      fund(rig, LEFT);
+      const result = await run(rig, mode);
+      expect(result.code, mode).toBe(EXIT.preflight);
+      expect(result.stdout, mode).toMatch(/FAIL\s+buyer ETH\s+.*for approve, lock and a refund/);
+    }
+  });
+
+  it("buyerLockOnRecord reads the record only: a lock with evidence is true; no record, no lock, an attempt without evidence and a damaged file are false", async () => {
+    const rig = await makeRig();
+    const swapId = `0x${"11".repeat(32)}`;
+    await mkdir(rig.stateDir, { recursive: true });
+    expect(await buyerLockOnRecord(rig.stateDir, swapId)).toBe(false); // no store at all (and none is created by the look)
+    expect(await exists(join(rig.stateDir, "buyer"))).toBe(false);
+    await writeBuyerRecord(rig, false, swapId);
+    expect(await buyerLockOnRecord(rig.stateDir, swapId)).toBe(false);
+    await rm(join(rig.stateDir, "buyer"), { recursive: true });
+    await writeBuyerRecord(rig, true, swapId);
+    expect(await buyerLockOnRecord(rig.stateDir, swapId)).toBe(true);
+    expect(await buyerLockOnRecord(rig.stateDir, `0x${"22".repeat(32)}`)).toBe(false); // another swap
+    expect(await buyerLockOnRecord(rig.stateDir, "not a swap id")).toBe(false);
+    const file = join(rig.stateDir, "buyer", "flows", `buyer-${swapId}.json`);
+    await writeFile(file, "damaged");
+    expect(await buyerLockOnRecord(rig.stateDir, swapId)).toBe(false);
+  });
+
+  it("--refund does not need the Seller's key file (a refund uses none of the Seller's EVM keys): it shows a warning and goes on; --resume and the dry run still fail on it", async () => {
+    const rig = await makeRig({ skipSellerKey: true });
+    await writeRun(rig, {}, true);
+    const refund = await run(rig, "refund");
+    expect(refund.stdout).toMatch(/WARN\s+seller account\s+\(not needed for this mode\) sellerKeyFile: no such file/);
+    expect(refund.stdout).not.toContain("a check it needs failed");
+    expect(refund.code).toBe(EXIT.refused); // past the pre-flight and the account checks, it stops at the Buyer's empty store
+    expect(refund.stderr).toContain("holds no record");
+    expect(refund.stderr).not.toContain("a key file did not load");
+    for (const mode of ["resume", "dry"] as const) {
+      const result = await run(rig, mode);
+      expect(result.code, mode).toBe(EXIT.preflight);
+      expect(result.stdout, mode).toMatch(/FAIL\s+seller account\s+sellerKeyFile: no such file/);
+    }
+  });
+
+  it("--refund with a Seller key file that names ANOTHER account than the run's is still refused", async () => {
+    const rig = await makeRig();
+    await writeRun(rig, { sellerAccount: `0x${"22".repeat(20)}` }, true);
+    const refund = await run(rig, "refund");
+    expect(refund.code).toBe(EXIT.refused);
+    expect(refund.stderr).toContain("the key files now name other accounts than the ones this run started with");
+  });
+});
+
 describe("bad configs and a failing endpoint", () => {
   it("exits 2 on a config it refuses, naming the field and never echoing a pasted key", async () => {
     const key = generatePrivateKey();
@@ -504,6 +677,77 @@ describe("the runner reacts to the flows' own refusals by their text", () => {
     expect(FLOW_MESSAGE.refundUnconfirmed.test("buyer: leg A was never locked, nothing to refund")).toBe(false);
     expect(FLOW_MESSAGE.neverLocked.test("buyer: refund signed but not yet confirmed")).toBe(false);
     for (const pattern of Object.values(FLOW_MESSAGE)) expect(pattern.test("evm-htlc: connected chain id 1 does not match pin")).toBe(false);
+  });
+});
+
+// R1-FUND-07 (P9 review round 1): after a recovered lock (one with no block number on record: a lock receipt timeout, a kill between the broadcast
+// and the save) the runner skipped the finality wait and its claim loop gave up after 20 re-reads, about 100 s at the default poll, so a finalized
+// lag of 15 to 39 minutes took many manual --resume runs. The fake chain is read-only (the settle itself is tests-anvil/rehearsal-runner.anvil.test.ts,
+// "a resume whose lock record has no block number"), so the wait is pinned here through the function the runner calls, against a finalized block that
+// passes the head only after more than 20 polls.
+describe("R1-FUND-07: a lock with no block number on record is waited for, not given up on", () => {
+  const hex = (n: bigint): string => `0x${n.toString(16)}`;
+
+  function finalityWorld(options: { head: bigint; finalized: bigint; step: bigint; pollMs?: number; waitLimitMs?: number }): { world: FinalityWorld; state: { sleeps: number[]; logs: string[]; reads: number; waitedMs: number } } {
+    const pollMs = options.pollMs ?? 5_000;
+    const state = { sleeps: [] as number[], logs: [] as string[], reads: 0, waitedMs: 0 };
+    let finalized = options.finalized;
+    let t = 1_790_000_000_000;
+    const rpc = {
+      request: async ({ method, params }: { method: string; params?: readonly unknown[] }): Promise<unknown> => {
+        if (method === "eth_blockNumber") return hex(options.head);
+        if (method !== "eth_getBlockByNumber") throw new Error(`unexpected ${method}`);
+        if (params?.[0] === "latest") return { number: hex(options.head) };
+        const number = finalized; // the "finalized" tag: it moves up by `step` blocks at every look
+        finalized += options.step;
+        state.reads += 1;
+        return { number: hex(number) };
+      },
+    } as unknown as CapturingRpc;
+    const config = parseRehearsalConfig(
+      {
+        rails: { evm: { pin: BASE_SEPOLIA_PIN, endpoint: "https://sepolia.base.org", contract: CONTRACT, assets: { USDC: TOKEN }, contractCodeHash: FAKE_ESCROW_CODE_HASH } },
+        buyerKeyFile: "b.key",
+        sellerKeyFile: "s.key",
+        amount: "1000000",
+        out: "bundle",
+        pollMs,
+        ...(options.waitLimitMs === undefined ? {} : { waitLimitMs: options.waitLimitMs }),
+      },
+      "/base",
+    );
+    const env: RehearsalEnv = {
+      now: () => t,
+      sleep: async (ms) => void (state.sleeps.push(ms), (t += ms), (state.waitedMs += ms)),
+      out: () => undefined,
+      err: () => undefined,
+    };
+    return { world: { config, env, rpc, log: (line) => void state.logs.push(line), pollMs }, state };
+  }
+
+  it("waits until the finalized block passes the head when the lock has no block number: more than 20 polls, then it returns", async () => {
+    const { world, state } = finalityWorld({ head: 1_000n, finalized: 900n, step: 4n }); // 25 looks to get from 900 to 1000
+    await waitLockFinal(world, undefined);
+    expect(state.sleeps.length).toBeGreaterThan(20);
+    expect(state.sleeps.length).toBe(25);
+    expect(state.waitedMs).toBeGreaterThan(20 * 5_000); // longer than the 20 re-reads the claim loop used to give up after
+    expect(state.logs.some((line) => line.includes("has no block number on record") && line.includes("block 1000"))).toBe(true);
+  });
+
+  it("with a block number it waits for that block only (as before), and returns at once when it is already final", async () => {
+    const withBlock = finalityWorld({ head: 1_000n, finalized: 900n, step: 4n });
+    await waitLockFinal(withBlock.world, 920n);
+    expect(withBlock.state.sleeps.length).toBe(5); // 900, 904, 908, 912, 916, 920
+    expect(withBlock.state.logs.some((line) => line.includes("no block number"))).toBe(false);
+    const already = finalityWorld({ head: 1_000n, finalized: 990n, step: 1n });
+    await waitLockFinal(already.world, 950n);
+    expect(already.state.sleeps).toEqual([]);
+  });
+
+  it("is bounded by waitLimitMs like every wait: a finalized block that never passes the head ends in a refusal that names --resume", async () => {
+    const stuck = finalityWorld({ head: 1_000n, finalized: 900n, step: 0n, pollMs: 5_000, waitLimitMs: 60_000 });
+    await expect(waitLockFinal(stuck.world, undefined)).rejects.toThrow(/was not final after \d+ s \(waitLimitMs\); run --resume to keep waiting/);
+    expect(stuck.state.waitedMs).toBeGreaterThan(60_000);
   });
 });
 
@@ -729,7 +973,7 @@ describe("bin/swap-rehearsal-evm.mjs (needs a build: npm test builds first)", ()
   });
 
   it("runs the dry run end to end through the command line against the fake chain: exit 0, a table, no key, no write", async () => {
-    const rig = await makeRig();
+    const rig = await makeRig({ anvil: true });
     const result = await bin([rig.configPath, "--state-dir", rig.stateDir]);
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");

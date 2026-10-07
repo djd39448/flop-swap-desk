@@ -31,6 +31,8 @@ import { encodeFunctionData, keccak256, pad, toEventSelector, type Address, type
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { decodeFlowRecord, encodeFlowRecord } from "../src/client/flow-record.js";
+import { FileFlowStore, flowDigest, flowKey } from "../src/client/flow-store.js";
 import { ANVIL_LOCAL_PIN } from "../src/rails/evm-htlc.js";
 import { keyScanner } from "../tests/helpers/evm-local.js";
 import { deployRailContracts, startAnvil, type AnvilHandle } from "./helpers/anvil.js";
@@ -254,6 +256,77 @@ async function leakingSeeds(rig: Rig, outputs: Record<string, string>): Promise<
   return leaking;
 }
 
+/** K5 (P8 rule 5 on the runner's surface): the Seller's swap secret, read from its flow record (the one place it is stored). */
+async function sellerSecret(rig: Rig): Promise<Hex> {
+  const store = new FileFlowStore(join(rig.stateDir, "seller", "flows"));
+  const key = (await store.list()).find((candidate) => candidate.startsWith("seller:"));
+  if (key === undefined) throw new Error("test setup: the Seller has no flow record");
+  const bytes = await store.load(key);
+  if (bytes === null) throw new Error("test setup: the Seller's flow record is gone");
+  const record = decodeFlowRecord(bytes, key);
+  if (record.role !== "seller") throw new Error("test setup: not a Seller record");
+  return record.preimage as Hex;
+}
+
+/** A path under the rig's directory with `/` separators, for the allowed-place rules below. */
+function slashed(rig: Rig, file: string): string {
+  return relative(rig.dir, file).replaceAll("\\", "/");
+}
+
+/**
+ * K5: names (never contents) of every output and every file under `dirs` that holds the secret, except the files `allowed` accepts. A run that
+ * has not revealed (a stop after the lock, a refund) may hold the secret in the Seller's own flow record and nowhere else: no output line, no
+ * venue or note file, no bundle file. Also proves the scan can see the secret where it lives (`where`, the files that hold it, is returned too).
+ */
+async function secretPlaces(
+  rig: Rig,
+  secret: Hex,
+  dirs: string[],
+  outputs: Record<string, string>,
+  allowed: (relative: string) => boolean,
+): Promise<{ stray: string[]; where: string[] }> {
+  const scan = keyScanner(secret);
+  const stray: string[] = [];
+  const where: string[] = [];
+  for (const [name, text] of Object.entries(outputs)) if (scan(text)) stray.push(`output:${name}`);
+  for (const dir of dirs) {
+    for (const file of await filesUnder(dir)) {
+      if (!scan(await readFile(file, "latin1"))) continue;
+      const name = slashed(rig, file);
+      where.push(name);
+      if (!allowed(name)) stray.push(name);
+    }
+  }
+  return { stray, where };
+}
+
+/** Waits (the chain mines a block a second) until the head is at least block `number`. */
+async function headAtLeast(chain: Chain, number: bigint): Promise<void> {
+  for (;;) {
+    if (BigInt(await chain.anvil.rpcCall<Hex>("eth_blockNumber", [])) >= number) return;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+/**
+ * R1-FUND-07: what a lock receipt timeout, or a kill between the broadcast and the save, leaves behind: the Buyer's record of its lock WITHOUT the
+ * block the lock landed in (the evidence keeps its ref and no more, as `recordLockLanded` writes it). The record is rewritten through the store.
+ */
+async function dropLockBlock(rig: Rig): Promise<void> {
+  const { swapId } = await readRun(rig);
+  const store = new FileFlowStore(join(rig.stateDir, "buyer", "flows"));
+  const key = flowKey("buyer", swapId);
+  const bytes = await store.load(key);
+  if (bytes === null) throw new Error("test setup: the Buyer has no flow record");
+  const record = decodeFlowRecord(bytes, key);
+  if (record.role !== "buyer" || record.lock.evidence === undefined) throw new Error("test setup: the Buyer's record holds no lock evidence");
+  const { ref, raw } = record.lock.evidence;
+  await store.save(key, encodeFlowRecord({ ...record, lock: { ...record.lock, evidence: { ref, raw } } }), flowDigest(bytes));
+}
+
+/** The Seller's flow record is the only allowed home of the secret before a reveal. */
+const SELLER_FLOWS = /^state\/seller\/flows\/[^/]+$/;
+
 async function exists(path: string): Promise<boolean> {
   try {
     await access(path);
@@ -451,6 +524,7 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
 
   describe("--yes on a chain whose finality lags", () => {
     it("waits for the lock and for the claim to be final (8 confirmations, a block a second): settles, and says it waited", async () => {
+      await headAtLeast(main, 15n); // the finalized block (8 below the head) must be past the escrow's deploy, or the pre-flight's state read fails (F9)
       const rig = await makeRig(main, { confirmations: 8 });
       const result = await run(rig, ["--yes"]);
       expect(result.stderr).toBe("");
@@ -490,6 +564,26 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(await chainFacts(main, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 });
       await expectCleanAndReplays(rig, { ...resumed, stdout: killed.stdout + resumed.stdout, stderr: killed.stderr + resumed.stderr }, "settled");
     }, 180_000);
+
+    it("a resume whose lock record has no block number waits for the finalized block instead of giving up after 20 re-reads (R1-FUND-07)", async () => {
+      // 15 confirmations at a block a second, polled every 250 ms: the lock reads final about 15 s after it landed, and the claim loop's 20 re-reads
+      // used to last 5 s, so a runner that skipped the wait exited 4 ("before verifyLockFinal(A) is true") here.
+      await headAtLeast(main, 25n); // the finalized block (15 below the head) must be past the escrow's deploy, or the pre-flight's state read fails (F9)
+      const rig = await makeRig(main, { confirmations: 15 });
+      const first = startRunner(rig, ["--yes"]);
+      await first.waitForLine(/step buyer\.lockLegA done/);
+      first.kill();
+      const killed = await first.done;
+      expect(killed.code).not.toBe(0);
+      await dropLockBlock(rig);
+      const resumed = await run(rig, ["--resume"]);
+      expect(resumed.stderr).toBe("");
+      expect(resumed.code).toBe(0);
+      expect(resumed.stdout).toContain("the lock of leg A has no block number on record");
+      expect(resumed.stdout).toContain("audit: the bundle replays offline to settled");
+      expect(await chainFacts(main, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 });
+      await expectCleanAndReplays(rig, { ...resumed, stdout: killed.stdout + resumed.stdout, stderr: killed.stderr + resumed.stderr }, "settled");
+    }, 240_000);
 
     it("--resume with nothing to resume (a state directory with no run) is refused with exit 4", async () => {
       const rig = await makeRig(main);
@@ -537,6 +631,14 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(early.stdout).toContain("leg A is refundable from");
       expect((await chainFacts(warp, rig)).refunded).toBe(0);
 
+      // K5: nothing has been revealed (the Seller never claimed), so the Seller's secret is in its own flow record and nowhere else: not in any output
+      // of the three runs so far, not in the venue or note files, not in any other record. (The control: the scan does see it in the Seller's record.)
+      const secret = await sellerSecret(rig);
+      const before = await secretPlaces(rig, secret, [rig.stateDir], { lockedOut: locked.stdout, lockedErr: locked.stderr, resumedOut: resumed.stdout, resumedErr: resumed.stderr, earlyOut: early.stdout, earlyErr: early.stderr }, (name) => SELLER_FLOWS.test(name));
+      expect(before.stray).toEqual([]);
+      expect(before.where.length).toBeGreaterThan(0);
+      expect(before.where.every((name) => SELLER_FLOWS.test(name))).toBe(true);
+
       const { deadlines } = await readRun(rig);
       await warpTo(deadlines.legB.refundAfterMs + 60_000);
       const refunded = await run(rig, ["--refund"]);
@@ -546,6 +648,10 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(refunded.stdout).toContain("step seller.refundLegB done");
       expect(refunded.stdout).toContain("audit: the bundle replays offline to refunded");
       expect(await chainFacts(warp, rig)).toEqual({ locked: 1, claimed: 0, refunded: 1, buyerTxs: 3, sellerTxs: 0 }); // approve, lock, refund
+      // K5, after the refund: still only the Seller's record holds it, and the bundle (which replays to refunded) and every output are clean.
+      const after = await secretPlaces(rig, secret, [rig.stateDir, rig.outDir], { lockedOut: locked.stdout, lockedErr: locked.stderr, earlyOut: early.stdout, refundedOut: refunded.stdout, refundedErr: refunded.stderr }, (name) => SELLER_FLOWS.test(name));
+      expect(after.stray).toEqual([]);
+      expect(after.where.length).toBeGreaterThan(0);
       expect(await tokenBalance(warp, rig.buyer)).toBe(100_000_000n); // the 1 USDC came back
       expect(await tokenBalance(warp, rig.seller)).toBe(0n);
       await expectCleanAndReplays(rig, { ...refunded, stdout: locked.stdout + early.stdout + refunded.stdout, stderr: locked.stderr + early.stderr + refunded.stderr }, "refunded");
@@ -560,7 +666,27 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(await chainFacts(warp, rig)).toEqual({ locked: 1, claimed: 0, refunded: 1, buyerTxs: 3, sellerTxs: 0 });
     }, 240_000);
 
+    it("a refund runs without the Seller's key file (it uses none of the Seller's EVM keys): shown as a warning, refunded, one lock, the bundle replays (R1-FUND-01 with F2)", async () => {
+      const rig = await makeRig(warp, { clock: "chain" });
+      const locked = await run(rig, ["--yes", "--stop-after", "lock"]);
+      expect(locked.code).toBe(0);
+      await rm(join(rig.keysDir, "seller.key")); // the Seller's key file is gone (or never reachable from this machine any more)
+      const { deadlines } = await readRun(rig);
+      await warpTo(deadlines.legB.refundAfterMs + 60_000);
+      const refunded = await run(rig, ["--refund"]);
+      expect(refunded.stderr).toBe("");
+      expect(refunded.code).toBe(0);
+      expect(refunded.stdout).toMatch(/WARN\s+seller account\s+\(not needed for this mode\) sellerKeyFile: no such file/);
+      expect(refunded.stdout).toContain("step buyer.refundLegA done");
+      expect(refunded.stdout).toContain("step seller.refundLegB done");
+      expect(refunded.stdout).toContain("audit: the bundle replays offline to refunded");
+      expect(await chainFacts(warp, rig)).toEqual({ locked: 1, claimed: 0, refunded: 1, buyerTxs: 3, sellerTxs: 0 }); // the Seller sent nothing
+      expect(await tokenBalance(warp, rig.buyer)).toBe(100_000_000n);
+      await expectCleanAndReplays(rig, { ...refunded, stdout: locked.stdout + refunded.stdout, stderr: locked.stderr + refunded.stderr }, "refunded");
+    }, 240_000);
+
     it("a refund that is not final yet is waited for (8 confirmations): the run says so and ends refunded", async () => {
+      await headAtLeast(warp, 15n); // the finalized block (8 below the head) must be past the escrow's deploy, or the pre-flight's state read fails (F9)
       const rig = await makeRig(warp, { clock: "chain", confirmations: 8 });
       const locked = await run(rig, ["--yes", "--stop-after", "lock"]);
       expect(locked.code).toBe(0);
@@ -572,6 +698,8 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(refunded.stdout).toContain("the refund of leg A is not final yet; waiting for the finalized block to pass the current head");
       expect(refunded.stdout).toContain("audit: the bundle replays offline to refunded");
       expect(await chainFacts(warp, rig)).toEqual({ locked: 1, claimed: 0, refunded: 1, buyerTxs: 3, sellerTxs: 0 });
+      const waited = await secretPlaces(rig, await sellerSecret(rig), [rig.stateDir, rig.outDir], { lockedOut: locked.stdout, lockedErr: locked.stderr, refundedOut: refunded.stdout, refundedErr: refunded.stderr }, (name) => SELLER_FLOWS.test(name)); // K5
+      expect(waited.stray).toEqual([]);
       await expectCleanAndReplays(rig, { ...refunded, stdout: locked.stdout + refunded.stdout, stderr: locked.stderr + refunded.stderr }, "refunded");
     }, 240_000);
 
@@ -592,6 +720,8 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(refunded.stdout).toContain("leg A was never locked");
       expect(refunded.stdout).toContain("audit: the bundle replays offline to refunded-b");
       expect((await chainFacts(warp, rig)).locked).toBe(0);
+      const neverLocked = await secretPlaces(rig, await sellerSecret(rig), [rig.stateDir, rig.outDir], { killedOut: killed.stdout, killedErr: killed.stderr, refundedOut: refunded.stdout, refundedErr: refunded.stderr }, (name) => SELLER_FLOWS.test(name)); // K5
+      expect(neverLocked.stray).toEqual([]);
       await expectCleanAndReplays(rig, { ...refunded, stdout: killed.stdout + refunded.stdout, stderr: killed.stderr + refunded.stderr }, "refunded-b");
     }, 240_000);
   });

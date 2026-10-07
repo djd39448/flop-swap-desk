@@ -34,6 +34,11 @@ export interface FakeChainOptions {
   pending?: "ok" | "bare" | "error" | "null";
   /** Reading `locks()` at the finalized block's hash answers an error (a pruned node). */
   noStateAtFinalized?: boolean;
+  /** What reading `locks()` at a block selected by hash answers INSTEAD of seven zero words: `"0x"` is what a node says for a block where the contract
+   *  is not there yet (a deploy younger than the finalized lag); a short hex string is an answer that is no ABI row. */
+  stateAtFinalizedAnswer?: string;
+  /** Seconds between two blocks, as the timestamps of the blocks read by number show it (the head and the finalized tag keep their own). Default 2 (Base Sepolia). */
+  blockTimeSec?: number;
   /** `eth_getLogs` refuses a range of more than this many blocks, both ends counted; null: no cap. Default 500. */
   logCap?: number | null;
   /** The gas price in wei. Default 1,000,000 (0.001 gwei). */
@@ -91,7 +96,7 @@ export function fakeChain(options: FakeChainOptions = {}): FakeChain {
     }
     if (typeof tag === "string" && /^0x[0-9a-fA-F]+$/.test(tag)) {
       const number = BigInt(tag);
-      return { result: block(number, headTs - Number(head - number) * 2) };
+      return { result: block(number, headTs - Number(head - number) * (options.blockTimeSec ?? 2)) };
     }
     return { error: { code: -32602, message: "bad block tag" } };
   };
@@ -148,6 +153,9 @@ export function fakeChain(options: FakeChainOptions = {}): FakeChain {
           const selector2 = params[1] as { blockHash?: string } | string | undefined;
           if (typeof selector2 === "object" && selector2 !== null && options.noStateAtFinalized === true) {
             return { error: { code: -32000, message: "missing trie node" } };
+          }
+          if (typeof selector2 === "object" && selector2 !== null && options.stateAtFinalizedAnswer !== undefined) {
+            return { result: options.stateAtFinalizedAnswer };
           }
           return { result: `0x${"00".repeat(32 * 7)}` };
         }

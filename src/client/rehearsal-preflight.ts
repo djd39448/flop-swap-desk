@@ -17,10 +17,15 @@
 //   state at finalized  `locks(hashLock)` can be read at the finalized block by its hash (EIP-1898), which the evidence reader needs
 //   log range      the endpoint's `eth_getLogs` cap against the config's `maxLogRange` (one probe of that many blocks must be
 //                  accepted and one of one more refused, or what the endpoint does is reported)
+//   log scan reach (a new swap, when maxLogRange is set) MAX_LOG_SCAN_CHUNKS calls of maxLogRange blocks must reach as far as leg A's window is
+//                  long (lock to refund time at the block time measured from the last 100 blocks, plus the 256-block marker margin), or a
+//                  claim that lands late could not be found by the Buyer's scan (F1)
 //   clock          the local clock against the chain's head
-//   buyer / seller the addresses (never a key), ETH against the gas the swap needs (generous per-call ceilings times twice the
-//                  node's gas price), the Buyer's token balance and allowance against the amount
-//   deadlines      SPEC 3.5 rules 1 to 3 and the claim margin, with the rail's own policy and the real numbers
+//   buyer / seller the addresses (never a key), ETH against the gas still to be sent (generous per-call ceilings times twice the
+//                  node's gas price; the Buyer's row is sized by what is left to send, R1-FUND-01; Base's L1 data fee is not counted),
+//                  the Buyer's token balance and allowance against the amount
+//   deadlines      SPEC 3.5 rules 1 to 3 and the claim margin, with the rail's own policy and the real numbers; on Base Sepolia, while the
+//                  rail still runs under the anvil policy, a new swap is refused (F3, interim until P9-4)
 //
 // Output is addresses, amounts, hashes of public code and block numbers. It never contains a key, and the endpoint appears as its
 // host only; any transport error text goes through the caller's `redact` first (a transport's own error names its URL).
@@ -31,10 +36,11 @@ import type { OfferFrame } from "@flop-labs/tclk";
 import { checkSwapDeadlines } from "../deadlines.js";
 import { EVM_HASH_RAIL_ABI } from "../vendor/evm-hash-rail.js";
 import { describeCodeProblem, judgeRuntimeCode } from "../rails/evm-code-pin.js";
-import { effectiveMaxLogRange } from "../rails/evm-htlc.js";
+import { BASE_SEPOLIA_PIN, effectiveMaxLogRange, EVM_MIN_LOG_RANGE, evmLogScanCoverage, MAX_LOG_SCAN_CHUNKS } from "../rails/evm-htlc.js";
 import type { CapturingRpc } from "../rails/rpc-capture.js";
 import { endpointHost, type RehearsalConfig, type RunDeadlines } from "./rehearsal-config.js";
-import type { RailLocalPolicy } from "./policy.js";
+import { EVM_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
+import { CLAIM_MARKER_REORG_MARGIN_EVM } from "./seller.js";
 
 export type RowStatus = "ok" | "fail" | "warn" | "info";
 
@@ -62,6 +68,9 @@ export const GAS_CEILING = Object.freeze({ approve: 120_000n, lock: 400_000n, cl
 /** The gas price the balance rows reserve against is the node's `eth_gasPrice` times this (a price can rise during a swap). */
 export const GAS_PRICE_CUSHION = 2n;
 
+/** Said in every ETH row: Base (an OP-stack chain) charges each transaction a layer-1 data fee on top of its gas, and no need here counts it (its allowance is P9-4's). */
+const L1_FEE_NOTE = "Base's L1 data fee is not included";
+
 /** What a lock needs from the run's start to read final besides the chain's own lag: approve and lock transactions, their receipts and the first polls. */
 export const LOCK_SETTLE_ALLOWANCE_MS = 10 * 60_000;
 
@@ -88,7 +97,16 @@ export interface PreflightInput {
   redact: (text: string) => string;
   /** Rows whose failure does not stop THIS mode (a refund does not use the claim's `pending` read): a failed one is shown as a warning. */
   notNeeded?: ReadonlySet<string>;
+  /**
+   * R1-FUND-01 (P9 review round 1): what the Buyer still has to SEND, which sizes its ETH row. `"approve-lock-refund"` (the default, a fresh run): the
+   * approve, the lock and, on the refund path, the refund. `"refund"`: the approve and the lock are already spent (`--refund`, or `--resume` with a
+   * lock on record, where the refund is the Buyer's only possible remaining write), so only the refund is reserved; asking again for the gas
+   * already spent could refuse an honest refund that the Buyer can pay.
+   */
+  buyerSends?: BuyerSends;
 }
+
+export type BuyerSends = "approve-lock-refund" | "refund";
 
 interface Block {
   number: bigint;
@@ -276,7 +294,15 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     const data = encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", args: [`0x${"00".repeat(32)}` as Hex] });
     const answer = await read("eth_call", [{ to: evm.contract, data }, { blockHash: finalized.hash }]);
     if (!answer.ok) add("state at finalized", "fail", `locks() at the finalized block by its hash failed (${answer.why}); the evidence reader needs exactly this read`);
-    else if (typeof answer.value !== "string" || !/^0x[0-9a-fA-F]*$/.test(answer.value) || answer.value.length < 66) {
+    else if (answer.value === "0x") {
+      // F9 (P9 review round 1): a node answers 0x (no data) for an eth_call at a block where the contract does not exist yet. That is the likely case
+      // within the finalized lag of a deploy (about 40 minutes on Base Sepolia), and "not an ABI-encoded row" would send a person looking in the wrong place.
+      add(
+        "state at finalized",
+        "fail",
+        `locks() at the finalized block ${finalized.number} answered 0x (no data): the escrow's code or state is not final yet at that block (a contract deployed within the finalized lag, ${lagMs === undefined ? "unknown here" : minutes(lagMs)}, is not there yet); wait that long after the deploy and run the dry run again`,
+      );
+    } else if (typeof answer.value !== "string" || !/^0x[0-9a-fA-F]*$/.test(answer.value) || answer.value.length < 66) {
       add("state at finalized", "fail", "locks() at the finalized block answered something that is not an ABI-encoded row");
     } else add("state at finalized", "ok", `locks() reads at finalized block ${finalized.number} by its hash (EIP-1898)`);
   }
@@ -301,11 +327,49 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
       const within = await logs(tip - BigInt(limit) + 1n); // exactly `limit` blocks, both ends counted
       const over = await logs(tip - BigInt(limit)); // `limit + 1` blocks
       if (!within.ok) {
-        add("log range", "fail", `the endpoint refused a scan of ${limit} blocks (${within.why}); maxLogRange ${limit} is too wide for it, so no log scan would work`);
+        add(
+          "log range",
+          "fail",
+          `the endpoint refused a scan of ${limit} blocks (${within.why}); maxLogRange ${limit} is too wide for it, so no log scan would work; lower it, but not below ${EVM_MIN_LOG_RANGE} (the resumed Seller's ${CLAIM_MARKER_REORG_MARGIN_EVM}-block marker margin must fit one call), so an endpoint that caps eth_getLogs lower cannot run this swap`,
+        );
       } else if (!over.ok) {
         add("log range", "ok", `maxLogRange ${limit}: the endpoint accepted ${limit} blocks and refused ${limit + 1} (${over.why})`);
       } else {
         add("log range", "warn", `maxLogRange ${limit}: the endpoint accepted ${limit} blocks and also ${limit + 1}; its cap is looser than the config's value (the scans are safe, with more calls than needed)`);
+      }
+    }
+  }
+
+  // -- the log scans' reach (F1 with R1-FUND-03, P9 review round 1) ----------------------------------------------------------------------------
+  // A claim can land at any time between leg A's lock and its refund time, and the Buyer's scan for it starts at its lock marker (the Seller's, 256
+  // blocks below its claim attempt) and reads OLDEST range first, at most MAX_LOG_SCAN_CHUNKS calls of maxLogRange blocks. A scan that cannot reach
+  // as far as a claim can land would leave the Buyer unable to learn the secret, so the window in blocks (leg A's refund time less its lock time, at
+  // the block time measured from the last 100 blocks, plus the marker margin) must fit in what one scan reads. A fresh run only: a resume or a
+  // refund has no new window.
+  const reach = evmLogScanCoverage(evm);
+  if (input.fresh && input.deadlines !== undefined && reach !== undefined) {
+    const windowMs = Math.max(0, input.deadlines.absolute.legA.refundAfterMs - input.deadlines.lockTimeMs);
+    if (!("block" in head)) {
+      add("log scan reach", "fail", "the head is unknown, so the block time, and with it leg A's window in blocks, cannot be measured");
+    } else {
+      const back = head.block.number >= 100n ? 100n : head.block.number;
+      const older = back === 0n ? undefined : await blockAt(`0x${(head.block.number - back).toString(16)}`);
+      if (older === undefined || "why" in older) {
+        add("log scan reach", "fail", `the block time cannot be measured (${older === undefined ? "the chain has no earlier block to measure against" : older.why}), so leg A's window in blocks is unknown`);
+      } else {
+        // Timestamps are whole seconds and a block's must be later than its parent's: a measured time under one second is a rounding artefact, not a faster chain.
+        const blockMs = Math.max(1_000, (head.block.timestampMs - older.block.timestampMs) / Number(back));
+        const needBlocks = Math.ceil(windowMs / blockMs) + CLAIM_MARKER_REORG_MARGIN_EVM;
+        const numbers = `${MAX_LOG_SCAN_CHUNKS} calls of maxLogRange ${limit ?? "?"} read ${reach} blocks above a marker (about ${minutes(reach * blockMs)}); leg A's window needs ${needBlocks} blocks (${minutes(windowMs)} from the lock to the refund time at ${(blockMs / 1000).toFixed(1)} s a block, plus ${CLAIM_MARKER_REORG_MARGIN_EVM} of marker margin)`;
+        if (needBlocks > reach) {
+          add(
+            "log scan reach",
+            "fail",
+            `${numbers}: a scan could not reach a claim that lands late in the window, and the Buyer could not learn the secret from the chain; raise maxLogRange (to at least ${Math.ceil(needBlocks / MAX_LOG_SCAN_CHUNKS)}) if the endpoint allows it, or shorten leg A's window`,
+          );
+        } else {
+          add("log scan reach", "ok", `${numbers}: it fits`);
+        }
       }
     }
   }
@@ -350,11 +414,16 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
       return;
     }
     const need = gas * price * GAS_PRICE_CUSHION;
-    if (balance < need) add(label, "fail", `${address}: ${formatEther(balance)} ETH, needs ${formatEther(need)} ETH for ${what} (${gas} gas ceiling): fund it first`);
-    else add(label, "ok", `${address}: ${formatEther(balance)} ETH, needs ${formatEther(need)} ETH for ${what} (${gas} gas ceiling)`);
+    const shown = `${address}: ${formatEther(balance)} ETH, needs ${formatEther(need)} ETH for ${what} (${gas} gas ceiling; ${L1_FEE_NOTE})`;
+    if (balance < need) add(label, "fail", `${shown}: fund it first`);
+    else add(label, "ok", shown);
   };
   if (buyerAddress !== undefined) {
-    await ethRow("buyer ETH", buyerAddress, GAS_CEILING.approve + GAS_CEILING.lock + GAS_CEILING.refund, "approve, lock and a refund");
+    if (input.buyerSends === "refund") {
+      await ethRow("buyer ETH", buyerAddress, GAS_CEILING.refund, "the refund (the approve and the lock are already sent)");
+    } else {
+      await ethRow("buyer ETH", buyerAddress, GAS_CEILING.approve + GAS_CEILING.lock + GAS_CEILING.refund, "approve, lock and a refund");
+    }
   }
   if (sellerAddress !== undefined) await ethRow("seller ETH", sellerAddress, GAS_CEILING.claim, "the claim");
 
@@ -390,6 +459,14 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     const asOffer = (leg: RunDeadlines["legA"]): OfferFrame => leg as unknown as OfferFrame; // checkSwapDeadlines reads only the three deadline fields
     const checked = checkSwapDeadlines(asOffer(absolute.legA), asOffer(absolute.legB), lockTimeMs, input.policy);
     const violations = [...checked.violations];
+    // F3 with R1-FUND-06 (P9 review round 1), an INTERIM guard until P9-4 selects BASE_SEPOLIA_POLICY by chain id: on Base Sepolia the rail still runs under
+    // the anvil policy, whose 20-minute finality budget was a median of the first samples and not a bound (the sample's maximum is 39 minutes) and whose
+    // 5-minute claim margin is below the worst case after the claim's last guard. A new swap there is refused (--refund and --resume never read this row).
+    if (evm.pin.chainId === BASE_SEPOLIA_PIN.chainId && input.policy === EVM_LOCAL_POLICY) {
+      violations.unshift(
+        "no Base Sepolia policy yet (P9-4): this chain's swaps still run under the anvil deadline policy (a 20-minute finality budget and a 5-minute claim margin that were not set from this chain's measured lag), so no new swap is started here until P9-4 replaces it; --refund and --resume of a swap already begun are not affected",
+      );
+    }
     const margin = input.policy.claimInclusionMarginMs;
     if (absolute.legA.refundAfterMs - absolute.legA.claimByMs < margin) {
       violations.push(`leg A: refundAfter - claimBy must be at least the claim-inclusion margin (${minutes(margin)}) or the Seller refuses to accept`);

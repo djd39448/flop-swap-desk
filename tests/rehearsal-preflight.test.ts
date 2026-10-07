@@ -31,7 +31,8 @@ import {
   type PreflightRow,
   type RowStatus,
 } from "../src/client/rehearsal-preflight.js";
-import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
+import { CLAIM_MARKER_REORG_MARGIN_EVM } from "../src/client/seller.js";
+import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN, MAX_LOG_SCAN_CHUNKS } from "../src/rails/evm-htlc.js";
 import { fakeChain, FAKE_ESCROW_CODE_HASH, type FakeChainOptions } from "./helpers/fake-chain.js";
 import { scriptedRpc } from "./helpers/scripted-rpc.js";
 
@@ -39,6 +40,12 @@ const CONTRACT = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 const HEAD_SEC = 1_790_000_000;
 const NOW_MS = HEAD_SEC * 1000 + 2_000;
+/**
+ * F3 (P9 review round 1): the pre-flight refuses a NEW swap on Base Sepolia while the rail's policy is `EVM_LOCAL_POLICY` itself (the interim guard,
+ * until P9-4 selects BASE_SEPOLIA_POLICY by chain id). The rows under test here are the ordinary ones, so they run under an equal copy of the anvil
+ * policy: another object, which is what P9-4's own policy will be.
+ */
+const STAND_IN_POLICY = Object.freeze({ ...EVM_LOCAL_POLICY });
 const buyerAddress = privateKeyToAccount(generatePrivateKey()).address;
 const sellerAddress = privateKeyToAccount(generatePrivateKey()).address;
 
@@ -84,7 +91,7 @@ async function preflight(
     nowMs: NOW_MS,
     fresh: true,
     deadlines: { absolute, lockTimeMs: NOW_MS + LOCK_ESTIMATE_MS },
-    policy: EVM_LOCAL_POLICY,
+    policy: STAND_IN_POLICY,
     redact: (text) => text.split("sepolia.base.org/secretpath").join("<rpc endpoint>"),
     ...overrides,
   });
@@ -356,16 +363,229 @@ describe("the accounts", () => {
     expect(status(run, "buyer token")).toBe("ok");
   });
 
-  it("fails when both parties are the same account, and when a key file did not load (with the loader's own text, no key)", async () => {
+  it("fails when both parties are the same account, and when a key file did not load (the field and the problem, no path, no key)", async () => {
     const same = await preflight({}, config(), { seller: { address: buyerAddress } });
     expect(status(same, "accounts")).toBe("fail");
     expect(row(same, "accounts").detail).toContain("the same account");
-    const problem = "evm key file /k/buyer.key: no such file";
+    const problem = "buyerKeyFile: no such file";
     const run = await preflight({}, config(), { buyer: { problem } });
     expect(status(run, "buyer account")).toBe("fail");
     expect(row(run, "buyer account").detail).toBe(problem);
     expect(run.report.rows.some((r) => r.check === "buyer ETH")).toBe(false);
     expect(run.report.ok).toBe(false);
+  });
+});
+
+// R1-FUND-01 with F2 (P9 review round 1): the Buyer's ETH row always asked for approve + lock + refund, so after the approve and the lock were
+// spent (about 258,000 gas) a Buyer who could pay the refund 2.9 times over was told "fund it first": --refund exited 3 (the refund was not sent)
+// and --resume exited 3 (the delay could cost a settle). The row is now sized by what is left to send.
+describe("the Buyer's ETH row is sized by what is left to send (R1-FUND-01)", () => {
+  const price = 1_000_000n;
+  const freshNeed = (GAS_CEILING.approve + GAS_CEILING.lock + GAS_CEILING.refund) * price * GAS_PRICE_CUSHION; // 1.44e12 at this price
+  const refundNeed = GAS_CEILING.refund * price * GAS_PRICE_CUSHION; // 4e11
+  const spent = (44_000n + 214_000n) * price; // what the approve and the lock really cost (258,000 gas)
+  const left = freshNeed - spent; // 1.182e12: the dry run's need minus what the approve and the lock spent
+  const funded = (wei: bigint): FakeChainOptions => ({ gasPriceWei: price, ethBalances: { [buyerAddress.toLowerCase()]: wei, [sellerAddress.toLowerCase()]: 10n ** 18n } });
+
+  it("a Buyer left with the dry run's need minus the approve and the lock passes a refund or a resume with a lock (it failed 'fund it first' before)", async () => {
+    expect(left).toBe(1_182_000_000_000n);
+    expect(left * 10n).toBeGreaterThan(29n * refundNeed); // 2.9 times what the refund can cost
+    // The old sizing, which a fresh run still has: the same Buyer is short.
+    const asFresh = await preflight(funded(left), config(), { fresh: false });
+    expect(status(asFresh, "buyer ETH")).toBe("fail");
+    expect(row(asFresh, "buyer ETH").detail).toContain("approve, lock and a refund");
+    expect(asFresh.report.ok).toBe(false);
+    // Refund and resume with a lock on record: only the refund is reserved.
+    const refund = await preflight(funded(left), config(), { fresh: false, buyerSends: "refund", notNeeded: new Set(["pending", "log range", "seller ETH", "seller account"]) });
+    expect(status(refund, "buyer ETH")).toBe("ok");
+    expect(row(refund, "buyer ETH").detail).toContain("for the refund (the approve and the lock are already sent)");
+    expect(row(refund, "buyer ETH").detail).toContain(`${GAS_CEILING.refund} gas ceiling`);
+    expect(refund.report.ok).toBe(true);
+    const resume = await preflight(funded(left), config(), { fresh: false, buyerSends: "refund" });
+    expect(status(resume, "buyer ETH")).toBe("ok");
+    expect(resume.report.ok).toBe(true);
+  });
+
+  it("the refund-only need is exact: one wei short fails, the need itself passes; and a rising gas price still trips it", async () => {
+    const exact = await preflight(funded(refundNeed), config(), { fresh: false, buyerSends: "refund" });
+    expect(status(exact, "buyer ETH")).toBe("ok");
+    const short = await preflight(funded(refundNeed - 1n), config(), { fresh: false, buyerSends: "refund" });
+    expect(status(short, "buyer ETH")).toBe("fail");
+    expect(row(short, "buyer ETH").detail).toContain("fund it first");
+    expect(row(short, "buyer ETH").detail).toContain(buyerAddress);
+    const spike = await preflight({ ...funded(left), gasPriceWei: 10_000_000_000n }, config(), { fresh: false, buyerSends: "refund" }); // 10 gwei
+    expect(status(spike, "buyer ETH")).toBe("fail");
+  });
+
+  it("a fresh run keeps the full need (approve, lock and refund) and says what it is for", async () => {
+    const need = (GAS_CEILING.approve + GAS_CEILING.lock + GAS_CEILING.refund) * price * GAS_PRICE_CUSHION;
+    const exact = await preflight(funded(need));
+    expect(status(exact, "buyer ETH")).toBe("ok");
+    expect(row(exact, "buyer ETH").detail).toContain("approve, lock and a refund");
+    expect(status(await preflight(funded(need - 1n)), "buyer ETH")).toBe("fail");
+  });
+
+  it("every ETH row says Base's L1 data fee is not included (its allowance is P9-4's)", async () => {
+    const ok = await preflight(funded(10n ** 18n));
+    for (const check of ["buyer ETH", "seller ETH"]) expect(row(ok, check).detail, check).toContain("Base's L1 data fee is not included");
+    const short = await preflight(funded(1n));
+    expect(status(short, "buyer ETH")).toBe("fail");
+    expect(row(short, "buyer ETH").detail).toContain("Base's L1 data fee is not included");
+    expect(row(short, "seller ETH").detail).toContain("Base's L1 data fee is not included");
+  });
+
+  it("a Seller account that did not load does not stop a refund (it is shown as a warning), and still fails any mode that needs it", async () => {
+    const problem = "sellerKeyFile: no such file";
+    const refundNotNeeded = new Set(["pending", "log range", "seller ETH", "seller account"]);
+    const refund = await preflight({}, config(), { fresh: false, buyerSends: "refund", seller: { problem }, notNeeded: refundNotNeeded });
+    expect(status(refund, "seller account")).toBe("warn");
+    expect(row(refund, "seller account").detail).toBe(`(not needed for this mode) ${problem}`);
+    expect(refund.report.ok).toBe(true);
+    const resume = await preflight({}, config(), { fresh: false, buyerSends: "refund", seller: { problem } });
+    expect(status(resume, "seller account")).toBe("fail");
+    expect(resume.report.ok).toBe(false);
+  });
+});
+
+// F3 with R1-FUND-06 (P9 review round 1): until P9-4 selects BASE_SEPOLIA_POLICY by chain id, Base Sepolia runs under the anvil policy, whose 20-minute
+// finality budget was a median and not a bound (the sample's maximum lag is 39 minutes) and whose 5-minute claim margin is below the worst case
+// after the claim's last guard. The deadlines row of a new swap on that chain says so and fails; a refund and a resume never read the row.
+describe("the interim Base Sepolia guard (F3)", () => {
+  it("fails the deadlines row on chain 84532 while the rail's policy is the anvil policy itself, with the known-good deadlines, and says P9-4", async () => {
+    const run = await preflight({}, config(), { policy: EVM_LOCAL_POLICY });
+    expect(status(run, "deadlines")).toBe("fail");
+    expect(row(run, "deadlines").detail).toContain("no Base Sepolia policy yet (P9-4)");
+    expect(row(run, "deadlines").detail).toContain("--refund and --resume of a swap already begun are not affected");
+    expect(run.report.ok).toBe(false);
+  });
+
+  it("keeps the other deadline violations beside it, and does not touch the anvil chain or a policy that is not the anvil policy", async () => {
+    const tooShort: DeadlineMinutes = { legA: { claimByMin: 30, refundAfterMin: 40, expiresMin: 20 }, legB: { claimByMin: 120, refundAfterMin: 180, expiresMin: 40 } };
+    const both = await preflight({}, config(), { policy: EVM_LOCAL_POLICY }, tooShort);
+    expect(row(both, "deadlines").detail).toContain("no Base Sepolia policy yet (P9-4)");
+    expect(row(both, "deadlines").detail).toContain("rule 1");
+    const anvil = config({ contractCodeHash: undefined }, {}, ANVIL_LOCAL_PIN);
+    expect(status(await preflight({ chainId: 31337 }, anvil, { policy: EVM_LOCAL_POLICY }), "deadlines")).toBe("ok");
+    expect(status(await preflight({}, config(), { policy: STAND_IN_POLICY }), "deadlines")).toBe("ok");
+  });
+
+  it("never blocks a refund or a resume: with fresh = false there is no deadlines row to fail, whatever the policy", async () => {
+    for (const buyerSends of ["refund", "approve-lock-refund"] as const) {
+      const run = await preflight({}, config(), { fresh: false, buyerSends, policy: EVM_LOCAL_POLICY });
+      expect(run.report.rows.map((r) => r.check)).not.toContain("deadlines");
+      expect(run.report.ok).toBe(true);
+    }
+  });
+});
+
+// F9 (P9 review round 1): a node answers 0x for an eth_call at a block where the contract does not exist yet, which is the likely case within the
+// finalized lag of a deploy. The row used to say "not an ABI-encoded row" (and mutant M26, which relaxed the length check, survived the whole suite).
+describe("the state read at the finalized block (F9)", () => {
+  it("fails with 'not final yet' wording when the node answers 0x, which is what a deploy younger than the finalized lag reads as", async () => {
+    const run = await preflight({ stateAtFinalizedAnswer: "0x" });
+    expect(status(run, "state at finalized")).toBe("fail");
+    const detail = row(run, "state at finalized").detail;
+    expect(detail).toContain("answered 0x (no data)");
+    expect(detail).toContain("the escrow's code or state is not final yet at that block");
+    expect(detail).toContain("20.0 min"); // the finalized lag of the fake chain: how long to wait after the deploy
+    expect(detail).not.toContain("not an ABI-encoded row");
+    expect(run.report.ok).toBe(false);
+  });
+
+  it("fails an answer that is hex but no ABI row (shorter than one row), and a non-hex answer, as 'not an ABI-encoded row'; a full row is ok", async () => {
+    for (const answer of ["0x00", `0x${"00".repeat(31)}`, "0xzz", "nonsense"]) {
+      const run = await preflight({ stateAtFinalizedAnswer: answer });
+      expect(status(run, "state at finalized"), answer).toBe("fail");
+      expect(row(run, "state at finalized").detail, answer).toContain("not an ABI-encoded row");
+    }
+    expect(status(await preflight({ stateAtFinalizedAnswer: `0x${"00".repeat(32)}` }), "state at finalized")).toBe("ok"); // 66 characters is the shortest row accepted
+    expect(status(await preflight(), "state at finalized")).toBe("ok");
+  });
+});
+
+// F1 runner part (P9 review round 1): the claim-log scan reads OLDEST range first from its marker, at most MAX_LOG_SCAN_CHUNKS calls of maxLogRange blocks.
+// A claim can land at any time between leg A's lock and its refund time, so those calls must reach as far as the window is long (at the block time
+// measured from the last blocks, plus the 256-block marker margin), or the Buyer could not learn the secret from the chain.
+describe("the log scans' reach covers leg A's window (F1)", () => {
+  const lockTimeMs = NOW_MS + LOCK_ESTIMATE_MS;
+  /** Leg A's window as `hours` hours (plus `extraMs`) from the lock to the refund time, the rest of the set as the known-good one. */
+  const window = (hours: number, extraMs = 0): NonNullable<PreflightInput["deadlines"]> => {
+    const absolute = absoluteDeadlines(KNOWN_GOOD_DEADLINES, NOW_MS);
+    const refundAfterMs = lockTimeMs + hours * 3_600_000 + extraMs;
+    return { absolute: { ...absolute, legA: { ...absolute.legA, refundAfterMs } }, lockTimeMs };
+  };
+
+  it("fails a cap of 300 against a 26-hour window at 2-second blocks, printing both numbers; the same window passes at the default 500", async () => {
+    const low = await preflight({ logCap: 300 }, config({ maxLogRange: 300 }), { deadlines: window(26) });
+    expect(status(low, "log scan reach")).toBe("fail");
+    const detail = row(low, "log scan reach").detail;
+    const need = 26 * 1800 + CLAIM_MARKER_REORG_MARGIN_EVM; // 46,800 blocks of 2 s, plus the margin
+    expect(detail).toContain(`${MAX_LOG_SCAN_CHUNKS} calls of maxLogRange 300 read 30000 blocks`);
+    expect(detail).toContain(`needs ${need} blocks`);
+    expect(detail).toContain("1560.0 min from the lock to the refund time");
+    expect(detail).toContain("2.0 s a block");
+    expect(detail).toContain(`raise maxLogRange (to at least ${Math.ceil(need / MAX_LOG_SCAN_CHUNKS)})`);
+    expect(low.report.ok).toBe(false);
+    const wide = await preflight({}, config(), { deadlines: window(26) });
+    expect(status(wide, "log scan reach")).toBe("ok");
+    expect(row(wide, "log scan reach").detail).toContain(`needs ${need} blocks`);
+    expect(row(wide, "log scan reach").detail).toContain("read 50000 blocks");
+  });
+
+  it("passes the known-good set at 500, and is exact at the boundary: a window of reach minus the margin passes, one block more fails", async () => {
+    const known = await preflight();
+    expect(status(known, "log scan reach")).toBe("ok");
+    expect(row(known, "log scan reach").detail).toContain("it fits");
+    // At 500 the reach is 50,000 blocks: 49,744 blocks of window and 256 of margin, 99,488 s at 2 s a block.
+    const edge = await preflight({}, config(), { deadlines: window(0, 99_488_000) });
+    expect(status(edge, "log scan reach")).toBe("ok");
+    const over = await preflight({}, config(), { deadlines: window(0, 99_488_000 + 2_000) }); // one more block
+    expect(status(over, "log scan reach")).toBe("fail");
+    expect(row(over, "log scan reach").detail).toContain("needs 50001 blocks");
+  });
+
+  it("measures the block time from the chain (12-second blocks make the same window short), never below one second a block", async () => {
+    const slow = await preflight({ logCap: 300, blockTimeSec: 12 }, config({ maxLogRange: 300 }), { deadlines: window(26) });
+    expect(status(slow, "log scan reach")).toBe("ok");
+    expect(row(slow, "log scan reach").detail).toContain("12.0 s a block");
+    expect(row(slow, "log scan reach").detail).toContain(`needs ${26 * 300 + CLAIM_MARKER_REORG_MARGIN_EVM} blocks`);
+    // A measured time under a second is a rounding artefact (timestamps are whole seconds): it is taken as one second a block, never less.
+    const quick = await preflight({ blockTimeSec: 0 }, config(), { deadlines: window(1) });
+    expect(row(quick, "log scan reach").detail).toContain("1.0 s a block");
+  });
+
+  it("fails closed when the block time cannot be measured, and is silent where one call reads any range (no maxLogRange: anvil)", async () => {
+    const chain = fakeChain({ headTimestampSec: HEAD_SEC, tokenBalances: { [buyerAddress.toLowerCase()]: 100_000_000n } });
+    const handlers = {
+      ...chain.handlers,
+      eth_getBlockByNumber: (params: readonly unknown[]) => (/^0x/.test(String(params[0])) ? { error: { code: -32000, message: "no history" } } : chain.handlers.eth_getBlockByNumber!(params)),
+    };
+    const { rpc } = scriptedRpc(handlers);
+    const report = await runPreflight({
+      config: config(),
+      rpc,
+      buyer: { address: buyerAddress },
+      seller: { address: sellerAddress },
+      nowMs: NOW_MS,
+      fresh: true,
+      deadlines: { absolute: absoluteDeadlines(KNOWN_GOOD_DEADLINES, NOW_MS), lockTimeMs },
+      policy: STAND_IN_POLICY,
+      redact: (t) => t,
+    });
+    const unmeasured = report.rows.find((r) => r.check === "log scan reach");
+    expect(unmeasured?.status).toBe("fail");
+    expect(unmeasured?.detail).toContain("the block time cannot be measured");
+    expect(report.ok).toBe(false);
+    const anvil = config({ contractCodeHash: undefined }, {}, ANVIL_LOCAL_PIN);
+    const unlimited = await preflight({ chainId: 31337, logCap: null }, anvil);
+    expect(unlimited.report.rows.map((r) => r.check)).not.toContain("log scan reach");
+  });
+
+  it("says in the log range row that maxLogRange cannot go below the 257-block floor when the endpoint refuses even the configured range", async () => {
+    const run = await preflight({ logCap: 100 });
+    expect(status(run, "log range")).toBe("fail");
+    expect(row(run, "log range").detail).toContain("lower it, but not below 257");
+    expect(row(run, "log range").detail).toContain(`${CLAIM_MARKER_REORG_MARGIN_EVM}-block marker margin`);
   });
 });
 
@@ -399,7 +619,7 @@ describe("a resume or a refund (fresh = false)", () => {
   it("leaves out the rows that belong to a new swap (deadlines, token, finality budget) and keeps the chain rows", async () => {
     const run = await preflight({}, config(), { fresh: false });
     const checks = run.report.rows.map((r) => r.check);
-    for (const gone of ["deadlines", "buyer token", "buyer allowance", "finality budget"]) expect(checks).not.toContain(gone);
+    for (const gone of ["deadlines", "buyer token", "buyer allowance", "finality budget", "log scan reach"]) expect(checks).not.toContain(gone);
     for (const kept of ["chain id", "escrow code", "finalized", "pending", "state at finalized", "log range", "clock", "buyer ETH", "seller ETH"]) expect(checks).toContain(kept);
     expect(run.report.ok).toBe(true);
   });
