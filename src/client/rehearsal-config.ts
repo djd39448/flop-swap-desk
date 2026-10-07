@@ -30,6 +30,8 @@
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 
+import { english } from "viem/accounts";
+
 import { ASSET_NAME_SHAPE, checkEvmRailConfig, type EvmFinality, type EvmRailConfig } from "../rails/evm-htlc.js";
 
 /** One leg's three deadlines, in minutes after the run's start (t0). */
@@ -158,6 +160,24 @@ function resolvePath(base: string, value: unknown, path: string): string {
   return isAbsolute(text) ? resolve(text) : resolve(base, text);
 }
 
+/** KR3-2: the BIP-39 English word list (the `english` export of viem/accounts, 2,048 lower-case words), for the phrase rule of `looksLikeKeyMaterial`. */
+const BIP39_ENGLISH: ReadonlySet<string> = new Set(english);
+
+/** KR3-2: this many consecutive BIP-39 words are a seed phrase (a 12-word mnemonic with one word dropped or doubled leaves 11). */
+const PHRASE_WORDS = 11;
+
+/** KR3-2: whether `value` holds `PHRASE_WORDS` or more consecutive BIP-39 English words once it is cut at every character that is not a letter (a number, a
+ *  label's colon, a comma, a slash, a backslash, a dot: whatever a person put around or between the words). */
+function holdsSeedPhrase(value: string): boolean {
+  let run = 0;
+  for (const token of value.split(/[^A-Za-z]+/)) {
+    if (token === "") continue;
+    run = BIP39_ENGLISH.has(token.toLowerCase()) ? run + 1 : 0;
+    if (run >= PHRASE_WORDS) return true;
+  }
+  return false;
+}
+
 /**
  * KR2-1: THE rule for "this text looks like key material", used by every guard of this runner so that it is identical everywhere. A
  * 64-digit key with ONE slip (a dropped digit, a space or newline inside, a letter O for a zero) always leaves a run of at least 32 hex
@@ -165,11 +185,21 @@ function resolvePath(base: string, value: unknown, path: string): string {
  * more words made of letters only. An ordinary path, host, name or file name has neither. A key broken into shorter runs (two or more
  * slips) cannot be told from other text by shape; where such a value is printed the runner's own rule (never print it) is the first
  * defence, and this check is the second.
+ *
+ * KR3-2: the same two tests also see a key written in groups or with invisible separators, and a decorated seed phrase. The hex test runs on the value
+ * as it is AND with every whitespace and format character (`\p{Cf}`: U+200B zero-width space, U+00AD soft hyphen, U+200D and the like) removed, keeping
+ * hyphens and every other character, so a key shown in groups of four or cut by zero-width characters is one run again while a UUID (hyphens between
+ * runs of at most 12 digits) is not. The phrase test runs on the value cut at every non-letter (so a numbered or labelled phrase, one with commas, and a
+ * phrase inside a path are still words in a row) and refuses 11 or more CONSECUTIVE words of the BIP-39 English list; the old test (11 or more
+ * whitespace-separated tokens made of letters only, any words) stays. Still not seen, as documented: two or more slips, hyphen-grouped keys,
+ * and phrases of 10 words or fewer.
  */
 export function looksLikeKeyMaterial(value: string): boolean {
   if (/[0-9a-fA-F]{32}/.test(value)) return true;
+  if (/[0-9a-fA-F]{32}/.test(value.replace(/[\s\p{Cf}]/gu, ""))) return true;
   const words = value.trim().split(/\s+/);
-  return words.length >= 11 && words.every((word) => /^[a-z]+$/i.test(word));
+  if (words.length >= 11 && words.every((word) => /^[a-z]+$/i.test(word))) return true;
+  return holdsSeedPhrase(value);
 }
 
 const KEY_LIKE_SHAPES = "a run of 32 or more hex digits, or a phrase of 11 or more words";

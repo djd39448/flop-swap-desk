@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { generatePrivateKey } from "viem/accounts";
+import { english, generateMnemonic, generatePrivateKey } from "viem/accounts";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
@@ -24,7 +24,7 @@ import {
   parseRehearsalConfig,
   RehearsalConfigError,
 } from "../src/client/rehearsal-config.js";
-import { decimalKeyScanner, keyScanner } from "./helpers/evm-local.js";
+import { decimalKeyScanner, phraseScanner, strippedKeyScanner } from "./helpers/evm-local.js";
 
 const CONTRACT = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
@@ -183,7 +183,7 @@ describe("parseRehearsalConfig", () => {
   // K1 (P9 review round 1): a key pasted with ONE slip passed the old guard (an unbroken run of 64 hex digits) and the dry run printed 63 of its digits.
   it("refuses a key pasted with one slip (a dropped digit, a space, a newline, an O for a zero) and a 32-digit run, by field name, without echoing any of it", () => {
     const key = generatePrivateKey(); // generated now, never written anywhere
-    const scan = keyScanner(key);
+    const scan = strippedKeyScanner(key);
     const slipped: Array<[string, string]> = [
       ["63 hex digits", key.slice(0, -1)],
       ["a digit dropped at the front", `0x${key.slice(3)}`],
@@ -219,16 +219,18 @@ describe("parseRehearsalConfig", () => {
       expect(message).not.toContain("winner");
       expect(message).not.toContain("WINNER");
     }
-    // Ten words, or eleven tokens that are not all words, are a path (a person's folder name), not a mnemonic.
+    // Ten words, or eleven tokens of which one is not a BIP-39 word, are a path (a person's folder name), not a mnemonic.
     expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: "legal winner thank year wave sausage worth useful legal winner" }), BASE).buyerKeyFile).toContain("sausage");
-    expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: `${eleven.replace("thank", "thank2")}.key` }), BASE).buyerKeyFile).toContain("thank2");
+    expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: `${eleven.replace("sausage", "xyzzy")}.key` }), BASE).buyerKeyFile).toContain("xyzzy");
+    // KR3-2: digits glued to a word do not protect a phrase any more (the phrase rule cuts at every non-letter), so this is refused.
+    expect(refusal(anvilConfig({ buyerKeyFile: `${eleven.replace("thank", "thank2")}.key` }))).toContain("buyerKeyFile looks like key material");
     // A run of 31 hex digits is a path.
     expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: `keys/${"ab".repeat(15)}c.key` }), BASE).buyerKeyFile).toContain("c.key");
   });
 
   it("refuses a pin name or caip2 that is not a short plain text by field name, so a key pasted there is not quoted back by the rail's own refusal", () => {
     const key = generatePrivateKey();
-    const scan = keyScanner(key);
+    const scan = strippedKeyScanner(key);
     const evm = (anvilConfig().rails as { evm: object }).evm;
     for (const field of ["name", "caip2"] as const) {
       for (const value of [key, `x ${key}`, "", "a".repeat(41), 7, null]) {
@@ -267,7 +269,7 @@ describe("parseRehearsalConfig", () => {
 
   it("refuses key material in out, in every asset name, in the asset field and in the endpoint host, by field name, without echoing any window of it", () => {
     const key = generatePrivateKey();
-    const scan = keyScanner(key);
+    const scan = strippedKeyScanner(key);
     const evm = (anvilConfig().rails as { evm: Record<string, unknown> }).evm;
     const withEvm = (extra: Record<string, unknown>): Record<string, unknown> => ({ ...anvilConfig(), rails: { evm: { ...evm, ...extra } } });
     const cases: Array<[string, string, Record<string, unknown>]> = [
@@ -325,6 +327,70 @@ describe("parseRehearsalConfig", () => {
     expect(refusal(anvilConfig({ asset: "bad asset" }))).toContain("asset must be a short plain name");
     expect(refusal(anvilConfig({ flopAmount: "-3" }))).toContain("flopAmount must be a positive decimal integer string");
     expect(parseRehearsalConfig(anvilConfig({ flopAmount: "99" }), BASE).flopAmount).toBe("99");
+  });
+
+  // KR3-2 (P9 review round 3): the rule saw a contiguous 32-hex run or a value that is ENTIRELY 11 or more bare letter words, so a whole key in groups or with
+  // invisible separators, and any decorated seed phrase, was printed by out, --state-dir and the config path. Every key and phrase here is generated now and
+  // only ever scanned for or compared, never written down; the assertions print labels and booleans.
+  it("KR3-2: refuses a key in groups or with invisible separators and a decorated seed phrase, by field name, without quoting any of it; a UUID, paths and plain text pass", () => {
+    const key = generatePrivateKey();
+    const bare = key.slice(2);
+    const words = generateMnemonic(english).split(" ");
+    const phrase = words.join(" ");
+    const cut = (size: number, separator: string): string => bare.match(new RegExp(`.{1,${size}}`, "g"))!.join(separator);
+    const scanKey = strippedKeyScanner(key);
+    const scanPhrase = phraseScanner(words);
+    const refused: Array<[string, string]> = [
+      ["a key in groups of 4 separated by spaces", `0x${cut(4, " ")}`],
+      ["a key in groups of 8 separated by tabs", cut(8, "\t")],
+      ["a key in groups of 4 separated by newlines", cut(4, "\n")],
+      ["a key with U+200B (zero-width space) every 15 characters", `0x${cut(15, "\u200b")}`],
+      ["a key with U+00AD (soft hyphen) every 15 characters", `0x${cut(15, "\u00ad")}`],
+      ["a key with U+200D (zero-width joiner) every 7 characters", `0x${cut(7, "\u200d")}`],
+      ["a key with U+FEFF every 9 characters", cut(9, "\ufeff")],
+      ["a key in groups of 4 inside a path", `bundles/${cut(4, " ")}/run`],
+      ["a numbered phrase", words.map((word, index) => `${index + 1}. ${word}`).join(" ")],
+      ["a labelled phrase", `Phrase: ${phrase}`],
+      ["a phrase with commas", words.join(",")],
+      ["a phrase with commas and spaces", words.join(", ")],
+      ["a phrase with hyphens", words.join("-")],
+      ["a phrase with a trailing period", `${phrase}.`],
+      ["a phrase as a POSIX path segment", `bundles/${phrase}`],
+      ["a phrase as a Windows path segment", `C:\\Users\\x\\${phrase}\\config.json`],
+      ["a phrase in upper case", phrase.toUpperCase()],
+      ["eleven words of the phrase, comma separated", words.slice(0, 11).join(",")],
+      ["a phrase with one word replaced by a number", [...words.slice(0, 5), "7", ...words.slice(6)].join(" ")],
+    ];
+    for (const [label, value] of refused) {
+      expect(scanKey(value) || scanPhrase(value), `${label}: the value must hold the key or the phrase, or this test proves nothing`).toBe(true);
+      expect(looksLikeKeyMaterial(value), label).toBe(true);
+      for (const field of ["buyerKeyFile", "sellerKeyFile", "out"] as const) {
+        const message = refusal(anvilConfig({ [field]: value }));
+        expect(message, `${field}: ${label}`).toContain(`${field} looks like key material`);
+        expect(scanKey(message) || scanPhrase(message), `${field}: ${label}: the refusal must not quote any window of it`).toBe(false);
+      }
+    }
+    // Ordinary values are not key material: a UUID, a run label, typical POSIX and Windows paths, a spaced file name, a 10-word phrase of ordinary words, hosts.
+    for (const value of [
+      "97811a09-a70d-4b56-ad4f-e4c4e7e05f8a",
+      "bundles/run-2026-10-07",
+      "C:/Users/x/out",
+      "C:\\Users\\someone\\AppData\\Local\\Temp\\rh-run-a1B2c3",
+      "/home/someone/bundles/the-first-swap-of-the-week-on-base-sepolia",
+      "My Documents/base sepolia keys/buyer.key",
+      "my first swap of the whole week on base sepolia",
+      "legal winner thank year wave sausage worth useful legal winner", // ten words of the list
+      "sepolia.base.org",
+      "base-sepolia-rpc.publicnode.com",
+      "base-sepolia.g.alchemy.com",
+      "localhost",
+      "127.0.0.1:8545",
+      "ab".repeat(15),
+    ]) {
+      expect(looksLikeKeyMaterial(value), value).toBe(false);
+    }
+    // The separators the rule strips are whitespace and format characters, never hyphens: a UUID in a path stays a path.
+    expect(parseRehearsalConfig(anvilConfig({ out: "bundles/97811a09-a70d-4b56-ad4f-e4c4e7e05f8a" }), BASE).out).toContain("a70d");
   });
 
   // KR3-1 (P9 review round 3): a private key written in decimal fits the amount shape (up to 78 digits) and used to be printed by the plan and the terms

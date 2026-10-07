@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 
 import { generateHashLock } from "@flop-labs/tclk";
 import { encodeFunctionResult } from "viem";
-import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { english, generateMnemonic, generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, EXIT, FLOW_MESSAGE, loadRunnerAccount, parseRunRecord, refundTimeReached, refundLegAWaiting, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
@@ -30,7 +30,7 @@ import { loadOrCreateIdentity } from "../src/client/rehearsal-world.js";
 import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
-import { decimalKeyScanner, keyScanner } from "./helpers/evm-local.js";
+import { decimalKeyScanner, keyScanner, phraseScanner, strippedKeyScanner } from "./helpers/evm-local.js";
 import { fakeChain, FAKE_ESCROW_CODE_HASH, serveFakeChain, type FakeChain, type FakeChainOptions } from "./helpers/fake-chain.js";
 
 const REPO_ROOT = fileURLToPath(new URL("../", import.meta.url));
@@ -383,8 +383,9 @@ describe("--resume and --refund look at the run before they touch anything", () 
 // config refuses any run of 32 or more hex digits (and any phrase of 11 or more words), and the runner never prints a configured key-file path
 // whatever the value is. Every key here is generated now and only ever scanned for (keyScanner answers a boolean).
 describe("K1: a key pasted into a key-file field is never printed back", () => {
-  /** The pasted key, and the values an operator could have typed for it: one slip (the config refuses these) and two or more (it cannot see these). */
-  function pastedForms(): { key: `0x${string}`; oneSlip: Array<[string, string]>; manySlips: Array<[string, string]> } {
+  /** The pasted key, and the values an operator could have typed for it: one slip, or whitespace between the digits (the config refuses these, KR3-2 for the
+   *  second kind) and two or more slips (it cannot see these). */
+  function pastedForms(): { key: `0x${string}`; oneSlip: Array<[string, string]>; separated: Array<[string, string]>; manySlips: Array<[string, string]> } {
     const key = generatePrivateKey();
     return {
       key,
@@ -394,19 +395,25 @@ describe("K1: a key pasted into a key-file field is never printed back", () => {
         ["a newline after digit 32", `${key.slice(0, 34)}\n${key.slice(34)}`],
         ["a letter O for a zero", `${key.slice(0, 30)}O${key.slice(31)}`],
       ],
-      // No unbroken run of 32 digits: the config's guard cannot know these hold a key, so only the runner's own rule keeps them off the screen.
-      manySlips: [
+      // KR3-2: whitespace between the runs does not hide a whole key from the rule any more (it strips whitespace and format characters first).
+      separated: [
         ["runs of 20 digits split by spaces", `${key.slice(0, 22)} ${key.slice(22, 42)} ${key.slice(42)}`],
         ["runs of 20 digits split by newlines", `${key.slice(0, 22)}\n${key.slice(22, 42)}\n${key.slice(42)}`],
+        ["groups of 4 digits split by tabs", key.slice(2).replace(/(.{4})/g, "$1\t")],
+      ],
+      // No unbroken run of 32 digits even with whitespace and format characters removed: the config's guard cannot know these hold a key, so only the runner's own
+      // rule keeps them off the screen (the README lists them: two or more slips, hyphen-grouped keys).
+      manySlips: [
         ["runs of 17 digits split by dots", key.slice(2).replace(/(.{17})/g, "$1.")],
+        ["runs of 20 digits split by hyphens", key.slice(2).replace(/(.{20})/g, "$1-")],
       ],
     };
   }
 
-  it("the four near-miss forms (a dropped digit, a space, a newline, an O for a zero) are refused by the config in a dry run: exit 2, by field name, nothing printed", async () => {
-    const { key, oneSlip } = pastedForms();
-    const scan = keyScanner(key);
-    for (const [label, value] of oneSlip) {
+  it("the four near-miss forms (a dropped digit, a space, a newline, an O for a zero) and a key cut by whitespace are refused by the config in a dry run: exit 2, by field name, nothing printed", async () => {
+    const { key, oneSlip, separated } = pastedForms();
+    const scan = strippedKeyScanner(key);
+    for (const [label, value] of [...oneSlip, ...separated]) {
       const rig = await makeRig({ configExtra: { buyerKeyFile: value } });
       const result = await run(rig);
       expect(result.code, label).toBe(EXIT.config);
@@ -419,7 +426,7 @@ describe("K1: a key pasted into a key-file field is never printed back", () => {
 
   it("a key broken into runs the config cannot see is still never printed: dry run, --yes, --resume and --refund all say 'buyerKeyFile: <problem>' and nothing else", async () => {
     const { key, manySlips } = pastedForms();
-    const scan = keyScanner(key);
+    const scan = strippedKeyScanner(key);
     for (const [label, value] of manySlips) {
       expect(scan(value), `${label}: the value must hold windows of the key, or this test proves nothing`).toBe(true);
       for (const mode of ["dry", "yes", "resume", "refund"] as const) {
@@ -442,7 +449,7 @@ describe("K1: a key pasted into a key-file field is never printed back", () => {
     const dir = await mkdtemp(join(tmpdir(), "rh-keyfile-"));
     dirs.push(dir);
     const pasted = generatePrivateKey();
-    const scan = keyScanner(pasted);
+    const scan = strippedKeyScanner(pasted);
     const sentence = async (name: string, content: string | null): Promise<string> => {
       const path = join(dir, name);
       if (content !== null) await writeFile(path, content, { mode: 0o600 });
@@ -489,7 +496,7 @@ describe("K2: a key pasted into contractCodeHash is never printed back", () => {
   it("a dry run (and --yes) against a chain whose escrow does not hash to it fails the row without a single window of it", async () => {
     for (const mode of ["dry", "yes"] as const) {
       const pasted = generatePrivateKey();
-      const scan = keyScanner(pasted);
+      const scan = strippedKeyScanner(pasted);
       const rig = await makeRig({ codeHash: pasted });
       const result = await run(rig, mode);
       expect(result.code, mode).toBe(EXIT.preflight);
@@ -504,7 +511,7 @@ describe("K2: a key pasted into contractCodeHash is never printed back", () => {
   it("the empty-code and unreadable-code rows do not print it either", async () => {
     for (const code of ["0x", "error"] as const) {
       const pasted = generatePrivateKey();
-      const scan = keyScanner(pasted);
+      const scan = strippedKeyScanner(pasted);
       const rig = await makeRig({ codeHash: pasted, chain: { code } });
       const result = await run(rig);
       expect(result.code, code).toBe(EXIT.preflight);
@@ -558,7 +565,7 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
   it("out: the bundle directory is refused by field name in a dry run and in --yes (a dry run used to exit 0 and print it twice)", async () => {
     for (const mode of ["dry", "yes"] as const) {
       const key = generatePrivateKey();
-      const scan = keyScanner(key);
+      const scan = strippedKeyScanner(key);
       const rig = await makeRig({ anvil: true, configExtra: { out: key } });
       const result = await run(rig, mode);
       await expectRefused(rig, result, scan, "out looks like key material", `out, ${mode}`);
@@ -568,7 +575,7 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
 
   it("out: one slip, a path that ends in the key, and a phrase are refused too", async () => {
     const key = generatePrivateKey();
-    const scan = keyScanner(key);
+    const scan = strippedKeyScanner(key);
     for (const [label, value] of [
       ["63 digits", key.slice(0, -1)],
       ["a space inside", `${key.slice(0, 34)} ${key.slice(34)}`],
@@ -583,7 +590,7 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
   it("--state-dir: refused by argument name in a dry run, --yes, --resume and --refund, before anything is read or created", async () => {
     for (const mode of ["dry", "yes", "resume", "refund"] as const) {
       const key = generatePrivateKey();
-      const scan = keyScanner(key);
+      const scan = strippedKeyScanner(key);
       const rig = await makeRig({ anvil: true });
       const stateDir = join(rig.dir, key);
       const result = await runWith(rig, mode, { stateDir });
@@ -594,7 +601,7 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
 
   it("the config path: refused by argument name, whether the key is the whole path or a directory in it", async () => {
     const key = generatePrivateKey();
-    const scan = keyScanner(key);
+    const scan = strippedKeyScanner(key);
     const rig = await makeRig({ anvil: true });
     for (const [label, configPath] of [
       ["the key itself", key],
@@ -612,7 +619,7 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
         ["an address", "0x00000000000000000000000000000000000000a1"],
       ] as const) {
         const key = generatePrivateKey();
-        const scan = keyScanner(key);
+        const scan = strippedKeyScanner(key);
         const rig = await makeRig({ anvil: true, evmExtra: { assets: { USDC: TOKEN, [key]: value } } });
         const result = await run(rig, mode);
         await expectRefused(rig, result, scan, "rails.evm.assets: the name at position 2 is not a short plain name", `assets name (${label}), ${mode}`);
@@ -631,7 +638,7 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
   it("the endpoint's host: refused by field name (it is printed on every run and a transport error names it)", async () => {
     for (const mode of ["dry", "yes"] as const) {
       const key = generatePrivateKey();
-      const scan = keyScanner(key);
+      const scan = strippedKeyScanner(key);
       const rig = await makeRig({ anvil: true, endpoint: `http://${key}.invalid/v2/x` });
       const result = await run(rig, mode);
       await expectRefused(rig, result, scan, "rails.evm.endpoint's host looks like key material", `endpoint host, ${mode}`);
@@ -652,6 +659,66 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
         await expectRefused(rig, result, scan, `${field} looks like key material`, `${field}, ${mode}`);
         expect(await exists(rig.stateDir), `${field}, ${mode}`).toBe(false);
       }
+    }
+  });
+
+  // KR3-2 (P9 review round 3): the rule saw a contiguous 32-hex run or a value that is ENTIRELY 11 or more bare letter words, so a whole key shown in groups of
+  // four or cut by zero-width characters, and a numbered, labelled or path-embedded seed phrase, exited 0 in a dry run and was printed (out, --state-dir, the config
+  // path). Every key and phrase is generated now; the scans are separator-stripping (keys) and word-order (phrases) and answer booleans only.
+  const cutInto = (text: string, size: number, separator: string): string => text.match(new RegExp(`.{1,${size}}`, "g"))!.join(separator);
+
+  /** The values that carry a generated key in a form the plain scanner cannot see, and one generated seed phrase in the decorated forms of the review. */
+  function hiddenForms(): Array<{ label: string; value: string; scan: (text: string) => boolean }> {
+    const key = generatePrivateKey();
+    const bare = key.slice(2);
+    const scanKey = strippedKeyScanner(key);
+    const words = generateMnemonic(english).split(" ");
+    const phrase = words.join(" ");
+    const scanPhrase = phraseScanner(words);
+    return [
+      { label: "a key in groups of 4 separated by spaces", value: `0x${cutInto(bare, 4, " ")}`, scan: scanKey },
+      { label: "a key with U+200B every 15 characters", value: `0x${cutInto(bare, 15, "\u200b")}`, scan: scanKey },
+      { label: "a key with U+00AD every 15 characters", value: `0x${cutInto(bare, 15, "\u00ad")}`, scan: scanKey },
+      { label: "a numbered phrase", value: words.map((word, index) => `${index + 1}. ${word}`).join(" "), scan: scanPhrase },
+      { label: "a labelled phrase", value: `Phrase: ${phrase}`, scan: scanPhrase },
+      { label: "a phrase with commas", value: words.join(","), scan: scanPhrase },
+      { label: "a phrase after a directory", value: `bundles/${phrase}`, scan: scanPhrase },
+      { label: "a phrase in a Windows path", value: `C:\\Users\\x\\${phrase}\\out`, scan: scanPhrase },
+    ];
+  }
+
+  it("KR3-2: out as a key in groups or with invisible separators, or as a decorated seed phrase, is refused by field name in a dry run and in --yes", async () => {
+    for (const mode of ["dry", "yes"] as const) {
+      for (const { label, value, scan } of hiddenForms()) {
+        expect(scan(value), `${label}: the value must hold the key or the phrase, or this test proves nothing`).toBe(true);
+        const rig = await makeRig({ anvil: true, configExtra: { out: value } });
+        const result = await run(rig, mode);
+        await expectRefused(rig, result, scan, "out looks like key material", `out (${label}), ${mode}`);
+        expect(await exists(rig.stateDir), `out (${label}), ${mode}`).toBe(false);
+      }
+    }
+  });
+
+  it("KR3-2: --state-dir as the same forms is refused by argument name in a dry run, --yes, --resume and --refund, before anything is read or created", async () => {
+    for (const mode of ["dry", "yes", "resume", "refund"] as const) {
+      for (const { label, value, scan } of hiddenForms()) {
+        const rig = await makeRig({ anvil: true });
+        const stateDir = join(rig.dir, value.replace(/[\\/:]/g, "_"));
+        expect(scan(stateDir), `${label}: the path must hold the key or the phrase, or this test proves nothing`).toBe(true);
+        const result = await runWith(rig, mode, { stateDir });
+        await expectRefused(rig, result, scan, "--state-dir looks like key material", `--state-dir (${label}), ${mode}`);
+        expect(await exists(stateDir), `--state-dir (${label}), ${mode}`).toBe(false);
+      }
+    }
+  });
+
+  it("KR3-2: the config path as the same forms (a directory in it, or the whole path) is refused by argument name, whether the file exists or not", async () => {
+    for (const { label, value, scan } of hiddenForms()) {
+      const rig = await makeRig({ anvil: true });
+      const configPath = join(rig.dir, value.replace(/[\\/:]/g, "_"), "config.json");
+      expect(scan(configPath), `${label}: the path must hold the key or the phrase, or this test proves nothing`).toBe(true);
+      const result = await runWith(rig, "dry", { configPath });
+      await expectRefused(rig, result, scan, "the config path looks like key material", `config path (${label})`);
     }
   });
 
@@ -1093,7 +1160,7 @@ describe("bad configs and a failing endpoint", () => {
     expect(result.code).toBe(EXIT.config);
     expect(result.stderr).toContain("buyerPrivateKey is not a field this runner knows");
     expect(result.stdout).toBe("");
-    expect(keyScanner(key)(result.stderr)).toBe(false);
+    expect(strippedKeyScanner(key)(result.stderr)).toBe(false);
     expect(rig.chain.methods).toEqual([]); // the endpoint was never touched
   });
 
@@ -1720,7 +1787,7 @@ describe("bin/swap-rehearsal-evm.mjs (needs a build: npm test builds first)", ()
   // sentence that names the argument, exit 2, before the config is read or the state directory touched.
   it("refuses a config path or a --state-dir that looks like key material: exit 2, the argument named, no window of the key in any output, nothing created", async () => {
     const key = generatePrivateKey();
-    const scan = keyScanner(key);
+    const scan = strippedKeyScanner(key);
     const rig = await makeRig({ anvil: true });
     const before = await readdir(rig.dir);
     for (const [label, args, named] of [

@@ -37,6 +37,29 @@ export function keyScanner(key: Hex): (text: string) => boolean {
 }
 
 /**
+ * KR3-2: `keyScanner` for output that may show the key cut by separators: `scan(text)` answers whether `text` holds a 16-hex-digit window of the key as it
+ * stands OR once every whitespace and format character (`\p{Cf}`: U+200B, U+00AD and the like) is removed, which is how a terminal shows a key written in
+ * groups or with invisible separators. A superset of `keyScanner`; a boolean only.
+ */
+export function strippedKeyScanner(key: Hex): (text: string) => boolean {
+  const plain = keyScanner(key);
+  return (text) => plain(text) || plain(text.replace(/[\s\p{Cf}]/gu, ""));
+}
+
+/**
+ * KR3-2: a scanner for a seed phrase given as its words: `scan(text)` answers whether `text` holds any 4 consecutive words of it, in order, with anything
+ * but letters between them (a space, a number, a comma, a slash, a backslash). A boolean only, so a failing assertion never prints a word.
+ */
+export function phraseScanner(words: readonly string[]): (text: string) => boolean {
+  const patterns: RegExp[] = [];
+  for (let i = 0; i + 4 <= words.length; i += 1) patterns.push(new RegExp(words.slice(i, i + 4).join("[^a-z]+")));
+  return (text) => {
+    const lower = text.toLowerCase();
+    return patterns.some((pattern) => pattern.test(lower));
+  };
+}
+
+/**
  * KR3-1: the same for a key written in decimal (`BigInt(key).toString(10)`, 76 to 78 digits): `scan(text)` answers whether `text` holds any window of
  * 20 consecutive digits of it. A boolean only, so an assertion built on it can never print the key.
  */
