@@ -1344,26 +1344,28 @@ export class BuyerFlow {
   /** B3: the SPEC 3.5 deadline arithmetic at `clock()` as the lock time, refusing with the lock-guard error. Run before a new lock is prepared
    *  (`checkLockGuards`) and, R1-FUND-08, again by the rail right before the last step of a multi-step lock (after the EVM approve's receipt). */
   private checkLockDeadlines(offerA: OfferFrame, offerB: OfferFrame): void {
-    const lockTimeMs = this.clock();
     const policy = this.rail.policy;
+    const lockTimeMs = this.clock();
     const deadlineCheck = checkSwapDeadlines(offerA, offerB, lockTimeMs, policy);
-    const violations = [...deadlineCheck.violations];
     // P94-FUND-05 (P9-FIXES-R4 decision 6), Base Sepolia only (the policy `evmLocalPolicyFor(84532)` selects; anvil's policy is another object and nothing changes for it):
     // rule 1 lets a lock through up to 90 minutes into the known-good set, but the Seller can claim only a lock that reads FINAL before leg A's claim-by, and the finalized lag
     // is budgeted at `finalityAMs` (80 minutes). The pre-flight's finality row asks for that room at the start of a fresh run; this asks for it at the clock of the lock (a slow
     // approve receipt, a --resume after a long stop), so a lock that could not be claimed in time (it would end in a 4 h 45 min refund rehearsal) is refused before anything is
-    // signed. No value is at stake either way; this only spares the run.
+    // signed. It is one more clause of the same lock-guard error below. No value is at stake either way; this only spares the run.
     if (policy === BASE_SEPOLIA_POLICY) {
       const needMs = policy.finalityAMs + LOCK_SETTLE_ALLOWANCE_MS;
       const leftMs = offerA.claimByMs - lockTimeMs;
       if (leftMs < needMs) {
-        violations.push(
+        deadlineCheck.violations.push(
           `finality: leg A's claim-by is ${leftMs} ms after the lock time, less than the ${needMs} ms (finality budget ${policy.finalityAMs} ms plus lock allowance ${LOCK_SETTLE_ALLOWANCE_MS} ms) the lock needs to read final and still be claimed (P94-FUND-05)`,
         );
+        deadlineCheck.ok = false;
       }
     }
-    if (!deadlineCheck.ok || violations.length > 0) {
-      throw new Error(`buyer: refusing to lock leg A — deadlines are no longer safe at lock time (B3): ${violations.join("; ")}`);
+    if (!deadlineCheck.ok) {
+      throw new Error(
+        `buyer: refusing to lock leg A — deadlines are no longer safe at lock time (B3): ${deadlineCheck.violations.join("; ")}`,
+      );
     }
   }
 
