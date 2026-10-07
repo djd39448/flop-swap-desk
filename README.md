@@ -230,9 +230,13 @@ written bundle for the key (`tests/evm-local-signer.test.ts`, `tests-anvil/local
 
 **How a local account writes.** `approve`, `lock`, `claim` and `refund` are signed by viem in this process and sent
 as `eth_sendRawTransaction`, never `eth_sendTransaction`. The nonce, gas and fee fields are viem's own defaults,
-read through the same `CapturingRpc` (so the captures show them; they are public data): one `eth_fillTransaction`
-on a client's first write where the node answers it (anvil does), otherwise `eth_getTransactionCount`,
-`eth_getBlockByNumber`, a fee read (`eth_maxPriorityFeePerGas`) and `eth_estimateGas`. The EIP-191 account proof
+read through the same `CapturingRpc` (so the captures show them; they are public data): `eth_getTransactionCount`,
+`eth_getBlockByNumber`, a fee read (`eth_maxPriorityFeePerGas`) and `eth_estimateGas`. `eth_fillTransaction` is answered
+inside the process with method-not-found and never asked of the endpoint, and the account viem signs with refuses, with
+a typed `EvmSignerRefusedError` that carries no transaction field, any chain id but the pinned one, a gas limit above
+`EVM_MAX_GAS_PER_WRITE` (500,000; measured writes: approve 44k, lock 214k, claim 65k on anvil) and a fee cap above
+`rails.evm.maxFeePerGasWei` (a positive integer, default 1,000 gwei; Base Sepolia's value is set in P9-4), so an endpoint
+that fills in another chain, a huge gas limit or huge fee caps gets nothing signed (`tests/evm-signer.test.ts`). The EIP-191 account proof
 is `account.signMessage` instead of the `personal_sign` call and is verified exactly as before. There is no nonce
 manager: the nonce is the endpoint's `pending` transaction count at each write. A count that lags (a load balancer
 behind a public endpoint) makes the node refuse the new transaction (`nonce too low`) or, when the fee is higher,
@@ -408,15 +412,16 @@ written down instead of hidden.
   `reconcileLockA()` in the same process does.
 - **A claim's last guard still has a few round trips after it.** With a JSON-RPC account viem's chain-id
   assertion and `eth_sendTransaction` follow the final deadline check; with a local account (see "Key files")
-  the fill or the individual nonce, block, fee and gas reads, and `eth_sendRawTransaction`: at most six calls
-  (a refused fill, then five). Each is a single attempt (transport retries are off) bounded by the RPC timeout
-  (45 s by default), so the worst case is 4.5 minutes, inside the 5-minute claim-inclusion margin. The real preimage
-  reaches the endpoint only after that guard, first in the gas estimate (or the fill), then in the broadcast
-  (`tests/evm-local-signer.test.ts` pins both facts).
+  the individual nonce, block, fee and gas reads, and `eth_sendRawTransaction`: at most six calls (the nonce, the
+  block, the priority fee, the gas price an endpoint without `eth_maxPriorityFeePerGas` is asked for instead, the gas
+  estimate, the send; `eth_fillTransaction` is answered inside the process and never asked). Each is a single attempt
+  (transport retries are off) bounded by the RPC timeout (45 s by default), so the worst case is 4.5 minutes, inside the
+  5-minute claim-inclusion margin. The real preimage reaches the endpoint only after that guard, first in the gas
+  estimate, then in the broadcast (`tests/evm-local-signer.test.ts` pins both facts).
 - **The claim endpoint is trusted with the preimage** at the moment the claim is sent (see
-  above). With a local account the gas estimate (or the fill) carries it a moment before the broadcast does.
+  above). With a local account the gas estimate carries it a moment before the broadcast does.
 - **A local signer has no fee bumping and no replacement logic.** viem prices each transaction once, from the latest
-  block's base fee and the endpoint's priority-fee answer (or the node's own fill). A transaction priced under a
+  block's base fee and the endpoint's priority-fee answer (never the node's own fill, which is not asked). A transaction priced under a
   rising fee market can sit pending: the receipt wait ends with `EvmReceiptTimeoutError`, and because the next
   transaction's nonce is the endpoint's `pending` count, a re-send queues behind the stuck one. A stuck lock or
   refund is a liveness problem: the contract's own deadlines and its duplicate and status checks decide

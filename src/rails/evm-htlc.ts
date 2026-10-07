@@ -46,7 +46,17 @@ import { verifyHashPreimage } from "@flop-labs/tclk";
 import { EVM_HASH_RAIL_ABI, EvmHashRail, type AddressBook, type AssetBook } from "../vendor/evm-hash-rail.js";
 import { CODE_HASH_SHAPE, describeCodeProblem, judgeRuntimeCode } from "./evm-code-pin.js";
 import { captureEvmLeg, evmEvidence, EVM_RAIL_ID, hashLockRefMismatch, type EvmAccounts, type EvmEvidenceResult } from "./evm-evidence.js";
+import {
+  EVM_DEFAULT_MAX_FEE_PER_GAS_WEI,
+  EVM_MAX_GAS_PER_WRITE,
+  guardLocalAccount,
+  refuseFillTransaction,
+  type EvmSignerRefusedError,
+  type EvmSignerWatch,
+} from "./evm-signer.js";
 import { verifiedExchangeBytes, type CapturingRpc } from "./rpc-capture.js";
+
+export { EVM_DEFAULT_MAX_FEE_PER_GAS_WEI, EVM_MAX_GAS_PER_WRITE, EvmSignerRefusedError } from "./evm-signer.js";
 
 /** §2.2 point 1. Only `"finalized"` is a defined tag today; the union leaves room for a
  *  future one without widening every caller to a bare string. */
@@ -92,6 +102,14 @@ export interface EvmRailConfig {
    * no limit (one call to `latest`, as before) otherwise; see `effectiveMaxLogRange`. Any positive integer is accepted.
    */
   maxLogRange?: number;
+  /**
+   * R1-FUND-02 (P9 fix pass): the highest fee, in wei per gas, a LOCAL account may sign for (`maxFeePerGas`, `maxPriorityFeePerGas` and
+   * `gasPrice` of every transaction are each held to it; a transaction without a fee cap is refused too). A positive integer, given as
+   * a number or as a string of decimal digits (a wei amount can outgrow a JSON number). Omitted: `EVM_DEFAULT_MAX_FEE_PER_GAS_WEI`
+   * (1,000 gwei), which anvil passes; the Base Sepolia value is set by P9-4. It binds only a local account (the node signs for a JSON-RPC
+   * one), together with the pinned chain id and `EVM_MAX_GAS_PER_WRITE` (see src/rails/evm-signer.ts).
+   */
+  maxFeePerGasWei?: number | string;
 }
 
 /** P9-3: the public Base Sepolia endpoint refuses `eth_getLogs` over more than 500 blocks (measured 2026-10-05,
@@ -286,7 +304,26 @@ export function evmRailConfigShapeReason(value: unknown): string | null {
   if (v.maxLogRange !== undefined && (typeof v.maxLogRange !== "number" || !Number.isSafeInteger(v.maxLogRange) || v.maxLogRange <= 0)) {
     return "evm rail config: maxLogRange must be a positive integer";
   }
+  if (v.maxFeePerGasWei !== undefined && maxFeePerGasWeiOf(v.maxFeePerGasWei) === undefined) {
+    return "evm rail config: maxFeePerGasWei must be a positive integer (a number, or a string of decimal digits without leading zeros)";
+  }
   return null;
+}
+
+/** A configured `maxFeePerGasWei` as a bigint, or `undefined` when it is not a positive integer (a safe-integer number, or 1 to 40 decimal digits). */
+function maxFeePerGasWeiOf(value: unknown): bigint | undefined {
+  if (typeof value === "number") return Number.isSafeInteger(value) && value > 0 ? BigInt(value) : undefined;
+  if (typeof value === "string" && /^[1-9][0-9]{0,39}$/.test(value)) return BigInt(value);
+  return undefined;
+}
+
+/** R1-FUND-02: the fee ceiling in force for `config`: the configured `maxFeePerGasWei`, else `EVM_DEFAULT_MAX_FEE_PER_GAS_WEI`. */
+export function effectiveMaxFeePerGasWei(config: EvmRailConfig): bigint {
+  if (config.maxFeePerGasWei === undefined) return EVM_DEFAULT_MAX_FEE_PER_GAS_WEI;
+  const configured = maxFeePerGasWeiOf(config.maxFeePerGasWei);
+  // Never a silent fall back to the (higher) default for a value that is not valid: a config that reaches here passed `checkEvmRailConfig`.
+  if (configured === undefined) throw new Error("evm-htlc: maxFeePerGasWei must be a positive integer");
+  return configured;
 }
 
 export type EvmRailConfigCheck = { ok: true; config: EvmRailConfig } | { ok: false; reason: string };
@@ -580,9 +617,11 @@ export interface EvmHtlcRailOptions {
   /** This party's own EVM account, one of two things. An `Address` is a JSON-RPC account (`createWalletClient({ account,
    *  ... })` holds no key: the node answers `eth_sendTransaction`; anvil's unlocked accounts). A viem `LocalAccount`
    *  (P9-1, from `loadEvmLocalAccount`) signs locally: viem fills nonce, gas and fees through the same `rpc`
-   *  (one `eth_fillTransaction` where the node answers it, else `eth_getTransactionCount`, `eth_estimateGas` and the
-   *  fee reads; all public data) and every write goes out as `eth_sendRawTransaction`, never `eth_sendTransaction`.
-   *  This module never reads, stores or prints a key. */
+   *  (`eth_getTransactionCount`, `eth_estimateGas` and the fee reads, all public data; `eth_fillTransaction` is answered
+   *  here with method-not-found and never asked of the endpoint, R1-FUND-02) and every write goes out as
+   *  `eth_sendRawTransaction`, never `eth_sendTransaction`. The account viem signs with is a guarded wrapper (see
+   *  src/rails/evm-signer.ts): it refuses any chain id but the pin's, a gas limit above `EVM_MAX_GAS_PER_WRITE` and a fee cap
+   *  above `EvmRailConfig.maxFeePerGasWei`, with a typed `EvmSignerRefusedError`. This module never reads, stores or prints a key. */
   account: Address | LocalAccount;
   /** Resolves a counterparty's tclk DID to its EVM address for the vendored rail's write path
    *  (`lock()` needs the payee's address). Populated from `src/rails/account-line.ts`'s
@@ -604,6 +643,7 @@ export class EvmHtlcRail {
   private readonly rail: EvmHashRail;
   private readonly clock: () => number;
   private readonly receiptWatch: ReceiptWatch;
+  private readonly signerWatch: EvmSignerWatch;
 
   private constructor(
     config: EvmRailConfig,
@@ -613,6 +653,7 @@ export class EvmHtlcRail {
     rail: EvmHashRail,
     clock: () => number,
     receiptWatch: ReceiptWatch,
+    signerWatch: EvmSignerWatch,
   ) {
     this.config = config;
     this.rpc = rpc;
@@ -621,6 +662,7 @@ export class EvmHtlcRail {
     this.rail = rail;
     this.clock = clock;
     this.receiptWatch = receiptWatch;
+    this.signerWatch = signerWatch;
   }
 
   /**
@@ -667,8 +709,26 @@ export class EvmHtlcRail {
       }
     }
     const receiptWatch: ReceiptWatch = { timeout: undefined };
+    const signerWatch: EvmSignerWatch = { refused: undefined };
     const publicClient = withReceiptTimeout(createPublicClient({ chain, transport }), options.config.receiptTimeoutMs, receiptWatch);
-    const walletClient = createWalletClient({ account: options.account, chain, transport });
+    // R1-FUND-02: a LOCAL account signs what viem hands it, and viem fills the chain id, gas and fee caps from the endpoint's answers.
+    // Its account is therefore the guarded wrapper (a refusal of any chain id but the pin's, of a gas limit above EVM_MAX_GAS_PER_WRITE
+    // and of a fee cap above the configured ceiling), and its transport answers `eth_fillTransaction` itself, with method-not-found, so
+    // the chain id comes from the pinned chain and every other field from an individual read that the guard then judges.
+    // A JSON-RPC account (an address) signs on the node and is unchanged.
+    const local = typeof options.account === "string" ? undefined : options.account;
+    const walletClient =
+      local === undefined
+        ? createWalletClient({ account: options.account as Address, chain, transport })
+        : createWalletClient({
+            account: guardLocalAccount(
+              local,
+              { chainId: options.config.pin.chainId, maxGas: EVM_MAX_GAS_PER_WRITE, maxFeePerGas: effectiveMaxFeePerGasWei(options.config) },
+              signerWatch,
+            ),
+            chain,
+            transport: custom(refuseFillTransaction(options.rpc), { retryCount: 0 }),
+          });
 
     const liveChainIdHex = (await options.rpc.request({ method: "eth_chainId", params: [] })) as Hex;
     const liveChainId = hexToNumber(liveChainIdHex);
@@ -714,16 +774,20 @@ export class EvmHtlcRail {
     // see (a write's `WriteEvidence.raw` must hold only that write's own exchanges).
     options.rpc.drain();
 
-    return new EvmHtlcRail(options.config, options.rpc, publicClient, walletClient, rail, options.clock ?? Date.now, receiptWatch);
+    return new EvmHtlcRail(options.config, options.rpc, publicClient, walletClient, rail, options.clock ?? Date.now, receiptWatch, signerWatch);
   }
 
   /** Runs one write through the vendored rail, which re-wraps every failure as `tclk: <reason>`: a receipt timeout recorded
    *  by the wrapped public client during this call is thrown back as the typed `EvmReceiptTimeoutError`. */
   private async viaVendoredRail(write: () => Promise<unknown>): Promise<void> {
     this.receiptWatch.timeout = undefined;
+    this.signerWatch.refused = undefined;
     try {
       await write();
     } catch (error) {
+      // R1-FUND-02: a signing refusal (nothing was sent) is thrown back typed, like a receipt timeout; the vendored rail has made it a `tclk: ...` Error.
+      const refused = this.signerWatch.refused;
+      if (refused !== undefined) throw refused;
       const timeout = this.receiptWatch.timeout;
       if (timeout !== undefined) throw timeout;
       throw error;
@@ -768,6 +832,7 @@ export class EvmHtlcRail {
     // instances' plain sequences could (see `CapturingRpc.setIdNamespace`).
     this.rpc.setIdNamespace(`write-approve:${asset}:${this.clock()}`);
     let hash: Hex;
+    this.signerWatch.refused = undefined;
     try {
       hash = await this.walletClient.writeContract({
         address: token,
@@ -775,6 +840,11 @@ export class EvmHtlcRail {
         functionName: "approve",
         args: [this.config.contract, BigInt(amount)],
       });
+    } catch (error) {
+      // R1-FUND-02: viem wraps the signer's refusal in its own error (whose text lists the request); the typed refusal is thrown instead.
+      const refused: EvmSignerRefusedError | undefined = this.signerWatch.refused;
+      if (refused !== undefined) throw refused;
+      throw error;
     } finally {
       this.rpc.setIdNamespace(undefined);
     }
@@ -844,13 +914,13 @@ export class EvmHtlcRail {
       // passing and the preimage going out. What follows is viem's own, each call a single
       // attempt with retries off and bounded by the CapturingRpc timeout: with a JSON-RPC
       // account, its chain-id assertion and `eth_sendTransaction`; with a local account (P9-1),
-      // `eth_getTransactionCount`, `eth_getBlockByNumber`, a fee read and `eth_estimateGas` (on a
-      // client's first write viem first tries one `eth_fillTransaction` instead, where the node has
-      // it), then `eth_sendRawTransaction`. The estimate and the fill carry the real preimage in
-      // their calldata, as the broadcast does a moment later: the endpoint is trusted with it
-      // either way, and nothing carries it before this guard (tests/evm-local-signer.test.ts pins
-      // that). That is a handful of calls, not an unbounded wait, and the policy's
-      // claimInclusionMarginMs is sized to cover it.
+      // `eth_getTransactionCount`, `eth_getBlockByNumber`, the fee reads and `eth_estimateGas`
+      // (`eth_fillTransaction` is answered with method-not-found inside this process and never
+      // asked of the endpoint, R1-FUND-02), then `eth_sendRawTransaction`. The estimate carries
+      // the real preimage in its calldata, as the broadcast does a moment later: the endpoint is
+      // trusted with it either way, and nothing carries it before this guard
+      // (tests/evm-local-signer.test.ts pins that). That is a handful of calls, not an
+      // unbounded wait, and the policy's claimInclusionMarginMs is sized to cover it.
       await this.assertBeforeNotAfterMsOrThrow(notAfterMs);
       await this.viaVendoredRail(() => this.rail.claim(hashLock, secret));
       return await this.captureWriteEvidence("Claimed", hashLock, fromBlock, before);

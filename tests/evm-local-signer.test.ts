@@ -178,9 +178,11 @@ describe("EvmHtlcRail with a LocalAccount: every write is eth_sendRawTransaction
     // What follows the guard is viem's own signing path, a handful of single-attempt calls; the preimage rides only the last ones.
     const after = exchanges.slice(guard + 1).map((exchange) => exchange.method);
     expect(after.at(-1)).toBe("eth_getLogs"); // the write-evidence lookup, after the receipt
-    // A client's first write first asks the node to fill the transaction (`eth_fillTransaction`; this mock answers method-not-found,
-    // and viem then falls back to the individual reads below).
-    expect(after.filter((method) => method !== "eth_fillTransaction").slice(0, 5)).toEqual([
+    // R1-FUND-02: the wallet client's transport answers `eth_fillTransaction` itself (method-not-found), so no fill call ever goes over the
+    // wire or into the capture, and viem takes the chain id from the pinned chain and reads the individual fields below.
+    expect(methodsOf(sellerWire.rpc)).not.toContain("eth_fillTransaction");
+    expect(sellerWire.calls).not.toContain("eth_fillTransaction");
+    expect(after.slice(0, 5)).toEqual([
       "eth_getTransactionCount",
       "eth_getBlockByNumber",
       "eth_maxPriorityFeePerGas",
@@ -188,7 +190,7 @@ describe("EvmHtlcRail with a LocalAccount: every write is eth_sendRawTransaction
       "eth_sendRawTransaction",
     ]);
     const carriers = exchanges.filter((exchange) => exchange.requestBody.toLowerCase().includes(bare)).map((exchange) => exchange.method);
-    expect(carriers.filter((method) => method !== "eth_fillTransaction")).toEqual(["eth_estimateGas", "eth_sendRawTransaction"]);
+    expect(carriers).toEqual(["eth_estimateGas", "eth_sendRawTransaction"]);
   });
 
   it("a node-refused raw send surfaces as a failure and does not move the account's nonce", async () => {

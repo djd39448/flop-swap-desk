@@ -229,14 +229,15 @@ export async function loadEvmLocalAccount(path: string, options: LoadEvmLocalAcc
 }
 
 /**
- * Wraps a viem private-key account so that nothing but its address and type show: frozen; `address` and `type` the only
+ * Wraps a viem private-key account so that nothing but its address and type show (any viem `LocalAccount` is accepted:
+ * src/rails/evm-signer.ts seals its guarded wrapper with this too): frozen; `address` and `type` the only
  * enumerable members; the signing functions, `publicKey` and `source` are real but non-enumerable (viem reads them by
  * name); `toJSON`, `toString`, `Symbol.toStringTag` and `util.inspect.custom` answer with the address and type only.
  * `structuredClone`, `Object.keys`, `Object.entries`, `{ ...account }` and `JSON.stringify` therefore see exactly
  * `{ address, type: "local" }`. The key is not a member: it lives in the closure of the viem account the signing
  * functions delegate to.
  */
-export function sealLocalAccount(inner: PrivateKeyAccount): LocalAccount {
+export function sealLocalAccount(inner: LocalAccount): LocalAccount {
   const address: Address = inner.address;
   const sealed = {} as Record<string | symbol, unknown>;
   const shown = (): { address: Address; type: "local" } => ({ address, type: "local" });

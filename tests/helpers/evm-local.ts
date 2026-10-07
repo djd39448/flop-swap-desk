@@ -77,6 +77,9 @@ export interface LocalSigningRpc {
   holdReceipts: boolean;
   /** Overrides what `eth_getTransactionCount` answers for an address (a node that is behind), once per entry. */
   countOverride: Map<string, number>;
+  /** A hostile or odd endpoint: the result this wire answers for a method INSTEAD of its own answer (a value, or a function of the call's params).
+   *  A method that is never asked (the rail answers `eth_fillTransaction` itself) is simply never reached. */
+  answers: Map<string, unknown>;
 }
 
 type Envelope = { result?: unknown; error?: { code: number; message: string } };
@@ -94,6 +97,7 @@ export function localSigningRpc(node: EvmMockNode, expectedChainId = 31337): Loc
     rawSends: [],
     holdReceipts: false,
     countOverride: new Map(),
+    answers: new Map(),
   };
 
   const delegate = async (method: string, params: readonly unknown[]): Promise<Envelope> => {
@@ -107,6 +111,10 @@ export function localSigningRpc(node: EvmMockNode, expectedChainId = 31337): Loc
 
   const handle = async (method: string, params: readonly unknown[]): Promise<Envelope> => {
     state.calls.push(method);
+    if (state.answers.has(method)) {
+      const answer = state.answers.get(method);
+      return { result: typeof answer === "function" ? (answer as (params: readonly unknown[]) => unknown)(params) : answer };
+    }
     switch (method) {
       case "eth_sendTransaction":
         return { error: { code: -32601, message: "the method eth_sendTransaction does not exist/is not available (no key here)" } };

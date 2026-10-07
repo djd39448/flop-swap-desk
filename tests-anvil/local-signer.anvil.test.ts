@@ -237,16 +237,16 @@ describe("Seller/Buyer client flows with LOCAL accounts against a real anvil nod
   }
 
   /** Every write is a raw transaction; nothing was sent through anvil's unlocked-account path; nothing was signed over RPC. The
-   *  nonce, gas and fee fields came from viem's defaults over the same CapturingRpc: either one `eth_fillTransaction` (a client's
-   *  first write, where the node answers it) or the individual reads. */
+   *  nonce, gas and fee fields came from viem's defaults over the same CapturingRpc, read one by one: the rail answers
+   *  `eth_fillTransaction` itself (R1-FUND-02), so it is never asked of anvil and never captured. */
   function expectLocalSigning(writeExchanges: readonly Exchange[]): void {
     const methods = methodsOf(writeExchanges);
     expect(methods).toContain("eth_sendRawTransaction");
     expect(methods).not.toContain("eth_sendTransaction");
     expect(methods).not.toContain("personal_sign");
-    const filled = methods.includes("eth_fillTransaction");
-    const individually = methods.includes("eth_getTransactionCount") && methods.includes("eth_estimateGas");
-    expect(filled || individually).toBe(true);
+    expect(methods).not.toContain("eth_fillTransaction");
+    expect(methods).toContain("eth_getTransactionCount");
+    expect(methods).toContain("eth_estimateGas");
   }
 
   it("scenario L1: settled with two local accounts; proofs resolve, writes are raw transactions, bundle replays with no key in it", async () => {
