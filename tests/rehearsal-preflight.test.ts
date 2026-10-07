@@ -447,6 +447,69 @@ describe("the Buyer's ETH row is sized by what is left to send (R1-FUND-01)", ()
   });
 });
 
+// R2-FUND-04 (P9 review round 2): two ETH rows still reserved gas that is spent or no longer needed. (i) The Seller's row asked for a 200,000-gas claim at twice the
+// price in --resume even after its claim landed (about 65,000 gas spent), so a Seller funded to the dry run's need failed it, and --resume exited 3 although only the
+// Buyer's paper claim was left: one runner drives both roles, so the Seller's balance blocked the Buyer's deadline-bound step. (ii) The refund-only Buyer row (200,000 gas
+// at twice the price) failed a Buyer who could pay the refund 2.7 times over once the price rose about 3x, and a refund has no deadline after leg A's refund time.
+describe("the Seller's row is sized by what is left to send, and a refund's short Buyer row is a warning (R2-FUND-04)", () => {
+  const price = 1_000_000n;
+  const claimNeed = GAS_CEILING.claim * price * GAS_PRICE_CUSHION; // 4e11
+  const sellerLeft = claimNeed - 65_000n * price; // funded to the dry run's need, minus the ~65k gas its claim spent: 3.35e11
+
+  it("(i) a Seller whose claim landed (balance 3.35e11 wei) does not fail a resume: the row is an info row that reserves nothing; without the knowledge it still fails (the old sizing)", async () => {
+    expect(sellerLeft).toBe(335_000_000_000n);
+    const funded: FakeChainOptions = { gasPriceWei: price, ethBalances: { [buyerAddress.toLowerCase()]: 10n ** 18n, [sellerAddress.toLowerCase()]: sellerLeft } };
+    // What --resume passed before this item (and passes whenever the Seller's claim is not proven): the claim is reserved in full.
+    const before = await preflight(funded, config(), { fresh: false, buyerSends: "refund" });
+    expect(status(before, "seller ETH")).toBe("fail");
+    expect(row(before, "seller ETH").detail).toContain("needs 0.0000004 ETH for the claim");
+    expect(before.report.ok).toBe(false);
+    const claimed = await preflight(funded, config(), { fresh: false, buyerSends: "refund", sellerSends: "nothing" });
+    expect(status(claimed, "seller ETH")).toBe("info");
+    expect(row(claimed, "seller ETH").detail).toContain(sellerAddress);
+    expect(row(claimed, "seller ETH").detail).toContain("nothing is left for the Seller to send (its claim already landed)");
+    expect(claimed.report.ok).toBe(true);
+    // A Seller with no ETH at all is no problem either once it has nothing to send; the explicit "claim" is the default.
+    const empty = await preflight({ ...funded, ethBalances: { [buyerAddress.toLowerCase()]: 10n ** 18n, [sellerAddress.toLowerCase()]: 0n } }, config(), { fresh: false, buyerSends: "refund", sellerSends: "nothing" });
+    expect(empty.report.ok).toBe(true);
+    const explicit = await preflight(funded, config(), { fresh: false, buyerSends: "refund", sellerSends: "claim" });
+    expect(status(explicit, "seller ETH")).toBe("fail");
+  });
+
+  it("(ii) a --refund Buyer holding the dry run's need minus the approve and the lock, at a price three times higher (balance 1.182e12, need 1.2e12), gets a WARN that still prints the need, and the refund goes ahead", async () => {
+    const p1 = 3_000_000n; // 0.003 gwei
+    const left = 1_182_000_000_000n;
+    expect(GAS_CEILING.refund * p1 * GAS_PRICE_CUSHION).toBe(1_200_000_000_000n);
+    const funded: FakeChainOptions = { gasPriceWei: p1, ethBalances: { [buyerAddress.toLowerCase()]: left, [sellerAddress.toLowerCase()]: 0n } };
+    const notNeeded = new Set(["pending", "log range", "seller ETH", "seller account"]);
+    const old = await preflight(funded, config(), { fresh: false, buyerSends: "refund", notNeeded });
+    expect(status(old, "buyer ETH")).toBe("fail"); // the old behaviour: "fund it first", exit 3
+    expect(old.report.ok).toBe(false);
+    const refund = await preflight(funded, config(), { fresh: false, buyerSends: "refund", buyerEthShort: "warn", notNeeded });
+    expect(status(refund, "buyer ETH")).toBe("warn");
+    expect(row(refund, "buyer ETH").detail).toContain("needs 0.0000012 ETH for the refund (the approve and the lock are already sent)");
+    expect(row(refund, "buyer ETH").detail).toContain(buyerAddress);
+    expect(row(refund, "buyer ETH").detail).toContain("fund it first");
+    expect(row(refund, "buyer ETH").detail).toContain("a refund does not need: it has no deadline after leg A's refund time");
+    expect(refund.report.ok).toBe(true);
+    // A Buyer that covers the need is still OK (not a warning), and the default for every other caller is still a failure.
+    const covered = await preflight({ ...funded, ethBalances: { [buyerAddress.toLowerCase()]: 1_200_000_000_000n } }, config(), { fresh: false, buyerSends: "refund", buyerEthShort: "warn", notNeeded });
+    expect(status(covered, "buyer ETH")).toBe("ok");
+    const resume = await preflight(funded, config(), { fresh: false, buyerSends: "refund" });
+    expect(status(resume, "buyer ETH")).toBe("fail");
+  });
+
+  it("the Seller's row of a fresh run keeps its claim reservation whatever sellerSends says elsewhere (the dry run and --yes never pass it), and the warning applies to the Buyer row only", async () => {
+    const funded: FakeChainOptions = { gasPriceWei: price, ethBalances: { [buyerAddress.toLowerCase()]: 1n, [sellerAddress.toLowerCase()]: 1n } };
+    const fresh = await preflight(funded);
+    expect(status(fresh, "buyer ETH")).toBe("fail");
+    expect(status(fresh, "seller ETH")).toBe("fail");
+    const warned = await preflight(funded, config(), { buyerEthShort: "warn" });
+    expect(status(warned, "buyer ETH")).toBe("warn");
+    expect(status(warned, "seller ETH")).toBe("fail"); // the warning is the Buyer's, for a refund; the Seller's row is never softened
+  });
+});
+
 // F3 with R1-FUND-06 (P9 review round 1): until P9-4 selects BASE_SEPOLIA_POLICY by chain id, Base Sepolia runs under the anvil policy, whose 20-minute
 // finality budget was a median and not a bound (the sample's maximum lag is 39 minutes) and whose 5-minute claim margin is below the worst case
 // after the claim's last guard. The deadlines row of a new swap on that chain says so and fails; a refund and a resume never read the row.

@@ -22,8 +22,8 @@
 //                  margin; R2-FUND-05), or a claim that lands late could not be found by the Buyer's scan (F1)
 //   clock          the local clock against the chain's head
 //   buyer / seller the addresses (never a key), ETH against the gas still to be sent (generous per-call ceilings times twice the
-//                  node's gas price; the Buyer's row is sized by what is left to send, R1-FUND-01; Base's L1 data fee is not counted),
-//                  the Buyer's token balance and allowance against the amount
+//                  node's gas price; both rows are sized by what is left to send, R1-FUND-01 and R2-FUND-04, and a refund's short Buyer row is
+//                  a warning; Base's L1 data fee is not counted), the Buyer's token balance and allowance against the amount
 //   deadlines      SPEC 3.5 rules 1 to 3 and the claim margin, with the rail's own policy and the real numbers; on Base Sepolia, while the
 //                  rail still runs under the anvil policy, a new swap is refused (F3, interim until P9-4)
 //
@@ -104,9 +104,23 @@ export interface PreflightInput {
    * already spent could refuse an honest refund that the Buyer can pay.
    */
   buyerSends?: BuyerSends;
+  /**
+   * R2-FUND-04 (P9 review round 2): what the Seller still has to SEND, which sizes its ETH row. `"claim"` (the default, and every case that is not
+   * proven otherwise): one claim. `"nothing"`: its claim already landed (its record says so, or `locks(hashLock)` reads Claimed), so a `--resume` that only has the
+   * Buyer's paper claim left must not be stopped by the Seller's balance; the row is then an info row and reserves no gas.
+   */
+  sellerSends?: SellerSends;
+  /**
+   * R2-FUND-04: how a Buyer ETH row that is short is reported. `"fail"` (the default): the swap cannot go. `"warn"` (`--refund`): the row still prints its need,
+   * but a refund has no deadline once leg A's refund time has passed and the node refuses a balance that is truly short before anything is sent, so a ceiling-sized
+   * reservation (twice the price, 200,000 gas) must not stand between an honest Buyer and its refund.
+   */
+  buyerEthShort?: "fail" | "warn";
 }
 
 export type BuyerSends = "approve-lock-refund" | "refund";
+
+export type SellerSends = "claim" | "nothing";
 
 interface Block {
   number: bigint;
@@ -403,7 +417,7 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     add("accounts", "fail", "the Buyer and the Seller key files are the same account; a swap needs two");
   }
 
-  const ethRow = async (label: string, address: Address, gas: bigint, what: string): Promise<void> => {
+  const ethRow = async (label: string, address: Address, gas: bigint, what: string, short: "fail" | "warn" = "fail"): Promise<void> => {
     const balanceAnswer = await read("eth_getBalance", [address, "latest"]);
     const balance = balanceAnswer.ok ? quantity(balanceAnswer.value) : null;
     if (balance === null) {
@@ -416,17 +430,23 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     }
     const need = gas * price * GAS_PRICE_CUSHION;
     const shown = `${address}: ${formatEther(balance)} ETH, needs ${formatEther(need)} ETH for ${what} (${gas} gas ceiling; ${L1_FEE_NOTE})`;
-    if (balance < need) add(label, "fail", `${shown}: fund it first`);
-    else add(label, "ok", shown);
+    if (balance >= need) add(label, "ok", shown);
+    else if (short === "warn") {
+      add(label, "warn", `${shown}: fund it first if the refund is refused for want of gas (this reserves a ceiling at twice the price, which a refund does not need: it has no deadline after leg A's refund time, and the node refuses a balance that is truly short before anything is sent)`);
+    } else add(label, "fail", `${shown}: fund it first`);
   };
   if (buyerAddress !== undefined) {
     if (input.buyerSends === "refund") {
-      await ethRow("buyer ETH", buyerAddress, GAS_CEILING.refund, "the refund (the approve and the lock are already sent)");
+      await ethRow("buyer ETH", buyerAddress, GAS_CEILING.refund, "the refund (the approve and the lock are already sent)", input.buyerEthShort ?? "fail");
     } else {
-      await ethRow("buyer ETH", buyerAddress, GAS_CEILING.approve + GAS_CEILING.lock + GAS_CEILING.refund, "approve, lock and a refund");
+      await ethRow("buyer ETH", buyerAddress, GAS_CEILING.approve + GAS_CEILING.lock + GAS_CEILING.refund, "approve, lock and a refund", input.buyerEthShort ?? "fail");
     }
   }
-  if (sellerAddress !== undefined) await ethRow("seller ETH", sellerAddress, GAS_CEILING.claim, "the claim");
+  if (sellerAddress !== undefined) {
+    // R2-FUND-04: a Seller whose claim already landed has nothing left to send; its balance must not stop a resume that only has the Buyer's paper claim to make.
+    if (input.sellerSends === "nothing") add("seller ETH", "info", `${sellerAddress}: nothing is left for the Seller to send (its claim already landed), so no gas is reserved`);
+    else await ethRow("seller ETH", sellerAddress, GAS_CEILING.claim, "the claim");
+  }
 
   if (input.fresh && buyerAddress !== undefined) {
     const token = evm.assets[config.asset];

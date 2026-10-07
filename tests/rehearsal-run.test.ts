@@ -16,16 +16,20 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { generateHashLock } from "@flop-labs/tclk";
+import { encodeFunctionResult } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { buyerLockOnRecord, EXIT, FLOW_MESSAGE, loadRunnerAccount, parseRunRecord, refundTimeReached, runRehearsal, untilRefundTime, waitLockFinal, type FinalityWorld, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
-import { encodeFlowRecord, newBuyerRecord } from "../src/client/flow-record.js";
+import { buyerLockNeverLanded, buyerLockOnRecord, EXIT, FLOW_MESSAGE, loadRunnerAccount, parseRunRecord, refundTimeReached, refundLegAWaiting, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { RefundNotFinalYetError } from "../src/client/buyer.js";
+import { encodeFlowRecord, newBuyerRecord, newSellerRecord } from "../src/client/flow-record.js";
 import { FileFlowStore, flowKey } from "../src/client/flow-store.js";
 import { parseRehearsalConfig } from "../src/client/rehearsal-config.js";
 import { loadOrCreateIdentity } from "../src/client/rehearsal-world.js";
 import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
+import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { keyScanner } from "./helpers/evm-local.js";
 import { fakeChain, FAKE_ESCROW_CODE_HASH, serveFakeChain, type FakeChain, type FakeChainOptions } from "./helpers/fake-chain.js";
 
@@ -677,14 +681,18 @@ describe("R1-FUND-01: --refund and --resume size the Buyer's ETH row by what is 
     expect(rig.chain.methods.filter((m) => WRITES.includes(m))).toEqual([]);
   });
 
-  it("--refund still stops for a Buyer who cannot pay the refund itself (one wei short of its own need)", async () => {
+  it("--refund no longer stops for a Buyer one wei short of the reservation (R2-FUND-04): the row warns with the need, and a --resume of the same state still stops", async () => {
     const rig = await makeRig({ chain: { gasPriceWei: 1_000_000n } });
     fund(rig, 400_000_000_000n - 1n); // 200,000 gas x 1e6 x 2, less one wei
     await writeRun(rig, {}, true);
     const result = await run(rig, "refund");
-    expect(result.code).toBe(EXIT.preflight);
-    expect(result.stdout).toMatch(/FAIL\s+buyer ETH\s+.*fund it first/);
-    expect(result.stdout).toContain("--refund did nothing because a check it needs failed");
+    expect(result.stdout).toMatch(/WARN\s+buyer ETH\s+.*needs 0\.0000004 ETH for the refund.*fund it first/);
+    expect(result.stdout).not.toContain("--refund did nothing because a check it needs failed");
+    expect(result.code).toBe(EXIT.refused); // past the pre-flight, it stops at the Buyer's empty store: the node itself refuses a balance that is truly short, before anything is sent
+    expect(result.stderr).toContain("holds no record");
+    const resumed = await run(rig, "resume");
+    expect(resumed.code).toBe(EXIT.preflight);
+    expect(resumed.stdout).toMatch(/FAIL\s+buyer ETH\s+.*fund it first/);
   });
 
   it("--resume reserves only the refund once a lock is on record, and the whole need before one is", async () => {
@@ -768,6 +776,284 @@ describe("R1-FUND-01: --refund and --resume size the Buyer's ETH row by what is 
   });
 });
 
+// R2-FUND-01 (P9 review round 2), the runner's part. A leg A lock attempt that never landed (the lock guard refused it after the approve, a signer refusal, a dropped lock, a
+// kill between the two) used to leave `--refund` exiting 4 for ever ("refund on an unknown lock") and the Seller's leg B never refunded. The Buyer now reads the chain first
+// and either records the verdict "never locked" (leg A's refund time is FINALIZED with no lock) or says it is not final yet (a typed error); the runner waits for the finalized
+// block on the second, refunds leg B on the first, and a --resume of a run holding the verdict continues as --refund. (The whole thing on a real node, where the approve lands and
+// the lock is refused: tests-anvil/rehearsal-runner.anvil.test.ts.)
+describe("R2-FUND-01: the --refund loop waits for the finalized block, and a --resume of a never-landed run is the refund path", () => {
+  const hex = (n: bigint): string => `0x${n.toString(16)}`;
+  const REFUND_AFTER = 1_790_005_400_000; // leg A's refund time in ms
+
+  /** A chain whose finalized block is `lagMs` behind the clock: its own timestamp reaches `REFUND_AFTER` at `REFUND_AFTER + lagMs`. */
+  function waitWorld(options: { startMs: number; lagMs: number; waitLimitMs?: number; pollMs?: number }): { world: FinalityWorld; state: { t: number; sleeps: number[]; logs: string[] } } {
+    const pollMs = options.pollMs ?? 5_000;
+    const state = { t: options.startMs, sleeps: [] as number[], logs: [] as string[] };
+    const finalizedMs = (): number => state.t - options.lagMs;
+    const rpc = {
+      request: async ({ method, params }: { method: string; params?: readonly unknown[] }): Promise<unknown> => {
+        if (method === "eth_blockNumber") return hex(1_000_000n);
+        if (method !== "eth_getBlockByNumber") throw new Error(`unexpected ${method}`);
+        const tag = String(params?.[0]);
+        if (tag === "latest") return { number: hex(1_000_000n), timestamp: hex(BigInt(Math.floor(state.t / 1000))) };
+        return { number: hex(900_000n), timestamp: hex(BigInt(Math.floor(finalizedMs() / 1000))) }; // the finalized tag, or its number
+      },
+    } as unknown as CapturingRpc;
+    const config = parseRehearsalConfig(
+      {
+        rails: { evm: { pin: BASE_SEPOLIA_PIN, endpoint: "https://sepolia.base.org", contract: CONTRACT, assets: { USDC: TOKEN }, contractCodeHash: FAKE_ESCROW_CODE_HASH } },
+        buyerKeyFile: "b.key",
+        sellerKeyFile: "s.key",
+        amount: "1000000",
+        out: "bundle",
+        pollMs,
+        ...(options.waitLimitMs === undefined ? {} : { waitLimitMs: options.waitLimitMs }),
+      },
+      "/base",
+    );
+    const env: RehearsalEnv = { now: () => state.t, sleep: async (ms) => void (state.sleeps.push(ms), (state.t += ms)), out: () => undefined, err: () => undefined };
+    return { world: { config, env, rpc, log: (line) => void state.logs.push(line), pollMs }, state };
+  }
+
+  const neverLocked = (): Error => new Error("buyer: leg A was never locked, nothing to refund");
+
+  it("a Buyer that says 'not final yet' is waited for until the finalized block's own time passes leg A's refund time, then asked again: the verdict ends the loop with no refund (leg B is refunded next)", async () => {
+    const { world, state } = waitWorld({ startMs: REFUND_AFTER + 60_000, lagMs: 20 * 60_000 }); // the finalized block is 20 minutes behind: it passes the refund time 19 minutes from now
+    const asked: number[] = [];
+    const buyer = {
+      refundLegA: async () => {
+        asked.push(state.t);
+        if (state.t - 20 * 60_000 < REFUND_AFTER) throw new RefundNotFinalYetError(`0x${"ab".repeat(32)}`, REFUND_AFTER);
+        throw neverLocked();
+      },
+    };
+    expect(await refundLegAWaiting(world, buyer)).toBeUndefined();
+    expect(asked).toHaveLength(2); // once at the start, once after the wait: never in a tight loop
+    expect(state.t).toBeGreaterThanOrEqual(REFUND_AFTER + 20 * 60_000); // not before the finalized block got there
+    expect(state.logs.some((line) => line.includes("a lock cannot be ruled out until the finalized block has passed leg A's refund time") && line.includes("not final yet"))).toBe(true);
+    expect(state.sleeps.every((ms) => ms === 5_000)).toBe(true);
+  });
+
+  it("a verdict at once (the finalized block is already past the refund time) is returned with no wait; any other error is thrown as it is", async () => {
+    const { world, state } = waitWorld({ startMs: REFUND_AFTER + 3_600_000, lagMs: 60_000 });
+    expect(await refundLegAWaiting(world, { refundLegA: async () => Promise.reject(neverLocked()) })).toBeUndefined();
+    expect(state.sleeps).toEqual([]);
+    const evidence = { ref: "0x01", raw: [] };
+    expect(await refundLegAWaiting(world, { refundLegA: async () => evidence })).toBe(evidence);
+    await expect(refundLegAWaiting(world, { refundLegA: async () => Promise.reject(new Error("buyer: refusing to refund leg A before its refundAfterMs")) })).rejects.toThrow("before its refundAfterMs");
+    await expect(refundLegAWaiting(world, { refundLegA: async () => Promise.reject(new Error("tclk: The contract function \"refund\" reverted")) })).rejects.toThrow("reverted");
+  });
+
+  it("is bounded by waitLimitMs: a finalized block that never gets there, or a Buyer that keeps saying 'not final yet', ends in a refusal that says nothing was sent and names --refund", async () => {
+    const stuck = waitWorld({ startMs: REFUND_AFTER + 60_000, lagMs: 10 * 24 * 3_600_000, waitLimitMs: 60_000 }); // a finalized block ten days behind
+    let calls = 0;
+    const buyer = { refundLegA: async () => (calls += 1, Promise.reject(new RefundNotFinalYetError(`0x${"ab".repeat(32)}`, REFUND_AFTER))) };
+    await expect(refundLegAWaiting(stuck.world, buyer)).rejects.toThrow(/the finalized block has not reached leg A's refund time .* after \d+ s \(waitLimitMs\).*nothing was sent or recorded; run --refund again to keep waiting/);
+    expect(calls).toBe(1);
+    expect(stuck.state.t - (REFUND_AFTER + 60_000)).toBeGreaterThan(60_000);
+    expect(stuck.state.t - (REFUND_AFTER + 60_000)).toBeLessThan(60_000 + 2 * 30_000); // it did not keep waiting far past the limit
+
+    // The runner's own read says the finalized block is there but the Buyer's read disagrees (a lagging second node): it asks again every poll, bounded by the limit.
+    const disagree = waitWorld({ startMs: REFUND_AFTER + 3_600_000, lagMs: 60_000, waitLimitMs: 60_000 });
+    let again = 0;
+    const stubborn = { refundLegA: async () => (again += 1, Promise.reject(new RefundNotFinalYetError(`0x${"ab".repeat(32)}`, REFUND_AFTER))) };
+    await expect(refundLegAWaiting(disagree.world, stubborn)).rejects.toThrow(/waitLimitMs/);
+    expect(again).toBeGreaterThan(3);
+    expect(again).toBeLessThan(20);
+  });
+
+  it("the existing wait for a refund that was sent but does not read final is unchanged: the finalized block must pass the head, bounded by waitLimitMs", async () => {
+    const { world, state } = waitWorld({ startMs: REFUND_AFTER + 60_000, lagMs: 0, waitLimitMs: 60_000 });
+    let calls = 0;
+    const evidence = { ref: "0x02", raw: [] };
+    const buyer = { refundLegA: async () => (calls += 1) < 2 ? Promise.reject(new Error("buyer: refund signed but not yet confirmed; it may never have been sent; call refundLegA() again later (G7)")) : evidence };
+    // The finalized block's number is fixed at 900,000 against a head of 1,000,000: it never passes, so the wait is bounded and ends in the --resume refusal.
+    await expect(refundLegAWaiting(world, buyer)).rejects.toThrow(/was not final after \d+ s \(waitLimitMs\); run --resume to keep waiting/);
+    expect(state.logs.some((line) => line.includes("the refund of leg A is not final yet; waiting for the finalized block to pass the current head"))).toBe(true);
+  });
+
+  /** A Buyer record that holds the verdict (or only an attempt), written the way the flow saves it. */
+  async function writeNeverLandedRecord(rig: Rig, verdict: boolean, swapId = `0x${"11".repeat(32)}`): Promise<void> {
+    const did = (await loadOrCreateIdentity(join(rig.stateDir, "buyer", "ed25519.seed"))).did; // the identity writeRun made: a resumed flow checks it
+    const deploymentId = `evm-htlc:contract=${CONTRACT.toLowerCase()}:assets=USDC=${TOKEN.toLowerCase()}`; // what the rig's rail pins (src/client/evm-rail.ts)
+    const record = newBuyerRecord({ swapId, did, railId: "evm-htlc", caip2: "eip155:84532", deploymentId, nowMs: Date.now() });
+    const stored = { ...record, lock: { attempted: true, hashLock: `0x${"ab".repeat(32)}`, framePosted: false, ...(verdict ? { neverLanded: true as const } : {}) } };
+    await new FileFlowStore(join(rig.stateDir, "buyer", "flows")).save(flowKey("buyer", swapId), encodeFlowRecord(stored), null);
+  }
+
+  it("buyerLockNeverLanded reads the verdict from the Buyer's record only: true for the verdict, false for an attempt, no record, another swap or a damaged file", async () => {
+    const rig = await makeRig();
+    const swapId = `0x${"11".repeat(32)}`;
+    await mkdir(rig.stateDir, { recursive: true });
+    expect(await buyerLockNeverLanded(rig.stateDir, swapId)).toBe(false);
+    expect(await exists(join(rig.stateDir, "buyer"))).toBe(false); // the look created nothing
+    await writeNeverLandedRecord(rig, false, swapId);
+    expect(await buyerLockNeverLanded(rig.stateDir, swapId)).toBe(false);
+    await rm(join(rig.stateDir, "buyer"), { recursive: true });
+    await writeNeverLandedRecord(rig, true, swapId);
+    expect(await buyerLockNeverLanded(rig.stateDir, swapId)).toBe(true);
+    expect(await buyerLockNeverLanded(rig.stateDir, `0x${"22".repeat(32)}`)).toBe(false);
+    await writeFile(join(rig.stateDir, "buyer", "flows", `buyer-${swapId}.json`), "damaged");
+    expect(await buyerLockNeverLanded(rig.stateDir, swapId)).toBe(false);
+  });
+
+  it("--resume of a run whose Buyer record holds the verdict continues as --refund (and says so): the refund pre-flight, a missing Seller key file only a warning, the refund path's own steps; an attempt without the verdict stays a --resume", async () => {
+    // `noFinalizedTag` fails a row that every mode needs, so the run ends at its pre-flight (exit 3) with nothing opened: the table's own title says which mode it was.
+    const rig = await makeRig({ skipSellerKey: true, chain: { noFinalizedTag: true } });
+    await writeRun(rig, {}, true);
+    await writeNeverLandedRecord(rig, true);
+    const redirected = await run(rig, "resume");
+    expect(redirected.stdout).toContain("--resume: the Buyer's record holds the verdict that leg A's lock attempt never landed");
+    expect(redirected.stdout).toContain("continuing as --refund");
+    expect(redirected.stdout).toContain("EVM rehearsal pre-flight before --refund");
+    expect(redirected.stdout).toMatch(/WARN\s+seller account\s+\(not needed for this mode\) sellerKeyFile: no such file/); // a resume would FAIL on it
+    expect(redirected.stdout).toMatch(/FAIL\s+finalized/);
+    expect(redirected.stdout).toContain("--refund did nothing because a check it needs failed");
+    expect(redirected.stderr).not.toContain("use --refund");
+    expect(redirected.code).toBe(EXIT.preflight);
+    expect(rig.chain.methods.filter((m) => WRITES.includes(m))).toEqual([]);
+
+    const plain = await makeRig({ skipSellerKey: true, chain: { noFinalizedTag: true } });
+    await writeRun(plain, {}, true);
+    await writeNeverLandedRecord(plain, false);
+    const resumed = await run(plain, "resume");
+    expect(resumed.stdout).toContain("EVM rehearsal pre-flight before --resume");
+    expect(resumed.stdout).not.toContain("continuing as --refund");
+    expect(resumed.stdout).toMatch(/FAIL\s+seller account\s+sellerKeyFile: no such file/);
+    expect(resumed.code).toBe(EXIT.preflight);
+  });
+
+  it("a finished run that ended refunded-b is reported by --resume as it is by --refund when its Buyer record holds the verdict (exit 0, no longer 'nothing to resume' exit 4)", async () => {
+    const rig = await makeRig();
+    await writeRun(rig, {}, true);
+    await writeNeverLandedRecord(rig, true);
+    await writeFile(join(rig.stateDir, "outcome.json"), `${JSON.stringify({ v: 1, swapId: `0x${"11".repeat(32)}`, outcome: "refunded-b", bundle: "somewhere" })}\n`);
+    for (const mode of ["resume", "refund"] as const) {
+      const result = await run(rig, mode);
+      expect(result.code, mode).toBe(EXIT.ok);
+      expect(result.stdout, mode).toContain(`this run already ended: swap 0x${"11".repeat(32)} refunded-b`);
+      expect(result.stderr, mode).toBe("");
+    }
+    // Without the verdict a finished refunded-b run is still "nothing to resume" for --resume (the exit 4 the anvil suite pins for a refunded run).
+    const other = await makeRig();
+    await writeRun(other, {}, true);
+    await writeFile(join(other.stateDir, "outcome.json"), `${JSON.stringify({ v: 1, swapId: `0x${"11".repeat(32)}`, outcome: "refunded-b", bundle: "somewhere" })}\n`);
+    const resumed = await run(other, "resume");
+    expect(resumed.code).toBe(EXIT.refused);
+    expect(resumed.stderr).toContain("so there is nothing to resume");
+  });
+
+  it("driveRefund hands the Buyer's step to refundLegAWaiting (no private copy of the loop that could forget the wait)", async () => {
+    const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
+    expect(text).toContain("await refundLegAWaiting(w, buyer)");
+    expect(text).toContain("error instanceof RefundNotFinalYetError");
+    expect(text).toContain("buyerLockNeverLanded(stateDir, existingRun.swapId)");
+  });
+});
+
+// R2-FUND-04 (P9 review round 2), the runner's part: --resume sizes the Seller's ETH row by what is left to send, read from the Seller's own record (its claim landed) or,
+// when the record is unclear (a claim was attempted and the process died before the outcome was saved), from `locks(hashLock)` reading Claimed at the latest block;
+// --refund turns a short Buyer row into a warning. (The rows themselves: tests/rehearsal-preflight.test.ts; a refund that goes ahead on a real node: the anvil suite.)
+describe("R2-FUND-04: what the Seller still has to send, read from its record and the chain", () => {
+  const CONTRACT_A = `0x${"c1".repeat(32)}`;
+  const LOCK = generateHashLock(); // a swap secret made now, only ever written to a temp store
+
+  /** The Seller's record as a store holds it: claim `outcome` and whether a claim was attempted. */
+  async function writeSellerRecord(stateDir: string, patch: { claimAttempted?: boolean; claimOutcome?: "none" | "landed" } = {}, contractA = CONTRACT_A): Promise<void> {
+    const base = newSellerRecord({ swapId: `0x${"11".repeat(32)}`, did: "did:key:z6Mkvendor", railId: "evm-htlc", caip2: "eip155:84532", deploymentId: "evm:test", nowMs: Date.now(), contractA, preimage: LOCK.preimage, statement: LOCK.hash });
+    const record = { ...base, claimAttempted: patch.claimAttempted ?? false, claimOutcome: patch.claimOutcome ?? ("none" as const) };
+    await new FileFlowStore(join(stateDir, "seller", "flows")).save(flowKey("seller", contractA), encodeFlowRecord(record), null);
+  }
+
+  /** A node that answers `locks(hashLock)` with `status` (and counts the reads). */
+  function node(status: number | "error"): { rpc: Pick<CapturingRpc, "request">; reads: string[] } {
+    const reads: string[] = [];
+    const rpc = {
+      request: async ({ method, params }: { method: string; params?: readonly unknown[] }): Promise<unknown> => {
+        if (method !== "eth_call") throw new Error(`unexpected ${method}`);
+        reads.push(String((params as unknown[])[1]));
+        if (status === "error") throw new Error("node down");
+        return encodeFunctionResult({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", result: [CONTRACT, CONTRACT, TOKEN, 1_000_000n, 1n, 2n, status] });
+      },
+    };
+    return { rpc: rpc as unknown as Pick<CapturingRpc, "request">, reads };
+  }
+
+  async function stateWith(patch?: { claimAttempted?: boolean; claimOutcome?: "none" | "landed" }): Promise<string> {
+    const stateDir = await mkdtemp(join(tmpdir(), "rh-sellersends-"));
+    dirs.push(stateDir);
+    if (patch !== undefined) await writeSellerRecord(stateDir, patch);
+    return stateDir;
+  }
+
+  it("a Seller record whose claim landed is 'nothing' without asking the chain; no record, no attempt, or a refused read is 'claim'", async () => {
+    const landed = node(1);
+    expect(await sellerSendsOnRecord(await stateWith({ claimAttempted: true, claimOutcome: "landed" }), landed.rpc, CONTRACT)).toBe("nothing");
+    expect(landed.reads).toEqual([]);
+    expect(await sellerSendsOnRecord(await stateWith(), node(2).rpc, CONTRACT)).toBe("claim"); // no Seller record at all: the claim is still to come
+    expect(await sellerSendsOnRecord(await stateWith({}), node(2).rpc, CONTRACT)).toBe("claim"); // a record, no claim attempted: nothing proves it
+    expect(await sellerSendsOnRecord("Z:/no/such/state/dir", node(2).rpc, CONTRACT)).toBe("claim");
+    // A damaged record never lifts the reservation.
+    const damaged = await stateWith({});
+    await writeFile(join(damaged, "seller", "flows", `seller-${CONTRACT_A}.json`), "damaged");
+    expect(await sellerSendsOnRecord(damaged, node(2).rpc, CONTRACT)).toBe("claim");
+  });
+
+  it("an unclear record (a claim attempted, its outcome never saved) is decided by locks(hashLock) at the latest block: Claimed is 'nothing'; Locked, no row, an error or a malformed answer is 'claim'", async () => {
+    const attempted = { claimAttempted: true, claimOutcome: "none" as const };
+    const claimed = node(2);
+    expect(await sellerSendsOnRecord(await stateWith(attempted), claimed.rpc, CONTRACT)).toBe("nothing");
+    expect(claimed.reads).toEqual(["latest"]);
+    for (const [label, status] of [["Locked", 1], ["no row", 0], ["Refunded", 3], ["a node that fails", "error"]] as const) {
+      expect(await sellerSendsOnRecord(await stateWith(attempted), node(status).rpc, CONTRACT), label).toBe("claim");
+    }
+    const malformed = { request: async (): Promise<unknown> => "0x1234" } as unknown as Pick<CapturingRpc, "request">;
+    expect(await sellerSendsOnRecord(await stateWith(attempted), malformed, CONTRACT)).toBe("claim");
+  });
+
+  it("two Seller records in one state directory are not read as proof (one directory is one swap): 'claim'", async () => {
+    const stateDir = await stateWith({ claimAttempted: true, claimOutcome: "landed" });
+    await writeSellerRecord(stateDir, { claimAttempted: true, claimOutcome: "landed" }, `0x${"c2".repeat(32)}`);
+    expect(await sellerSendsOnRecord(stateDir, node(2).rpc, CONTRACT)).toBe("claim");
+  });
+
+  it("--resume with a Seller record whose claim landed does not fail the Seller's row at a balance of 3.35e11 wei: the row is an info row, and the run goes on to its other checks", async () => {
+    const funded: FakeChainOptions = { gasPriceWei: 1_000_000n, pending: "error" }; // `pending` fails the --resume pre-flight on a row of its own: nothing is started
+    const withClaim = await makeRig({ chain: funded });
+    withClaim.chain.handlers.eth_getBalance = (params) => ({ result: String(params[0]).toLowerCase() === withClaim.seller.toLowerCase() ? `0x${(335_000_000_000n).toString(16)}` : `0x${(10n ** 18n).toString(16)}` });
+    await writeRun(withClaim, {}, true);
+    await writeSellerRecord(withClaim.stateDir, { claimAttempted: true, claimOutcome: "landed" });
+    const resumed = await run(withClaim, "resume");
+    expect(resumed.stdout).toMatch(/seller ETH\s+0x[0-9a-fA-F]{40}: nothing is left for the Seller to send \(its claim already landed\)/);
+    expect(resumed.stdout).not.toMatch(/FAIL\s+seller ETH/);
+    expect(resumed.stdout).toMatch(/FAIL\s+pending/); // the only failure is the one this test put there
+    expect(resumed.code).toBe(EXIT.preflight);
+
+    // The control: the same Seller balance with no Seller record is still short for the claim it has to make.
+    const without = await makeRig({ chain: funded });
+    without.chain.handlers.eth_getBalance = (params) => ({ result: String(params[0]).toLowerCase() === without.seller.toLowerCase() ? `0x${(335_000_000_000n).toString(16)}` : `0x${(10n ** 18n).toString(16)}` });
+    await writeRun(without, {}, true);
+    const refused = await run(without, "resume");
+    expect(refused.stdout).toMatch(/FAIL\s+seller ETH\s+.*needs 0\.0000004 ETH for the claim/);
+    expect(refused.code).toBe(EXIT.preflight);
+  });
+
+  it("--refund prints a short Buyer ETH row as a WARN with its need and goes past the pre-flight (it stops at the Buyer's empty store here, not at 'fund it first')", async () => {
+    const rig = await makeRig({ chain: { gasPriceWei: 3_000_000n } });
+    rig.chain.handlers.eth_getBalance = (params) => ({ result: String(params[0]).toLowerCase() === rig.buyer.toLowerCase() ? `0x${(1_182_000_000_000n).toString(16)}` : "0x0" });
+    await writeRun(rig, {}, true);
+    const refund = await run(rig, "refund");
+    expect(refund.stdout).toMatch(/WARN\s+buyer ETH\s+0x[0-9a-fA-F]{40}: 0\.000001182 ETH, needs 0\.0000012 ETH for the refund \(the approve and the lock are already sent\)/);
+    expect(refund.stdout).not.toContain("a check it needs failed");
+    expect(refund.code).toBe(EXIT.refused); // past the pre-flight, at the Buyer's empty store
+    expect(refund.stderr).toContain("holds no record");
+    // A --resume of the same state keeps the strict row.
+    const resume = await run(rig, "resume");
+    expect(resume.stdout).toMatch(/FAIL\s+buyer ETH/);
+    expect(resume.code).toBe(EXIT.preflight);
+  });
+});
+
 describe("bad configs and a failing endpoint", () => {
   it("exits 2 on a config it refuses, naming the field and never echoing a pasted key", async () => {
     const key = generatePrivateKey();
@@ -848,21 +1134,24 @@ describe("the runner reacts to the flows' own refusals by their text", () => {
 // passes the head only after more than 20 polls.
 describe("R1-FUND-07: a lock with no block number on record is waited for, not given up on", () => {
   const hex = (n: bigint): string => `0x${n.toString(16)}`;
+  /** The lock's identity a recovered lock's wait is given (its target file lives in a fresh state directory). The node here cannot read state (no eth_call), so the wait is for the target block. */
+  async function recovered(): Promise<RecoveredLock> {
+    const stateDir = await mkdtemp(join(tmpdir(), "rh-lockfinal-"));
+    dirs.push(stateDir);
+    return { hashLock: `0x${"ab".repeat(32)}`, swapId: `0x${"11".repeat(32)}`, stateDir };
+  }
 
   function finalityWorld(options: { head: bigint; finalized: bigint; step: bigint; pollMs?: number; waitLimitMs?: number }): { world: FinalityWorld; state: { sleeps: number[]; logs: string[]; reads: number; waitedMs: number } } {
     const pollMs = options.pollMs ?? 5_000;
     const state = { sleeps: [] as number[], logs: [] as string[], reads: 0, waitedMs: 0 };
-    let finalized = options.finalized;
     let t = 1_790_000_000_000;
     const rpc = {
       request: async ({ method, params }: { method: string; params?: readonly unknown[] }): Promise<unknown> => {
         if (method === "eth_blockNumber") return hex(options.head);
         if (method !== "eth_getBlockByNumber") throw new Error(`unexpected ${method}`);
         if (params?.[0] === "latest") return { number: hex(options.head) };
-        const number = finalized; // the "finalized" tag: it moves up by `step` blocks at every look
-        finalized += options.step;
         state.reads += 1;
-        return { number: hex(number) };
+        return { number: hex(options.finalized + options.step * BigInt(state.sleeps.length)) }; // the "finalized" tag moves up by `step` blocks at every poll (every sleep)
       },
     } as unknown as CapturingRpc;
     const config = parseRehearsalConfig(
@@ -888,7 +1177,7 @@ describe("R1-FUND-07: a lock with no block number on record is waited for, not g
 
   it("waits until the finalized block passes the head when the lock has no block number: more than 20 polls, then it returns", async () => {
     const { world, state } = finalityWorld({ head: 1_000n, finalized: 900n, step: 4n }); // 25 looks to get from 900 to 1000
-    await waitLockFinal(world, undefined);
+    await waitLockFinal(world, undefined, await recovered());
     expect(state.sleeps.length).toBeGreaterThan(20);
     expect(state.sleeps.length).toBe(25);
     expect(state.waitedMs).toBeGreaterThan(20 * 5_000); // longer than the 20 re-reads the claim loop used to give up after
@@ -897,18 +1186,157 @@ describe("R1-FUND-07: a lock with no block number on record is waited for, not g
 
   it("with a block number it waits for that block only (as before), and returns at once when it is already final", async () => {
     const withBlock = finalityWorld({ head: 1_000n, finalized: 900n, step: 4n });
-    await waitLockFinal(withBlock.world, 920n);
+    await waitLockFinal(withBlock.world, 920n, await recovered());
     expect(withBlock.state.sleeps.length).toBe(5); // 900, 904, 908, 912, 916, 920
     expect(withBlock.state.logs.some((line) => line.includes("no block number"))).toBe(false);
     const already = finalityWorld({ head: 1_000n, finalized: 990n, step: 1n });
-    await waitLockFinal(already.world, 950n);
+    await waitLockFinal(already.world, 950n, await recovered());
     expect(already.state.sleeps).toEqual([]);
   });
 
   it("is bounded by waitLimitMs like every wait: a finalized block that never passes the head ends in a refusal that names --resume", async () => {
     const stuck = finalityWorld({ head: 1_000n, finalized: 900n, step: 0n, pollMs: 5_000, waitLimitMs: 60_000 });
-    await expect(waitLockFinal(stuck.world, undefined)).rejects.toThrow(/was not final after \d+ s \(waitLimitMs\); run --resume to keep waiting/);
+    await expect(waitLockFinal(stuck.world, undefined, await recovered())).rejects.toThrow(/was not final after \d+ s \(waitLimitMs\); run --resume to keep waiting/);
     expect(stuck.state.waitedMs).toBeGreaterThan(60_000);
+  });
+});
+
+// R2-FUND-03 (P9 review round 2): the wait R1-FUND-07 added for a recovered lock (no block number on record) waited for the finalized block to pass the head read NOW,
+// without looking at the lock: a whole finalized lag (39.3 minutes at the sample's maximum) on EVERY --resume, even for a lock final for hours or already claimed,
+// ahead of the Seller's claim and the Buyer's leg B claim; and with waitLimitMs below the lag each resume took a new head and never finished. The lock is read first
+// now (a row at the finalized block ends the wait), and the head read at the first wait is kept in the state directory, so a later resume waits for the same block.
+describe("R2-FUND-03: a recovered lock is read before it is waited for, and the wait's target is kept across resumes", () => {
+  const hex = (n: bigint): string => `0x${n.toString(16)}`;
+  const LAG = 1_180n; // the sample's maximum finalized lag in blocks (2,360 s at 2 s a block)
+  const HEAD0 = 47_784_683n;
+
+  /** A chain that moves with the clock (a block every 2 s) and a finalized tag LAG blocks behind the head; `locks(hashLock)` has a row from `lockBlock` on. */
+  function timedWorld(options: { lockBlock: bigint; status?: number; stateReadable?: boolean; waitLimitMs?: number; pollMs?: number }): {
+    world: FinalityWorld;
+    state: { sleeps: number[]; logs: string[]; headReads: number; calls: string[] };
+    clock: { t: number; t0: number };
+    waited: () => number;
+  } {
+    const pollMs = options.pollMs ?? 5_000;
+    const state = { sleeps: [] as number[], logs: [] as string[], headReads: 0, calls: [] as string[] };
+    const clock = { t: 1_790_000_000_000, t0: 1_790_000_000_000 };
+    const headAt = (): bigint => HEAD0 + BigInt(Math.floor((clock.t - clock.t0) / 2_000));
+    const rpc = {
+      request: async ({ method, params }: { method: string; params?: readonly unknown[] }): Promise<unknown> => {
+        state.calls.push(method);
+        if (method === "eth_blockNumber") {
+          state.headReads += 1;
+          return hex(headAt());
+        }
+        if (method === "eth_getBlockByNumber") return { number: hex(params?.[0] === "latest" ? headAt() : headAt() - LAG) };
+        if (method === "eth_call") {
+          if (options.stateReadable === false) throw new Error("missing trie node");
+          const at = BigInt(String((params as unknown[])[1]));
+          const status = at >= options.lockBlock ? (options.status ?? 1) : 0;
+          return encodeFunctionResult({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", result: [CONTRACT, CONTRACT, TOKEN, 1_000_000n, 1n, 2n, status] });
+        }
+        throw new Error(`unexpected ${method}`);
+      },
+    } as unknown as CapturingRpc;
+    const config = parseRehearsalConfig(
+      {
+        rails: { evm: { pin: BASE_SEPOLIA_PIN, endpoint: "https://sepolia.base.org", contract: CONTRACT, assets: { USDC: TOKEN }, contractCodeHash: FAKE_ESCROW_CODE_HASH } },
+        buyerKeyFile: "b.key",
+        sellerKeyFile: "s.key",
+        amount: "1000000",
+        out: "bundle",
+        pollMs,
+        ...(options.waitLimitMs === undefined ? {} : { waitLimitMs: options.waitLimitMs }),
+      },
+      "/base",
+    );
+    const env: RehearsalEnv = { now: () => clock.t, sleep: async (ms) => void (state.sleeps.push(ms), (clock.t += ms)), out: () => undefined, err: () => undefined };
+    return { world: { config, env, rpc, log: (line) => void state.logs.push(line), pollMs }, state, clock, waited: () => clock.t - clock.t0 };
+  }
+
+  async function lockIn(): Promise<RecoveredLock> {
+    const stateDir = await mkdtemp(join(tmpdir(), "rh-lockfinal-"));
+    dirs.push(stateDir);
+    return { hashLock: `0x${"ab".repeat(32)}`, swapId: `0x${"11".repeat(32)}`, stateDir };
+  }
+
+  it("a recovered lock that landed 5,000 blocks ago (final for hours) is read at the finalized block and returns at once: no wait, no new head read (it waited 2,360 s)", async () => {
+    const lock = await lockIn();
+    const { world, state, waited } = timedWorld({ lockBlock: HEAD0 - 5_000n });
+    await waitLockFinal(world, undefined, lock);
+    expect(waited()).toBe(0);
+    expect(state.sleeps).toEqual([]);
+    expect(state.headReads).toBe(0); // the head was never read: nothing was waited for
+    expect(state.logs.some((line) => line.includes("has no block number on record") && line.includes("it is final, no wait"))).toBe(true);
+    expect((await readdir(lock.stateDir)).length).toBe(0); // and no target was kept
+  });
+
+  it.each([[2, "Claimed (the Seller's claim already landed)"], [3, "Refunded"], [1, "Locked"]] as const)("a final row of any status but None ends the wait: %s, %s", async (status, _name) => {
+    const { world, state, waited } = timedWorld({ lockBlock: HEAD0 - 5_000n, status });
+    await waitLockFinal(world, undefined, await lockIn());
+    expect(waited()).toBe(0);
+    expect(state.sleeps).toEqual([]);
+  });
+
+  it("a lock still inside the finalized lag is waited for only until the finalized block passes ITS block, not the head's: 100 blocks below the head it is released after about 2,160 s, not 2,360 s", async () => {
+    const { world, state, waited } = timedWorld({ lockBlock: HEAD0 - 100n });
+    await waitLockFinal(world, undefined, await lockIn());
+    expect(waited()).toBeGreaterThanOrEqual(2_160_000); // the finalized block (head - 1,180) reaches the lock's block at head0 + 1,080
+    expect(waited()).toBeLessThan(2_160_000 + 2 * 5_000);
+    expect(waited()).toBeLessThan(2_360_000);
+    expect(state.headReads).toBe(1); // one head read, at the first wait
+  });
+
+  it("the target is kept at the first wait, so a second resume waits for THE SAME block: a limit below the lag ends the first resume, and the second one returns at once once that block is final (it used to take a new head and never finish)", async () => {
+    const lock = await lockIn();
+    // A node that cannot answer the state read (a pruned one): only the block number is left to wait for.
+    const first = timedWorld({ lockBlock: HEAD0 - 100n, stateReadable: false, waitLimitMs: 60_000 });
+    await expect(waitLockFinal(first.world, undefined, lock)).rejects.toThrow(/was not final after \d+ s \(waitLimitMs\); run --resume to keep waiting/);
+    const kept = JSON.parse(await readFile(join(lock.stateDir, "lockfinal.json"), "utf8")) as Record<string, unknown>;
+    expect(kept).toEqual({ v: 1, swapId: lock.swapId, hashLock: lock.hashLock, target: HEAD0.toString() });
+
+    // The operator comes back after a whole lag: the finalized block (head - 1,180) is past the kept target (head0), though it is far below a NEW head.
+    const second = timedWorld({ lockBlock: HEAD0 - 100n, stateReadable: false, waitLimitMs: 60_000 });
+    second.clock.t += 2_400_000;
+    await waitLockFinal(second.world, undefined, lock);
+    expect(second.state.sleeps).toEqual([]); // no waiting
+    expect(second.state.headReads).toBe(0); // and no new head was read
+    expect(second.state.logs.some((line) => line.includes(`block ${HEAD0}`) && line.includes("kept from the first wait"))).toBe(true);
+  });
+
+  it("a target file of another swap or another lock, or a damaged one, is not used: the head is read afresh and the file is rewritten", async () => {
+    for (const content of [
+      JSON.stringify({ v: 1, swapId: `0x${"22".repeat(32)}`, hashLock: `0x${"ab".repeat(32)}`, target: "99999999999" }),
+      JSON.stringify({ v: 1, swapId: `0x${"11".repeat(32)}`, hashLock: `0x${"cd".repeat(32)}`, target: "99999999999" }),
+      JSON.stringify({ v: 2, swapId: `0x${"11".repeat(32)}`, hashLock: `0x${"ab".repeat(32)}`, target: "5" }),
+      "{ damaged",
+    ]) {
+      const lock = await lockIn();
+      await writeFile(join(lock.stateDir, "lockfinal.json"), content);
+      const { world, state } = timedWorld({ lockBlock: HEAD0 - 100n, stateReadable: false, waitLimitMs: 60_000 });
+      await expect(waitLockFinal(world, undefined, lock)).rejects.toThrow(/was not final/);
+      expect(state.headReads).toBe(1);
+      const kept = JSON.parse(await readFile(join(lock.stateDir, "lockfinal.json"), "utf8")) as { swapId: string; hashLock: string; target: string };
+      expect(kept).toEqual({ v: 1, swapId: lock.swapId, hashLock: lock.hashLock, target: HEAD0.toString() });
+    }
+  });
+
+  it("a lock with a block number on record is waited for by that block alone, as before: no state read, no file", async () => {
+    const lock = await lockIn();
+    const { world, state, waited } = timedWorld({ lockBlock: HEAD0 - 100n });
+    await waitLockFinal(world, HEAD0 - 1_100n, lock); // the finalized block (head - 1,180) passes it after 40 blocks
+    expect(waited()).toBeGreaterThanOrEqual(80_000);
+    expect(state.calls).not.toContain("eth_call");
+    expect((await readdir(lock.stateDir)).length).toBe(0);
+  });
+
+  it("driveSettle gives the wait the hash lock it must read, ahead of the Seller's claim and the Buyer's learnSecret and claimLegB (code order)", async () => {
+    const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
+    expect(text).toContain("await waitLockFinal(w, lockA.writeEvidence.blockNumber, { hashLock: lockA.hashLock, swapId: run.swapId, stateDir: w.stateDir });");
+    const at = (needle: string): number => text.indexOf(needle);
+    const order = ["const lockA = await buyer.lockLegA();", "await waitLockFinal(w, lockA.writeEvidence.blockNumber", "claimed = await seller.claimLegA(lockA.hashLock);", "const secret = await buyer.learnSecret();", "await buyer.claimLegB(secret);"].map(at);
+    expect(order.every((position) => position > 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
   });
 });
 

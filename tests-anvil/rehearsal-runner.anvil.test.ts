@@ -14,13 +14,18 @@
 //                    finishes the swap and the chain still shows one lock and one claim (and the accounts' transaction counts show
 //                    no second approve, lock or claim).
 //   --refund         on an anvil whose time is moved: `--yes --stop-after lock`, a refund run too early (exit 5, nothing sent), the
-//                    refund after the deadlines (`refunded`), and a run killed before leg A was locked (`refunded-b`).
+//                    refund after the deadlines (`refunded`), and a run killed before leg A was locked (`refunded-b`); a refund whose
+//                    Buyer holds less ETH than the pre-flight's ceiling-sized reservation (a warning, the refund goes ahead; R2-FUND-04);
+//                    and a lock attempt that never landed (the approve landed, the local signer refused the lock) which ends in the
+//                    verdict, waits for the finalized block, refunds leg B and replays to `refunded-b` (R2-FUND-01).
 //
 // Every case scans every file the runner wrote (the bundle and the whole state directory) and its stdout and stderr for BOTH private
 // keys, and the bundle and the output for the two Ed25519 venue seeds too, as booleans only: a failure names a file, never a byte of
 // a key. `npm run test:anvil` only; `npm test` never spawns anvil or the runner.
 
 import { spawn, execFile, type ChildProcess } from "node:child_process";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -102,6 +107,8 @@ interface RigOptions {
   fundBuyerEth?: boolean;
   buyerTokens?: bigint;
   codeHash?: Hex;
+  /** The endpoint the config names instead of the node's own (a proxy in front of it). */
+  endpoint?: string;
 }
 
 /** Two fresh parties: keys generated now into mode-0600 files, funded from anvil's account 0, and a config that names them. */
@@ -131,7 +138,7 @@ async function makeRig(chain: Chain, options: RigOptions = {}): Promise<Rig> {
     rails: {
       evm: {
         pin: options.confirmations === undefined ? ANVIL_LOCAL_PIN : { ...ANVIL_LOCAL_PIN, finality: { mode: "confirmations", confirmations: options.confirmations } },
-        endpoint: chain.anvil.endpoint,
+        endpoint: options.endpoint ?? chain.anvil.endpoint,
         contract: chain.contract,
         assets: { USDC: chain.token },
         contractCodeHash: options.codeHash ?? chain.codeHash,
@@ -156,6 +163,47 @@ async function makeRig(chain: Chain, options: RigOptions = {}): Promise<Rig> {
     seller,
     leaks: (text) => scanners.some((scan) => scan(text)),
   };
+}
+
+interface FaultProxy {
+  url: string;
+  /** While set, an `eth_estimateGas` for a call TO this address is answered 500,001 gas (one above the local signer's ceiling); null: every call passes through. */
+  inflateEstimatesTo: Address | null;
+  close: () => Promise<void>;
+}
+
+/**
+ * R2-FUND-01: a JSON-RPC proxy in front of the node that makes the local signer refuse a write the node would accept: the estimate for the lock (a call to the
+ * escrow) is inflated past the signer's gas ceiling, so the approve lands and the lock is refused, which is one of the ways a lock attempt never lands (the others:
+ * the lock guard after the approve's receipt, a dropped lock, a kill between the two). Everything else is passed to the node unchanged.
+ */
+async function startFaultProxy(target: string): Promise<FaultProxy> {
+  const proxy: FaultProxy = { url: "", inflateEstimatesTo: null, close: async () => undefined };
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      void (async () => {
+        const body = Buffer.concat(chunks).toString("utf8");
+        const call = JSON.parse(body) as { id: number | string; method: string; params?: Array<{ to?: string }> };
+        response.setHeader("content-type", "application/json");
+        if (proxy.inflateEstimatesTo !== null && call.method === "eth_estimateGas" && call.params?.[0]?.to?.toLowerCase() === proxy.inflateEstimatesTo.toLowerCase()) {
+          response.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, result: "0x7a121" }));
+          return;
+        }
+        const upstream = await fetch(target, { method: "POST", headers: { "content-type": "application/json" }, body });
+        response.statusCode = upstream.status;
+        response.end(await upstream.text());
+      })().catch(() => {
+        response.statusCode = 502;
+        response.end();
+      });
+    });
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  proxy.url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  proxy.close = () => new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  return proxy;
 }
 
 interface RunResult {
@@ -724,5 +772,91 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(neverLocked.stray).toEqual([]);
       await expectCleanAndReplays(rig, { ...refunded, stdout: killed.stdout + refunded.stdout, stderr: killed.stderr + refunded.stderr }, "refunded-b");
     }, 240_000);
+
+    it("a --refund Buyer holding less than the pre-flight's ceiling-sized reservation (it covers the real refund) gets a WARN with the need, and the refund goes ahead (R2-FUND-04)", async () => {
+      const rig = await makeRig(warp, { clock: "chain" });
+      const locked = await run(rig, ["--yes", "--stop-after", "lock"]);
+      expect(locked.code).toBe(0);
+      // What viem will ask the node to hold for a refund: a gas limit of about 65,000 times 1.2 x the base fee plus the tip. 120,000 times that covers it with room, and is far
+      // below the pre-flight's reservation of 200,000 gas at twice the price (it would FAIL the Buyer's row before this item and --refund would exit 3, "fund it first").
+      const price = BigInt(await warp.anvil.rpcCall<Hex>("eth_gasPrice", []));
+      const base = BigInt((await warp.anvil.rpcCall<{ baseFeePerGas: Hex }>("eth_getBlockByNumber", ["latest", false])).baseFeePerGas);
+      const tip = BigInt(await warp.anvil.rpcCall<Hex>("eth_maxPriorityFeePerGas", []));
+      const balance = 120_000n * ((base * 12n) / 10n + tip);
+      expect(balance * 2n).toBeLessThan(400_000n * price); // the premise: even at half today's price the reservation is above the balance
+      await warp.anvil.rpcCall("anvil_setBalance", [rig.buyer, `0x${balance.toString(16)}`]);
+      const { deadlines } = await readRun(rig);
+      await warpTo(deadlines.legB.refundAfterMs + 60_000);
+      const refunded = await run(rig, ["--refund"]);
+      expect(refunded.stderr).toBe("");
+      expect(refunded.code).toBe(0);
+      expect(refunded.stdout).toMatch(/WARN\s+buyer ETH\s+0x[0-9a-fA-F]{40}: .* ETH, needs .* ETH for the refund \(the approve and the lock are already sent\).*fund it first/);
+      expect(refunded.stdout).not.toContain("a check it needs failed");
+      expect(refunded.stdout).toContain("step buyer.refundLegA done");
+      expect(await chainFacts(warp, rig)).toEqual({ locked: 1, claimed: 0, refunded: 1, buyerTxs: 3, sellerTxs: 0 }); // approve, lock, refund
+      expect(await tokenBalance(warp, rig.buyer)).toBe(100_000_000n);
+      await expectCleanAndReplays(rig, { ...refunded, stdout: locked.stdout + refunded.stdout, stderr: locked.stderr + refunded.stderr }, "refunded");
+    }, 240_000);
+
+    // R2-FUND-01 (P9 review round 2): the approve landed and the lock was refused (here: the local signer refuses it, its estimate past the gas ceiling). The record says "lock
+    // attempted, no evidence", and a refund of an unknown lock reverts for ever: --refund exited 4 every time and the Seller's leg B was never refunded. Now the Buyer reads the
+    // chain, and says "not final yet" until a FINALIZED block is at or past leg A's refund time (8 confirmations here, so the runner really waits), then records the verdict.
+    it("a lock attempt that never landed (the approve landed, the signer refused the lock) ends in a verdict: --refund waits for the finalized block, refunds leg B and replays to refunded-b; --resume continues the same way (R2-FUND-01)", async () => {
+      await headAtLeast(warp, 15n); // the finalized block (8 below the head) must be past the escrow's deploy, or the pre-flight's state read fails (F9)
+      const proxy = await startFaultProxy(warp.anvil.endpoint);
+      try {
+        const rig = await makeRig(warp, { clock: "chain", confirmations: 8, endpoint: proxy.url });
+        proxy.inflateEstimatesTo = warp.contract;
+        const refused = await run(rig, ["--yes", "--stop-after", "lock"]);
+        expect(refused.code).toBe(4);
+        expect(refused.stderr).toContain("refusing to sign");
+        proxy.inflateEstimatesTo = null;
+        expect(await chainFacts(warp, rig)).toEqual({ locked: 0, claimed: 0, refunded: 0, buyerTxs: 1, sellerTxs: 0 }); // the approve landed; no lock was ever signed or sent
+        expect(await exists(rig.outDir)).toBe(false);
+
+        // Leg A's refund time has come on the chain; leg B's (180 min) has not.
+        const { deadlines } = await readRun(rig);
+        await warpTo(deadlines.legA.refundAfterMs + 60_000);
+        const first = await run(rig, ["--refund"]);
+        expect(first.stderr).toBe("");
+        expect(first.stdout).toContain("a lock cannot be ruled out until the finalized block has passed leg A's refund time"); // the runner waited for the finalized block, never exit 4 for ever
+        expect(first.stdout).toContain("step buyer.refundLegA done: leg A was never locked: nothing to refund on chain");
+        expect(first.stdout).toContain("leg A is refunded; leg B (the paper note) is not refundable yet");
+        expect(first.code).toBe(5);
+        expect(await exists(rig.outDir)).toBe(false);
+
+        // The Buyer's record now holds the verdict: a --resume has no swap to settle and continues as --refund (it used to say "use --refund", exit 4).
+        const early = await run(rig, ["--resume"]);
+        expect(early.stderr).toBe("");
+        expect(early.stdout).toContain("--resume: the Buyer's record holds the verdict that leg A's lock attempt never landed");
+        expect(early.stdout).toContain("continuing as --refund");
+        expect(early.code).toBe(5);
+
+        await warpTo(deadlines.legB.refundAfterMs + 60_000);
+        const done = await run(rig, ["--resume"]);
+        expect(done.stderr).toBe("");
+        expect(done.code).toBe(0);
+        expect(done.stdout).toContain("continuing as --refund");
+        expect(done.stdout).toContain("step seller.refundLegB done");
+        expect(done.stdout).toContain("audit: the bundle replays offline to refunded-b");
+        expect(await chainFacts(warp, rig)).toEqual({ locked: 0, claimed: 0, refunded: 0, buyerTxs: 1, sellerTxs: 0 }); // nothing was sent but the approve
+        // K5: the swap never revealed, so the Seller's secret is in its own flow record and nowhere else.
+        const outputs = { refusedOut: refused.stdout, refusedErr: refused.stderr, firstOut: first.stdout, earlyOut: early.stdout, doneOut: done.stdout, doneErr: done.stderr };
+        const secret = await secretPlaces(rig, await sellerSecret(rig), [rig.stateDir, rig.outDir], outputs, (name) => SELLER_FLOWS.test(name));
+        expect(secret.stray).toEqual([]);
+        await expectCleanAndReplays(rig, { ...done, stdout: refused.stdout + first.stdout + early.stdout + done.stdout, stderr: refused.stderr + first.stderr + early.stderr + done.stderr }, "refunded-b");
+
+        // A finished run is only reported, by either mode (the verdict makes --resume the refund path, so it answers as --refund does), and nothing is sent again.
+        for (const flag of ["--refund", "--resume"]) {
+          const again = await run(rig, [flag]);
+          expect(again.code, flag).toBe(0);
+          expect(again.stdout, flag).toContain("this run already ended: swap");
+          expect(again.stdout, flag).toContain("refunded-b");
+        }
+        expect(await chainFacts(warp, rig)).toEqual({ locked: 0, claimed: 0, refunded: 0, buyerTxs: 1, sellerTxs: 0 });
+      } finally {
+        await proxy.close();
+      }
+    }, 300_000);
   });
 });
