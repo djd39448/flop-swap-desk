@@ -761,7 +761,8 @@ venue and a local paper-note file, signing with the two local key files. Modes (
   ends in a verdict (R2-FUND-01):** a lock attempt with no evidence is read on the chain first. While no finalized block is at or past leg
   A's refund time, a lock that was not seen cannot be ruled out, so `--refund` says so ("the refund is not final yet, waiting for that
   block"), waits for the finalized block (real polling, bounded by `waitLimitMs`: a finalized block that does not get there ends in exit 4
-  with "nothing was sent or recorded; run --refund again to keep waiting") and asks again. Once it is final and no lock exists, the Buyer
+  with "nothing was sent or recorded; run --refund again to keep waiting") and asks again. (The bound applies to each wait and to the loop as
+  a whole, so a `--refund` can run up to about twice `waitLimitMs` before it refuses; a refusal always says nothing was sent.) Once it is final and no lock exists, the Buyer
   is reported as never locked (`step buyer.refundLegA done: leg A was never locked: nothing to refund on chain`), the Seller refunds its
   paper leg B (exit 5 until leg B's refund time has come), and the bundle replays to `refunded-b`.
 
