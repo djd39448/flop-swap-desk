@@ -1156,7 +1156,8 @@ export class BuyerFlow {
     await this.persist();
 
     const before = connected.exchanges.length;
-    const writeEvidence = await connected.commitLock();
+    // R1-FUND-08: a rail whose lock takes more than one outward step (EVM: approve, then lock) runs this deadline guard again before its last one.
+    const writeEvidence = await connected.commitLock({ beforeFinalSend: () => this.checkLockDeadlines(offerA, offerB) });
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
     this.lockEvidence = writeEvidence;
     await this.persist();
@@ -1177,12 +1178,7 @@ export class BuyerFlow {
    * rail right now (E1: `legBVerified` is only "was true once"). Never run to RECOGNISE a lock that already landed.
    */
   private async checkLockGuards(offerA: OfferFrame, offerB: OfferFrame, acceptB: AcceptFrame): Promise<void> {
-    const deadlineCheck = checkSwapDeadlines(offerA, offerB, this.clock(), this.rail.policy);
-    if (!deadlineCheck.ok) {
-      throw new Error(
-        `buyer: refusing to lock leg A — deadlines are no longer safe at lock time (B3): ${deadlineCheck.violations.join("; ")}`,
-      );
-    }
+    this.checkLockDeadlines(offerA, offerB);
 
     // K3: re-check the asset at lock time too — defense in depth, since `offerA.asset` cannot
     // have changed since `bid()` already checked it, but spending real value is exactly the
@@ -1221,6 +1217,17 @@ export class BuyerFlow {
     const legBStillLocked = await this.paperRail.verifyLock(termsB, acceptB.contract);
     if (!legBStillLocked) {
       throw new Error("buyer: refusing to lock leg A — leg B no longer verifies on the paper rail (E1)");
+    }
+  }
+
+  /** B3: the SPEC 3.5 deadline arithmetic at `clock()` as the lock time, refusing with the lock-guard error. Run before a new lock is prepared
+   *  (`checkLockGuards`) and, R1-FUND-08, again by the rail right before the last step of a multi-step lock (after the EVM approve's receipt). */
+  private checkLockDeadlines(offerA: OfferFrame, offerB: OfferFrame): void {
+    const deadlineCheck = checkSwapDeadlines(offerA, offerB, this.clock(), this.rail.policy);
+    if (!deadlineCheck.ok) {
+      throw new Error(
+        `buyer: refusing to lock leg A — deadlines are no longer safe at lock time (B3): ${deadlineCheck.violations.join("; ")}`,
+      );
     }
   }
 
@@ -1346,7 +1353,7 @@ export class BuyerFlow {
     this.preparedLock = fresh;
     await this.persist(); // BEFORE the second send
     const before = connected.exchanges.length;
-    const writeEvidence = await connected.commitLock();
+    const writeEvidence = await connected.commitLock({ beforeFinalSend: () => this.checkLockDeadlines(offerA, offerB) }); // R1-FUND-08, as in lockLegAUnlatched
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
     this.lockEvidence = writeEvidence;
     await this.persist();

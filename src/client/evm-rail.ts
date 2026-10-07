@@ -27,6 +27,7 @@ import {
   type PreparedLock,
   type RailAccounts,
   type RailBlockMarker,
+  type RailCommitOptions,
   type RailEvidenceResult,
   type RailRefundOptions,
   type RailWriteEvidence,
@@ -147,14 +148,17 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
    *  reverts on-chain without it. Both writes land on the same `CapturingRpc` log this
    *  connected handle's `exchanges` getter already exposes, so a flow's own before/after slicing
    *  around this one call still captures both (B5), exactly as it did when a flow called
-   *  `approve` then `lock` directly. */
-  async commitLock(): Promise<RailWriteEvidence> {
+   *  `approve` then `lock` directly. R1-FUND-08: the approve's receipt wait can take up to `receiptTimeoutMs`, and the vendored lock itself checks
+   *  only `clock < refundAfterMs`, so the caller's deadline guard (`options.beforeFinalSend`: the flow's SPEC 3.5 arithmetic at the clock of that
+   *  moment) runs AGAIN after the approve's receipt and before the lock; if it throws, no lock is sent (the approve stands: an allowance, no value). */
+  async commitLock(options?: RailCommitOptions): Promise<RailWriteEvidence> {
     if (this.prepared === undefined) {
       throw new Error("evm-rail: commitLock called before prepareLock");
     }
     const { terms, feeBps } = this.prepared;
     this.prepared = undefined;
     await this.rail.approve(terms.asset, terms.amount);
+    await options?.beforeFinalSend?.();
     return this.rail.lock(terms, feeBps);
   }
 

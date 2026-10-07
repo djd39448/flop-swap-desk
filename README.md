@@ -437,6 +437,10 @@ written down instead of hidden.
   the Base Sepolia policy of P9-4 sets its own) and the claim's last deadline guard, which refuses to broadcast
   inside the margin; nothing re-prices a claim that is already out. A person speeds a stuck transaction up (same
   nonce, higher fee) from a wallet that holds the key file's key.
+- **The lock is not sent behind an unchecked clock.** The Buyer's deadline guard runs before the lock is prepared and again after the
+  `approve`'s receipt, right before the lock itself (`commitLock`'s `beforeFinalSend`): the receipt wait can last up to
+  `receiptTimeoutMs`, and the contract's own check is only `clock < refundAfterMs`. A reveal window that closed during the approve
+  refuses with the usual lock-guard error and no lock goes out (the approve stands: an allowance, no value). `tests/evm-lock-guard.test.ts`.
 - **A restart costs gas at most.** After a crash a repeated `approve`, `lock`, `claim` or `refund` is refused by the
   contract (a duplicate hash lock, a spent status), so a resumed EVM flow cannot lock or pay twice; the price of
   the repeat is gas (see "Resume").

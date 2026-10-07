@@ -144,6 +144,17 @@ export type RailClaimRecovery =
   | { outcome: "never-landed" };
 
 /**
+ * R1-FUND-08 (P9 fix pass): what a caller may hand `commitLock`. `beforeFinalSend` runs, awaited, immediately before the rail's FINAL outward
+ * step of a lock that takes more than one (`evm-htlc`: after the ERC20 `approve`'s receipt, before the `lock` itself) and refuses by throwing,
+ * in which case nothing further is sent. The flow passes the deadline guard it ran before `commitLock` (the arithmetic of SPEC 3.5 at the then
+ * current clock): a slow approve receipt (up to `receiptTimeoutMs`, a day at most) must not push the lock past the Seller's reveal window
+ * unchecked. A rail whose lock is one outward step ignores it.
+ */
+export interface RailCommitOptions {
+  beforeFinalSend?: () => void | Promise<void>;
+}
+
+/**
  * P4-BTC-FIXES.md G3 (client half of H2)/G2's own "record before sending" rule, generalised
  * over every rail: everything a caller needs to RECORD, before ever risking a broadcast that
  * might succeed on the wire without this flow ever learning so (a flaky read on the response,
@@ -270,7 +281,7 @@ export interface ConnectedCounterAssetRail {
   signAccountProof(message: string): Promise<AccountProof>;
   /** Broadcasts whatever `prepareLock` most recently prepared on this same connected handle;
    *  throws if `prepareLock` was never called first. */
-  commitLock(): Promise<RailWriteEvidence>;
+  commitLock(options?: RailCommitOptions): Promise<RailWriteEvidence>;
   /** The Seller's claim — `notAfterMs` is this write's own last-moment deadline bound
    *  (re-checked against fresh chain time immediately before broadcast,
    *  P22-P24-EVM-FIXES-R3.md E4); a rail whose claim path could otherwise leak a secret on
