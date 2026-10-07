@@ -286,6 +286,10 @@ export interface BuyerFlowState {
     attempted: boolean;
     /** What `prepareLock` returned: the ref and the rail's recovery handle (persist BEFORE `commitLock`). */
     prepared?: { ref: string; recovery?: LockRecovery };
+    /** Where the chain was when the lock was prepared, the start of every later scan for the Seller's claim: the tip read just before `prepareLock`.
+     *  P9-4 decision 4: on EVM the value saved is the tip MINUS a reorg margin (256 blocks since P9-4, floored at 0), like `claimFromBlock` on the Seller's
+     *  record, so a lock and a claim that a reorg re-includes below the tip are still inside the scan; the other rails save the plain marker. A record
+     *  written before P9-4 holds the plain tip: the field keeps its meaning (the scan's start), only the margin differs. */
     fromBlock?: BlockMarkerJson;
     accounts?: RailAccountsJson;
     hashLock?: string;

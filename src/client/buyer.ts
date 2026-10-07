@@ -256,6 +256,28 @@ export class LockPendingError extends Error {
   }
 }
 
+/**
+ * P9-4 decision 4: how many blocks BELOW the chain tip the Buyer's saved EVM lock marker starts, the Buyer's twin of the Seller's
+ * `CLAIM_MARKER_REORG_MARGIN_EVM` (256, the same number: a sibling constant here because buyer.ts does not import seller.ts). The marker is the tip
+ * read just before the lock is prepared; it is the start of every later scan for the Seller's claim (`learnSecret`, a resumed
+ * `lockLegA`/`refundLegA` that looks for a claim). The Seller's claim lands above the lock and the lock above the marker, so the plain tip was
+ * enough while every read was final, but a reorg that branches below that tip can re-include the lock AND the claim in blocks under the marker
+ * (the Base Sepolia safe head trails the unsafe tip by up to 98 blocks in the 24-hour sample), and a scan that starts AT the marker then never
+ * sees the claim. 256 clears that lag with room and fits one `eth_getLogs` call of the 500-block range cap. EVM only: the other rails' markers are
+ * numbers (a Bitcoin height, a NEAR height, a Solana slot) and are saved as they are.
+ */
+export const LOCK_MARKER_REORG_MARGIN_EVM = 256;
+
+/** P9-4 decision 4: `marker` (the chain tip read before the lock is prepared) minus the reorg margin when it is an EVM block number (a bigint), floored
+ *  at 0; any other marker is returned as it is (a value that cannot be saved is refused by the save, R2-09). */
+export function lockMarkerWithReorgMargin(marker: RailBlockMarker): RailBlockMarker {
+  if (typeof marker === "bigint" && marker >= 0n) {
+    const margin = BigInt(LOCK_MARKER_REORG_MARGIN_EVM);
+    return marker > margin ? marker - margin : 0n;
+  }
+  return marker;
+}
+
 /** The text `refundLegA` throws when leg A was never locked (the runner recognises it: `FLOW_MESSAGE.neverLocked`). */
 const NEVER_LOCKED = "buyer: leg A was never locked, nothing to refund";
 
@@ -1193,7 +1215,8 @@ export class BuyerFlow {
     const connected = await this.rail.connect(termsA, accounts);
     await this.checkChainClock(connected);
 
-    const fromBlock = await connected.currentBlockMarker();
+    // P9-4 decision 4: saved with a reorg margin (EVM), like the Seller's claim marker, so a lock and a claim a reorg re-includes below the tip are still scanned.
+    const fromBlock = lockMarkerWithReorgMargin(await connected.currentBlockMarker());
 
     // G3 (client half of H2): build (and, for a rail that needs one, sign) the lock transaction
     // WITHOUT broadcasting it yet - `prepared.ref` is already fully determined at this point (a
