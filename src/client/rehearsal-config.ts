@@ -32,7 +32,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 
 import { english } from "viem/accounts";
 
-import { ASSET_NAME_SHAPE, checkEvmRailConfig, type EvmFinality, type EvmRailConfig } from "../rails/evm-htlc.js";
+import { ASSET_NAME_SHAPE, checkEvmRailConfig, PIN_TEXT_SHAPE, type EvmFinality, type EvmRailConfig } from "../rails/evm-htlc.js";
 
 /** One leg's three deadlines, in minutes after the run's start (t0). */
 export interface LegDeadlineMinutes {
@@ -108,7 +108,6 @@ const DEADLINE_FIELDS = ["legA", "legB"] as const;
 const LEG_FIELDS = ["claimByMin", "refundAfterMin", "expiresMin"] as const;
 
 const AMOUNT = /^[1-9][0-9]{0,77}$/;
-const PIN_TEXT = /^[A-Za-z0-9:_.-]{1,40}$/;
 const ANVIL_CHAIN_ID = 31337;
 
 const DEFAULT_POLL_MS = 5_000;
@@ -242,7 +241,7 @@ function cleanEvmConfig(value: unknown): EvmRailConfig {
   // text is refused here by field name: a key pasted into either (the same operator mistake as K1 and K2) would otherwise come back in that refusal.
   for (const field of ["name", "caip2"] as const) {
     const text = pin[field];
-    if (text !== undefined && (typeof text !== "string" || !PIN_TEXT.test(text))) {
+    if (text !== undefined && (typeof text !== "string" || !PIN_TEXT_SHAPE.test(text))) {
       throw new RehearsalConfigError(`rails.evm.pin.${field} must be a short plain text (letters, digits and - _ . :), as the README's pin shows it`);
     }
   }

@@ -226,7 +226,7 @@ export function validateEvmRailConfig(config: EvmRailConfig): void {
   const canonicalName = CANONICAL_PIN_NAMES.get(config.pin.chainId);
   if (canonicalName !== undefined && config.pin.name !== canonicalName) {
     throw new Error(
-      `evm-htlc: chain id ${config.pin.chainId} must be pinned as "${canonicalName}", got "${config.pin.name}"`,
+      `evm-htlc: chain id ${config.pin.chainId} must be pinned as "${canonicalName}", got ${quotedPinText(config.pin.name) ?? UNPLAIN_PIN_TEXT}`,
     );
   }
   // P9-2 (rule 2): a Base Sepolia config trusts its escrow by code, never by address alone.
@@ -262,6 +262,25 @@ export const ASSET_NAME_SHAPE = /^[A-Za-z0-9_-]{1,32}$/;
 const UNPLAIN_ASSET = "an asset whose name is not a short plain name";
 
 /**
+ * KR3-3 (P9 review round 3): the shape of a pin name or caip2 this build quotes in a refusal: 1 to 40 letters, digits and `: _ . -` (`base-sepolia`, `anvil-local`,
+ * `eip155:84532`, `bip122:` plus 32 hex digits). It is the runner's own `PIN_TEXT` (src/client/rehearsal-config.ts holds its pin fields to this same shape), and
+ * it is defined here because a rail module never imports from the client.
+ */
+export const PIN_TEXT_SHAPE = /^[A-Za-z0-9:_.-]{1,40}$/;
+
+/**
+ * KR3-3: how the refusals of this module that name a pin's `name` or `caip2` speak of one that is NOT a short plain text (`PIN_TEXT_SHAPE`): they never quote it. The
+ * refusals reach `watch.mjs` (`report.railsConfigError`, its notes and stderr) and `audit-export --rails`, whose files have no key field, so a key pasted into the
+ * wrong field of a hand-written rails file would otherwise come back whole (the same class as `UNPLAIN_ASSET`).
+ */
+const UNPLAIN_PIN_TEXT = "a pin name (or caip2) that is not a short plain text";
+
+/** The text between double quotes when `text` is a short plain text, and `null` when it is anything else (a value that must not be quoted). */
+function quotedPinText(text: unknown): string | null {
+  return typeof text === "string" && PIN_TEXT_SHAPE.test(text) ? `"${text}"` : null;
+}
+
+/**
  * P22-P24-EVM-FIXES.md A3: whether `value` even has the shape of an `EvmRailConfig` — every
  * field present and typed, and `pin.caip2` actually derived from `pin.chainId` (`"eip155:" +
  * chainId`, never a value that could disagree with the chain id everything else here trusts).
@@ -283,7 +302,8 @@ export function evmRailConfigShapeReason(value: unknown): string | null {
   if (typeof pin.name !== "string" || pin.name === "") return "evm rail config: pin.name must be a non-empty string";
   if (typeof pin.caip2 !== "string") return "evm rail config: pin.caip2 must be a string";
   if (pin.caip2 !== `eip155:${pin.chainId}`) {
-    return `evm rail config: pin.caip2 "${pin.caip2}" does not match pin.chainId ${pin.chainId} (expected "eip155:${pin.chainId}")`;
+    const shown = quotedPinText(pin.caip2);
+    return `evm rail config: pin.caip2 ${shown !== null ? shown : `is ${UNPLAIN_PIN_TEXT} and`} does not match pin.chainId ${pin.chainId} (expected "eip155:${pin.chainId}")`;
   }
   if (pin.finality === null || typeof pin.finality !== "object") return "evm rail config: pin.finality is not an object";
   const finality = pin.finality as Record<string, unknown>;
