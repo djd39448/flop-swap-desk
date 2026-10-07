@@ -627,12 +627,18 @@ export interface EvmLockRecord {
  * process stopped waiting. It is what `approve`, `lock`, `claim` and `refund` throw when the wait times out (never a hang,
  * never the vendored rail's `tclk: Timed out ...` text), so a caller can tell "sent, outcome unknown" from "refused".
  * The right next step is to read the chain (`readLock`, `verifyLockFinal`, `findClaimedPreimage`) before sending anything
- * again; the P8 recover paths do exactly that.
+ * again; the P8 recover paths do exactly that. P9-4 decision 7 (R1-FUND-04): `write` names which write it was (the rail method that made it sets
+ * it), so a flow saves only the hash of a lock or a claim, and a resumed flow asks the node about that hash (`EvmHtlcRail.transactionStatus`)
+ * before it sends the write again.
  */
+export type EvmWriteKind = "approve" | "lock" | "claim" | "refund";
+
 export class EvmReceiptTimeoutError extends Error {
   readonly hash: Hex;
   readonly timeoutMs: number;
-  constructor(hash: Hex, timeoutMs: number) {
+  /** Which write timed out; `undefined` only for a wait made outside a rail method. */
+  readonly write: EvmWriteKind | undefined;
+  constructor(hash: Hex, timeoutMs: number, write?: EvmWriteKind) {
     super(
       `evm-htlc: no receipt for transaction ${hash} within ${timeoutMs} ms; it was broadcast and may still be mined, ` +
         "so read the chain before sending anything again",
@@ -640,8 +646,18 @@ export class EvmReceiptTimeoutError extends Error {
     this.name = "EvmReceiptTimeoutError";
     this.hash = hash;
     this.timeoutMs = timeoutMs;
+    this.write = write;
   }
 }
+
+/**
+ * P9-4 decision 7: what the node says of a transaction this process once sent (`EvmHtlcRail.transactionStatus`).
+ *   `pending`   the node holds it and has not mined it (or says it is mined but has no receipt for it yet: the answers disagree, nothing is decided);
+ *   `success`   it is mined and its receipt says it succeeded;
+ *   `reverted`  it is mined and its receipt says it reverted (it did nothing);
+ *   `unknown`   the node does not know the hash (never held, dropped, or replaced).
+ */
+export type EvmTransactionStatus = "pending" | "success" | "reverted" | "unknown";
 
 /**
  * P9-2 (rule 2): the code at `config.contract` is not the pinned one. `connect()` throws this before any write when the contract's
@@ -965,7 +981,7 @@ export class EvmHtlcRail {
 
   /** Runs one write through the vendored rail, which re-wraps every failure as `tclk: <reason>`: a receipt timeout recorded
    *  by the wrapped public client during this call is thrown back as the typed `EvmReceiptTimeoutError`. */
-  private async viaVendoredRail(write: () => Promise<unknown>): Promise<void> {
+  private async viaVendoredRail(write: () => Promise<unknown>, kind: EvmWriteKind): Promise<void> {
     this.receiptWatch.timeout = undefined;
     this.receiptWatch.receiptBlock = undefined;
     this.signerWatch.refused = undefined;
@@ -975,8 +991,8 @@ export class EvmHtlcRail {
       // R1-FUND-02: a signing refusal (nothing was sent) is thrown back typed, like a receipt timeout; the vendored rail has made it a `tclk: ...` Error.
       const refused = this.signerWatch.refused;
       if (refused !== undefined) throw refused;
-      const timeout = this.receiptWatch.timeout;
-      if (timeout !== undefined) throw timeout;
+      const timeout = this.receiptWatch.timeout as EvmReceiptTimeoutError | undefined; // set by the wrapped public client while `write` ran (the reset above narrows it)
+      if (timeout !== undefined) throw new EvmReceiptTimeoutError(timeout.hash, timeout.timeoutMs, kind);
       throw error;
     }
   }
@@ -1035,7 +1051,13 @@ export class EvmHtlcRail {
     } finally {
       this.rpc.setIdNamespace(undefined);
     }
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
+    let receipt: Awaited<ReturnType<PublicClient["waitForTransactionReceipt"]>>;
+    try {
+      receipt = await this.publicClient.waitForTransactionReceipt({ hash });
+    } catch (error) {
+      if (error instanceof EvmReceiptTimeoutError) throw new EvmReceiptTimeoutError(error.hash, error.timeoutMs, "approve");
+      throw error;
+    }
     if (receipt.status !== "success") {
       throw new Error(`evm-htlc: approve transaction mined but reverted on-chain (hash: ${hash})`);
     }
@@ -1058,7 +1080,7 @@ export class EvmHtlcRail {
     this.rpc.setIdNamespace(`write-lock:${terms.statement}:${this.clock()}`);
     try {
       const fromBlock = await this.publicClient.getBlockNumber();
-      await this.viaVendoredRail(() => this.rail.lock(terms));
+      await this.viaVendoredRail(() => this.rail.lock(terms), "lock");
       return await this.captureWriteEvidence("Locked", terms.statement as Hex, fromBlock, before);
     } finally {
       this.rpc.setIdNamespace(undefined);
@@ -1115,7 +1137,7 @@ export class EvmHtlcRail {
       // far larger than any measured one, triggers it. That is a handful of calls, not an
       // unbounded wait, and the policy's claimInclusionMarginMs is sized to cover it.
       await this.assertBeforeNotAfterMsOrThrow(notAfterMs);
-      await this.viaVendoredRail(() => this.rail.claim(hashLock, secret));
+      await this.viaVendoredRail(() => this.rail.claim(hashLock, secret), "claim");
       return await this.captureWriteEvidence("Claimed", hashLock, fromBlock, before);
     } finally {
       this.rpc.setIdNamespace(undefined);
@@ -1242,7 +1264,7 @@ export class EvmHtlcRail {
     this.rpc.setIdNamespace(`write-refund:${hashLock}:${this.clock()}`);
     try {
       const fromBlock = await this.publicClient.getBlockNumber();
-      await this.viaVendoredRail(() => this.rail.refund(hashLock));
+      await this.viaVendoredRail(() => this.rail.refund(hashLock), "refund");
       return await this.captureWriteEvidence("Refunded", hashLock, fromBlock, before);
     } finally {
       this.rpc.setIdNamespace(undefined);
@@ -1379,6 +1401,33 @@ export class EvmHtlcRail {
     const name = names[status];
     if (name === undefined) throw new Error(`evm-htlc: locks(hashLock) returned an unknown status byte ${String(status)}`);
     return { status: name, payer, payee, token, amount, claimByMs, refundAfterMs };
+  }
+
+  /**
+   * P9-4 decision 7 (R1-FUND-04): what the node says of a transaction this account sent and stopped waiting for (a write whose receipt wait timed out,
+   * `EvmReceiptTimeoutError.hash`). Reads only: `eth_getTransactionByHash`, then, for a mined one, `eth_getTransactionReceipt`. `null` is `unknown`; a
+   * transaction with no block is `pending` (the node still holds it); a mined one is read from its receipt (`success`, `reverted`), and a mined one with no
+   * receipt yet is `pending` too (the two answers disagree: nothing is decided). An answer that names another transaction, or no usable status, or
+   * a transport failure, throws: it is never read as `unknown` (which lets a flow send again).
+   */
+  async transactionStatus(txHash: Hex): Promise<EvmTransactionStatus> {
+    const found = await this.rpc.request({ method: "eth_getTransactionByHash", params: [txHash] });
+    if (found === null) return "unknown";
+    if (typeof found !== "object" || Array.isArray(found)) throw new Error("evm-htlc: eth_getTransactionByHash answered something that is not a transaction");
+    const tx = found as { hash?: unknown; blockNumber?: unknown };
+    if (typeof tx.hash !== "string" || tx.hash.toLowerCase() !== txHash.toLowerCase()) {
+      throw new Error("evm-htlc: eth_getTransactionByHash answered another transaction than the one asked for");
+    }
+    if (tx.blockNumber === null || tx.blockNumber === undefined) return "pending";
+    if (typeof tx.blockNumber !== "string" || !/^0x[0-9a-fA-F]+$/.test(tx.blockNumber)) {
+      throw new Error("evm-htlc: eth_getTransactionByHash answered a block number that is not a hex number");
+    }
+    const receipt = await this.rpc.request({ method: "eth_getTransactionReceipt", params: [txHash] });
+    if (receipt === null) return "pending";
+    const status = typeof receipt === "object" && !Array.isArray(receipt) ? (receipt as { status?: unknown }).status : undefined;
+    if (status === "0x1") return "success";
+    if (status === "0x0") return "reverted";
+    throw new Error("evm-htlc: eth_getTransactionReceipt answered a receipt without a usable status");
   }
 
   /**

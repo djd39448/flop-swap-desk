@@ -153,6 +153,7 @@ import { EVM_RAIL_ID } from "../rails/evm-evidence.js";
 import { NEAR_RAIL_ID } from "../rails/near-evidence.js";
 import { parseNearRef } from "../rails/near-ref.js";
 import { NearPayoutFailedError } from "../rails/near-htlc.js";
+import { EvmReceiptTimeoutError } from "../rails/evm-htlc.js";
 import { SOL_CLAIM_LANDING_MARGIN_MS, SolClaimFailedError, SolNotLandedError, SolPendingError, parseSolRef } from "../rails/sol-htlc.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
@@ -263,6 +264,25 @@ export class RevealNotPostedError extends Error {
     );
     this.name = "RevealNotPostedError";
     this.refundAfterMs = refundAfterMs;
+  }
+}
+
+/**
+ * P9-4 decision 7 (R1-FUND-04, EVM only): a resumed `claimLegA` found no claim on chain, but the node still holds (or has just mined) the transaction of an
+ * earlier claim whose receipt wait timed out. Nothing new was signed and nothing is sent: call `claimLegA()` again later. `status` is the node's answer:
+ * `pending` (held, not mined) or `success` (mined, but the claim log and the lock row did not show it yet: the endpoint's answers disagree).
+ */
+export class ClaimPendingError extends Error {
+  readonly txHash: string;
+  readonly status: "pending" | "success";
+  constructor(txHash: string, status: "pending" | "success") {
+    super(
+      `seller: an earlier claim of leg A (transaction ${txHash}) is ${status === "pending" ? "still held by the node, not mined yet" : "mined but not visible to the lock and log reads yet"} - ` +
+        "call claimLegA() again later; nothing new was signed (P9-4)",
+    );
+    this.name = "ClaimPendingError";
+    this.txHash = txHash;
+    this.status = status;
   }
 }
 
@@ -392,6 +412,8 @@ export class SellerFlow {
   /** R1-13: where the chain was when the first claim was about to be sent (EVM and Bitcoin, with a store): a resumed `claimLegA` looks for
    *  its own claim from here, never from genesis (a public RPC refuses or drowns in a scan from block 0). */
   private claimFromBlock?: RailBlockMarker;
+  /** P9-4 decision 7: the hash of a claim write whose receipt wait timed out (EVM only), saved after the timeout; see `ClaimPendingError`. */
+  private claimTxHash?: string;
   private claimOutcome: "none" | "landed" | "failed-public" = "none";
   private legBRefundAttempted = false;
   private legBRefundDone = false;
@@ -652,6 +674,7 @@ export class SellerFlow {
     }
     this.claimAttempted = record.claimAttempted;
     if (record.claimFromBlock !== undefined) this.claimFromBlock = markerFromJson(record.claimFromBlock);
+    if (record.claimTxHash !== undefined) this.claimTxHash = record.claimTxHash;
     this.claimRecords = record.claimRecords.map((entry) => ({ ...entry }));
     if (record.publicClaimSignature !== undefined) this.publicClaimSignature = record.publicClaimSignature;
     this.neverLandedClaims = record.neverLandedClaims;
@@ -672,6 +695,7 @@ export class SellerFlow {
       ...(this.frozenLegARailRef === undefined ? {} : { frozenLegARailRef: this.frozenLegARailRef }),
       claimAttempted: this.claimAttempted,
       ...(this.claimFromBlock === undefined ? {} : { claimFromBlock: markerToJson(this.claimFromBlock) }),
+      ...(this.claimTxHash === undefined ? {} : { claimTxHash: this.claimTxHash }),
       claimRecords: this.claimRecords.map((entry) => ({ ...entry })),
       ...(this.publicClaimSignature === undefined ? {} : { publicClaimSignature: this.publicClaimSignature }),
       neverLandedClaims: this.neverLandedClaims,
@@ -1486,6 +1510,10 @@ export class SellerFlow {
         // S2-4: on Solana the retry is sent BEFORE any reveal post (the retry is what pays the Seller; the reveal
         // frame follows it, and is posted best-effort if the retry cannot land).
         skipDeadlineGuards = true;
+      } else if (lookedUpOnChain) {
+        // P9-4 decision 7 (R1-FUND-04): no claim of this flow's own is on chain. An earlier claim whose receipt wait timed out may still be held by the node
+        // (or be mined and not visible to these reads yet): ask before a second claim is signed.
+        await this.refuseWhileClaimPending(connected);
       }
     }
 
@@ -1614,6 +1642,16 @@ export class SellerFlow {
         break;
       } catch (error) {
         this.#heldClaimExchanges.push(...connected.exchanges.slice(before)); // B5, held until the reveal (R1-22)
+        // P9-4 decision 7 (R1-FUND-04): a claim whose receipt wait timed out WAS sent; its hash is saved so a resumed claim can ask the node about it
+        // before it sends another. Only with a store (a flow without one is not resumed); a failed save leaves the flow failed, the timeout is still thrown.
+        if (error instanceof EvmReceiptTimeoutError && error.write === "claim" && this.#journal !== undefined) {
+          this.claimTxHash = error.hash;
+          try {
+            await this.persist();
+          } catch {
+            // the journal is failed: the next call says so
+          }
+        }
         // R3-2: a claim that was broadcast and never landed (starved). The secret may have been seen; count it (the
         // next claim is priced higher) and sign again while the rail's landing bound still allows it. The bound ends
         // the effort with the starved error below, never a silent drop.
@@ -1698,6 +1736,19 @@ export class SellerFlow {
     this.frozenLegAAccounts = accounts;
     this.frozenLegARailRef = railRef;
     await this.persist();
+  }
+
+  /**
+   * P9-4 decision 7 (R1-FUND-04, EVM only): with the hash of an earlier claim write whose receipt wait timed out (`claimTxHash`), the node is asked about it
+   * (`transactionStatus`) before a second claim is built. `pending` (still held) and `success` (mined, but the lock row and the claim log this call just read do not show
+   * it: the endpoint's answers disagree) end the call with `ClaimPendingError`, nothing sent. `reverted` (the claim did nothing; the preimage is public in its call data
+   * and the lock is still open) and `unknown` (the node does not know it) go on to the guarded claim exactly as before. A transport failure propagates.
+   */
+  private async refuseWhileClaimPending(connected: ConnectedCounterAssetRail): Promise<void> {
+    const hash = this.claimTxHash;
+    if (hash === undefined || connected.transactionStatus === undefined) return;
+    const status = await connected.transactionStatus(hash);
+    if (status === "pending" || status === "success") throw new ClaimPendingError(hash, status);
   }
 
   private neverLandedField(): { neverLandedClaims?: number } {

@@ -893,3 +893,93 @@ describe("R2-FUND-01 (record part): lock.neverLanded", () => {
     expect(() => decodeFlowRecord(envelope(record))).toThrow(FlowStoreCorruptError);
   });
 });
+
+// P9-4 decision 7 (record part; R1-FUND-04): two strictly decoded optional fields, extended in place (the record version stays 1). The Buyer's `lock.prepared.recovery`
+// may be an EVM handle `{ chain: "evm", txHash }`, the hash of a lock write whose receipt wait timed out (a refund's recovery never is); the Seller's `claimTxHash` is the
+// hash of a claim write that timed out and needs `claimAttempted`. Both are lower-case 0x + 64 hex. Neither can hold a key or a preimage, and a record without them decodes as before.
+describe("P9-4 decision 7 (record part): the EVM handle of a timed-out lock write and the Seller's claimTxHash", () => {
+  const at = (record: Record<string, unknown>, ...path: string[]): Record<string, unknown> => path.reduce((o, k) => o[k] as Record<string, unknown>, record);
+  const GOOD = `0x${"1d".repeat(32)}`;
+
+  const buyerWith = (handle: unknown): Record<string, unknown> => {
+    const r = plain(sampleBuyerRecord());
+    at(r, "lock", "prepared").recovery = handle;
+    return r;
+  };
+  const sellerWith = (hash: unknown): Record<string, unknown> => {
+    const r = plain(sampleSellerRecord());
+    r.claimTxHash = hash;
+    return r;
+  };
+
+  it("a Buyer record with an EVM handle decodes, keeps it, and encodes to the same bytes again", () => {
+    const record = buyerWith({ chain: "evm", txHash: GOOD });
+    const decoded = decodeFlowRecord(envelope(record));
+    if (decoded.role !== "buyer") throw new Error("expected a Buyer record");
+    expect(decoded.lock.prepared?.recovery).toEqual({ chain: "evm", txHash: GOOD });
+    expect(text(encodeFlowRecord(decoded))).toBe(text(envelope(record)));
+  });
+
+  it("a Seller record with claimTxHash decodes, keeps it, and encodes to the same bytes again; the samples themselves carry neither", () => {
+    const record = sellerWith(GOOD);
+    const decoded = decodeFlowRecord(envelope(record));
+    if (decoded.role !== "seller") throw new Error("expected a Seller record");
+    expect(decoded.claimTxHash).toBe(GOOD);
+    expect(text(encodeFlowRecord(decoded))).toBe(text(envelope(record)));
+    for (const sample of sampleRecords()) {
+      expect(JSON.stringify(sample)).not.toContain('"claimTxHash"');
+      expect(JSON.stringify(sample)).not.toContain('"evm"');
+    }
+    expect(FLOW_RECORD_VERSION).toBe(1); // extended in place
+  });
+
+  const refusedBuyer: Array<[label: string, record: () => Record<string, unknown>]> = [
+    ["an EVM handle with a short hash", () => buyerWith({ chain: "evm", txHash: "0x12" })],
+    ["an EVM handle with an upper-case hash", () => buyerWith({ chain: "evm", txHash: GOOD.toUpperCase().replace("0X", "0x") })],
+    ["an EVM handle with a hash that is not hex", () => buyerWith({ chain: "evm", txHash: `0x${"g".repeat(64)}` })],
+    ["an EVM handle without its hash", () => buyerWith({ chain: "evm" })],
+    ["an EVM handle with an extra field", () => buyerWith({ chain: "evm", txHash: GOOD, rawTx: "00" })],
+    ["an EVM handle holding a BTC field", () => buyerWith({ chain: "evm", txid: "ab".repeat(32), rawTx: "00" })],
+    ["an EVM handle in the refund's recovery (a refund never has one)", () => {
+      const r = plain(sampleBuyerRecord());
+      at(r, "refund").recovery = { chain: "evm", txHash: GOOD };
+      return r;
+    }],
+  ];
+  it.each(refusedBuyer)("buyer: %s is refused", (_label, record) => {
+    expect(() => decodeFlowRecord(envelope(record()))).toThrow(FlowStoreCorruptError);
+  });
+
+  const refusedSeller: Array<[label: string, record: () => Record<string, unknown>]> = [
+    ["a claimTxHash that is short", () => sellerWith("0x12")],
+    ["a claimTxHash in upper case", () => sellerWith(GOOD.toUpperCase().replace("0X", "0x"))],
+    ["a claimTxHash that is not a string", () => sellerWith(42)],
+    ["a claimTxHash that is null", () => sellerWith(null)],
+    ["a claimTxHash without a claim attempt (it is saved after one)", () => {
+      const r = sellerWith(GOOD);
+      r.claimAttempted = false;
+      r.claimOutcome = "none";
+      r.claimRecords = [];
+      delete r.claimFromBlock;
+      delete r.publicClaimSignature;
+      return r;
+    }],
+  ];
+  it.each(refusedSeller)("seller: %s is refused", (_label, record) => {
+    expect(() => decodeFlowRecord(envelope(record()))).toThrow(FlowStoreCorruptError);
+  });
+
+  it("a Buyer record never carries claimTxHash, and a Seller record never carries an EVM handle in a lock object (closed schema)", () => {
+    const buyer = plain(sampleBuyerRecord());
+    buyer.claimTxHash = GOOD;
+    expect(() => decodeFlowRecord(envelope(buyer))).toThrow(FlowStoreCorruptError);
+    const seller = plain(sampleSellerRecord());
+    seller.lock = { attempted: true, framePosted: false, prepared: { ref: GOOD, recovery: { chain: "evm", txHash: GOOD } } };
+    expect(() => decodeFlowRecord(envelope(seller))).toThrow(FlowStoreCorruptError);
+  });
+
+  it("the hash is public data: neither field name nor value trips the forbidden-field scan", () => {
+    assertNoForbiddenFields(envelope(buyerWith({ chain: "evm", txHash: GOOD })), "buyer with an EVM handle");
+    assertNoForbiddenFields(envelope(sellerWith(GOOD)), "seller with a claimTxHash");
+  });
+});

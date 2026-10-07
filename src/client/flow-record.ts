@@ -262,6 +262,11 @@ export interface SellerFlowState {
    *  `claimAttempted`, before the first send. R2-13: the value is the tip when the attempt was saved MINUS a reorg margin (6 blocks on Bitcoin,
    *  256 on EVM since R3-08, floored at 0), so a claim a reorg mines below that tip is still inside the scan. */
   claimFromBlock?: BlockMarkerJson;
+  /** P9-4 decision 7 (R1-FUND-04, EVM only): the hash of the Seller's claim write whose receipt wait timed out (`EvmReceiptTimeoutError.hash`), saved AFTER
+   *  the timeout (the hash is known only once the node accepted the send) and public data (no key, no preimage). A resumed `claimLegA` that finds no claim on
+   *  chain asks the node about it (`eth_getTransactionByHash`) before it sends a second claim: a transaction the node still holds is `pending`. Needs
+   *  `claimAttempted`; absent for a claim that did not time out and for every other rail. */
+  claimTxHash?: string;
   /** Solana: every claim signature signed and not yet resolved (recorded before simulate/send). */
   claimRecords: RailClaimRecord[];
   publicClaimSignature?: string;
@@ -814,9 +819,14 @@ class Reader {
     return out;
   }
 
-  recovery(value: unknown, path: string): LockRecovery {
+  /** `evmAllowed`: the lock's own `prepared.recovery` may be an EVM handle (P9-4 decision 7: the hash of a lock write that timed out); a refund's never is. */
+  recovery(value: unknown, path: string, evmAllowed = false): LockRecovery {
     if (value === null || typeof value !== "object" || Array.isArray(value)) this.fail(path, "must be an object");
     const chain = (value as Record<string, unknown>).chain;
+    if (chain === "evm" && evmAllowed) {
+      const o = this.object(value, path, ["chain", "txHash"]);
+      return { chain: "evm", txHash: this.string(o.txHash, `${path}.txHash`, { pattern: /^0x[0-9a-f]{64}$/ }) };
+    }
     if (chain === "btc") {
       const o = this.object(value, path, ["chain", "txid", "rawTx"]);
       return {
@@ -844,7 +854,7 @@ class Reader {
         ...(signedSlot === undefined ? {} : { signedSlot }),
       };
     }
-    return this.fail(`${path}.chain`, 'must be "btc", "near" or "sol"');
+    return this.fail(`${path}.chain`, evmAllowed ? 'must be "btc", "near", "sol" or "evm"' : 'must be "btc", "near" or "sol"');
   }
 
   claimRecord(value: unknown, path: string): RailClaimRecord {
@@ -863,7 +873,7 @@ const COMMON_REQUIRED = ["v", "role", "swapId", "did", "railId", "caip2", "deplo
 const COMMON_OPTIONAL = ["contractB", "lockTimeMs", "legB"] as const;
 // A Seller record is keyed by contract A (R1-14), so it has one from birth; a Buyer learns it with accept A.
 const SELLER_REQUIRED = ["contractA", "preimage", "statement", "claimAttempted", "claimRecords", "neverLandedClaims", "claimOutcome", "revealPosted", "receiptPosted", "legBRefund"] as const;
-const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature", "claimFromBlock", "legBClaimSeen"] as const;
+const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature", "claimFromBlock", "claimTxHash", "legBClaimSeen"] as const;
 const BUYER_REQUIRED = ["legBVerified", "lock", "legBClaimAttempted", "legBClaimed", "refund", "refundNotes"] as const;
 const BUYER_OPTIONAL = ["contractA", "ownAccountLine", "legBClaimAdopted"] as const;
 
@@ -991,6 +1001,8 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
   if (claimOutcome !== "none" && !claimAttempted) r.fail(`${path}.claimOutcome`, "a claim outcome needs claimAttempted");
   const claimFromBlock = r.optional(o, "claimFromBlock", (v, p) => r.marker(v, p), path);
   if (claimFromBlock !== undefined && !claimAttempted) r.fail(`${path}.claimFromBlock`, "is saved with claimAttempted and needs it");
+  const claimTxHash = r.optional(o, "claimTxHash", (v, p) => r.string(v, p, { pattern: /^0x[0-9a-f]{64}$/ }), path);
+  if (claimTxHash !== undefined && !claimAttempted) r.fail(`${path}.claimTxHash`, "is saved after a claim attempt and needs claimAttempted");
   if (claimOutcome === "failed-public" && publicClaimSignature === undefined) r.fail(`${path}.publicClaimSignature`, "is required for a failed-public claim: it is the proof the secret is public");
   const refundObject = r.object(o.legBRefund, `${path}.legBRefund`, ["attempted", "done", "framesPosted"]);
   const legBClaimSeen = r.optional(
@@ -1028,6 +1040,7 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
     ...(ownAccountLine === undefined ? {} : { ownAccountLine }),
     claimAttempted,
     ...(claimFromBlock === undefined ? {} : { claimFromBlock }),
+    ...(claimTxHash === undefined ? {} : { claimTxHash }),
     claimRecords,
     ...(publicClaimSignature === undefined ? {} : { publicClaimSignature }),
     neverLandedClaims: r.int(o.neverLandedClaims, `${path}.neverLandedClaims`),
@@ -1059,7 +1072,7 @@ function parseBuyer(r: Reader, o: Record<string, unknown>, path: string, common:
     "prepared",
     (v, p) => {
       const q = r.object(v, p, ["ref"], ["recovery"]);
-      const recovery = r.optional(q, "recovery", (x, pp) => r.recovery(x, pp), p);
+      const recovery = r.optional(q, "recovery", (x, pp) => r.recovery(x, pp, true), p);
       return { ref: r.string(q.ref, `${p}.ref`), ...(recovery === undefined ? {} : { recovery }) };
     },
     `${path}.lock`,

@@ -109,6 +109,9 @@ export interface LocalSigningRpc {
   rawSends: RawSend[];
   /** When true `eth_getTransactionReceipt` answers null for every hash (a chain that never confirms). */
   holdReceipts: boolean;
+  /** P9-4 decision 7: what `eth_getTransactionByHash` answers. "hidden" (the default, as always): null for every hash. "node": the stateful node's own answer
+   *  (a pooled transaction has no block, a mined one has its block, an unknown hash is null), which the node serves only while its `answerTxByHash` is on. */
+  byHash: "hidden" | "node";
   /** Overrides what `eth_getTransactionCount` answers for an address (a node that is behind), once per entry. */
   countOverride: Map<string, number>;
   /** A hostile or odd endpoint: the result this wire answers for a method INSTEAD of its own answer (a value, or a function of the call's params).
@@ -130,6 +133,7 @@ export function localSigningRpc(node: EvmMockNode, expectedChainId = 31337): Loc
     calls: [],
     rawSends: [],
     holdReceipts: false,
+    byHash: "hidden",
     countOverride: new Map(),
     answers: new Map(),
   };
@@ -178,7 +182,7 @@ export function localSigningRpc(node: EvmMockNode, expectedChainId = 31337): Loc
         if (state.holdReceipts) return { result: null };
         return delegate(method, params);
       case "eth_getTransactionByHash":
-        return { result: null };
+        return state.byHash === "node" ? delegate(method, params) : { result: null };
       case "eth_sendRawTransaction": {
         const raw = String(params[0]) as Hex;
         const parsed = parseTransaction(raw);
@@ -191,8 +195,10 @@ export function localSigningRpc(node: EvmMockNode, expectedChainId = 31337): Loc
         // The node's own fault knobs apply: a send it refuses is not applied (the nonce stays), a send whose reply it loses IS
         // applied (the nonce moves) although the caller sees an error.
         const sendsBefore = node.sends.length;
+        const heldBefore = node.held.length;
         const applied = await delegate("eth_sendTransaction", [{ from, to: parsed.to, data: parsed.data }]);
-        if (node.sends.length > sendsBefore) counts.set(from.toLowerCase(), expected + 1);
+        // a pooled send (P9-4 decision 7) counts too: the node holds it, so the account's pending nonce has moved
+        if (node.sends.length > sendsBefore || node.held.length > heldBefore) counts.set(from.toLowerCase(), expected + 1);
         return applied;
       }
       default:

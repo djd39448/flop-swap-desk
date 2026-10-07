@@ -8,6 +8,10 @@
 //
 // A reorg is modelled only as far as the resume tests need it: `reorgLog` moves an event's log to another block number (R2-13).
 //
+// P9-4 decision 7 (a write whose receipt never comes): `holdNextSend(fn)` pools the next send of that kind WITHOUT mining it (the node accepted it and
+// answered its hash, nothing else changed); `answerTxByHash` makes the node answer `eth_getTransactionByHash` (a pooled transaction has no block; a mined one
+// has its block); `releaseHeld()` mines the pool, `failHeld()` mines it as reverted (a receipt with status 0, no effect), `dropHeld()` forgets it.
+//
 // Fault knobs, each firing once: `rejectNextSend(fn)` answers the send with a JSON-RPC error WITHOUT applying it (the transaction
 // never happened); `loseNextSendReply(fn)` applies the effect and then answers with an error (the transaction landed, the reply was
 // lost). `sends` records every send that was applied, so a test can count approvals and locks exactly.
@@ -91,6 +95,11 @@ export class EvmMockNode {
   readonly rows = new Map<string, EvmRow>();
   readonly sends: AppliedSend[] = [];
   blockNumber = 5n;
+  /** P9-4 decision 7: when true the node answers `eth_getTransactionByHash` (default false: the method is not served, as before). */
+  answerTxByHash = false;
+  /** P9-4 decision 7: sends accepted into the pool and not mined (see `holdNextSend`). */
+  readonly held: Array<{ fn: SendKind; txHash: Hex; tx: { from: Address; to: Address; data: Hex } }> = [];
+  private readonly holdNext = new Set<SendKind>();
   /** When true `eth_getLogs` answers nothing (an evidence lookup that finds no event although the transaction mined). */
   hideLogs = false;
   /** A public provider's cap (R1-13, P9-3): an `eth_getLogs` over more than this many blocks (`fromBlock` to `toBlock`, BOTH ends counted,
@@ -128,7 +137,7 @@ export class EvmMockNode {
   /** See `SendHook`. */
   hook: SendHook | undefined;
   private readonly logs: StoredLog[] = [];
-  private readonly receipts = new Map<string, { blockNumber: bigint; to: Address; from: Address }>();
+  private readonly receipts = new Map<string, { blockNumber: bigint; to: Address; from: Address; status?: "0x0" | "0x1" }>();
   private txCounter = 0;
   private readonly rejectNext = new Set<SendKind>();
   private readonly loseNext = new Set<SendKind>();
@@ -154,6 +163,25 @@ export class EvmMockNode {
 
   rejectNextSend(fn: SendKind): void {
     this.rejectNext.add(fn);
+  }
+  /** P9-4 decision 7: the next send of this kind is accepted into the pool (its hash is answered) and NOT mined: no row, no log, no receipt, no block. */
+  holdNextSend(fn: SendKind): void {
+    this.holdNext.add(fn);
+  }
+  /** P9-4 decision 7: mines every pooled send, in order, each under the hash its sender was given. */
+  releaseHeld(): void {
+    for (const entry of this.held.splice(0)) this.send(entry.tx, entry.txHash, true);
+  }
+  /** P9-4 decision 7: mines every pooled send as a REVERTED transaction (a block, a receipt with status 0, no effect on any lock). */
+  failHeld(): void {
+    for (const entry of this.held.splice(0)) {
+      const blockNumber = this.mine();
+      this.receipts.set(entry.txHash, { blockNumber, to: entry.tx.to, from: entry.tx.from, status: "0x0" });
+    }
+  }
+  /** P9-4 decision 7: the node forgets every pooled send (dropped from its pool, never mined). */
+  dropHeld(): void {
+    this.held.length = 0;
   }
   loseNextSendReply(fn: SendKind): void {
     this.loseNext.add(fn);
@@ -239,7 +267,7 @@ export class EvmMockNode {
         if (this.lagTipReads > 0) this.lagArmed = true;
         return {
           result: {
-            status: "0x1",
+            status: receipt.status ?? "0x1",
             transactionHash: params[0],
             blockHash: this.blockHash(receipt.blockNumber),
             blockNumber: numberToHex(receipt.blockNumber),
@@ -273,6 +301,16 @@ export class EvmMockNode {
       }
       case "eth_call":
         return this.call(params[0] as { to?: string; data?: string });
+      case "eth_getTransactionByHash": {
+        if (!this.answerTxByHash) return { error: { code: -32601, message: `mock evm node: unexpected method ${method}` } };
+        const hash = String(params[0]);
+        const pooled = this.held.find((entry) => entry.txHash === hash);
+        const base = { hash, nonce: "0x0", gas: "0x5208", value: "0x0", type: "0x2" };
+        if (pooled !== undefined) return { result: { ...base, blockNumber: null, blockHash: null, transactionIndex: null, from: pooled.tx.from, to: pooled.tx.to, input: pooled.tx.data } };
+        const mined = this.receipts.get(hash);
+        if (mined !== undefined) return { result: { ...base, blockNumber: numberToHex(mined.blockNumber), blockHash: this.blockHash(mined.blockNumber), transactionIndex: "0x0", from: mined.from, to: mined.to, input: "0x" } };
+        return { result: null };
+      }
       case "eth_sendTransaction":
         return this.send(params[0] as { from: Address; to: Address; data: Hex });
       default:
@@ -341,7 +379,7 @@ export class EvmMockNode {
     });
   }
 
-  private send(tx: { from: Address; to: Address; data: Hex }): Envelope {
+  private send(tx: { from: Address; to: Address; data: Hex }, presetHash?: Hex, released = false): Envelope {
     const from = getAddress(tx.from);
     const isToken = tx.to.toLowerCase() === this.token.toLowerCase();
     let fn: SendKind;
@@ -353,10 +391,15 @@ export class EvmMockNode {
       decoded = decodeFunctionData({ abi: EVM_HASH_RAIL_ABI, data: tx.data });
       fn = decoded.functionName as SendKind;
     }
-    if (this.rejectNext.delete(fn)) return { error: { code: -32000, message: `mock evm node: ${fn} not accepted (test)` } };
+    if (!released && this.rejectNext.delete(fn)) return { error: { code: -32000, message: `mock evm node: ${fn} not accepted (test)` } };
+    if (!released && this.holdNext.delete(fn)) {
+      const pooledHash = `0x${(++this.txCounter).toString(16).padStart(64, "0")}` as Hex;
+      this.held.push({ fn, txHash: pooledHash, tx: { from, to: tx.to, data: tx.data } });
+      return { result: pooledHash };
+    }
     const hookToken = this.hook?.begin(fn, from);
 
-    const txHash = `0x${(++this.txCounter).toString(16).padStart(64, "0")}` as Hex;
+    const txHash = presetHash ?? (`0x${(++this.txCounter).toString(16).padStart(64, "0")}` as Hex);
     const blockNumber = this.mine();
     const now = BigInt(this.nowMs());
     let hashLock: Hex | undefined;

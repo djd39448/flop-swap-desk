@@ -170,7 +170,9 @@ export interface PreparedLock {
    * P8-RESUME-SPEC.md (rule 1, "durable before visible"): the rail's own handle on the transaction `prepareLock`
    * built and signed, which a caller persists together with `ref` BEFORE `commitLock()` and hands back to
    * `recoverLock` after a crash. Absent for a rail that needs none (`evm-htlc`: the ref IS the hash lock, and a
-   * repeated lock is refused by the contract on a duplicate hash lock).
+   * repeated lock is refused by the contract on a duplicate hash lock). P9-4 decision 7: `evm-htlc` has one only AFTER the fact: when the
+   * lock write's receipt wait timed out, the flow saves that transaction's hash here (`{ chain: "evm", txHash }`) so a resumed `recoverLock`
+   * can ask the node whether it still holds it.
    */
   recovery?: LockRecovery;
 }
@@ -186,11 +188,15 @@ export interface PreparedLock {
  *   - `sol`: the transaction signature (base58), the blockhash it was signed against, the last block height at which
  *     that blockhash is still valid, and the slot it was read at (a node with no ledger back to it cannot prove
  *     "never landed", see `RailClaimRecord`).
+ *   - `evm` (P9-4 decision 7, a LOCK only): the hash of the lock write whose receipt wait timed out (`EvmReceiptTimeoutError.hash`). It is
+ *     known only after the send, so it is saved after the timeout, never before the send; it is a public transaction hash (no key, no
+ *     preimage). `recoverLock` asks the node about it (`eth_getTransactionByHash`).
  */
 export type LockRecovery =
   | { chain: "btc"; txid: string; rawTx: string }
   | { chain: "near"; txHash: string; signedTxBase64: string }
-  | { chain: "sol"; signature: string; blockhash: string; lastValidBlockHeight: number; signedSlot?: number };
+  | { chain: "sol"; signature: string; blockhash: string; lastValidBlockHeight: number; signedSlot?: number }
+  | { chain: "evm"; txHash: string };
 
 /**
  * P8-RESUME-SPEC.md: what the chain says about a recorded transaction (a lock via `recoverLock`, a refund via
@@ -318,6 +324,13 @@ export interface ConnectedCounterAssetRail {
    * already landed is not one.
    */
   recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome>;
+
+  /**
+   * P9-4 decision 7 (EVM only, R1-FUND-04): what the node says of a transaction this party sent whose receipt wait timed out: `pending` (the node
+   * still holds it, or the answers disagree), `success`, `reverted`, or `unknown` (the node does not know the hash). A read, nothing is sent; a
+   * transport failure or a malformed answer throws and is never read as `unknown`. The Seller's resumed claim asks it before it sends a second claim.
+   */
+  transactionStatus?(txHash: string): Promise<"pending" | "success" | "reverted" | "unknown">;
   /**
    * R1-01 (part 2): re-send the IDENTICAL persisted bytes of the lock `prepared` names, once, after `recoverLock`
    * answered `unknown`. Never signs anything new, and can never move funds twice (identical bytes have one hash and

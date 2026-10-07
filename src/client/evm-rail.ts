@@ -177,7 +177,7 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
   /** P8: `evm-htlc` takes the recorder options for interface symmetry and never calls them: with a JSON-RPC account the
    *  node signs and sends in one call, and with a local account (P9-1) the transaction is signed and broadcast inside
    *  viem's `sendTransaction`, which returns only the hash once the node has it, so there is no signed refund to hand
-   *  over before the send either way (and `LockRecovery` has no EVM shape: the P8 record format is unchanged). The P8
+   *  over before the send either way (and `LockRecovery`'s EVM shape is for a LOCK write that timed out, never for a refund). The P8
    *  order holds for a local account exactly as for a JSON-RPC one: the flow persists its intent first, then calls
    *  this. A repeated refund after a crash is recognised from the lock's own state (`verifyLockFinal` reads
    *  `refunded`), not from a handle. */
@@ -196,15 +196,35 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
    */
   async recoverLock(prepared: PreparedLock): Promise<LockRecoveryOutcome> {
     const row = await this.rail.readLock(prepared.ref as Hex);
-    if (row === null) return "never-landed";
-    if (!isAddressEqual(row.payer, this.account)) {
-      throw new RailRecoveryRefusedError(
-        "lock-conflict",
-        prepared.ref,
-        `a lock already exists under this hash lock with payer ${row.payer}, not this account ${this.account}`,
-      );
+    if (row !== null) {
+      if (!isAddressEqual(row.payer, this.account)) {
+        throw new RailRecoveryRefusedError(
+          "lock-conflict",
+          prepared.ref,
+          `a lock already exists under this hash lock with payer ${row.payer}, not this account ${this.account}`,
+        );
+      }
+      return "landed";
     }
-    return "landed";
+    // P9-4 decision 7 (R1-FUND-04): no row at the latest block. When the flow saved the hash of a lock write whose receipt wait timed out, the node is
+    // asked about it before this answers "never-landed" (which lets the flow send an approve and a lock again): a transaction the node still holds is
+    // `pending` (nothing new is sent), one that was mined and reverted did nothing (`never-landed`), one it does not know is `never-landed` as before.
+    // A transaction mined successfully whose row this read does not show is not decided either (the endpoint's answers disagree): `pending`, ask again.
+    const recovery = prepared.recovery;
+    if (recovery === undefined) return "never-landed";
+    if (recovery.chain !== "evm") {
+      throw new RailRecoveryRefusedError("handle-mismatch", prepared.ref, `a ${recovery.chain} recovery handle was given to the evm-htlc rail`);
+    }
+    if (!/^0x[0-9a-fA-F]{64}$/.test(recovery.txHash)) {
+      throw new RailRecoveryRefusedError("handle-mismatch", prepared.ref, "the saved EVM recovery handle does not hold a transaction hash");
+    }
+    const status = await this.rail.transactionStatus(recovery.txHash as Hex);
+    return status === "pending" || status === "success" ? "pending" : "never-landed";
+  }
+
+  /** P9-4 decision 7: what the node says of a write this party sent and stopped waiting for; see `EvmHtlcRail.transactionStatus`. */
+  async transactionStatus(txHash: string): Promise<"pending" | "success" | "reverted" | "unknown"> {
+    return this.rail.transactionStatus(txHash as Hex);
   }
 
   async verifyLockFinal(terms: LockTerms, ref: string, accounts: RailAccounts): Promise<RailEvidenceResult> {

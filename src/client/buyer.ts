@@ -143,6 +143,7 @@ import { checkSwapDeadlines } from "../deadlines.js";
 import { checkLegBMatchesWant, checkOrientation, classifySwapOffer, isSwapId, legAContext } from "../profile.js";
 import { encodeFrameWith, makeOfferWith } from "../rails/custom-frames.js";
 import { SOL_RAIL_ID } from "../rails/custom-rails.js";
+import { EvmReceiptTimeoutError } from "../rails/evm-htlc.js";
 import { NearRefundFailedError, NearTxFailedError } from "../rails/near-htlc.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { SolRefundFailedError } from "../rails/sol-htlc.js";
@@ -1250,7 +1251,7 @@ export class BuyerFlow {
 
     const before = connected.exchanges.length;
     // R1-FUND-08: a rail whose lock takes more than one outward step (EVM: approve, then lock) runs this deadline guard again before its last one.
-    const writeEvidence = await connected.commitLock({ beforeFinalSend: () => this.checkLockDeadlines(offerA, offerB) });
+    const writeEvidence = await this.commitLockRecordingTimeout(connected, offerA, offerB);
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
     this.lockEvidence = writeEvidence;
     await this.persist();
@@ -1262,6 +1263,33 @@ export class BuyerFlow {
     await this.announceLockA(acceptA.contract, writeEvidence.ref);
 
     return { hashLock, writeEvidence };
+  }
+
+  /**
+   * P9-4 decision 7 (R1-FUND-04, EVM only): `connected.commitLock`, and when it throws the typed receipt timeout of the LOCK write (not of the approve: an
+   * approve is harmless to repeat), the hash of that transaction is saved in the prepared lock's recovery handle (`{ chain: "evm", txHash }`) before the error
+   * goes on. A resumed `recoverLockA` then asks the node about the hash, and a transaction the node still holds is `pending` (`LockPendingError`) instead of
+   * `never-landed`, which would send an approve and a lock again. Only with a store; a save that fails leaves the flow failed as for any refused save, and
+   * the timeout is still what the caller sees.
+   */
+  private async commitLockRecordingTimeout(
+    connected: ConnectedCounterAssetRail,
+    offerA: OfferFrame,
+    offerB: OfferFrame,
+  ): Promise<RailWriteEvidence> {
+    try {
+      return await connected.commitLock({ beforeFinalSend: () => this.checkLockDeadlines(offerA, offerB) });
+    } catch (error) {
+      if (error instanceof EvmReceiptTimeoutError && error.write === "lock" && this.#journal !== undefined && this.preparedLock !== undefined) {
+        this.preparedLock = { ref: this.preparedLock.ref, recovery: { chain: "evm", txHash: error.hash } };
+        try {
+          await this.persist();
+        } catch {
+          // the journal is failed: the next call says so; the timeout below is what this call reports
+        }
+      }
+      throw error;
+    }
   }
 
   /**
@@ -1446,7 +1474,7 @@ export class BuyerFlow {
     this.preparedLock = fresh;
     await this.persist(); // BEFORE the second send
     const before = connected.exchanges.length;
-    const writeEvidence = await connected.commitLock({ beforeFinalSend: () => this.checkLockDeadlines(offerA, offerB) }); // R1-FUND-08, as in lockLegAUnlatched
+    const writeEvidence = await this.commitLockRecordingTimeout(connected, offerA, offerB); // R1-FUND-08, as in lockLegAUnlatched
     this.writeExchanges.push(...connected.exchanges.slice(before)); // B5
     this.lockEvidence = writeEvidence;
     await this.persist();
