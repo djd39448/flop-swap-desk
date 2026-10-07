@@ -161,7 +161,10 @@ This builds `dist/` and the contracts, then spawns a real `anvil` node (found vi
 the on-chain `Claimed` log alone when the Seller never posts a reveal frame), and
 `tests-anvil/local-signer.anvil.test.ts` (the settle and refund paths again with both parties' accounts local, keys
 generated at test time; see "Key files"), and `tests-anvil/rehearsal-runner.anvil.test.ts` (the rehearsal runner as a child
-process: the dry run, a settle, a kill and a resume, and the refund paths; see "Deploying EvmHashRail to Base Sepolia"). `npm test` never
+process: the dry run, a settle, a kill and a resume, and the refund paths, among them a refund without the Seller's key file and a resume
+whose Buyer record lost its lock's block number; every output, state file and bundle is scanned for the two keys, the venue seeds and the
+key files' directory and names, and the stop-after-lock, resume and refund cases also for the Seller's secret, which may sit only in the
+Seller's own flow record before a reveal; see "Deploying EvmHashRail to Base Sepolia"). `npm test` never
 spawns `anvil` — a missing binary fails `test:anvil` loudly instead.
 
 **Fixture capture is opt-in.** Every client-flow scenario writes its watch-root bundle to a
@@ -202,15 +205,25 @@ whose key lives in a closure.
 
 1. Create a throwaway account with `cast wallet new`. It prints an address and a private key. Copy the private key
    (the `0x` followed by 64 hex characters) into a new file, on one line, and nothing else: no label, no
-   comment, no second line. Clear the terminal's scrollback afterwards.
+   comment, no second line. Clear the terminal's scrollback afterwards (`cast wallet new` printed the key there).
+   **Write the file with a text editor (Notepad, VS Code): paste the key, save, close. Never write it with a shell
+   command** (`echo 0x... > file`, `Set-Content`, `Out-File`: any command line that contains the key). PowerShell's
+   PSReadLine keeps every command line you typed in a plaintext history file (`(Get-PSReadLineOption).HistorySavePath`
+   names it), and other shells keep a history too, so a key typed into a command stays on disk long after the
+   terminal is cleared.
 2. Make the file readable by you alone: on Linux or macOS `chmod 600 <file>`; on Windows keep the key directory
-   private to your user (for example `icacls <dir> /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"`), because the
-   mode bits mean nothing there and the loader does not check them on win32.
+   private to your user, because the mode bits mean nothing there and the loader does not check them on win32. In
+   PowerShell: `icacls <dir> /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F"`. In cmd: `icacls <dir>
+   /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"`. PowerShell does not expand `%USERNAME%`, so the cmd form does not
+   work there, and the PowerShell form does not work in cmd. Read the result back with `icacls <dir>`.
 3. Never use the airdrop key, and never a key that holds mainnet value or anything you would miss. A key file is
    for a throwaway testnet account that you fund from a faucet. The conventional names for the G1 rehearsal are
    `flop-swap-desk-keys\base-sepolia.buyer.key` and `base-sepolia.seller.key`, outside this repository. The
    G1 runner (`bin/swap-rehearsal-evm.mjs`, see "Deploying EvmHashRail to Base Sepolia") takes the two paths from its config
    file (`buyerKeyFile`, `sellerKeyFile`); nothing in this repository reads an environment variable for a key.
+   `.gitignore` ignores every file whose name ends in `.key`, so `git add -A` cannot stage a key file that has such a
+   name even if it sits inside a working tree; that is a backstop for a slip (a key file with another name is not
+   covered), not a place to keep one.
 
 **What the loader refuses** (with a typed `EvmKeyFileError`; its `code` is `not-found`, `unreadable`, `not-a-file`,
 `empty` or `malformed`, and `problem` names the exact case): an empty path, a missing file, a directory or other
@@ -221,6 +234,18 @@ valid secp256k1 key, and a file over 256 bytes. The message names the path and t
 the content, not even its length. On Linux and macOS a file that group or other users can access (mode `& 0o077`)
 is still loaded but raises one warning (`process.emitWarning`, code `EVM_KEY_FILE_MODE`, or the caller's own
 `warn` callback) that names the path and the mode.
+
+**The G1 runner never prints a key file's path.** A path that a person got wrong can be the key itself pasted with a slip
+(a dropped digit, a space or newline inside, a letter O for a zero), and a message that names the path would print it
+back. So the runner (`bin/swap-rehearsal-evm.mjs`) turns every key-file failure, in the dry run, `--yes`, `--resume` and
+`--refund` alike, into `<field>: <the problem sentence>` (for example `buyerKeyFile: no such file`), never the configured path and
+never the loader's own message; the group-or-other mode warning is shown the same way, by field name (`describeKeyFileProblem`
+in `src/client/evm-key-file.ts` is the fixed sentence). The config check is the second defence: a `buyerKeyFile` or
+`sellerKeyFile` value that holds a run of 32 or more hex digits, or a phrase of 11 or more words made of letters, in any letter
+case, is refused by field name before anything is loaded (exit 2; a 64-digit key with one slip always leaves a run of at least 32).
+Two more config fields could echo a pasted key through a refusal that quotes them, and are held to the same rule: a key pasted into
+`contractCodeHash` is never printed back (see "Trust the contract by its code"), and `rails.evm.pin.name` and `caip2` must be short
+plain texts (letters, digits and `- _ . :`, at most 40) or the config is refused by field name.
 
 **What the desk prints: only addresses.** The loaded account is frozen; `JSON.stringify`, `util.inspect`
 (with or without custom inspection), `String()`, `Object.keys` and `structuredClone` show only its address and
@@ -233,10 +258,16 @@ as `eth_sendRawTransaction`, never `eth_sendTransaction`. The nonce, gas and fee
 read through the same `CapturingRpc` (so the captures show them; they are public data): `eth_getTransactionCount`,
 `eth_getBlockByNumber`, a fee read (`eth_maxPriorityFeePerGas`) and `eth_estimateGas`. `eth_fillTransaction` is answered
 inside the process with method-not-found and never asked of the endpoint, and the account viem signs with refuses, with
-a typed `EvmSignerRefusedError` that carries no transaction field, any chain id but the pinned one, a gas limit above
-`EVM_MAX_GAS_PER_WRITE` (500,000; measured writes: approve 44k, lock 214k, claim 65k on anvil) and a fee cap above
-`rails.evm.maxFeePerGasWei` (a positive integer, default 1,000 gwei; Base Sepolia's value is set in P9-4), so an endpoint
-that fills in another chain, a huge gas limit or huge fee caps gets nothing signed (`tests/evm-signer.test.ts`). The EIP-191 account proof
+a typed `EvmSignerRefusedError` that carries no transaction field (its `rule` is `chain-id`, `gas` or `fee`, its `limit` the
+configured bound), any chain id but the pinned one, a gas limit above `EVM_MAX_GAS_PER_WRITE` (500,000; measured writes: approve
+44k, lock 214k, claim 65k on anvil) and a fee cap above `rails.evm.maxFeePerGasWei` (a positive integer, a number or a string
+of decimal digits; default `EVM_DEFAULT_MAX_FEE_PER_GAS_WEI`, 1,000 gwei, which anvil passes; Base Sepolia's value is set in P9-4),
+so an endpoint that fills in another chain, a huge gas limit or huge fee caps gets nothing signed
+(`tests/evm-signer.test.ts`). Every fee field of a transaction (`maxFeePerGas`, `maxPriorityFeePerGas`, `gasPrice`) is held to the
+ceiling, and a transaction with no gas limit or no fee cap is refused too. The rehearsal runner's config does not take
+`maxFeePerGasWei` yet (its `rails.evm` field list is closed), so a runner run signs under the default until P9-4 decides the
+Base Sepolia value and adds the field. A refusal sends nothing, and `approve`, `lock`, `claim` and `refund` all throw the typed
+error itself, not viem's own wrapper (which lists the request) nor the vendored rail's `tclk: ...` text. The EIP-191 account proof
 is `account.signMessage` instead of the `personal_sign` call and is verified exactly as before. There is no nonce
 manager: the nonce is the endpoint's `pending` transaction count at each write. A count that lags (a load balancer
 behind a public endpoint) makes the node refuse the new transaction (`nonce too low`) or, when the fee is higher,
@@ -250,7 +281,10 @@ status), as before.
 viem's own 180 seconds) bounds every receipt wait of every write, including the vendored rail's. When it runs out the
 write throws `EvmReceiptTimeoutError` (`hash`, `timeoutMs`): the transaction was broadcast and may still be mined;
 nothing was refused. Read the chain before sending anything again (the resumed flows do: `readLock`,
-`verifyLockFinal`, `findClaimedPreimage`). A slower public chain raises the number; it changes nothing about safety.
+`verifyLockFinal`, `findClaimedPreimage`). A slower public chain raises the number; it changes nothing about safety. A
+write that only timed out and is STILL PENDING shows nothing to that read (no lock row, no log yet), so the resumed flow reads
+"never landed" and signs and sends it again: a repeated lock or claim is refused by the contract and costs only gas (see
+"Known limits of the EVM leg"); it is not true that a resume never sends a second one.
 
 **Trust the contract by its code, not its address (P9-2).** `EvmRailConfig.contractCodeHash` is the keccak256 of the
 escrow's deployed runtime code, the bytes `eth_getCode` answers (`0x` and 64 hex digits). A Base Sepolia (84532) config
@@ -258,7 +292,12 @@ must carry it: a config without it is refused by every entry point that validate
 `--rails`, the replay, `examples/audit-export.mjs`); an anvil config may carry it or not, and one without it behaves exactly as
 before. When it is present, `connect()` reads `eth_getCode(contract, "latest")` right after the chain-id check and refuses,
 before any write, a contract whose code is empty or hashes differently, with the typed `EvmContractCodeError` (`problem`
-`empty`, `malformed` or `mismatch`; the expected and the observed hash are named, and both are public data). The evidence
+`empty`, `malformed` or `mismatch`). Its text prints the OBSERVED hash in full (it is the hash of public code) and the pinned
+value only as its first ten characters and `...` (for example `0x6ab36fa3...`): a pinned value has the same `0x` and 64 hex digits
+as a private key, so an operator who pastes a key into `contractCodeHash` by mistake would otherwise see it printed whole by the
+first mismatch, and a hash cannot be told from a key by its shape. The same text is the dry run's `escrow code` row and the evidence
+reader's reason (so `audit-export` prints no pinned value either); the error's typed `expected` field still holds the pinned value as
+configured, and no runner path prints it. The evidence
 reader records the same read in every capture of a pinned config and judges it against the auditor's own pin: a leg whose code
 differs, whose capture never read the code, or that was taken without the pin reads `railVerified: null` with the reason, so the
 board never folds on an unpinned contract (a capture cannot opt itself out of the auditor's pin). `node bin/evm-code-hash.mjs
@@ -289,6 +328,16 @@ log, so it throws before reading anything; its tip is never planned below the bl
 by a node that is a block behind cannot cut the range below a write that landed), and a lookup that finds no log re-plans with a
 fresh tip and reads again up to 3 times (`EVM_WRITE_LOOKUP_REPLANS`) before it reports "found 0" (the write is never repeated). A scan reads up to the tip it saw at its start; a claim mined after that is found by
 the next call (the flows' own retries and polls make it).
+
+*The bound and the way out.* The rehearsal runner's dry run checks the bound for a new swap (the `log scan reach` row under "What
+the dry-run table means": `evmLogScanCoverage(config)`, 100 x `maxLogRange`, against leg A's window at the block time it measures)
+and fails a config whose cap cannot cover it, so a swap that passes cannot meet the bound by waiting. If a scan still reports it
+(a window longer than the cap covers, or a block time that changed), nothing is lost by the error itself: the Buyer's refund does
+no log scan, and a Seller whose lock is already paid out is not stopped by it (see "Resume"). The way out is an endpoint that
+accepts wider `eth_getLogs` ranges: put it in `rails.evm.endpoint` with a larger `maxLogRange` and run `--resume` again. The
+runner's check that a run is still the run its config describes (`runMatchesConfig`) compares the chain id, the escrow contract, the
+asset and the two amounts, and neither the endpoint nor `maxLogRange`, so a run may continue through another endpoint; the
+pre-flight that `--resume` runs first (its `log range` row) probes that the new endpoint really accepts the cap that is set.
 
 **The claim endpoint sees the real preimage once, at the one moment it must.** Before
 `EvmHtlcRail.claim` ever sends a real transaction, it runs two preimage-free simulations against
@@ -421,8 +470,11 @@ written down instead of hidden.
   the individual nonce, block, fee and gas reads, and `eth_sendRawTransaction`: at most six calls (the nonce, the
   block, the priority fee, the gas price an endpoint without `eth_maxPriorityFeePerGas` is asked for instead, the gas
   estimate, the send; `eth_fillTransaction` is answered inside the process and never asked). Each is a single attempt
-  (transport retries are off) bounded by the RPC timeout (45 s by default), so the worst case is 4.5 minutes, inside the
-  5-minute claim-inclusion margin. The real preimage reaches the endpoint only after that guard, first in the gas
+  (transport retries are off) bounded by the RPC timeout (45 s by default), so the worst case is 4.5 minutes; the guard's own
+  `pending` read can itself be up to 45 s stale, which makes it about 5.25 minutes, and that is more than the anvil policy's
+  5-minute claim-inclusion margin (P9 review round 1). Nothing is lost by it today: in the known-good deadline set the Seller's
+  claim-by guard keeps a claim 30 minutes clear of leg A's refund time, and the Base Sepolia margin (10 minutes or more) and the
+  arithmetic in its deadline tests are P9-4's. The real preimage reaches the endpoint only after that guard, first in the gas
   estimate, then in the broadcast (`tests/evm-local-signer.test.ts` pins both facts).
 - **The claim endpoint is trusted with the preimage** at the moment the claim is sent (see
   above). With a local account the gas estimate carries it a moment before the broadcast does.
@@ -444,6 +496,15 @@ written down instead of hidden.
 - **A restart costs gas at most.** After a crash a repeated `approve`, `lock`, `claim` or `refund` is refused by the
   contract (a duplicate hash lock, a spent status), so a resumed EVM flow cannot lock or pay twice; the price of
   the repeat is gas (see "Resume").
+- **A lock or claim that is still pending at resume is sent again.** This is the case the contract's refusal exists for, and it is
+  the reason the runner no longer promises "never a second lock or claim": a repeated lock or claim is refused by the contract and
+  costs only gas. A write whose receipt wait timed out (`EvmReceiptTimeoutError`) leaves no lock row and no `Claimed` log yet, so the
+  resumed flow reads "never landed" (its `recoverLock`, or the claim's log scan) and signs and sends a second copy. Whichever copy
+  is mined second reverts (a duplicate hash lock, a spent status), and `approve` sets the allowance rather than adding to it, so at
+  most one lock and one claim take effect in any order and the repeat costs gas. For a claim the repeat also sends a preimage that
+  the first claim has already put in the mempool, so nothing new is revealed. The code option (persist the timed-out transaction hash
+  and ask `eth_getTransactionByHash` before sending again, with a nonce decision) is P9-4's. The runner's reaction to a closed claim
+  window is worded for this case (see "Known limits of the runner").
 
 ## Deploying EvmHashRail to Base Sepolia
 
@@ -462,15 +523,19 @@ The session that wrote this never sees a key (see "Key files").
 
 ### Dave's steps, in order
 
-1. Make three throwaway accounts: the Buyer's and the Seller's (two key files, see "Key files": `cast wallet new`, the key copied
-   into a one-line file, mode 0600, outside this repository) and a deployer (either of the two, or a third; it needs ETH only).
+1. Make three throwaway accounts: the Buyer's and the Seller's (two key files, see "Key files": `cast wallet new`, the key pasted
+   into a one-line file with a text editor, never typed into a shell command, readable by you alone, outside this repository) and a
+   deployer (either of the two, or a third; it needs ETH only).
 2. Fund them from the faucets: Base Sepolia ETH for all of them (both parties pay gas: the Buyer an approve, a lock and, on the refund
    path, a refund; the Seller a claim), and Circle's test USDC (`faucet.circle.com`, Base Sepolia) for the Buyer. The runner's dry
-   run says exactly how much it needs.
+   run says how much each address needs for gas, and every ETH row says that Base's L1 data fee is not included (the allowance for it
+   is P9-4's), so fund with a margin.
 3. Deploy the escrow (next section) and check its code.
 4. Hand the session the contract address and the RPC URL; the session writes the config for review (the shape is below).
 5. Run the dry run, read the table, then run `--yes`. For the refund path run `--yes --stop-after lock`, then `--refund` (wall
-   clock: at least three hours, see "Deadlines").
+   clock: at least three hours, see "Deadlines"). Until P9-4 sets the Base Sepolia policy, the dry run on chain 84532 fails its
+   `deadlines` row on purpose (exit 3) and `--yes` refuses, so a new swap is not started under the anvil policy; `--refund` and
+   `--resume` of a swap that was already begun are never blocked by it (see "Deadlines").
 6. Keep the bundle (`out`): it is the proof, replayed offline by `examples/audit-export.mjs`.
 
 ### Deploy the escrow
@@ -479,7 +544,10 @@ The session that wrote this never sees a key (see "Key files").
 whole deployment. Run these from the repository root (the contract is named by its path, and the code hash below holds for
 exactly that path and the pinned toolchain in `foundry.toml`, see `PROVENANCE.md`). The first command stores the deployer's key in
 Foundry's own encrypted keystore (it asks for the key and a password at the prompt; the key never goes into a file of this
-repository); the second deploys; the third reads the deployed code back and hashes it.
+repository); the second deploys; the third reads the deployed code back and hashes it. The recorded hash holds for the toolchain
+`PROVENANCE.md` names (forge 1.8.3, solc 0.8.24, optimizer on at 200 runs, `evm_version = "cancun"`, `bytecode_hash = "ipfs"`, CBOR
+metadata on, the `forge-std/=lib/forge-std/src/` remapping): a contract built with another forge gives other bytes, and its deploy
+must match the recorded hash before it is used (the check after the deploy below), or the address is not to be used.
 
 ```bash
 cast wallet import base-sepolia-deployer --interactive
@@ -536,13 +604,14 @@ refused by name (never by value), so a key pasted under a wrong name cannot ride
 
 | field | meaning |
 |---|---|
-| `rails.evm.pin` | the chain pin, as in every `EvmRailConfig` (84532 is tied to the name `base-sepolia`); `finality` `tag` `finalized` is the default and the one the lag is measured against |
+| `rails.evm.pin` | the chain pin, as in every `EvmRailConfig` (84532 is tied to the name `base-sepolia`); `finality` `tag` `finalized` is the default and the one the lag is measured against. `name` and `caip2` must be short plain texts (letters, digits and `- _ . :`, at most 40), refused by field name otherwise, because the rail's own refusals quote them |
 | `rails.evm.endpoint` | the JSON-RPC URL, one for the whole run (there is no nonce manager: a load balancer that answers some calls from a node a block behind can make a write fail with `nonce too low`, which costs liveness only). It may carry no credentials, query or fragment (refused); a key in its PATH cannot be told from a path, so use a keyless endpoint such as `https://sepolia.base.org`: the URL is written into the bundle |
 | `rails.evm.contract`, `assets.USDC` | the deployed escrow, and Circle's Base Sepolia USDC (an asset book entry is the token allow list) |
-| `rails.evm.contractCodeHash` | required on 84532 (see above) |
-| `rails.evm.maxLogRange` | the endpoint's `eth_getLogs` cap in blocks (500 on the public endpoint; the default on 84532; at least 257, a smaller value is refused); the dry run probes it |
+| `rails.evm.contractCodeHash` | required on 84532 (see above); a mismatch prints the observed hash in full and this value only as its first ten characters |
+| `rails.evm.maxLogRange` | the endpoint's `eth_getLogs` cap in blocks (500 on the public endpoint; the default on 84532; at least 257, a smaller value is refused by field name); the dry run probes it, and for a new swap checks that 100 calls of it cover leg A's window (the `log scan reach` row) |
+| `rails.evm.maxFeePerGasWei` | not a runner config field yet (the field list is closed, so it is refused by name): the local signer's fee ceiling is its default, 1,000 gwei, until P9-4 decides the Base Sepolia value (see "Key files") |
 | `rails.evm.receiptTimeoutMs` | how long one receipt wait lasts (default 180 s); a timeout is a typed error that says the transaction was sent and may still be mined, and `--resume` reads the chain before it sends anything |
-| `buyerKeyFile`, `sellerKeyFile` | the two key files, loaded by `loadEvmLocalAccount` (see "Key files"); they must be two different files, and a value that looks like key material (a run of 64 hex digits, a twelve-word phrase) is refused by field name before any message could print it |
+| `buyerKeyFile`, `sellerKeyFile` | the two key files, loaded by `loadEvmLocalAccount` (see "Key files"); they must be two different files, and a value that looks like key material (a run of 32 or more hex digits, a phrase of 11 or more words, in any letter case) is refused by field name before any message could print it. A key file that does not load is reported as `<field>: <problem>`, and the configured path is never printed (see "Key files") |
 | `deadlines` | `"known-good"` (default, the set below) or `{ "legA": { "claimByMin", "refundAfterMin", "expiresMin" }, "legB": { ... } }` in whole minutes after the run's start; the dry run checks the rules with the numbers it is given |
 | `amount` | leg A's amount in the token's minimal units (USDC has 6 decimals: `"1000000"` is 1 USDC), a decimal integer string |
 | `out` | the bundle directory: absent or empty when the bundle is written |
@@ -562,6 +631,16 @@ Sepolia trailed the head by 14.5 to 39 minutes in the 92 samples of 2026-10-06 (
 (which the Seller refunds on paper so the swap folds to `refunded`) not before t0+180, so it costs at least three hours of wall clock;
 there is no time warp on a real chain.
 
+**Interim guard: no Base Sepolia policy yet (F3, P9-4 replaces it).** The rail still runs every chain under `EVM_LOCAL_POLICY`, whose
+20-minute finality budget was a median of the first samples and not a bound (the largest sampled lag is 39 minutes) and whose 5-minute
+claim margin is below the worst case after the claim's last guard. So, while the pin is 84532 and the rail's policy is that anvil policy,
+the `deadlines` row of a NEW swap (dry run and `--yes`) fails with "no Base Sepolia policy yet (P9-4)": a dry run on Base Sepolia exits 3
+by design, the other rows are still printed, and `--yes` refuses. The row exists only for a new swap, so `--refund` and `--resume` of a
+swap already begun are never blocked by it. P9-4 selects `BASE_SEPOLIA_POLICY` by the pin's chain id and removes the guard. The known-good
+set above also fails the deadline rule that links the two legs (SPEC 3.5 rule 2: leg B's claim-by must be at least leg A's refund time plus
+the finality budget) once the budget is 40 minutes or more: with the 60 minutes the sample points to, leg A's refund time +90 plus 60 is
++150 and the set's leg B claim-by is +120. It passes at the anvil policy's 20 minutes. P9-4 chooses the set for the real policy.
+
 ### The runner
 
 ```bash
@@ -573,7 +652,8 @@ venue and a local paper-note file, signing with the two local key files. Modes (
 
 - **no flag, the dry run.** Loads both key files (to show the two addresses; never a key), reads the chain, prints the pre-flight
   table and the plan, and sends nothing and writes nothing (not even the state directory). Exit 0 only if every check that is needed
-  holds, so a green dry run is what `--yes` would accept.
+  holds, so a green dry run is what `--yes` would accept. On Base Sepolia the `deadlines` row fails until P9-4 (see "Deadlines"), so
+  the dry run exits 3 there by design; the rest of the table is still printed and still the thing to read.
 - **`--yes`.** Runs the same checks first and refuses (exit 3, nothing sent) unless they hold. Then it runs the choreography the anvil
   suite runs: bid, accept, the leg B lock on paper, both account lines (signed locally), the leg A approve and lock on the chain, a real
   wait until the lock reads at the finalized block, the claim, the Buyer learning the secret and claiming leg B, a real wait until the
@@ -582,12 +662,20 @@ venue and a local paper-note file, signing with the two local key files. Modes (
   first half of the refund rehearsal).
 - **`--resume`.** After a stop or a kill, continues the run in `--state-dir`: both roles are rebuilt from their P8 records (see
   "Resume"), the local venue and notes are read back from their files, and each step reads what it needs from the records and the
-  chain, so there is never a second lock or claim. A run started with `--stop-after lock` stops at the lock again.
+  chain, so a repeated lock or claim is refused by the contract and costs only gas (a write that was still pending when the run
+  stopped is signed and sent again: see "Known limits of the EVM leg"). A run started with `--stop-after lock` stops at the lock
+  again. A lock recovered from the chain that has no block number on record (its receipt wait timed out, or the process was killed
+  between the broadcast and the save) is waited for like any other: the runner reads the head and waits, bounded by `waitLimitMs`,
+  until the finalized block passes it, instead of re-reading 20 times (about 100 seconds) and giving up with exit 4. The pre-flight
+  sizes the Buyer's ETH row by what is left to send: with a lock on record only the refund is reserved (see the table).
 - **`--refund`.** The Buyer refunds leg A once leg A's refund time has come (the local clock and the chain's head must both be past it),
   the Seller refunds leg B (the paper note) once its own has, then the bundle and `--expect <swapId>=refunded` (`refunded-b` when
   leg A was never locked). A refund time that has not come is reported (exit 5) and the command can be repeated later; `--wait` waits
   for it here instead. The runner waits until the refund is final before it writes the bundle. If the Seller already claimed, the Buyer's flow refuses
-  the refund (the lock was claimed); use `--resume`, which learns the secret and claims leg B.
+  the refund (the lock was claimed); use `--resume`, which learns the secret and claims leg B. The Buyer's ETH row reserves the refund
+  only (the approve and the lock are already spent), and the Seller's key file is not needed: a refund moves nothing of the Seller's on
+  the chain, so a missing or unreadable Seller key file is shown as a warning (the run's recorded Seller account stands in), though a Seller
+  key file that does load and names another account than the run's is still refused.
 
 `--state-dir` (default `.state/rehearsal-evm`, gitignored) holds `run.json` (the swap's public parameters: its id, deadlines, the two
 DIDs and addresses), `buyer/` and `seller/` (each party's P8 flow records, and an Ed25519 seed that signs only that party's lines of
@@ -597,7 +685,8 @@ directory is secret-grade** (the Seller's record holds the swap secret): see "Th
 means on Windows. One state directory is one swap; start a new one in a new directory. A Ctrl-C is a kill like any other: `--resume`
 continues. The bundle is written to a sibling `<out>.partial-...` directory and renamed to `out` once it is whole, so a kill while it is
 written leaves only that sibling (delete it) and `out` empty or absent. The bundle after a resume lacks the crashed process's RPC
-exchanges (see "Limits of resume"). The config, the key paths and the state directory path are printed; a key never is.
+exchanges (see "Limits of resume"). The runner prints the endpoint's host only, the two addresses, the pre-flight table, the bundle
+directory (`out`) and its steps; it never prints a key, and never a key file's path either (see "Key files").
 
 Exit codes: 0 done (or a clean dry run); 2 bad arguments, config or state; 3 the pre-flight failed (nothing was sent); 4 a step refused
 (the first line of its reason is printed, with the endpoint removed); 5 not yet (a refund time has not come); 6 the bundle was written
@@ -612,16 +701,18 @@ for a refund, shows a row that only a claim or a log scan uses as a warning, so 
 |---|---|
 | `endpoint` | the host only is shown, never the URL; `WARN` for plain `http` to a host that is not this machine (use `https`) |
 | `chain id` | `eth_chainId` equals the pin (84532). Another number: the URL is not Base Sepolia |
-| `escrow code` | the keccak of `eth_getCode(contract)` equals `contractCodeHash`. A mismatch or empty code: wrong address, or the deploy has not landed or the node is a block behind (retry) |
+| `escrow code` | the keccak of `eth_getCode(contract)` equals `contractCodeHash`. A mismatch or empty code: wrong address, or the deploy has not landed or the node is a block behind (retry). The row prints the observed hash in full and the pinned value only as its first ten characters (`0x6ab36fa3...`), so a key pasted into `contractCodeHash` is never printed back |
 | `finalized` | the `finalized` tag exists and how far it trails the head in blocks and seconds. No tag and no `fallbackConfirmations`: no lock would ever read final, so the Seller could never claim |
 | `finality budget` | lag plus ten minutes (the time to land the lock) fits before leg A's claim-by. A fail: the endpoint's lag is too long for the deadline set; widen leg A's windows |
 | `pending` | the `pending` tag answers; the claim's last deadline guard reads it |
-| `state at finalized` | `locks()` can be read at the finalized block by its hash (EIP-1898), which the evidence reader needs; a pruned node fails it |
-| `log range` | one `eth_getLogs` probe of `maxLogRange` blocks must be accepted and one of one more block refused; or what the endpoint does is reported (`WARN`: looser than the config, safe; `FAIL`: it refuses even `maxLogRange`, lower it) |
+| `state at finalized` | `locks()` can be read at the finalized block by its hash (EIP-1898), which the evidence reader needs; a pruned node fails it. An answer of `0x` fails with "the escrow's code or state is not final yet at that block": a contract deployed within the finalized lag (about 40 minutes on Base Sepolia) is not there yet at the finalized block, so wait that long after the deploy and run the dry run again; a hex answer too short to be a row says "not an ABI-encoded row" |
+| `log range` | one `eth_getLogs` probe of `maxLogRange` blocks must be accepted and one of one more block refused; or what the endpoint does is reported (`WARN`: looser than the config, safe; `FAIL`: it refuses even `maxLogRange`, so lower it, but never below the 257-block floor the resumed Seller's marker margin needs: an endpoint that caps `eth_getLogs` lower than that cannot run this swap) |
+| `log scan reach` | (a new swap with a `maxLogRange`; silent where one call reads any range, as on anvil) `MAX_LOG_SCAN_CHUNKS` x `maxLogRange` blocks (100 calls, `evmLogScanCoverage`) must reach as far as leg A's window is long: its lock-to-refund time at the block time measured from the head and the block 100 back (never under one second a block), plus the 256-block marker margin. Both numbers are printed with the `maxLogRange` that would fit (at 500, 50,000 blocks, about 28 hours). A fail means a claim that lands late in the window could not be found by the Buyer's scan, so the Buyer could not learn the secret from the chain: raise `maxLogRange` if the endpoint allows it, or shorten leg A's window. A block time that cannot be measured fails the row; the block time is the one at dry-run time and is not re-checked later |
 | `clock` | the local clock and the chain's head differ by under a minute (a refund and a claim are judged against both); fix the machine's time if it fails |
-| `gas price`, `buyer ETH`, `seller ETH` | each party's ETH against its gas: generous per-call ceilings (approve 120,000, lock 400,000, claim 200,000, refund 200,000 gas, against 44,000, 214,000 and 65,000 measured on anvil with the mock token) at twice the node's gas price. Fund the address shown |
+| `gas price`, `buyer ETH`, `seller ETH` | each party's ETH against the gas still to be sent: generous per-call ceilings (approve 120,000, lock 400,000, claim 200,000, refund 200,000 gas, against 44,000, 214,000 and 65,000 measured on anvil with the mock token) at twice the node's gas price. The Buyer's row is sized by what is left to send: a new swap reserves approve + lock + refund; `--refund`, and `--resume` once the Buyer's record holds a landed lock, reserve the refund only (a record that is missing, damaged or holds an attempt without evidence keeps the full need). Every ETH row says that **Base's L1 data fee is not included** (an OP-stack chain charges each transaction a layer-1 data fee on top of its gas, and no need here counts it; its allowance is P9-4's), so fund with a margin. Fund the address shown |
+| `buyer account`, `seller account`, `accounts` | the key file loaded (the address is shown), and the two accounts differ. A key file that does not load fails the row with `<field>: <problem>` (for example `sellerKeyFile: no such file`), never the path or any content; in `--refund` the Seller's row is only a warning |
 | `buyer token`, `buyer allowance` | the Buyer's USDC against the amount (the allowance is information: the lock's own approve sets it to the amount) |
-| `deadlines` | SPEC 3.5 rules 1 to 3 and the Seller's claim-inclusion margin, with the rail's own policy and the real numbers, and the absolute times of every deadline |
+| `deadlines` | SPEC 3.5 rules 1 to 3 and the Seller's claim-inclusion margin, with the rail's own policy and the real numbers, and the absolute times of every deadline. On Base Sepolia, until P9-4, it fails a new swap with "no Base Sepolia policy yet" (see "Deadlines") |
 | `state directory`, `bundle directory` | no earlier run in the state directory (use `--resume`, `--refund` or a new directory) and an absent or empty `out` |
 
 ### Known limits of the runner
@@ -631,7 +722,15 @@ for a refund, shows a row that only a claim or a log scan uses as a warning, so 
 - **A stuck claim is not re-priced.** The Seller's claim pays viem's default fee; a claim that sits pending past leg A's refund time can
   lose the swap's atomicity (see "Known limits of the EVM leg"). The Base Sepolia claim margin and fee choice are P9-4's.
 - **A run is one endpoint.** There is no failover and no nonce manager.
-- **The Seller's key is loaded for a refund too** (both key files must load in every mode), although leg B's refund is on paper.
+- **A closed claim window is not the end of an earlier claim.** When the Seller's claim window has closed the runner stops with "the
+  Seller's claim window has closed, so no new claim is sent" and says leg A goes back to the Buyer, but a claim that was sent before the
+  window closed may still be pending and can still land until leg A's refund time. If it lands, the lock reads Claimed, `--refund` is
+  refused (the contract has paid the Seller) and `--resume` learns the secret and claims leg B; if it does not, leg A is refundable once
+  its refund time has come. So run `--refund` once leg A's refund time has come, and `--resume` if it is refused because the lock was claimed.
+- **The Buyer's ETH row does not count Base's L1 data fee**, and the gas ceilings were measured on anvil with the mock token, never
+  against the real Base Sepolia USDC (a proxied FiatToken). Both are P9-4's; the ceilings are 2 to 3 times the anvil figures.
+- **The log scan reach row uses the block time at dry-run time.** A chain whose block time changes later is not re-checked.
+- **A healthy dry run on Base Sepolia exits 3 until P9-4** (the interim `deadlines` guard; see "Deadlines").
 - **Windows.** The state directory and the key files rely on the folder's ACLs, not mode bits (see "Key files" and "Resume").
 - **Solana devnet is not part of this section** and stays as the Solana section says: localnet only.
 
@@ -743,9 +842,17 @@ offline from signet's genesis header (version 1, the same coinbase merkle root a
 1598918400, bits `0x1e0377ae`, nonce 52613770: its double sha256, byte-reversed, is exactly this
 hash). That shows the constant is the genesis of that header; it does not show that a node agrees.
 So the pin keeps the name `btc-signet-UNVERIFIED` until it has met a live signet node, which is
-Dave's step at G1 time: `bitcoin-cli -signet getblockhash 0` must print exactly the value above.
-`BtcHtlcRail.connect` makes the same comparison and refuses a node that reports another chain name
-or another genesis, before any write.
+Dave's step at G1 time, and dropping `-UNVERIFIED` needs BOTH of these from that node:
+`bitcoin-cli -signet getblockhash 0` must print exactly the value above, AND `bitcoin-cli -signet
+getblockchaininfo` must report a `signet_challenge` equal to the default signet's,
+`512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae`.
+The genesis hash alone does not tell a node on the public signet from a node on a private one: a node started with
+`-signetchallenge=51` (a challenge anyone can satisfy, so anyone can mine its blocks) reports chain `signet` and the very same
+genesis hash (checked on an offline Bitcoin Core 31.1 node, 2026-10), and only its `signet_challenge` (`51`) differs.
+`BtcHtlcRail.connect` makes the genesis comparison and refuses a node that reports another chain name or another genesis, before any
+write; it does NOT compare the challenge yet, so it accepts such a custom signet, which would let a counterparty rewrite its own
+lock's confirmations on a chain it can mine. Testnet only and not part of G1; adding the default challenge to the pin and comparing
+it in `assertPinnedChain` is for the first Bitcoin stage.
 
 **The node.** A signet node for this client is started with `-signet -txindex=1`: the client reads
 arbitrary funding and spending transactions by txid (`getrawtransaction`), so the transaction index
@@ -784,7 +891,14 @@ claim and the refund price their fee from the node:
   and refund in the committed regtest fixtures are 139 and 131, which a test checks), never less than
   1,000 satoshis in total, and never so much that its output falls under the 546 satoshi dust limit (a
   leg of the 2,046 satoshi minimum pays at most 1,500). At the cap a claim pays 7,000 satoshis to a
-  P2WPKH address and 7,600 to a P2WSH one.
+  P2WPKH address and 7,600 to a P2WSH one. **Small signet legs pay below the estimate at high fee
+  rates:** the dust limit caps the fee at the leg's amount minus 546 satoshis, so a leg under about
+  8,000 satoshis (a claim at the cap pays 7,600 to a P2WSH payee, and 7,600 plus 546 is 8,146) cannot
+  always pay the rate it asks for. At 30 sat/vB a 2,046 satoshi leg's claim pays 1,500 satoshis (about 10.9 sat/vB) where the
+  rule asks for 4,110 (30 x 137 virtual bytes), which leaves an underpriced claim in the mempool with its
+  preimage visible. Signet only and not part of G1: the fix (raise the signet minimum lockable amount
+  to cover a claim at the cap rate, or refuse a leg that cannot pay it) is for the first Bitcoin stage;
+  until then keep a signet leg above about 8,000 satoshis.
 - The funding transaction asks the wallet for the same rate (`fee_rate`, in sat/vB, on
   `walletcreatefundedpsbt`). The cap is a rate: a wallet that builds a funding from very many inputs
   pays it on a larger transaction.
@@ -1789,8 +1903,11 @@ the refusal and the latch stay as they were.
   means it was paid) and scans only to recover the claim's evidence, so a scan that cannot finish never stalls a Seller that is
   already paid: its reveal and receipt are posted and it never claims again. A Seller whose lock is NOT paid and whose scan
   cannot finish (a tip more than 100 ranges past the marker, or an endpoint that refuses the range) fails with the typed
-  `EvmLogScanBoundError` or the endpoint's error before anything is sent or posted, and so does every retry; it is never read
-  as "no claim" (a claim that may still land is never followed by a second one). The Buyer's lock marker keeps no margin; that is not a route under the default pin, which reads the
+  `EvmLogScanBoundError` or the endpoint's error before anything is sent or posted, and so does every retry; a scan that cannot
+  finish is never read as "no claim", and the way out is an endpoint that accepts wider ranges (see "Log scans fit the endpoint's
+  range cap"). A claim that was sent and is still PENDING is not on chain yet, so a scan that finishes reads nothing for it and
+  the resumed Seller sends its claim again: the contract refuses whichever copy is mined second (a spent lock), so the price is gas,
+  not value (see "Known limits of the EVM leg"). The Buyer's lock marker keeps no margin; that is not a route under the default pin, which reads the
   lock at the finalized tag, but a deployment that pins by confirmations below the chain's reorg depth needs one there
   as well. After a restart a repeated approve, lock, claim or refund is refused by the contract, so the only cost is
   gas.

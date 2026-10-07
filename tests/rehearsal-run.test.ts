@@ -782,6 +782,29 @@ describe("K3: every failure text the runner prints is redacted before it is cut"
   });
 });
 
+describe("R1-FUND-04: the runner's own texts do not promise that a resume sends nothing twice", () => {
+  const PROMISE = /there is never a second lock or claim/;
+  const TRUTH = /a repeated lock or claim is refused by the contract and costs only gas/;
+
+  it("the runner's header, the command line's usage and the README say a repeated lock or claim is refused by the contract and costs only gas", async () => {
+    for (const file of [join("src", "client", "rehearsal-run.ts"), join("bin", "swap-rehearsal-evm.mjs"), "README.md"]) {
+      // The sentence may be wrapped over comment or indentation lines: compare it with the whitespace and comment marks folded.
+      const text = (await readFile(join(REPO_ROOT, file), "utf8")).replace(/\s*\n\s*(\/\/\s*)?/g, " ");
+      expect(text, file).not.toMatch(PROMISE);
+      expect(text, file).toMatch(TRUTH);
+    }
+  });
+
+  it("the closed-claim-window reaction says an earlier claim may still be pending, and what to run", async () => {
+    const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
+    const reaction = text.match(/the Seller's claim window has closed[^\n]*/)?.[0] ?? "";
+    expect(reaction).toMatch(/a claim this run sent earlier may still be pending/);
+    expect(reaction).toMatch(/--refund/);
+    expect(reaction).toMatch(/--resume/);
+    expect(reaction).not.toMatch(/leg A will go back to the Buyer:/);
+  });
+});
+
 describe("refundTimeReached", () => {
   it("needs the local clock AND the chain's head at or past the refund time (the contract judges the chain's)", () => {
     expect(refundTimeReached(1_000, 1_000, 1_000)).toBe(true);

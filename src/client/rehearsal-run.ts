@@ -12,7 +12,8 @@
 //                          chain's clock. `--stop-after lock` ends after the lock (the Seller never claims: the first half of a refund rehearsal).
 //   --resume               a fresh process continues the run from the state directory: the P8 flow records (both roles), the durable
 //                          venue and paper notes (src/client/rehearsal-world.ts) and run.json. Each step reads what it needs from
-//                          the records and the chain, so a kill at any instant costs nothing: there is never a second lock or claim.
+//                          the records and the chain, so a kill at any instant costs gas at most: a repeated lock or claim is refused by the
+//                          contract and costs only gas (a write that was still pending when the run stopped is signed and sent again).
 //   --refund               drives the refund path after the deadlines: the Buyer refunds leg A once leg A's refund time has come
 //                          (the local clock AND the chain's head must be past it), the Seller refunds leg B (the paper note) once
 //                          its refund time has come, then the bundle and `--expect <swapId>=refunded` (or `refunded-b` when leg A
@@ -721,7 +722,7 @@ async function driveSettle(w: World): Promise<number> {
       const message = messageOf(error);
       if (FLOW_MESSAGE.claimWindowClosed.test(message)) {
         throw new RunnerRefusal(
-          `${describeFailure(error, w.redact)}; the Seller's claim window has closed, so leg A will go back to the Buyer: run --refund once leg A's refund time ${iso(run.deadlines.legA.refundAfterMs)} has come`,
+          `${describeFailure(error, w.redact)}; the Seller's claim window has closed, so no new claim is sent, but a claim this run sent earlier may still be pending and can land until leg A's refund time ${iso(run.deadlines.legA.refundAfterMs)}: once it has come, run --refund (leg A goes back to the Buyer unless that claim landed; if the lock was claimed --refund is refused and --resume finishes the swap)`,
         );
       }
       if (!FLOW_MESSAGE.lockNotFinal.test(message) || attempt >= CLAIM_REREAD_ATTEMPTS || w.env.now() - claimStartedMs > w.config.waitLimitMs) throw error;

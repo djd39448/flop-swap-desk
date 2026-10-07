@@ -28,8 +28,8 @@ Modes (at most one):
                read (real waiting), claim, learn the secret, claim leg B, write the bundle, replay it with audit-export
                (--expect <swapId>=settled). Runs the pre-flight first and refuses to broadcast unless it passes.
                --stop-after lock  ends after the lock: the Seller never claims (the first half of a refund rehearsal).
-  --resume     Continue the run in --state-dir after a stop or a kill: both roles are rebuilt from their records, so there is never
-               a second lock or claim. A run started with --stop-after lock stops at the lock again.
+  --resume     Continue the run in --state-dir after a stop or a kill: both roles are rebuilt from their records, and a repeated lock
+               or claim is refused by the contract and costs only gas. A run started with --stop-after lock stops at the lock again.
   --refund     Drive the refund path: the Buyer refunds leg A once its refund time has come, the Seller refunds leg B (the paper
                note) once its own has, then the bundle and --expect <swapId>=refunded (refunded-b when leg A was never locked).
                The Seller's key file is not needed for a refund (nothing of the Seller's moves on the chain): a missing one is a warning.

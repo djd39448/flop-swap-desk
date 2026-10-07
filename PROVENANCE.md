@@ -392,9 +392,19 @@ keys at test time, and the loader reads a key only from a file an operator names
 - `src/client/evm-key-file.ts` - `loadEvmLocalAccount(path)`: reads one `0x`-prefixed 32-byte hex key, refuses everything
   else with the typed `EvmKeyFileError` (a message that names the path and the problem and never any content), warns on a
   group- or world-accessible file on POSIX (the check is skipped on win32), and returns a frozen viem `LocalAccount` that
-  prints, serialises and inspects as its address and type only (`sealLocalAccount`).
+  prints, serialises and inspects as its address and type only (`sealLocalAccount`, which since the P9 review round 1 fix pass
+  takes any viem `LocalAccount`, so the guarded wrapper below is sealed the same way). `describeKeyFileProblem(problem)` (added
+  in that pass, K1) is the loader's fixed problem sentence without the path, for a caller that must never print the path: the
+  rehearsal runner prints `<field>: <that sentence>`.
+- `src/rails/evm-signer.ts` - new in the fix pass (R1-FUND-02): `guardLocalAccount` wraps the sealed account so that its
+  `signTransaction` refuses, with the typed `EvmSignerRefusedError` (no transaction field on it), a chain id other than the pin's,
+  a gas limit missing or above `EVM_MAX_GAS_PER_WRITE` (500,000), or a fee cap missing or above `EvmRailConfig.maxFeePerGasWei`
+  (default `EVM_DEFAULT_MAX_FEE_PER_GAS_WEI`, 1,000 gwei); `refuseFillTransaction` makes the local-signing transport answer
+  `eth_fillTransaction` with method-not-found in-process, so the endpoint is never asked to fill (and never fills a chain id, gas
+  or fee) a transaction this process signs. It sends nothing and holds no key.
 - Extended first-party files: `src/rails/evm-htlc.ts` (the `account` option is an `Address` or a `LocalAccount`; local
-  accounts send `eth_sendRawTransaction`; `EvmRailConfig.receiptTimeoutMs`; the typed `EvmReceiptTimeoutError`; the public
+  accounts send `eth_sendRawTransaction` through the guarded account above; `EvmRailConfig.receiptTimeoutMs` and `maxFeePerGasWei`;
+  the typed `EvmReceiptTimeoutError`; the public
   client's `waitForTransactionReceipt` is wrapped so the vendored rail's receipt waits are bounded too, while
   `src/vendor/evm-hash-rail.ts` stays byte-identical) and `src/client/evm-rail.ts` (the same option; the EIP-191 account
   proof is `account.signMessage` for a local account, verified as before).
@@ -404,7 +414,12 @@ keys at test time, and the loader reads a key only from a file an operator names
   scan of every capture, venue line, store record and rendering for the key) and the helper `tests/helpers/evm-local.ts`
   (key generation into a temporary file loaded by the real loader, a key scanner that answers a boolean only, and a mock
   node that also answers nonce, gas, fee and raw-send reads). They were outside the `typecheck` gate when written and are
-  inside it since P9-7 (see that section at the end of this file).
+  inside it since P9-7 (see that section at the end of this file). Added in the fix pass: `tests/evm-signer.test.ts` (R1-FUND-02:
+  each signing rule and the order they apply in, a refusal that carries no transaction field, the review's hostile
+  `eth_fillTransaction` answer refused by the guard alone and never asked of the endpoint by the rail, a typed refusal out of
+  `approve`, `lock` and `claim` with nothing sent, the configurable fee ceiling) and `tests/evm-lock-guard.test.ts` (R1-FUND-08:
+  the lock's deadline guard runs again after the approve's receipt, at the rail seam and through the real `BuyerFlow`);
+  `tests/helpers/evm-local.ts` gained an `answers` map (a test makes the endpoint answer one method its own way).
 - Live test: `tests-anvil/local-signer.anvil.test.ts` (a Buyer and a Seller with local accounts, funded by anvil's account 0,
   settle and refund end to end, bundles scanned for the keys and replayed through `examples/audit-export.mjs`).
 
@@ -422,7 +437,9 @@ bytes `eth_getCode` answers); `EvmHtlcRail.connect` and the evidence reader refu
 **Dave's deployed contract must report the runtime value through `bin/evm-code-hash.mjs`** (`node bin/evm-code-hash.mjs
 <rpc-url> <address>` prints `keccak256 0x...` and `bytes 3416`); that is the string that goes into `contractCodeHash` in
 `rails.json`. Another value means the code at that address is not this source built with this toolchain, and the desk will
-refuse it.
+refuse it. **A deploy built with another forge (or another solc, other settings, or a checkout without `lib/forge-std`) must
+match the recorded hash before it is used**: compare `bin/evm-code-hash.mjs`'s `keccak256` line with the runtime value above, and if
+it differs do not use the address and do not pin the new value until someone has found out why the bytes moved.
 
 How the value was taken (2026-10-06, in the `flop-swap-desk-g1` worktree at branch `phase2-g1`, not from any earlier local
 build): `forge clean`, then `forge build` (forge 1.8.3, commit `cae51ad458f6abb64852b7709eb784352429825d`, built
@@ -441,24 +458,64 @@ settings, an edited file (a comment included) or another path gives another hash
 value on purpose. The earlier local reference in the G1 research sheet (the same two numbers, 3416 bytes and `0x6ab36fa3...`)
 was from an untracked build; this clean build reproduces it.
 
+**The toolchain, written down (F6, P9 review round 1).** The recorded hashes hold for exactly this, all of it:
+
+| setting | value |
+|---|---|
+| forge | 1.8.3, commit `cae51ad458f6abb64852b7709eb784352429825d` (built 2026-09-15) |
+| solc | 0.8.24 (`solc_version` in `foundry.toml`; the build records `0.8.24+commit.e11b9ed9`) |
+| optimizer | on, 200 runs (`optimizer`, `optimizer_runs`) |
+| `evm_version` | `"cancun"` (`foundry.toml`) |
+| `bytecode_hash` | `"ipfs"` (`foundry.toml`) |
+| `cbor_metadata` | `true` (`foundry.toml`) |
+| remapping | `:forge-std/=lib/forge-std/src/` (an empty context; forge detects it from `lib/forge-std`, `forge config` prints it as `forge-std/=lib/forge-std/src/`, and the build's metadata records it under `settings.remappings`) |
+| sources | `contracts/EvmHashRail.sol`, `contracts/IERC20.sol`, with `lib/forge-std` at `v1.16.2` present |
+
+When the value was first recorded `foundry.toml` named none of `evm_version`, `bytecode_hash` and `cbor_metadata`: forge 1.8.3 chose
+`cancun` for solc 0.8.24 by itself, so another forge version could have chosen another one and built other bytes without anyone
+changing a file. Since the fix pass `foundry.toml` states all three. They were checked not to move the hash: a `forge clean` and a
+`forge build` in a clean scratch copy of the worktree gave runtime `0x6ab36fa334036370445c22ca9f7999872ae56777d3c969438fb4b2414152da27`
+over 3,416 bytes and creation `0xb068f157be227cd9fef6611b4e9549aab69f8d8c334cc6375e40914edc754c7f` over 3,445 bytes, unchanged. The
+control: the same copy with `evm_version = "shanghai"` gives a different runtime hash (`0xe82229b5...6df4`), so the setting is what
+pins the bytes. No test pins this (a test cannot run another forge); the check is the clean build and the hash above, which the gate
+repeats.
+
 ## First-party code-pin and log-scan files (P9-2, P9-3) - unaudited, testnet-only
 
 Not vendored: original to this repo. No key material in any of them.
 
 - `src/rails/evm-code-pin.ts` - the one judgement of a contract's code against `contractCodeHash` (`judgeRuntimeCode`),
-  shared by `EvmHtlcRail.connect` and the evidence reader so they cannot disagree.
-- Extended first-party files: `src/rails/evm-htlc.ts` (`EvmRailConfig.contractCodeHash` and `maxLogRange`; the typed
-  `EvmContractCodeError` and `EvmLogScanBoundError`; `effectiveMaxLogRange`; the chunked write-evidence lookup and
-  `findClaimedPreimage`), `src/rails/evm-evidence.ts` (the capture records `eth_getCode` for a pinned config and the
-  decoder fails closed on it) and `src/client/seller.ts` (comments only). `src/vendor/evm-hash-rail.ts`, `vendor/tclk` and
-  `contracts/` are untouched.
+  shared by `EvmHtlcRail.connect` and the evidence reader so they cannot disagree. Since the fix pass (K2) its refusal text,
+  `describeCodeProblem`, prints the observed hash in full and the pinned value only as its first 10 characters and `...`: a pinned
+  value has a private key's shape, so one pasted there by mistake must not be printed back (the one change covers `connect()`, the
+  pre-flight's `escrow code` row and the evidence reason that `audit-export` prints).
+- Extended first-party files: `src/rails/evm-htlc.ts` (`EvmRailConfig.contractCodeHash` and `maxLogRange`, which must be at least
+  `EVM_MIN_LOG_RANGE` (257); the typed `EvmContractCodeError` and `EvmLogScanBoundError`; `effectiveMaxLogRange`;
+  `evmLogScanCoverage`, the blocks one scan reaches above its marker; the chunked write-evidence lookup, whose tip is floored at the
+  write's own receipt block and re-planned up to `EVM_WRITE_LOOKUP_REPLANS` (3) times when it finds no log (F7); and
+  `findClaimedPreimage`, which reads the OLDEST range first from the marker, so what a bound leaves unread is the newest part:
+  F1 with R1-FUND-03), `src/rails/evm-evidence.ts` (the capture records `eth_getCode` for a pinned config and the decoder fails
+  closed on it), `src/client/counter-rail.ts` (the optional `claimPaidOut(ref)` member and `RailCommitOptions`, whose
+  `beforeFinalSend` is the lock's second deadline guard, R1-FUND-08), `src/client/evm-rail.ts` (`claimPaidOut` reads
+  `locks(hashLock)`: Claimed with this account as payee; `commitLock` runs `beforeFinalSend` after the approve's receipt),
+  `src/client/buyer.ts` (passes its own lock-time deadline guard, with the unchanged B3 error text, at both `commitLock` call sites)
+  and `src/client/seller.ts` (`findPriorPreimage`: a resumed Seller asks `claimPaidOut` before it scans, so a scan that cannot
+  finish never stalls a Seller that is already paid; an unpaid Seller is scanned and stalls on a failed scan exactly as before).
+  `src/vendor/evm-hash-rail.ts`, `vendor/tclk` and `contracts/` are untouched.
 - `bin/evm-code-hash.mjs` - prints the keccak256 and byte length of the code at an address; read-only, one JSON-RPC call,
   never prints the RPC URL.
 - Hermetic tests: `tests/evm-code-pin.test.ts`, `tests/evm-code-hash-bin.test.ts` (against a throwaway local HTTP server),
   `tests/evm-log-scan.test.ts`, the P9-3 block of `tests/flow-resume-sell.test.ts`, and the helper `tests/helpers/scripted-rpc.ts`;
   the stateful mock node (`tests/helpers/evm-mock-node.ts`) answers `eth_getCode`, a chain id, and refuses an `eth_getLogs` range
-  over its cap exactly as the public endpoint does.
-- Live tests: `tests-anvil/code-pin.anvil.test.ts` and `tests-anvil/log-scan.anvil.test.ts`.
+  over its cap exactly as the public endpoint does. Changed in the fix pass: `tests/evm-code-pin.test.ts` (K2: the pinned value is
+  never printed in full by `describeCodeProblem`, by `connect()` or by the evidence reason, with a key as the pin);
+  `tests/evm-log-scan.test.ts` (the review's cases: marker 5, claim at block 18, tip 50,600 blocks above must return the preimage; the
+  bound leaves the newest part unread; the 257 floor; F7's lagging tip and empty lookups) and `tests/flow-resume-sell.test.ts` (a
+  resume 300, 600, 1,000 and 60,000 blocks late costs one `eth_getLogs` call; the old bound and anchor cases became unpaid variants
+  with paid variants beside them: a paid Seller is not stalled by the bound); the mock node gained two knobs, `lagTipReads` (a tip
+  read that lags the receipt) and `emptyLogQueries` (a lookup that finds nothing a number of times).
+- Live tests: `tests-anvil/code-pin.anvil.test.ts` and `tests-anvil/log-scan.anvil.test.ts` (now with the smallest legal cap, 257,
+  and a few hundred mined blocks).
 
 ## First-party Bitcoin signet pin, policy and fee files (P9-5, handoff/P9-G1-READINESS-SPEC.md) - unaudited, testnet-only
 
@@ -474,7 +531,13 @@ signs). Nothing here has talked to a live signet node.
 - The signet genesis hash is the double sha256 of signet's genesis header (version 1, merkle root
   `4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b`, time 1598918400, bits `0x1e0377ae`, nonce 52613770), derived
   offline in `tests/btc-htlc.test.ts` (the same procedure over mainnet's header reproduces mainnet's genesis hash). It equals
-  the value G1-PREP section 4 read from a public block explorer. It has not been compared with a live node.
+  the value G1-PREP section 4 read from a public block explorer. It has not been compared with a live node. Dropping `-UNVERIFIED`
+  needs two things from a live node, not one: the genesis hash, AND `getblockchaininfo().signet_challenge` equal to the default
+  signet's `512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae`,
+  because a node started with another challenge (`-signetchallenge=51`) reports the same genesis hash and the same chain name
+  (checked on an offline Bitcoin Core 31.1 node in the P9 review round 1; the pin does not compare the challenge yet, which is for the
+  Bitcoin stage, F5). Likewise a small signet leg's claim and refund fee is capped at the amount minus the dust limit, below the fee
+  rule's estimate (a leg under about 8,000 satoshis at a high rate; R1-FUND-05, also for the Bitcoin stage): the README says so.
 - Hermetic tests: `tests/btc-signet-fee.test.ts` (new: the size bound against the two real Core-signed spends in
   `fixtures/btc-regtest-2026-09-28/`, the rate and fee rules, the policy selection) and the P9-5 blocks of
   `tests/btc-htlc.test.ts` and `tests/btc-evidence.test.ts` (the pin, the adapter against a mocked bitcoind, the retry rule).
@@ -494,13 +557,32 @@ the operator names and are never printed, stored or inspected; the tests generat
   pre-flight table (chain id, code pin, finalized lag, `pending`, state at the finalized hash, log cap, clock, balances, deadlines);
   `src/client/rehearsal-world.ts` - the in-memory venue and paper notes made durable (atomic file writes), the two parties'
   Ed25519 venue seeds, and the one-runner lock; `src/client/rehearsal-run.ts` - the modes (dry run, `--yes`, `--resume`,
-  `--refund`), `run.json` and `outcome.json`, the bundle and the `audit-export` replay.
+  `--refund`), `run.json` and `outcome.json`, the bundle and the `audit-export` replay. Changed in the P9 review round 1 fix pass:
+  the runner prints a key-file failure as `<field>: <problem>` and never the path (`loadRunnerAccount`, K1), the config refuses a
+  key-file value with a run of 32 or more hex digits or a phrase of 11 or more words and a pin `name` or `caip2` that is not a
+  short plain text (K1), the Buyer's ETH row is sized by what is left to send (`buyerLockOnRecord`, R1-FUND-01 with F2) and a
+  refund no longer needs the Seller's key file, a lock with no block number is waited for (`waitLockFinal`, R1-FUND-07), failure
+  texts are redacted before they are cut (K3), the pre-flight has a `log scan reach` row (F1), the `state at finalized` row says "not
+  final yet" for an answer of `0x` (F9) and the `deadlines` row refuses a new swap on 84532 while the rail still runs the anvil
+  policy (F3 with R1-FUND-06, interim until P9-4).
 - Hermetic tests: `tests/rehearsal-config.test.ts`, `tests/rehearsal-world.test.ts`, `tests/rehearsal-preflight.test.ts`,
   `tests/rehearsal-run.test.ts` (the runner and its command line against a fake read-only chain served by a throwaway local HTTP
-  server), and the helper `tests/helpers/fake-chain.ts`.
+  server), and the helper `tests/helpers/fake-chain.ts`. Added in the fix pass, all four test files and the helper: K1 (four near-miss
+  key forms, a key broken into runs the config cannot see, in the dry run, `--yes`, `--resume` and `--refund`, scanned with the key
+  scanner); K2 (a key as `contractCodeHash`); K3 (a 220-character prefix and an endpoint crossing character 300); K4 (`.gitignore`
+  names `*.key`); R1-FUND-01 (the Buyer's row in each mode, to the wei, the same case in resume mode, `buyerLockOnRecord`, a refund
+  without the Seller's key file, a Seller key file that names another account); R1-FUND-07 (`waitLockFinal`); F1 (the `log scan reach`
+  row at the boundary, at 12-second blocks, unmeasurable, silent on anvil; the 257 floor in the config check and in the row text); F3
+  (the interim guard, and that it never blocks a refund or a resume); F9 (an answer of `0x` fails with the new wording, which kills
+  mutant M26); R1-FUND-04 (the runner's header, usage and README no longer promise a resume sends nothing twice, and the closed-claim-window
+  reaction names a possibly pending earlier claim). The fake chain gained two knobs: `stateAtFinalizedAnswer` (what the state read at the
+  finalized hash answers) and `blockTimeSec`.
 - Live test: `tests-anvil/rehearsal-runner.anvil.test.ts` (the runner as a child process against real anvil nodes: the dry run, a
   settle, a kill and a resume at two cuts, and the refund paths; every file it wrote and its output scanned for both keys and for
-  the venue seeds) and the `blockTimeSeconds` option of `tests-anvil/helpers/anvil.ts`.
+  the venue seeds) and the `blockTimeSeconds` option of `tests-anvil/helpers/anvil.ts`. Added in the fix pass: a refund without the
+  Seller's key file, a resume whose Buyer record lost its lock's block number (R1-FUND-07), a scan of every output, state file and
+  bundle for the key files' directory and names (K1), and a scan of the stop-after-lock, resume and refund runs for the Seller's
+  secret, which may sit only in the Seller's own flow record before a reveal (K5).
 - The gas ceilings of the pre-flight were measured on anvil with the mock token (approve 44,000, lock 214,000, claim 65,000 gas);
   a refund was not measured.
 
@@ -535,3 +617,40 @@ files with the same hashes before and after, none of them from `tests/`).
 - Not in the gate: `tests-anvil/`, `tests-regtest/`, `tests-near/` and `tests-sol/`. Under a scratch config the first has 2
   diagnostics (`tests-anvil/client-flows.anvil.test.ts`, a `string` where a hex type is wanted), the third 3
   (`tests-near/client-flows.near.test.ts`, `txHash` possibly undefined); `tests-regtest/` and `tests-sol/` report none.
+
+## P9 review round 1 fix pass (handoff/P9-FIXES-R1.md) - the item list
+
+Not vendored: original to this repo. The first review round of P9 (head `56103b5`; three lenses and a synthesis) found no route by
+which an honest party loses value in this build and no leak of a key that the code loads from its file; it found two routes by
+which a key an operator had put in the wrong config field was printed back (K1, K2), a local signer that signed whatever chain id,
+gas and fees the endpoint filled in (R1-FUND-02) and a log scan whose bound left the oldest blocks unread (F1 with R1-FUND-03). The
+fix pass changed the files named in the sections above; this table names each item once, with its test, so that none is missing.
+Every code fix has a test that was watched to fail with the fix disabled.
+
+| item | fix | pinned by |
+|---|---|---|
+| K1 | the runner prints `<field>: <problem>`, never a key-file path; the config refuses a run of 32 or more hex digits and a phrase of 11 or more words in a key-file field; `rails.evm.pin.name` and `caip2` must be short plain texts | `tests/rehearsal-run.test.ts`, `tests/rehearsal-config.test.ts`, `tests-anvil/rehearsal-runner.anvil.test.ts` |
+| K2 | `describeCodeProblem` prints the pinned value as 10 characters and `...` | `tests/evm-code-pin.test.ts`, `tests/rehearsal-run.test.ts` |
+| K3 | `describeFailure` redacts, then cuts; the runner's claim, re-read and lock read-back texts use the endpoint redactor | `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts` |
+| K4 | `.gitignore` names `*.key` | `tests/rehearsal-config.test.ts` |
+| K5 | test only: the stop-after-lock, resume and refund runs are scanned for the Seller's secret | `tests-anvil/rehearsal-runner.anvil.test.ts` |
+| R1-FUND-01 with F2 | the Buyer's ETH row is sized by what is left to send; `--refund` needs no Seller key file | `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts`, `tests-anvil/rehearsal-runner.anvil.test.ts` |
+| R1-FUND-02 | the guarded local account and the in-process answer to `eth_fillTransaction` (`src/rails/evm-signer.ts`) | `tests/evm-signer.test.ts`, `tests/evm-local-signer.test.ts`, `tests-anvil/local-signer.anvil.test.ts` |
+| F1 with R1-FUND-03 | oldest range first from the marker; `maxLogRange` of at least 257; `claimPaidOut`; `evmLogScanCoverage` and the `log scan reach` row | `tests/evm-log-scan.test.ts`, `tests/flow-resume-sell.test.ts`, `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts`, `tests-anvil/log-scan.anvil.test.ts` |
+| F7 | the write-evidence lookup floors its tip at the receipt's block and re-plans up to 3 times | `tests/evm-log-scan.test.ts` |
+| R1-FUND-07 | a lock with no block number on record is waited for until the finalized block passes the head (`waitLockFinal`) | `tests/rehearsal-run.test.ts`, `tests-anvil/rehearsal-runner.anvil.test.ts` |
+| R1-FUND-08 | the lock's deadline guard runs again after the approve's receipt | `tests/evm-lock-guard.test.ts` |
+| F3 with R1-FUND-06 | interim: a new swap on 84532 under the anvil policy fails the `deadlines` row (P9-4 replaces it) | `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts` |
+| F9 | an answer of `0x` to the state read at the finalized hash says "not final yet" | `tests/rehearsal-preflight.test.ts` |
+| F6 | `foundry.toml` pins `evm_version`, `bytecode_hash` and `cbor_metadata` | none (a clean build and the recorded hash; see the toolchain table above) |
+| R1-FUND-04 | wording only: a repeated lock or claim is refused by the contract and costs only gas; the closed-claim-window reaction names a possibly pending earlier claim | `tests/rehearsal-run.test.ts` (the texts of the runner header, the usage, the README and the reaction) |
+| K4 (docs), F5, R1-FUND-05 | README only: the key-file hygiene text, the signet `-UNVERIFIED` criterion (genesis hash and the default signet challenge) and the small-leg fee note | none |
+
+Routed on, not done here: F4, F8, the code option of R1-FUND-04 and the other P9-4 questions (the Base Sepolia policy, the fee
+ceiling value and the runner config field for it, the known-good deadline set, the claim margin, the L1 data-fee allowance, the
+stuck-claim question, nonce handling); R1-FUND-05 and F5 (the code) for the first Bitcoin stage.
+
+What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/` and `package.json` are
+byte-identical to `56103b5`; no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no new fixture; the
+runtime code hash is the one in the table above. The hermetic count after the pass: 116 files, 3629 passed, 7 skipped (before it, at
+the end of P9-7: 114 files, 3517 passed, 7 skipped).
