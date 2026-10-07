@@ -7,7 +7,9 @@
 // `receiptTimeoutMs` 6,000 (above viem's 4-second polling interval: a real node answers the first receipt read, made at once, with nothing even for a transaction it mines at once, so a shorter wait would time out an ordinary approve; the hermetic suite's 150 ms is for its instant mock) the receipt wait times out (`EvmReceiptTimeoutError`), the flow saves the hash in the P8 record, and:
 //   - a second `lockLegA()` and a resumed one answer `LockPendingError` with no second approve and no second lock sent;
 //   - a second `claimLegA()` and a resumed one answer `ClaimPendingError` with no second claim signed;
-//   - once a block is mined the resumed flow recognises the transaction and finishes (one lock, one claim on chain).
+//   - once a block is mined the resumed flow recognises the transaction and finishes (one lock, one claim on chain);
+//   - P94-FUND-01: the claim's hash is in the Seller's record and with the runner's `onClaimSent` callback while the receipt wait is still running (2 s into a 6 s wait),
+//     and the pending sentence names it.
 // Keys are generated at test time and loaded through the real key-file loader; none is printed. `npm run test:anvil` only.
 
 import { MemoryNoteStore, PaperRail, verifyHashPreimage } from "@flop-labs/tclk";
@@ -17,7 +19,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { BuyerFlow, LockPendingError } from "../src/client/buyer.js";
 import { createEvmCounterRail } from "../src/client/evm-rail.js";
-import { MemoryFlowStore } from "../src/client/flow-store.js";
+import { decodeFlowRecord, type SellerFlowRecord } from "../src/client/flow-record.js";
+import { MemoryFlowStore, flowKey } from "../src/client/flow-store.js";
 import { ClaimPendingError, SellerFlow } from "../src/client/seller.js";
 import { MemoryVenue } from "../src/client/venue.js";
 import { swapId as computeSwapId } from "../src/profile.js";
@@ -109,7 +112,7 @@ describe("a write the node still holds is not sent again (real anvil, local acco
     return { rpc: new CapturingRpc({ endpoint: anvil.endpoint, fetch: fetchImpl }), sends };
   }
 
-  async function setup(buyerSeed: string, sellerSeed: string) {
+  async function setup(buyerSeed: string, sellerSeed: string, onClaimSent?: (hash: string) => void) {
     const buyerAccount: LocalAccount = await makeLocalAccount();
     const sellerAccount: LocalAccount = await makeLocalAccount();
     await fund(buyerAccount.address);
@@ -127,7 +130,7 @@ describe("a write the node still holds is not sent again (real anvil, local acco
     const noteStore = new MemoryNoteStore();
     const stores = { buyer: new MemoryFlowStore(), seller: new MemoryFlowStore() };
     const buyerOptions = () => ({ identity: buyerId, venue, paperRail: new PaperRail(noteStore, clock), rail: createEvmCounterRail({ config, rpc: buyerRpc, account: buyerAccount, clock }), clock, store: stores.buyer });
-    const sellerOptions = () => ({ identity: sellerId, venue, paperRail: new PaperRail(noteStore, clock), rail: createEvmCounterRail({ config, rpc: sellerRpc, account: sellerAccount, clock }), clock, store: stores.seller });
+    const sellerOptions = () => ({ identity: sellerId, venue, paperRail: new PaperRail(noteStore, clock), rail: createEvmCounterRail({ config, rpc: sellerRpc, account: sellerAccount, clock }), clock, store: stores.seller, ...(onClaimSent === undefined ? {} : { onClaimSent }) });
     const buyer = new BuyerFlow(buyerOptions());
     const seller = new SellerFlow(sellerOptions());
     const swapId = computeSwapId(buyerId.did, `0000${buyerSeed}${sellerSeed}`);
@@ -138,7 +141,7 @@ describe("a write the node still holds is not sent again (real anvil, local acco
     await buyer.verifyLegBLocked();
     await seller.postAccountLineA(sellerAccount.address);
     await buyer.postAccountLineA(buyerAccount.address);
-    return { buyer, seller, buyerSends: buyerWire.sends, sellerSends: sellerWire.sends, pool, swapId, acceptA, buyerOptions, sellerOptions };
+    return { buyer, seller, buyerSends: buyerWire.sends, sellerSends: sellerWire.sends, pool, swapId, acceptA, buyerOptions, sellerOptions, stores };
   }
 
   async function mine(blocks: number): Promise<void> {
@@ -176,19 +179,39 @@ describe("a write the node still holds is not sent again (real anvil, local acco
   }, 120_000);
 
   it("the Seller's claim is held by the node: a second and a resumed claimLegA are ClaimPendingError with no second claim signed; once mined the resumed Seller posts the frames and the Buyer learns the secret", async () => {
-    const s = await setup("73", "74");
+    const told: string[] = [];
+    const s = await setup("73", "74", (hash) => void told.push(hash));
     const lockA = await s.buyer.lockLegA();
     await mine(3); // the lock is final: anvil's finalized block trails the head by two
     s.pool.next = true; // the claim (sent to the escrow) is pooled
-    const timeout = await caught(s.seller.claimLegA(lockA.hashLock));
+    let settled = false;
+    const claiming = caught(s.seller.claimLegA(lockA.hashLock)).then((error) => {
+      settled = true;
+      return error;
+    });
+    // P94-FUND-01: 2 s into the 6 s receipt wait the claim is in the node's pool, its hash is in the Seller's record and with the runner's callback
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    expect(settled, "the receipt wait is still running").toBe(false);
+    const sellerKey = flowKey("seller", s.acceptA.contract);
+    const during = decodeFlowRecord((await s.stores.seller.load(sellerKey))!, sellerKey) as SellerFlowRecord;
+    const sentHash = during.claimTxHash!;
+    expect(sentHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(told).toEqual([sentHash]);
+    const pooled = await anvil.rpcCall<{ hash: string; blockNumber: Hex | null } | null>("eth_getTransactionByHash", [sentHash]);
+    expect(pooled?.hash.toLowerCase()).toBe(sentHash); // the node holds exactly this transaction, with no block
+    expect(pooled?.blockNumber).toBeNull();
+    const timeout = await claiming;
     expect(timeout).toBeInstanceOf(EvmReceiptTimeoutError);
     expect((timeout as EvmReceiptTimeoutError).write).toBe("claim");
+    expect((timeout as EvmReceiptTimeoutError).hash).toBe(sentHash);
     const sentBefore = s.sellerSends.count;
     expect(sentBefore).toBe(1);
 
     const again = await caught(s.seller.claimLegA(lockA.hashLock));
     expect(again).toBeInstanceOf(ClaimPendingError);
     expect((again as ClaimPendingError).status).toBe("pending");
+    expect((again as ClaimPendingError).message).toContain(sentHash); // the sentence names the public hash
+    expect((again as ClaimPendingError).message).toContain("speed the claim up with the same nonce and a higher fee");
     const resumed = await SellerFlow.resume({ ...s.sellerOptions(), swapId: s.swapId, contractA: s.acceptA.contract });
     expect(await caught(resumed.flow.claimLegA(lockA.hashLock))).toBeInstanceOf(ClaimPendingError);
     expect(s.sellerSends.count, "no second claim was signed").toBe(sentBefore);
