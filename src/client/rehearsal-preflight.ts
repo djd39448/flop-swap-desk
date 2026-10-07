@@ -12,7 +12,7 @@
 //                  observed hash is printed so a person can pin it
 //   finalized      the `finalized` tag exists, and how far it lags the head in blocks and seconds (the Seller may claim only
 //                  once the lock reads at that block)
-//   finality budget  the lag plus the time a lock needs to land fits before leg A's claim-by
+//   finality budget  the larger of the measured lag and the policy's finality budget (P9-4 decision 12), plus the time a lock needs to land, fits before leg A's claim-by
 //   pending        the `pending` tag answers (the claim's last deadline guard reads it)
 //   state at finalized  `locks(hashLock)` can be read at the finalized block by its hash (EIP-1898), which the evidence reader needs
 //   log range      the endpoint's `eth_getLogs` cap against the config's `maxLogRange` (one probe of that many blocks must be
@@ -281,16 +281,18 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     if (lagMs === undefined) {
       add("finality budget", "fail", "the finalized lag is unknown, so it cannot be set against leg A's claim-by");
     } else {
-      const needMs = lagMs + LOCK_SETTLE_ALLOWANCE_MS;
+      // P9-4 decision 12 (F4): the lag measured now is one reading of a number that stands still for 35 to 45 minutes at times (the 24-hour sample's largest finalized lag
+      // is 51.4 minutes, its median 19 minutes), so a quiet moment must not pass a run that the policy's own finality budget would not: the row uses the LARGER of the lag
+      // measured now and the policy's budget (`finalityAMs`: 20 minutes on anvil, 80 on Base Sepolia), plus the time a lock needs to land, against leg A's claim-by.
+      const budgetMs = input.policy.finalityAMs;
+      const usedMs = Math.max(lagMs, budgetMs);
+      const needMs = usedMs + LOCK_SETTLE_ALLOWANCE_MS;
       const haveMs = claimBy - input.nowMs;
+      const numbers = `the larger of the finalized lag measured now (${minutes(lagMs)}) and the policy's finality budget (${minutes(budgetMs)}), ${minutes(usedMs)}, plus ${minutes(LOCK_SETTLE_ALLOWANCE_MS)} to land it`;
       if (needMs > haveMs) {
-        add(
-          "finality budget",
-          "fail",
-          `a lock would read final about ${minutes(needMs)} after the run starts (finalized lag ${minutes(lagMs)} plus ${minutes(LOCK_SETTLE_ALLOWANCE_MS)} to land it) but leg A's claim-by is in ${minutes(haveMs)}: the Seller could not claim in time`,
-        );
+        add("finality budget", "fail", `a lock would read final about ${minutes(needMs)} after the run starts (${numbers}) but leg A's claim-by is in ${minutes(haveMs)}: the Seller could not claim in time`);
       } else {
-        add("finality budget", "ok", `a lock reads final about ${minutes(needMs)} after the run starts (lag ${minutes(lagMs)} plus ${minutes(LOCK_SETTLE_ALLOWANCE_MS)}); leg A's claim-by is in ${minutes(haveMs)}, ${minutes(haveMs - needMs)} to spare`);
+        add("finality budget", "ok", `a lock reads final about ${minutes(needMs)} after the run starts (${numbers}); leg A's claim-by is in ${minutes(haveMs)}, ${minutes(haveMs - needMs)} to spare`);
       }
     }
   }

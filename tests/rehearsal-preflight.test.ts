@@ -239,6 +239,51 @@ describe("finality", () => {
     expect(status(over, "finality budget")).toBe("fail");
   });
 
+  // P9-4 decision 12 (F4): the lag measured at dry-run time is one reading of a number that stands still for 35 to 45 minutes at times. The row uses the LARGER of that lag and
+  // the policy's finality budget (20 minutes on anvil, 80 on Base Sepolia), plus the 10 minutes a lock needs to land, against leg A's claim-by, and prints both numbers.
+  it("P9-4 d12: a quiet moment (15-minute lag) does not pass what the 80-minute budget would not: the budget is used, both numbers are printed; the anvil set fails on 84532, the Base Sepolia set passes", async () => {
+    const quiet = 15 * 60;
+    const base = await preflight({ finalizedLagSec: quiet }, config(), {}, BASE_SET);
+    expect(status(base, "finality budget")).toBe("ok");
+    const detail = row(base, "finality budget").detail;
+    expect(detail).toContain("the larger of the finalized lag measured now (15.0 min) and the policy's finality budget (80.0 min), 80.0 min, plus 10.0 min to land it");
+    expect(detail).toContain("a lock reads final about 90.0 min after the run starts");
+    expect(detail).toContain("leg A's claim-by is in 115.0 min, 25.0 min to spare");
+
+    const anvilSet = await preflight({ finalizedLagSec: quiet }, config(), {}, ANVIL_SET);
+    expect(status(anvilSet, "finality budget")).toBe("fail"); // before this decision: 15 + 10 = 25 min, which fits +60 and passed
+    const failed = row(anvilSet, "finality budget").detail;
+    expect(failed).toContain("a lock would read final about 90.0 min after the run starts");
+    expect(failed).toContain("(15.0 min) and the policy's finality budget (80.0 min)");
+    expect(failed).toContain("leg A's claim-by is in 60.0 min");
+    expect(failed).toContain("the Seller could not claim in time");
+    expect(anvilSet.report.ok).toBe(false);
+  });
+
+  it("P9-4 d12: a lag above the budget is used as it is (105 minutes + 10 fits claim-by +115 exactly, one second more does not); the row says it used the lag", async () => {
+    const exact = await preflight({ finalizedLagSec: 105 * 60 }, config(), {}, BASE_SET);
+    expect(status(exact, "finality budget")).toBe("ok");
+    expect(row(exact, "finality budget").detail).toContain("(105.0 min) and the policy's finality budget (80.0 min), 105.0 min, plus 10.0 min");
+    expect(row(exact, "finality budget").detail).toContain("0.0 min to spare");
+    expect(status(await preflight({ finalizedLagSec: 105 * 60 + 1 }, config(), {}, BASE_SET), "finality budget")).toBe("fail");
+  });
+
+  it("P9-4 d12: the budget applies on anvil too (20 minutes + 10 needs a claim-by of +30 even when the lag measured is 5 minutes)", async () => {
+    const anvil = config({ contractCodeHash: undefined }, {}, ANVIL_LOCAL_PIN);
+    const claimBy = (min: number): DeadlineMinutes => ({ legA: { ...ANVIL_SET.legA, claimByMin: min }, legB: ANVIL_SET.legB });
+    const short = await preflight({ chainId: 31337, finalizedLagSec: 5 * 60 }, anvil, {}, claimBy(29));
+    expect(status(short, "finality budget")).toBe("fail");
+    expect(row(short, "finality budget").detail).toContain("(5.0 min) and the policy's finality budget (20.0 min)");
+    const exact = await preflight({ chainId: 31337, finalizedLagSec: 5 * 60 }, anvil, {}, claimBy(30));
+    expect(status(exact, "finality budget")).toBe("ok");
+    expect(row(exact, "finality budget").detail).toContain("0.0 min to spare");
+  });
+
+  it("an unknown lag still fails the row (the budget alone is not read as a measurement)", async () => {
+    const run = await preflight({ noFinalizedTag: true }, config(), {}, BASE_SET);
+    expect(row(run, "finality budget").detail).toContain("the finalized lag is unknown");
+  });
+
   it("fails when the state at the finalized block cannot be read by its hash (a pruned node)", async () => {
     const run = await preflight({ noStateAtFinalized: true });
     expect(status(run, "state at finalized")).toBe("fail");

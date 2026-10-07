@@ -209,7 +209,9 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     expect(result.stdout).toContain("Nothing was sent. Fix the failed checks");
     expect(result.stdout).not.toContain("This was a dry run");
     expect(result.stdout).toMatch(/OK\s+chain id\s+84532 matches the pin base-sepolia/); // everything else about the chain is fine
-    expect(result.stdout.match(/^ {2}FAIL {2}\S+/gm)).toEqual(["  FAIL  deadlines"]); // the deadlines row is the only failure
+    // P9-4 decision 12: the finality row uses the policy's 80-minute budget (plus 10) against leg A's claim-by of +60, so it fails with the deadlines row; nothing else does.
+    expect(result.stdout).toMatch(/FAIL\s+finality budget\s+a lock would read final about 90\.0 min after the run starts \(the larger of the finalized lag measured now \(20\.0 min\) and the policy's finality budget \(80\.0 min\)/);
+    expect(result.stdout.match(/^ {2}FAIL {2}.{1,20}?(?= {2})/gm)).toEqual(["  FAIL  finality budget", "  FAIL  deadlines"]);
 
     const yes = await makeRig({ configExtra: { deadlines: anvilSet } });
     const refused = await run(yes, "yes");
