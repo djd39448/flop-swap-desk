@@ -50,7 +50,7 @@ import { decodeFunctionResult, encodeFunctionData, type Address, type Hex } from
 import type { LocalAccount } from "viem/accounts";
 
 import { swapId as computeSwapId } from "../profile.js";
-import { effectiveMaxLogRange } from "../rails/evm-htlc.js";
+import { effectiveMaxLogRange, evmLogScanCoverage, MAX_LOG_SCAN_CHUNKS } from "../rails/evm-htlc.js";
 import { CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../vendor/evm-hash-rail.js";
 import { writeBundle, type BundleEvidenceSummary } from "./bundle.js";
@@ -71,7 +71,8 @@ import {
 } from "./rehearsal-config.js";
 import { describeFailure, renderPreflight, runPreflight, type BuyerSends, type PreflightReport, type PreflightRow, type SellerSends } from "./rehearsal-preflight.js";
 import { acquireRunLock, DurableNoteStore, DurableVenue, loadOrCreateIdentity, RehearsalWorldError, RunLockedError, writeFileDurable, type RehearsalIdentity } from "./rehearsal-world.js";
-import { SellerFlow, type SellerNextStep } from "./seller.js";
+import { evmLocalPolicyFor } from "./policy.js";
+import { CLAIM_MARKER_REORG_MARGIN_EVM, SellerFlow, type SellerNextStep } from "./seller.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -127,8 +128,8 @@ export interface RunRecord {
   sellerAccount: string;
   /**
    * P2R2-PIN-06 (P9 review round 2): the effective `maxLogRange` of the config the run STARTED with (the configured value, else the chain's default; absent where no
-   * cap is in force, and in a run.json written before this field existed). The claim-log scan and the pre-flight's reach row were sized for it, so `--resume` with
-   * a smaller cap is refused by field name (a larger one, or none, is fine).
+   * cap is in force, and in a run.json written before this field existed). P9-4 decision 11: its PRESENCE says the run's claim-log scan was sized for a cap, so `--resume`
+   * checks that the config's cap still reaches leg A's window (`logScanWindowTooLong`); a run.json without it is not checked.
    */
   maxLogRange?: number;
 }
@@ -270,16 +271,27 @@ function runMatchesConfig(run: RunRecord, config: RehearsalConfig): string | nul
 }
 
 /**
- * P2R2-PIN-06: a `--resume` through a smaller `maxLogRange` than the run started with. The run's claim-log scan reads at most MAX_LOG_SCAN_CHUNKS calls of that
- * cap, and the reach row of the pre-flight checked leg A's window against the cap the run began with, so a smaller one could leave a late claim beyond the scan's
- * bound (the Buyer could then not learn the secret from the chain). Refused by field name; the way on is to resume with the original cap (or a larger one). A run.json
- * without the field (older, or a chain with no cap) is not checked, and neither is a config with no cap at all.
+ * P9-4 decision 11 (the window check that replaces P2R2-PIN-06's "never smaller than the run started with"): the run's claim-log scan reads at most MAX_LOG_SCAN_CHUNKS
+ * calls of `maxLogRange` blocks above its marker, oldest range first, and a claim can land at any time between the lock and leg A's refund time, so what matters is not
+ * whether the cap shrank but whether the scan still REACHES leg A's window. `--resume` is refused only when `MAX_LOG_SCAN_CHUNKS` x the new effective cap is below
+ * ceil((leg A's refund time - the run's start) / the policy's block time) + the 256-block marker margin (the same measure as the dry run's "log scan reach" row, at the
+ * POLICY's block time: 2 s on Base Sepolia, 1 s on anvil, not a fresh measurement). A run.json without the recorded cap (older, or a chain with no cap in force) is not
+ * checked, and neither is a config with no cap at all. The refusal names both numbers, and the cap that would do. Exported for its own tests.
  */
-function logRangeShrank(run: RunRecord, config: RehearsalConfig): string | null {
+export function logScanWindowTooLong(run: RunRecord, config: RehearsalConfig): string | null {
   if (run.maxLogRange === undefined) return null;
-  const now = effectiveMaxLogRange(config.rails.evm);
-  if (now === undefined || now >= run.maxLogRange) return null;
-  return `maxLogRange is ${now} in the config, smaller than the ${run.maxLogRange} this run started with: the run's log scans and its pre-flight were sized for ${run.maxLogRange}, so resume with maxLogRange ${run.maxLogRange} or more`;
+  const reach = evmLogScanCoverage(config.rails.evm);
+  const cap = effectiveMaxLogRange(config.rails.evm);
+  if (reach === undefined || cap === undefined) return null;
+  const blockMs = evmLocalPolicyFor(run.chainId).blockTimeMs;
+  const windowMs = Math.max(0, run.deadlines.legA.refundAfterMs - run.t0Ms);
+  const needBlocks = Math.ceil(windowMs / blockMs) + CLAIM_MARKER_REORG_MARGIN_EVM;
+  if (reach >= needBlocks) return null;
+  return (
+    `maxLogRange is ${cap} in the config: ${MAX_LOG_SCAN_CHUNKS} calls of it read ${reach} blocks above a marker, but leg A's window needs ${needBlocks} blocks ` +
+    `(${(windowMs / 60_000).toFixed(1)} min from the run's start to leg A's refund time at ${(blockMs / 1000).toFixed(1)} s a block, plus ${CLAIM_MARKER_REORG_MARGIN_EVM} of marker margin): ` +
+    `a claim that lands late in the window could be beyond the scan, so resume with maxLogRange ${Math.ceil(needBlocks / MAX_LOG_SCAN_CHUNKS)} or more`
+  );
 }
 
 // --- small helpers --------------------------------------------------------------------------------------------------------------
@@ -1287,7 +1299,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
 
     if (!fresh) {
       if (existingRun === null) throw new RunnerRefusal(`${stateDir} holds no run (no ${RUN_FILE}); there is nothing to ${mode === "resume" ? "resume" : "refund"} here`);
-      const mismatch = runMatchesConfig(existingRun, config) ?? (mode === "resume" ? logRangeShrank(existingRun, config) : null);
+      const mismatch = runMatchesConfig(existingRun, config) ?? (mode === "resume" ? logScanWindowTooLong(existingRun, config) : null);
       if (mismatch !== null) throw new RunnerRefusal(`the config no longer matches this run: ${mismatch}`);
       // A finished run is only reported: nothing on the chain or in the state directory is touched again.
       const finished = await readOutcome(stateDir);

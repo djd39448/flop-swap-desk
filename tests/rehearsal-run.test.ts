@@ -1658,43 +1658,109 @@ describe("R1-FUND-04: the runner's own texts do not promise that a resume sends 
 // started with a cap of 500 and passed a 26-hour window could be resumed through a cap of 300 and never be checked again: a late claim then lies past the
 // scan's bound. The fresh start records the effective cap in run.json; --resume refuses a smaller one by field name. (The fresh start's own recording is
 // proven on a real node: tests-anvil/rehearsal-runner.anvil.test.ts.)
-describe("P2R2-PIN-06: --resume refuses a smaller maxLogRange than the run started with", () => {
-  it("a run that started with 500 and is resumed with 300 is refused naming maxLogRange, before the chain is read; --refund is not affected (it reads no logs)", async () => {
-    const small = await makeRig({ anvil: true, maxLogRange: 300, chain: { logCap: 300 } });
-    await writeRun(small, { chainId: 31337, maxLogRange: 500 }, true);
-    const refused = await run(small, "resume");
-    expect(refused.code).toBe(EXIT.refused);
-    expect(refused.stderr).toContain("the config no longer matches this run: maxLogRange is 300 in the config, smaller than the 500 this run started with");
-    expect(refused.stderr).toContain("resume with maxLogRange 500 or more");
-    expect(refused.stdout).toBe(""); // refused before the pre-flight printed anything
-    expect(small.chain.methods).toEqual([]); // and before the endpoint was touched
-    expect((await readdir(small.stateDir)).sort()).toEqual(["buyer", "run.json", "seller"]); // only what writeRun made (the identities' seeds): nothing new
+// P2R2-PIN-06 (P9 review round 2) refused a --resume through any smaller maxLogRange than the run started with; P9-4 decision 11 turns that into a WINDOW check at the policy's
+// block time: --resume is refused only when 100 x the new effective cap is below ceil((leg A's refund time - the run's start) / the policy's block time) + 256, naming both numbers.
+describe("P9-4 d11 (P2R2-PIN-06): --resume checks that the cap still reaches leg A's window", () => {
+  const HOUR = 3_600_000;
+  /** A run.json whose leg A window is `windowMs` long (the run started an hour ago: every other deadline is in the future of t0 only by the usual spacing). */
+  const windowRun = (windowMs: number, chainId: number, extra: Record<string, unknown> = {}): Record<string, unknown> => {
+    const t0 = Date.now() - HOUR;
+    return {
+      chainId,
+      t0Ms: t0,
+      lockTimeMs: t0 + 600_000,
+      deadlines: {
+        legA: { claimByMs: t0 + 3_600_000, refundAfterMs: t0 + windowMs, expiresMs: t0 + 1_800_000 },
+        legB: { claimByMs: t0 + windowMs + 3_600_000, refundAfterMs: t0 + windowMs + 7_200_000, expiresMs: t0 + 2_400_000 },
+      },
+      ...extra,
+    };
+  };
 
-    const refund = await run(small, "refund");
-    expect(refund.stderr).not.toContain("maxLogRange");
-    expect(refund.stderr).toContain("holds no record"); // past the check, at the Buyer's empty store
-  });
-
-  it("the same cap, a larger one, no cap at all, and a run.json without the field are all let through (the pre-flight then stops them on a failing row, so nothing is started)", async () => {
-    // `pending: "error"` makes the --resume pre-flight fail on its own row: proof that the run got past the maxLogRange check, with nothing written.
-    for (const [label, rigMax, runMax] of [
-      ["the same cap", 500, 500],
-      ["a larger cap", 800, 500],
-      ["a run.json without the field", 500, undefined],
+  it("a run that started with 500 and a 90-minute window, resumed at 300, passes the check (PIN-06 refused it): it goes on to the pre-flight; --refund is not affected either way", async () => {
+    // `pending: "error"` makes the --resume pre-flight fail on its own row: proof that the run got past the check, with nothing written.
+    for (const [label, rigOptions, chainId] of [
+      ["anvil (1 s blocks: 5,400 + 256 blocks needed, 30,000 read)", { anvil: true, maxLogRange: 300, chain: { logCap: 300, pending: "error" as const } }, 31337],
+      ["Base Sepolia (2 s blocks: 2,700 + 256 blocks needed, 30,000 read)", { evmExtra: { maxLogRange: 300 }, chain: { logCap: 300, pending: "error" as const } }, 84532],
     ] as const) {
-      const rig = await makeRig({ anvil: true, maxLogRange: rigMax, chain: { logCap: rigMax, pending: "error" } });
-      await writeRun(rig, { chainId: 31337, ...(runMax === undefined ? {} : { maxLogRange: runMax }) }, true);
+      const rig = await makeRig(rigOptions);
+      await writeRun(rig, { chainId, maxLogRange: 500 }, true); // writeRun's own window is 90 minutes
       const result = await run(rig, "resume");
       expect(result.stderr, label).not.toContain("maxLogRange");
       expect(result.code, label).toBe(EXIT.preflight);
       expect(result.stdout, label).toMatch(/FAIL\s+pending/);
     }
-    // No cap in the config at all (anvil without maxLogRange): unlimited, so never smaller.
+  });
+
+  it("a window beyond 100 x 300 blocks + 256 is refused naming both numbers, before the chain is read; the boundary is exact, at the policy's block time (2 s on Base Sepolia)", async () => {
+    // 100 calls of 300 blocks read 30,000 blocks. At 2 s a block, a window of 59,488,000 ms is 29,744 blocks + 256 = 30,000: it fits; one millisecond more needs 30,001.
+    const fits = await makeRig({ evmExtra: { maxLogRange: 300 }, chain: { logCap: 300, pending: "error" } });
+    await writeRun(fits, windowRun(59_488_000, 84532, { maxLogRange: 500 }), true);
+    const passed = await run(fits, "resume");
+    expect(passed.stderr).not.toContain("maxLogRange");
+    expect(passed.code).toBe(EXIT.preflight); // past the check, stopped by the failing pending row
+
+    const over = await makeRig({ evmExtra: { maxLogRange: 300 }, chain: { logCap: 300 } });
+    await writeRun(over, windowRun(59_488_001, 84532, { maxLogRange: 500 }), true);
+    const refused = await run(over, "resume");
+    expect(refused.code).toBe(EXIT.refused);
+    expect(refused.stderr).toContain(
+      "the config no longer matches this run: maxLogRange is 300 in the config: 100 calls of it read 30000 blocks above a marker, but leg A's window needs 30001 blocks " +
+        "(991.5 min from the run's start to leg A's refund time at 2.0 s a block, plus 256 of marker margin)",
+    );
+    expect(refused.stderr).toContain("resume with maxLogRange 301 or more");
+    expect(refused.stdout).toBe(""); // refused before the pre-flight printed anything
+    expect(over.chain.methods).toEqual([]); // and before the endpoint was touched
+    expect((await readdir(over.stateDir)).sort()).toEqual(["buyer", "run.json", "seller"]); // only what writeRun made: nothing new
+
+    // --refund reads no logs: the same state is refunded as far as the Buyer's empty store.
+    const refund = await run(over, "refund");
+    expect(refund.stderr).not.toContain("maxLogRange");
+    expect(refund.stderr).toContain("holds no record");
+  });
+
+  it("the block time is the chain's own policy's: a 10-hour window needs 36,256 blocks on anvil (1 s blocks) and is refused at a cap of 300, and 18,256 on Base Sepolia (2 s) and passes", async () => {
+    const anvil = await makeRig({ anvil: true, maxLogRange: 300, chain: { logCap: 300 } });
+    await writeRun(anvil, windowRun(10 * HOUR, 31337, { maxLogRange: 500 }), true);
+    const refused = await run(anvil, "resume");
+    expect(refused.code).toBe(EXIT.refused);
+    expect(refused.stderr).toContain("100 calls of it read 30000 blocks above a marker, but leg A's window needs 36256 blocks (600.0 min from the run's start to leg A's refund time at 1.0 s a block, plus 256 of marker margin)");
+    expect(refused.stderr).toContain("resume with maxLogRange 363 or more");
+    const base = await makeRig({ evmExtra: { maxLogRange: 300 }, chain: { logCap: 300, pending: "error" } });
+    await writeRun(base, windowRun(10 * HOUR, 84532, { maxLogRange: 500 }), true);
+    const passed = await run(base, "resume");
+    expect(passed.stderr).not.toContain("maxLogRange");
+    expect(passed.code).toBe(EXIT.preflight);
+  });
+
+  it("a run.json without the recorded cap, and a config with no cap at all, are not checked, whatever the window", async () => {
+    // No recorded cap (older run.json, or a chain with no cap in force): a 100-hour window at a cap of 300 is not looked at.
+    const old = await makeRig({ anvil: true, maxLogRange: 300, chain: { logCap: 300, pending: "error" } });
+    await writeRun(old, windowRun(100 * HOUR, 31337), true);
+    const oldResult = await run(old, "resume");
+    expect(oldResult.stderr).not.toContain("maxLogRange");
+    expect(oldResult.code).toBe(EXIT.preflight);
+    // No cap in the config (anvil without maxLogRange: unlimited), though the run recorded one.
     const unlimited = await makeRig({ anvil: true, evmExtra: { maxLogRange: undefined }, chain: { pending: "error", logCap: null } });
-    await writeRun(unlimited, { chainId: 31337, maxLogRange: 500 }, true);
+    await writeRun(unlimited, windowRun(100 * HOUR, 31337, { maxLogRange: 500 }), true);
     const result = await run(unlimited, "resume");
     expect(result.stderr).not.toContain("maxLogRange");
     expect(result.code).toBe(EXIT.preflight);
+  });
+
+  it("the same cap, a larger one and a smaller one that still reaches the window are all let through (the pre-flight then stops them on a failing row, so nothing is started)", async () => {
+    for (const [label, rigMax, runMax] of [
+      ["the same cap", 500, 500],
+      ["a larger cap", 800, 500],
+      ["a smaller cap that still reaches", 257, 500],
+    ] as const) {
+      const rig = await makeRig({ anvil: true, maxLogRange: rigMax, chain: { logCap: rigMax, pending: "error" } });
+      await writeRun(rig, { chainId: 31337, maxLogRange: runMax }, true);
+      const result = await run(rig, "resume");
+      expect(result.stderr, label).not.toContain("maxLogRange");
+      expect(result.code, label).toBe(EXIT.preflight);
+      expect(result.stdout, label).toMatch(/FAIL\s+pending/);
+    }
   });
 
   it("a fresh --yes writes the effective cap into run.json before it sends anything: the configured one, and nothing where no cap is in force", async () => {
