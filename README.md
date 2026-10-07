@@ -285,7 +285,9 @@ cap, and what does not fit is the NEWEST part, which throws `EvmLogScanBoundErro
 answering "no claim". So the bound is a property of the leg's window (its refund time minus its lock time, plus the 256-block
 margin, must fit in `MAX_LOG_SCAN_CHUNKS x maxLogRange` blocks), never of how late a scan runs; a preimage found inside the first 100
 ranges is returned whatever lies above. The write-evidence lookup needs the whole range to prove there is exactly one
-log, so it throws before reading anything. A scan reads up to the tip it saw at its start; a claim mined after that is found by
+log, so it throws before reading anything; its tip is never planned below the block of the write's own receipt (a tip read answered
+by a node that is a block behind cannot cut the range below a write that landed), and a lookup that finds no log re-plans with a
+fresh tip and reads again up to 3 times (`EVM_WRITE_LOOKUP_REPLANS`) before it reports "found 0" (the write is never repeated). A scan reads up to the tip it saw at its start; a claim mined after that is found by
 the next call (the flows' own retries and polls make it).
 
 **The claim endpoint sees the real preimage once, at the one moment it must.** Before

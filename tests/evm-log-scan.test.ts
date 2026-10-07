@@ -20,6 +20,7 @@ import {
   EVM_MIN_LOG_RANGE,
   BASE_SEPOLIA_PIN,
   EvmHtlcRail,
+  EVM_WRITE_LOOKUP_REPLANS,
   EvmLogScanBoundError,
   MAX_LOG_SCAN_CHUNKS,
   checkEvmRailConfig,
@@ -492,6 +493,68 @@ describe("P9-3 the write-evidence lookup: paged the same way, one log required a
     });
     const buyer = await EvmHtlcRail.connect({ config: node.config(), rpc, account: BUYER.address, addressBook: ADDRESS_BOOK, clock: NOW });
     await expect(buyer.lock(terms, 0)).rejects.toThrow(/expected exactly one Locked log .* found 0/);
+  });
+
+  it("F7: a tip read answered one block behind the write's own receipt does not fail a landed lock: the lock succeeds with its evidence", async () => {
+    const node = capped();
+    const buyer = await connect(node, BUYER);
+    const terms = termsFor(generateHashLock().hash);
+    await buyer.approve("USDC", terms.amount);
+    node.lagTipReads = 2; // the first eth_blockNumber after each receipt (the lock's start marker, then the lookup's tip) is one block behind
+    const evidence = await buyer.lock(terms, 0);
+    expect(evidence.event).toBe("Locked");
+    expect(evidence.blockNumber).toBe(node.blockNumber);
+    expect(node.count("lock")).toBe(1);
+  });
+
+  it("F7: the planned tip is floored at the receipt's block: tip reads that stay behind for every re-read still find the lock, and no range ends below the write", async () => {
+    const node = capped();
+    const buyer = await connect(node, BUYER);
+    const terms = termsFor(generateHashLock().hash);
+    await buyer.approve("USDC", terms.amount);
+    node.lagTipReads = 50; // every tip read after a receipt is behind, so re-planning alone could never recover
+    node.logRanges.length = 0;
+    const evidence = await buyer.lock(terms, 0);
+    expect(evidence.event).toBe("Locked");
+    const lockBlock = evidence.blockNumber;
+    expect(node.logRanges.at(-1)?.to, "the last range ends at the receipt's block, not one below it").toBe(lockBlock);
+    expect(node.logRanges).toHaveLength(1); // found at once: no re-plan was needed
+  });
+
+  it("F7: a lookup that finds no log re-plans with a fresh tip, at most 3 times (4 reads in all), then reports found 0; the write itself is never repeated", async () => {
+    expect(EVM_WRITE_LOOKUP_REPLANS).toBe(3);
+    const found = capped();
+    const buyer = await connect(found, BUYER);
+    const terms = termsFor(generateHashLock().hash);
+    await buyer.approve("USDC", terms.amount);
+    found.emptyLogQueries = 3; // the node answers the first three reads empty, the fourth right
+    found.logRanges.length = 0;
+    expect((await buyer.lock(terms, 0)).event).toBe("Locked");
+    expect(found.logRanges, "one initial read and three re-plans").toHaveLength(4);
+    expect(found.count("lock")).toBe(1);
+
+    const lost = capped();
+    const other = await connect(lost, BUYER);
+    const otherTerms = termsFor(generateHashLock().hash);
+    await other.approve("USDC", otherTerms.amount);
+    lost.emptyLogQueries = 4;
+    lost.logRanges.length = 0;
+    await expect(other.lock(otherTerms, 0)).rejects.toThrow(/expected exactly one Locked log .* found 0/);
+    expect(lost.logRanges, "the bound is three re-plans").toHaveLength(4);
+    expect(lost.count("lock"), "the lock landed once and is not sent again").toBe(1);
+  });
+
+  it("F7: the re-plan also covers the unlimited single call to latest (anvil): two empty answers, the third right", async () => {
+    const node = capped(31337);
+    node.maxLogSpan = undefined;
+    const buyer = await connect(node, BUYER);
+    const terms = termsFor(generateHashLock().hash);
+    await buyer.approve("USDC", terms.amount);
+    node.emptyLogQueries = 2;
+    node.logRanges.length = 0;
+    expect((await buyer.lock(terms, 0)).event).toBe("Locked");
+    expect(node.logRanges).toHaveLength(3);
+    expect(node.logRanges.every((range) => range.latest)).toBe(true);
   });
 
   it("anvil keeps its one call to latest for the lookup (no extra read, unchanged evidence shape)", async () => {

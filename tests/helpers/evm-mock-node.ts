@@ -99,6 +99,12 @@ export class EvmMockNode {
   maxLogSpan: bigint | undefined;
   /** When true every `eth_getLogs` is refused with an error (a provider that is down for log queries). */
   refuseLogs = false;
+  /** F7: the next this-many `eth_getLogs` calls answer an empty list whatever the filter (a load-balanced node that has not seen the block yet). */
+  emptyLogQueries = 0;
+  /** F7: after an `eth_getTransactionReceipt` is answered, the next this-many `eth_blockNumber` answers are one block BEHIND the chain (a tip read that a
+   *  node lagging the one that answered the receipt gives). */
+  lagTipReads = 0;
+  private lagArmed = false;
   /** Every `fromBlock` an `eth_getLogs` was asked for, in order (a test reads where a scan started). */
   readonly logQueries: bigint[] = [];
   /** Every `eth_getLogs` range that was asked for, in order, refused ones included (`to` is the tip for a "latest" call, `latest` says so). */
@@ -194,6 +200,11 @@ export class EvmMockNode {
         return { result: who === this.railContract.toLowerCase() ? this.contractCode : "0x" };
       }
       case "eth_blockNumber":
+        if (this.lagArmed && this.lagTipReads > 0) {
+          this.lagTipReads -= 1;
+          if (this.lagTipReads === 0) this.lagArmed = false;
+          return { result: numberToHex(this.blockNumber - 1n) };
+        }
         return { result: numberToHex(this.blockNumber) };
       case "personal_sign": {
         const account = String(params[1]).toLowerCase();
@@ -211,6 +222,7 @@ export class EvmMockNode {
       case "eth_getTransactionReceipt": {
         const receipt = this.receipts.get(String(params[0]));
         if (receipt === undefined) return { result: null };
+        if (this.lagTipReads > 0) this.lagArmed = true;
         return {
           result: {
             status: "0x1",
@@ -238,6 +250,10 @@ export class EvmMockNode {
         if (this.refuseLogs) return { error: { code: -32000, message: "mock evm node: eth_getLogs refused (test)" } };
         if (this.maxLogSpan !== undefined && to - from + 1n > this.maxLogSpan) {
           return { error: { code: -32602, message: `mock evm node: query exceeds the block range limit of ${this.maxLogSpan} (test)` } };
+        }
+        if (this.emptyLogQueries > 0) {
+          this.emptyLogQueries -= 1;
+          return { result: [] };
         }
         return { result: this.getLogs(filter) };
       }

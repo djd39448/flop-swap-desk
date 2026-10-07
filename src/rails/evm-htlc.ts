@@ -123,6 +123,11 @@ export const BASE_SEPOLIA_MAX_LOG_RANGE = 500;
  *  lies in the first ranges above the marker), never of how late the scan runs. */
 export const MAX_LOG_SCAN_CHUNKS = 100;
 
+/** F7: how many times the write-evidence lookup re-plans (a fresh tip read, the whole range read again) when it finds no log before it
+ *  gives up with "found 0". A load-balanced endpoint can answer the receipt from one node and the tip or the logs from another that has
+ *  not seen the block yet; the write is on chain, so a bounded re-read is the answer, never a second write. */
+export const EVM_WRITE_LOOKUP_REPLANS = 3;
+
 /** R1-FUND-03: the smallest `maxLogRange` a config may carry: the resumed Seller's claim marker sits `CLAIM_MARKER_REORG_MARGIN_EVM` (256)
  *  blocks below the tip it read, so a range of at least 257 blocks keeps that margin inside one call. */
 export const EVM_MIN_LOG_RANGE = 257;
@@ -590,6 +595,8 @@ interface LogScanPlan {
  *  has re-wrapped the error as `tclk: ...`). One write runs at a time on one rail handle. */
 interface ReceiptWatch {
   timeout: EvmReceiptTimeoutError | undefined;
+  /** F7: the block number of the last receipt a wait returned (the write's own block), so the evidence lookup never plans below it. */
+  receiptBlock: bigint | undefined;
 }
 
 /** The viem `waitForTransactionReceipt` parameters, without naming a chain. */
@@ -606,7 +613,9 @@ function withReceiptTimeout(client: PublicClient, receiptTimeoutMs: number | und
     async waitForTransactionReceipt(parameters: ReceiptWaitParameters) {
       const withTimeout = parameters.timeout === undefined && receiptTimeoutMs !== undefined ? { ...parameters, timeout: receiptTimeoutMs } : parameters;
       try {
-        return await client.waitForTransactionReceipt(withTimeout);
+        const receipt = await client.waitForTransactionReceipt(withTimeout);
+        watch.receiptBlock = receipt.blockNumber;
+        return receipt;
       } catch (error) {
         if (error instanceof WaitForTransactionReceiptTimeoutError) {
           const typed = new EvmReceiptTimeoutError(parameters.hash, withTimeout.timeout ?? VIEM_RECEIPT_TIMEOUT_MS);
@@ -718,7 +727,7 @@ export class EvmHtlcRail {
         throw new Error("evm-htlc: refusing to connect: account must be an address or a local account");
       }
     }
-    const receiptWatch: ReceiptWatch = { timeout: undefined };
+    const receiptWatch: ReceiptWatch = { timeout: undefined, receiptBlock: undefined };
     const signerWatch: EvmSignerWatch = { refused: undefined };
     const publicClient = withReceiptTimeout(createPublicClient({ chain, transport }), options.config.receiptTimeoutMs, receiptWatch);
     // R1-FUND-02: a LOCAL account signs what viem hands it, and viem fills the chain id, gas and fee caps from the endpoint's answers.
@@ -791,6 +800,7 @@ export class EvmHtlcRail {
    *  by the wrapped public client during this call is thrown back as the typed `EvmReceiptTimeoutError`. */
   private async viaVendoredRail(write: () => Promise<unknown>): Promise<void> {
     this.receiptWatch.timeout = undefined;
+    this.receiptWatch.receiptBlock = undefined;
     this.signerWatch.refused = undefined;
     try {
       await write();
@@ -1075,19 +1085,16 @@ export class EvmHtlcRail {
   private async captureWriteEvidence(event: WriteEventName, hashLock: Hex, fromBlock: bigint, before: number): Promise<WriteEvidence> {
     // P9-3: the lookup is paged to the endpoint's range cap like every scan, and an answer needs every page: exactly one log across
     // them all. A range that cannot be covered inside the bound is refused up front (a part read would prove nothing about "one").
-    const plan = await this.planLogScan(fromBlock);
+    // F7: the planned tip never lies below the block the write's own receipt came from (a tip read answered by a node that is behind
+    // would cut the range below the write), and a lookup that finds NO log re-plans with a fresh tip and reads again, at most
+    // `EVM_WRITE_LOOKUP_REPLANS` times, before it reports "found 0". Several logs are never retried.
+    let plan = await this.planLogScan(fromBlock, this.receiptWatch.receiptBlock);
     if (plan.unread !== undefined) throw this.logScanBoundError(fromBlock, plan);
-    const logs = [];
-    for (const range of plan.ranges) {
-      logs.push(
-        ...(await this.publicClient.getLogs({
-          address: this.config.contract,
-          event: WRITE_EVENT_ABI[event],
-          args: { hashLock },
-          fromBlock: range.from,
-          toBlock: range.to,
-        })),
-      );
+    let logs = await this.readWriteLogs(event, hashLock, plan);
+    for (let replans = 0; logs.length === 0 && replans < EVM_WRITE_LOOKUP_REPLANS; replans += 1) {
+      plan = await this.planLogScan(fromBlock, this.receiptWatch.receiptBlock);
+      if (plan.unread !== undefined) throw this.logScanBoundError(fromBlock, plan);
+      logs = await this.readWriteLogs(event, hashLock, plan);
     }
     if (logs.length !== 1) {
       throw new Error(
@@ -1114,6 +1121,23 @@ export class EvmHtlcRail {
       logIndex: log.logIndex,
       raw,
     };
+  }
+
+  /** Every `event` log for `hashLock` across the planned ranges, oldest range first. */
+  private async readWriteLogs(event: WriteEventName, hashLock: Hex, plan: LogScanPlan) {
+    const logs = [];
+    for (const range of plan.ranges) {
+      logs.push(
+        ...(await this.publicClient.getLogs({
+          address: this.config.contract,
+          event: WRITE_EVENT_ABI[event],
+          args: { hashLock },
+          fromBlock: range.from,
+          toBlock: range.to,
+        })),
+      );
+    }
+    return logs;
   }
 
   /**
@@ -1213,16 +1237,18 @@ export class EvmHtlcRail {
    * (`eth_blockNumber` through the capturing transport, never viem's cached block number), and the span is cut from `fromBlock` upwards
    * into ranges of at most `maxLogRange` blocks (both ends counted, so a 500-block range is `to - from + 1 = 500`), at most
    * `MAX_LOG_SCAN_CHUNKS` of them; whatever newer part does not fit is returned as `unread`, for the caller to refuse or report, never
-   * silently dropped. A start above the tip has no range at all.
+   * silently dropped. A start above the tip has no range at all. `minTip` (F7) floors the tip read: a node a block or two behind the
+   * write's own receipt must not cut the plan below the block the write landed in.
    */
-  private async planLogScan(fromBlock: bigint): Promise<LogScanPlan> {
+  private async planLogScan(fromBlock: bigint, minTip?: bigint): Promise<LogScanPlan> {
     const limit = effectiveMaxLogRange(this.config);
     if (limit === undefined) return { ranges: [{ from: fromBlock, to: "latest" }], tip: undefined, unread: undefined, limit: undefined };
     const raw = await this.rpc.request({ method: "eth_blockNumber", params: [] });
     if (typeof raw !== "string" || !/^0x[0-9a-fA-F]+$/.test(raw)) {
       throw new Error("evm-htlc: eth_blockNumber returned something that is not a hex number, so a log scan cannot be planned");
     }
-    const tip = BigInt(raw);
+    const read = BigInt(raw);
+    const tip = minTip !== undefined && minTip > read ? minTip : read;
     const width = BigInt(limit);
     const ranges: LogRange[] = [];
     let low = fromBlock;
