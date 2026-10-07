@@ -35,7 +35,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { promises as fsp } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -56,6 +56,7 @@ import {
   absoluteDeadlines,
   loadRehearsalConfig,
   LOCK_ESTIMATE_MS,
+  looksLikeKeyMaterial,
   RehearsalConfigError,
   type RehearsalConfig,
   type RunDeadlines,
@@ -80,7 +81,8 @@ export type RehearsalMode = "dry" | "yes" | "resume" | "refund";
 export interface RehearsalOptions {
   configPath: string;
   mode: RehearsalMode;
-  /** The state directory (run.json, the two parties' flow records and seeds, the venue and note files). */
+  /** The state directory (run.json, the two parties' flow records and seeds, the venue and note files), as the caller wrote it: a relative path is
+   *  resolved against the working directory here, AFTER the key-like check (KR2-1), so a long directory path of the machine is never judged. */
   stateDir: string;
   /** `--yes` only: stop after leg A is locked and recorded (the Seller never claims). */
   stopAfter?: "lock";
@@ -898,9 +900,27 @@ function describeSwapPlan(config: RehearsalConfig, absolute: RunDeadlines, t0Ms:
   ];
 }
 
+/**
+ * KR2-1 (P9 review round 2): the two arguments the runner prints back (the config path in its refusals, the state directory in its rows and
+ * messages) must not be key material. A key pasted where a path belongs is refused here, BEFORE anything is read, written, sent or printed, with a
+ * fixed sentence that names the argument and never its value (the same rule as every config field: `looksLikeKeyMaterial`).
+ */
+function keyLikeArgument(options: RehearsalOptions): string | undefined {
+  if (looksLikeKeyMaterial(options.configPath)) return "the config path";
+  if (looksLikeKeyMaterial(options.stateDir)) return "--state-dir";
+  return undefined;
+}
+
 /** Everything one invocation does. Returns the process exit code; throws nothing. */
 export async function runRehearsal(options: RehearsalOptions): Promise<number> {
   const { env, mode } = options;
+  const keyLike = keyLikeArgument(options);
+  if (keyLike !== undefined) {
+    env.err(
+      `rehearsal: ${keyLike} looks like key material (a run of 32 or more hex digits, or a phrase of 11 or more words) and not a path: it must name a file or a directory, never a key; nothing was read, written or sent`,
+    );
+    return EXIT.config;
+  }
   let config: RehearsalConfig;
   try {
     config = await loadRehearsalConfig(options.configPath);
@@ -913,7 +933,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
   const out = (line: string): void => env.out(redact(line));
   const errLine = (line: string): void => env.err(redact(line));
   const safeEnv: RehearsalEnv = { ...env, out, err: errLine };
-  const stateDir = options.stateDir;
+  const stateDir = resolve(options.stateDir);
 
   let release: (() => Promise<void>) | undefined;
   try {

@@ -239,7 +239,7 @@ export function validateEvmRailConfig(config: EvmRailConfig): void {
   for (const [asset, address] of Object.entries(config.assets)) {
     if (isAddressEqual(address, BASE_MAINNET_USDC)) {
       throw new Error(
-        `evm-htlc: asset "${asset}" resolves to Base mainnet USDC (${BASE_MAINNET_USDC}); refusing to configure it (D-09)`,
+        `evm-htlc: ${ASSET_NAME_SHAPE.test(asset) ? `asset "${asset}"` : UNPLAIN_ASSET} resolves to Base mainnet USDC (${BASE_MAINNET_USDC}); refusing to configure it (D-09)`,
       );
     }
   }
@@ -247,6 +247,19 @@ export function validateEvmRailConfig(config: EvmRailConfig): void {
 }
 
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+
+/**
+ * KR2-1 (P9 review round 2): the shape of an asset name this build prints or writes down: 1 to 32 letters, digits, `-` and `_`
+ * (`USDC`, `usdc-test`). The runner's config holds every `assets` name to it before anything else reads the config.
+ */
+export const ASSET_NAME_SHAPE = /^[A-Za-z0-9_-]{1,32}$/;
+
+/**
+ * KR2-1: how the refusals of this module that name an asset speak of one whose name is NOT a plain name (`ASSET_NAME_SHAPE`): they never
+ * quote it. A key pasted into the wrong place is the case this is for, and these texts reach terminals, logs and the output of
+ * `watch.mjs` and `audit-export`, which this module cannot tell apart from the runner's.
+ */
+const UNPLAIN_ASSET = "an asset whose name is not a short plain name";
 
 /**
  * P22-P24-EVM-FIXES.md A3: whether `value` even has the shape of an `EvmRailConfig` — every
@@ -299,7 +312,7 @@ export function evmRailConfigShapeReason(value: unknown): string | null {
   }
   for (const [asset, address] of Object.entries(v.assets as Record<string, unknown>)) {
     if (typeof address !== "string" || !HEX_ADDRESS.test(address)) {
-      return `evm rail config: assets["${asset}"] must be a 0x-address`;
+      return `evm rail config: ${ASSET_NAME_SHAPE.test(asset) ? `assets["${asset}"]` : UNPLAIN_ASSET} must be a 0x-address`;
     }
   }
   if (v.receiptTimeoutMs !== undefined) {

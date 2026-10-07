@@ -13,7 +13,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -64,6 +64,8 @@ interface RigOptions {
   codeHash?: string;
   skipSellerKey?: boolean;
   configExtra?: Record<string, unknown>;
+  /** Fields merged into `rails.evm` after the rig's own (KR2-1: an `assets` book with another name in it). */
+  evmExtra?: Record<string, unknown>;
   endpoint?: string;
 }
 
@@ -94,6 +96,7 @@ async function makeRig(options: RigOptions = {}): Promise<Rig> {
         assets: { USDC: TOKEN },
         contractCodeHash: options.codeHash ?? FAKE_ESCROW_CODE_HASH,
         ...(options.anvil === true ? { maxLogRange: options.maxLogRange ?? 500 } : {}),
+        ...options.evmExtra,
       },
     },
     buyerKeyFile: "keys/buyer.key",
@@ -504,6 +507,142 @@ describe("K2: a key pasted into contractCodeHash is never printed back", () => {
       expect(result.stdout, code).toMatch(/FAIL\s+escrow code/);
       expect(scan(result.stdout) || scan(result.stderr), code).toBe(false);
     }
+  });
+});
+
+// KR2-1 (P9 review round 2, critical by the rubric): the key-echo class of K1 and K2 was still open for five more places a key can be pasted into by
+// the same clipboard mix-up: `out` (a dry run exited 0 and printed it twice), --state-dir, the config path, a `rails.evm.assets` name (quoted by the
+// rail's refusal, or silently carried into the bundle's rails.json when its value is an address) and the endpoint's host. Every one is now refused by
+// field or argument name, with exit 2, before the chain is touched, and nothing is written. Every key here is generated now and only ever scanned
+// for (keyScanner answers a boolean); a failing assertion names a mode and a field and never a byte of a key.
+describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset name or the endpoint host is never printed back", () => {
+  /** Labels (never names or contents) of the places under `dir` whose NAME or CONTENT holds a window of the key; the config file the test itself wrote (it
+   *  holds the pasted value, as the operator's file would) is the one thing not read. */
+  async function placesWith(dir: string, scan: (text: string) => boolean, input: string): Promise<string[]> {
+    const found: string[] = [];
+    const walk = async (at: string): Promise<void> => {
+      for (const entry of await readdir(at, { withFileTypes: true })) {
+        const path = join(at, entry.name);
+        if (scan(entry.name)) found.push(`a name of kind ${entry.isDirectory() ? "directory" : "file"}`);
+        if (entry.isDirectory()) await walk(path);
+        else if (path !== input && scan(await readFile(path, "latin1"))) found.push(`the content of a file ${relative(dir, path).split(/[\\/]/).length} deep`);
+      }
+    };
+    await walk(dir);
+    return found;
+  }
+
+  /** What every case must show: exit 2, the named field or argument, nothing on stdout, no window of the key anywhere, the endpoint never touched. */
+  async function expectRefused(rig: Rig, result: Outcome, scan: (text: string) => boolean, named: string, where: string): Promise<void> {
+    expect(result.code, where).toBe(EXIT.config);
+    expect(result.stderr, where).toContain(named);
+    expect(result.stdout, where).toBe("");
+    expect(scan(result.stdout) || scan(result.stderr), `${where}: no window of the pasted key may reach out or err`).toBe(false);
+    expect(await placesWith(rig.dir, scan, rig.configPath), `${where}: nothing the run wrote may hold a window of the key`).toEqual([]);
+    expect(rig.chain.methods, where).toEqual([]); // refused before the endpoint was touched
+    expect(await exists(rig.outDir), where).toBe(false);
+  }
+
+  async function runWith(rig: Rig, mode: RehearsalMode, over: { configPath?: string; stateDir?: string }): Promise<Outcome> {
+    const out: string[] = [];
+    const err: string[] = [];
+    const env: RehearsalEnv = { now: () => Date.now(), sleep: async () => undefined, out: (line) => void out.push(line), err: (line) => void err.push(line) };
+    const code = await runRehearsal({ configPath: over.configPath ?? rig.configPath, mode, stateDir: over.stateDir ?? rig.stateDir, env });
+    return { code, stdout: out.join("\n"), stderr: err.join("\n") };
+  }
+
+  it("out: the bundle directory is refused by field name in a dry run and in --yes (a dry run used to exit 0 and print it twice)", async () => {
+    for (const mode of ["dry", "yes"] as const) {
+      const key = generatePrivateKey();
+      const scan = keyScanner(key);
+      const rig = await makeRig({ anvil: true, configExtra: { out: key } });
+      const result = await run(rig, mode);
+      await expectRefused(rig, result, scan, "out looks like key material", `out, ${mode}`);
+      expect(await exists(rig.stateDir), `out, ${mode}`).toBe(false);
+    }
+  });
+
+  it("out: one slip, a path that ends in the key, and a phrase are refused too", async () => {
+    const key = generatePrivateKey();
+    const scan = keyScanner(key);
+    for (const [label, value] of [
+      ["63 digits", key.slice(0, -1)],
+      ["a space inside", `${key.slice(0, 34)} ${key.slice(34)}`],
+      ["a directory path ending in the key", `/home/someone/bundles/${key}`],
+      ["a 12-word phrase", "legal winner thank year wave sausage worth useful legal winner thank yellow"],
+    ] as const) {
+      const rig = await makeRig({ anvil: true, configExtra: { out: value } });
+      await expectRefused(rig, await run(rig), scan, "out looks like key material", `out (${label})`);
+    }
+  });
+
+  it("--state-dir: refused by argument name in a dry run, --yes, --resume and --refund, before anything is read or created", async () => {
+    for (const mode of ["dry", "yes", "resume", "refund"] as const) {
+      const key = generatePrivateKey();
+      const scan = keyScanner(key);
+      const rig = await makeRig({ anvil: true });
+      const stateDir = join(rig.dir, key);
+      const result = await runWith(rig, mode, { stateDir });
+      await expectRefused(rig, result, scan, "--state-dir looks like key material", `--state-dir, ${mode}`);
+      expect(await exists(stateDir), `--state-dir, ${mode}`).toBe(false);
+    }
+  });
+
+  it("the config path: refused by argument name, whether the key is the whole path or a directory in it", async () => {
+    const key = generatePrivateKey();
+    const scan = keyScanner(key);
+    const rig = await makeRig({ anvil: true });
+    for (const [label, configPath] of [
+      ["the key itself", key],
+      ["a directory named by the key", join(rig.dir, key, "config.json")],
+    ] as const) {
+      const result = await runWith(rig, "dry", { configPath });
+      await expectRefused(rig, result, scan, "the config path looks like key material", `config path (${label})`);
+    }
+  });
+
+  it("a rails.evm.assets name: refused by field name whether its value is not an address (the rail used to quote it) or IS one (it used to ride into rails.json)", async () => {
+    for (const mode of ["dry", "yes"] as const) {
+      for (const [label, value] of [
+        ["a value that is not an address", "not-an-address"],
+        ["an address", "0x00000000000000000000000000000000000000a1"],
+      ] as const) {
+        const key = generatePrivateKey();
+        const scan = keyScanner(key);
+        const rig = await makeRig({ anvil: true, evmExtra: { assets: { USDC: TOKEN, [key]: value } } });
+        const result = await run(rig, mode);
+        await expectRefused(rig, result, scan, "rails.evm.assets: the name at position 2 is not a short plain name", `assets name (${label}), ${mode}`);
+        expect(await exists(rig.stateDir), `assets name (${label}), ${mode}`).toBe(false);
+      }
+    }
+    // 32 hex digits are a plain-looking name by length, and still key material.
+    const half = generatePrivateKey().slice(2, 34);
+    const rig = await makeRig({ anvil: true, evmExtra: { assets: { USDC: TOKEN, [half]: "0x00000000000000000000000000000000000000a1" } } });
+    const result = await run(rig);
+    expect(result.code).toBe(EXIT.config);
+    expect(result.stderr).toContain("rails.evm.assets: the name at position 2");
+    expect(result.stderr).not.toContain(half);
+  });
+
+  it("the endpoint's host: refused by field name (it is printed on every run and a transport error names it)", async () => {
+    for (const mode of ["dry", "yes"] as const) {
+      const key = generatePrivateKey();
+      const scan = keyScanner(key);
+      const rig = await makeRig({ anvil: true, endpoint: `http://${key}.invalid/v2/x` });
+      const result = await run(rig, mode);
+      await expectRefused(rig, result, scan, "rails.evm.endpoint's host looks like key material", `endpoint host, ${mode}`);
+    }
+  });
+
+  it("ordinary values are not refused: a UUID in a path, a short hex name, a long English path (no false positive on what a person really types)", async () => {
+    const rig = await makeRig({
+      anvil: true,
+      configExtra: { out: "bundles/97811a09-a70d-4b56-ad4f-e4c4e7e05f8a/the-first-swap-of-the-week-on-base-sepolia" },
+      evmExtra: { assets: { USDC: TOKEN, "usdc-0123456789abcdef": TOKEN } },
+    });
+    const result = await run(rig);
+    expect(result.code).toBe(EXIT.ok);
+    expect(result.stdout).toContain("This was a dry run");
   });
 });
 
@@ -1016,6 +1155,31 @@ describe("bin/swap-rehearsal-evm.mjs (needs a build: npm test builds first)", ()
     expect(result.code).toBe(EXIT.config);
     expect(result.stderr).toContain("cannot read the config file");
   });
+  // KR2-1: a key typed where a path belongs (the shell history already holds it, but the output comes back to the session) is refused with a fixed
+  // sentence that names the argument, exit 2, before the config is read or the state directory touched.
+  it("refuses a config path or a --state-dir that looks like key material: exit 2, the argument named, no window of the key in any output, nothing created", async () => {
+    const key = generatePrivateKey();
+    const scan = keyScanner(key);
+    const rig = await makeRig({ anvil: true });
+    const before = await readdir(rig.dir);
+    for (const [label, args, named] of [
+      ["the config path", [key], "the config path looks like key material"],
+      ["the config path, one slip", [key.slice(0, -1), "--yes"], "the config path looks like key material"],
+      ["--state-dir", [rig.configPath, "--state-dir", key], "--state-dir looks like key material"],
+      ["--state-dir, a path that ends in the key", [rig.configPath, "--state-dir", join("some", "dir", key), "--resume"], "--state-dir looks like key material"],
+      ["--state-dir with --refund", [rig.configPath, "--state-dir", key, "--refund", "--wait"], "--state-dir looks like key material"],
+    ] as const) {
+      const result = await bin([...args]);
+      expect(result.code, label).toBe(EXIT.config);
+      expect(result.stderr, label).toContain(named);
+      expect(result.stdout, label).toBe("");
+      expect(scan(result.stdout) || scan(result.stderr), `${label}: no window of the pasted key may reach out or err`).toBe(false);
+    }
+    expect(await readdir(rig.dir)).toEqual(before);
+    expect(await exists(join(REPO_ROOT, key))).toBe(false);
+    expect(rig.chain.methods).toEqual([]);
+  });
+
 
   it("runs the dry run end to end through the command line against the fake chain: exit 0, a table, no key, no write", async () => {
     const rig = await makeRig({ anvil: true });

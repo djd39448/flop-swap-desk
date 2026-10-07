@@ -11,8 +11,6 @@
 // The only network it speaks to is rails.evm.endpoint in the config. It posts to no HTTP venue. It never prints a key, nor
 // the endpoint URL (only its host).
 
-import { resolve } from "node:path";
-
 /** The exit code for bad arguments, config or state (`EXIT.config` of src/client/rehearsal-run.ts), known before the module is loaded. */
 const EXIT_CONFIG = 2;
 
@@ -129,7 +127,7 @@ const env = {
 const code = await runRehearsal({
   configPath: args.config,
   mode: args.mode ?? "dry",
-  stateDir: resolve(args.stateDir),
+  stateDir: args.stateDir, // as typed: the runner refuses key-like text in it (KR2-1) before it resolves it against the working directory
   ...(args.stopAfter === null ? {} : { stopAfter: args.stopAfter }),
   ...(args.wait ? { wait: true } : {}),
   env,

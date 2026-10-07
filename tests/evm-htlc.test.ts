@@ -21,8 +21,10 @@ import {
 } from "viem";
 import type { LockTerms } from "@flop-labs/tclk";
 import { generateHashLock } from "@flop-labs/tclk";
+import { generatePrivateKey } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 
+import { keyScanner } from "./helpers/evm-local.js";
 import { EVM_HASH_RAIL_ABI, type AddressBook } from "../src/vendor/evm-hash-rail.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import {
@@ -290,6 +292,35 @@ describe("checkEvmRailConfig — shape check plus validateEvmRailConfig, never t
     expect(result.ok).toBe(false);
     expect(!result.ok && result.reason).toMatch(/assets\["USDC"\] must be a 0x-address/);
   });
+  // KR2-1 (P9 review round 2): these refusals serve the runner, watch.mjs and audit-export alike, so they quote an asset name only when it is a short
+  // plain name; a key pasted as a name (the clipboard mix-up of K1 and K2) must not come back in a refusal.
+  it("quotes an asset name only when it is a short plain name: a key used as a name is never echoed (the shape refusal and the D-09 refusal)", () => {
+    const key = generatePrivateKey();
+    const scan = keyScanner(key);
+    const odd = [key, `x ${key}`, key.slice(2, 34) + "!", "a".repeat(33)];
+    for (const name of odd) {
+      const shape = checkEvmRailConfig({ ...configFor(ANVIL_LOCAL_PIN), assets: { USDC: TOKEN, [name]: "not-an-address" } });
+      expect(shape.ok).toBe(false);
+      expect(!shape.ok && shape.reason).toContain("an asset whose name is not a short plain name must be a 0x-address");
+      expect(scan(!shape.ok ? shape.reason : ""), "the shape refusal").toBe(false);
+      const config = { ...configFor(ANVIL_LOCAL_PIN), assets: { USDC: TOKEN, [name]: BASE_MAINNET_USDC } };
+      let message = "";
+      try {
+        validateEvmRailConfig(config);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain("an asset whose name is not a short plain name resolves to Base mainnet USDC");
+      expect(scan(message), "the D-09 refusal").toBe(false);
+    }
+    // A plain name is still quoted, as before: the person needs to know which asset.
+    const plain = checkEvmRailConfig({ ...configFor(ANVIL_LOCAL_PIN), assets: { "usdc-test_2": "nope" } });
+    expect(!plain.ok && plain.reason).toContain('assets["usdc-test_2"] must be a 0x-address');
+    const config = configFor(ANVIL_LOCAL_PIN);
+    config.assets["usdc-test_2"] = BASE_MAINNET_USDC;
+    expect(() => validateEvmRailConfig(config)).toThrow(/asset "usdc-test_2" resolves to Base mainnet USDC/);
+  });
+
 });
 
 describe("EvmHtlcRail.lock — feeBps and lock-kind refusal", () => {

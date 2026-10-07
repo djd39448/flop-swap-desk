@@ -20,6 +20,7 @@ import {
   KNOWN_GOOD_DEADLINES,
   loadRehearsalConfig,
   LOCK_ESTIMATE_MS,
+  looksLikeKeyMaterial,
   parseRehearsalConfig,
   RehearsalConfigError,
 } from "../src/client/rehearsal-config.js";
@@ -239,6 +240,66 @@ describe("parseRehearsalConfig", () => {
     // The README's pins are plain texts and still pass; the rail's own name check still names a wrong one.
     expect(parseRehearsalConfig(baseSepoliaConfig(), BASE).rails.evm.pin.name).toBe("base-sepolia");
     expect(refusal({ ...anvilConfig(), rails: { evm: { ...evm, pin: { ...ANVIL_LOCAL_PIN, name: "base-sepolia" } } } })).toContain("rails.evm:");
+  });
+
+  // KR2-1 (P9 review round 2): one exported rule, applied to every value the runner prints back or writes into the bundle.
+  it("looksLikeKeyMaterial is one rule: 32 hex digits in a run, or eleven words of letters; a UUID, a Windows path and a few plain words are not key material", () => {
+    const key = generatePrivateKey();
+    for (const value of [key, key.slice(2), key.slice(3), key.slice(2, 34), `dir/${key.slice(2, 34)}.key`, key.toUpperCase().replace("0X", "0x"), `${key.slice(0, 34)} ${key.slice(34)}`]) {
+      expect(looksLikeKeyMaterial(value), "a key or a slipped key").toBe(true);
+    }
+    expect(looksLikeKeyMaterial("legal winner thank year wave sausage worth useful legal winner thank")).toBe(true);
+    for (const value of [
+      "",
+      "bundle",
+      "97811a09-a70d-4b56-ad4f-e4c4e7e05f8a",
+      "C:\\Users\\someone\\AppData\\Local\\Temp\\claude\\scratchpad\\p9fix2",
+      "C:/Program Files/keys/base-sepolia.buyer.key",
+      key.slice(2, 33), // 31 digits
+      "ab".repeat(15),
+      "legal winner thank year wave sausage worth useful legal winner", // ten words
+      "sepolia.base.org",
+      "127.0.0.1:8545",
+    ]) {
+      expect(looksLikeKeyMaterial(value), value).toBe(false);
+    }
+  });
+
+  it("refuses key material in out, in every asset name, in the asset field and in the endpoint host, by field name, without echoing any window of it", () => {
+    const key = generatePrivateKey();
+    const scan = keyScanner(key);
+    const evm = (anvilConfig().rails as { evm: Record<string, unknown> }).evm;
+    const withEvm = (extra: Record<string, unknown>): Record<string, unknown> => ({ ...anvilConfig(), rails: { evm: { ...evm, ...extra } } });
+    const cases: Array<[string, string, Record<string, unknown>]> = [
+      ["out", "out looks like key material", anvilConfig({ out: key })],
+      ["out, one slip", "out looks like key material", anvilConfig({ out: key.slice(0, -1) })],
+      ["out, a path that ends in the key", "out looks like key material", anvilConfig({ out: `bundles/${key}` })],
+      ["an asset name, with a value that is not an address", "rails.evm.assets: the name at position 2", withEvm({ assets: { USDC: TOKEN, [key]: "nope" } })],
+      ["an asset name, with an address as its value", "rails.evm.assets: the name at position 2", withEvm({ assets: { USDC: TOKEN, [key]: TOKEN } })],
+      ["an asset name of 32 hex digits", "rails.evm.assets: the name at position 2", withEvm({ assets: { USDC: TOKEN, [key.slice(2, 34)]: TOKEN } })],
+      ["an asset name with a space and the key", "rails.evm.assets: the name at position 1", withEvm({ assets: { [`x ${key}`]: TOKEN, USDC: TOKEN } })],
+      ["the asset field", "asset must be a short plain name", anvilConfig({ asset: key })],
+      ["the endpoint's host", "rails.evm.endpoint's host looks like key material", withEvm({ endpoint: `https://${key}.example.org/v2/x` })],
+      ["the endpoint's host, upper case", "rails.evm.endpoint's host looks like key material", withEvm({ endpoint: `https://${key.toUpperCase().replace("0X", "0x")}.example.org` })],
+    ];
+    for (const [label, named, config] of cases) {
+      const message = refusal(config);
+      expect(message, label).toContain(named);
+      expect(scan(message), `${label}: no window of the pasted key may be quoted`).toBe(false);
+    }
+    // The endpoint's PATH stays documented only: it cannot be told from a provider's API-key path, and it is never printed.
+    expect(parseRehearsalConfig(withEvm({ endpoint: `https://sepolia.base.org/v2/${key.slice(2, 34)}` }), BASE).rails.evm.endpoint).toContain("/v2/");
+  });
+
+  it("holds every asset name to a short plain name before the rail's own checks run: the rail's refusals never see (or quote) a name that is not one", () => {
+    const evm = (anvilConfig().rails as { evm: Record<string, unknown> }).evm;
+    const withAssets = (assets: Record<string, unknown>): Record<string, unknown> => ({ ...anvilConfig(), rails: { evm: { ...evm, assets } } });
+    for (const name of ["", "a b", "usdc.test", "x".repeat(33), "ü", "a/b", "0x" + "ab".repeat(20)]) {
+      expect(refusal(withAssets({ USDC: TOKEN, [name]: TOKEN })), JSON.stringify(name.length)).toContain("rails.evm.assets: the name at position 2 is not a short plain name");
+    }
+    // The README's names pass, with the value checks of the rail after them.
+    expect(parseRehearsalConfig(withAssets({ USDC: TOKEN, "usdc-test_2": TOKEN }), BASE).rails.evm.assets["usdc-test_2"]).toBe(TOKEN);
+    expect(refusal(withAssets({ USDC: "nope" }))).toContain('assets["USDC"] must be a 0x-address');
   });
 
   it("names the 32-digit and 11-word rule in the refusal (and no longer says a run of 64)", () => {

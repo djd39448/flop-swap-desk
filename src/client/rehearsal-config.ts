@@ -20,12 +20,17 @@
 // so a URL that carries credentials, a query or a fragment is refused here; a key embedded in the PATH of a URL cannot be told
 // from a path and is the operator's to avoid (the README says so, and the runner never prints the URL, only its host).
 //
+// KR2-1 (P9 review round 2): every other value this runner prints back or writes into the bundle is held to the same rule by ONE
+// helper, `looksLikeKeyMaterial` (a run of 32 or more hex digits, or a phrase of 11 or more words): the two key-file fields, `out`,
+// every `rails.evm.assets` name (also held to a short plain name), the endpoint's HOST and, in `runRehearsal`, the config path and
+// `--state-dir`. A refusal names the field and never the value.
+//
 // No environment variable is read, no clock, no network: this module only checks data it is given.
 
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 
-import { checkEvmRailConfig, type EvmFinality, type EvmRailConfig } from "../rails/evm-htlc.js";
+import { ASSET_NAME_SHAPE, checkEvmRailConfig, type EvmFinality, type EvmRailConfig } from "../rails/evm-htlc.js";
 
 /** One leg's three deadlines, in minutes after the run's start (t0). */
 export interface LegDeadlineMinutes {
@@ -102,7 +107,6 @@ const LEG_FIELDS = ["claimByMin", "refundAfterMin", "expiresMin"] as const;
 
 const AMOUNT = /^[1-9][0-9]{0,77}$/;
 const PIN_TEXT = /^[A-Za-z0-9:_.-]{1,40}$/;
-const ASSET_NAME = /^[A-Za-z0-9_-]{1,32}$/;
 const ANVIL_CHAIN_ID = 31337;
 
 const DEFAULT_POLL_MS = 5_000;
@@ -155,22 +159,32 @@ function resolvePath(base: string, value: unknown, path: string): string {
 }
 
 /**
+ * KR2-1: THE rule for "this text looks like key material", used by every guard of this runner so that it is identical everywhere. A
+ * 64-digit key with ONE slip (a dropped digit, a space or newline inside, a letter O for a zero) always leaves a run of at least 32 hex
+ * digits, whichever way it is broken and in either letter case; a 12-word mnemonic with a dropped or doubled word leaves a phrase of 11 or
+ * more words made of letters only. An ordinary path, host, name or file name has neither. A key broken into shorter runs (two or more
+ * slips) cannot be told from other text by shape; where such a value is printed the runner's own rule (never print it) is the first
+ * defence, and this check is the second.
+ */
+export function looksLikeKeyMaterial(value: string): boolean {
+  if (/[0-9a-fA-F]{32}/.test(value)) return true;
+  const words = value.trim().split(/\s+/);
+  return words.length >= 11 && words.every((word) => /^[a-z]+$/i.test(word));
+}
+
+const KEY_LIKE_SHAPES = "a run of 32 or more hex digits, or a phrase of 11 or more words";
+
+/**
  * A key-file field names a FILE. A person who pastes the key itself (or a mnemonic phrase) into it, possibly with a slip (a dropped digit, a
  * space or newline inside, a letter O for a zero), must not see it echoed by any later message that names the path (the runner prints
- * `<field>: <problem>` and never the path, which is the FIRST defence; this check is the second), so a value that looks like key material is
- * refused here, by field name only, before any message could carry it. K1 (P9 review round 1): the shapes are a run of 32 or more hex digits
- * (a 64-digit key with ONE slip always leaves a run of at least 32, whichever way it is broken, in either letter case) and a phrase of 11 or more
- * words made of letters only (a 12-word mnemonic with a dropped or doubled word), matched case-insensitively. An ordinary path has neither.
+ * `<field>: <problem>` and never the path, which is the FIRST defence; this check is the second), so a value that looks like key material
+ * (`looksLikeKeyMaterial`, K1 of P9 review round 1) is refused here, by field name only, before any message could carry it.
+ * KR2-1: the same refusal guards `out` (the bundle directory, printed and used to name files), with `expected` saying what the field is for.
  */
-function refuseKeyLikePath(value: unknown, field: string): void {
+function refuseKeyLikePath(value: unknown, field: string, expected = "a path: it must name the FILE that holds the key, never the key itself"): void {
   if (typeof value !== "string") return;
-  const looksLikeKey = /[0-9a-fA-F]{32}/.test(value);
-  const words = value.trim().split(/\s+/);
-  const looksLikePhrase = words.length >= 11 && words.every((word) => /^[a-z]+$/i.test(word));
-  if (looksLikeKey || looksLikePhrase) {
-    throw new RehearsalConfigError(
-      `${field} looks like key material (a run of 32 or more hex digits, or a phrase of 11 or more words) and not a path: it must name the FILE that holds the key, never the key itself`,
-    );
+  if (looksLikeKeyMaterial(value)) {
+    throw new RehearsalConfigError(`${field} looks like key material (${KEY_LIKE_SHAPES}) and not ${expected}`);
   }
 }
 
@@ -191,6 +205,15 @@ function cleanEvmConfig(value: unknown): EvmRailConfig {
   const finality = requireObject(pin.finality, "rails.evm.pin.finality");
   closed(finality, finality.mode === "confirmations" ? CONFIRMATIONS_FINALITY_FIELDS : TAG_FINALITY_FIELDS, "rails.evm.pin.finality");
   const assets = requireObject(evm.assets, "rails.evm.assets");
+  // KR2-1: an asset name is quoted by the rail's refusals, printed by the runner and written into the bundle's rails.json, so every name is held to a short
+  // plain name BEFORE anything else reads the config (a key pasted as a name must not ride along with a valid address). The name is never shown.
+  Object.keys(assets).forEach((name, index) => {
+    if (!ASSET_NAME_SHAPE.test(name) || looksLikeKeyMaterial(name)) {
+      throw new RehearsalConfigError(
+        `rails.evm.assets: the name at position ${index + 1} is not a short plain name (1 to 32 letters, digits, - and _, and not key material); it is not shown here, and no key belongs in this file`,
+      );
+    }
+  });
 
   const cleanFinality = (finality.mode === "confirmations"
     ? { mode: "confirmations", confirmations: finality.confirmations }
@@ -223,6 +246,10 @@ function assertEndpoint(endpoint: string): void {
     throw new RehearsalConfigError("rails.evm.endpoint is not a URL");
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new RehearsalConfigError("rails.evm.endpoint must be an http or https URL");
+  // KR2-1: the host is printed on every run (the endpoint row) and a transport error names it: a key pasted into it is refused by field name.
+  if (looksLikeKeyMaterial(url.hostname)) {
+    throw new RehearsalConfigError(`rails.evm.endpoint's host looks like key material (${KEY_LIKE_SHAPES}) and not a host name; the endpoint must be the URL of a node`);
+  }
   if (url.username !== "" || url.password !== "") {
     throw new RehearsalConfigError("rails.evm.endpoint must not carry credentials (user or password): the URL is written into the bundle's rails.json");
   }
@@ -270,11 +297,12 @@ export function parseRehearsalConfig(value: unknown, baseDir: string, file = "")
   const amount = requireString(top.amount, "amount");
   if (!AMOUNT.test(amount)) throw new RehearsalConfigError("amount must be a positive decimal integer string in the token's minimal units");
   const asset = top.asset === undefined ? "USDC" : requireString(top.asset, "asset");
-  if (!ASSET_NAME.test(asset)) throw new RehearsalConfigError("asset must be a short plain name (letters, digits, - and _)");
+  if (!ASSET_NAME_SHAPE.test(asset) || looksLikeKeyMaterial(asset)) throw new RehearsalConfigError("asset must be a short plain name (letters, digits, - and _)");
   if (evm.assets[asset] === undefined) throw new RehearsalConfigError(`asset "${asset}" is not a key of rails.evm.assets`);
   const flopAmount = top.flopAmount === undefined ? DEFAULT_FLOP_AMOUNT : requireString(top.flopAmount, "flopAmount");
   if (!AMOUNT.test(flopAmount)) throw new RehearsalConfigError("flopAmount must be a positive decimal integer string");
 
+  refuseKeyLikePath(top.out, "out", "a directory path: it must name the bundle directory, never a key");
   const out = resolvePath(baseDir, top.out, "out");
 
   const clock = top.clock === undefined ? "system" : top.clock;
