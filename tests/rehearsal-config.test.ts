@@ -573,7 +573,7 @@ describe("parseRehearsalConfig", () => {
     expect(BASE_SEPOLIA_POLICY.finalityAMs).toBe(4_800_000);
     const below = refusal(baseSepoliaConfig({}, { waitLimitMs: BASE_SEPOLIA_POLICY.finalityAMs - 1 }));
     expect(below).toContain("waitLimitMs 4799999 is below the finality budget of base-sepolia (4800000 ms, 80 min)");
-    expect(refusal(baseSepoliaConfig({}, { waitLimitMs: 60_000, pollMs: 250 }))).toContain("waitLimitMs 60000 is below the finality budget");
+    expect(refusal(baseSepoliaConfig({}, { waitLimitMs: 60_000, pollMs: 2_000 }))).toContain("waitLimitMs 60000 is below the finality budget");
     expect(refusal(baseSepoliaConfig({}, { waitLimitMs: 1_200_000 }))).toContain("waitLimitMs 1200000 is below the finality budget"); // the anvil budget (20 min) is not enough there
     expect(parseRehearsalConfig(baseSepoliaConfig({}, { waitLimitMs: BASE_SEPOLIA_POLICY.finalityAMs }), BASE).waitLimitMs).toBe(4_800_000);
     expect(parseRehearsalConfig(baseSepoliaConfig({}, { waitLimitMs: 6 * 60 * 60_000 }), BASE).waitLimitMs).toBe(21_600_000);
@@ -583,6 +583,26 @@ describe("parseRehearsalConfig", () => {
     // Anvil: no floor (a short wait limit is what the live suites use).
     expect(parseRehearsalConfig(anvilConfig({ pollMs: 50, waitLimitMs: 100 }), BASE).waitLimitMs).toBe(100);
     expect(parseRehearsalConfig(anvilConfig({ pollMs: 250, waitLimitMs: 3_000 }), BASE).waitLimitMs).toBe(3_000);
+  });
+
+  // P94-PIN-03 (P9-FIXES-R4 decision 7, spec rule 3): a finality wait on Base Sepolia lasts at least the 80-minute budget and reads the public endpoint once per poll
+  // (one to three requests), so a 50 ms poll was 20 to 60 requests a second for that whole time. The floor on 84532 is the policy's block time.
+  it("P94-PIN-03: on Base Sepolia pollMs may not be below the policy's block time (2,000 ms), refused by field name; 2,000 passes; anvil keeps its floor of 50", () => {
+    expect(BASE_SEPOLIA_POLICY.blockTimeMs).toBe(2_000);
+    for (const pollMs of [50, 250, 1_999]) {
+      const message = refusal(baseSepoliaConfig({}, { pollMs }));
+      expect(message, String(pollMs)).toContain(`pollMs ${pollMs} is below the block time of base-sepolia (2000 ms)`);
+      expect(message, String(pollMs)).not.toContain("waitLimitMs");
+    }
+    expect(parseRehearsalConfig(baseSepoliaConfig({}, { pollMs: 2_000 }), BASE).pollMs).toBe(2_000);
+    expect(parseRehearsalConfig(baseSepoliaConfig({}, { pollMs: 5_000 }), BASE).pollMs).toBe(5_000);
+    expect(parseRehearsalConfig(baseSepoliaConfig(), BASE).pollMs).toBe(5_000); // the default is above the floor
+    // The field's own shape refusals come first and are unchanged: below the general floor of 50 it is the shape message, and a non-number is refused as before.
+    expect(refusal(baseSepoliaConfig({}, { pollMs: 10 }))).toContain("pollMs must be an integer from 50");
+    expect(refusal(baseSepoliaConfig({}, { pollMs: "2000" }))).toContain("pollMs must be an integer from 50");
+    // Anvil: no block-time floor (the live suites poll every 50 to 250 ms).
+    expect(parseRehearsalConfig(anvilConfig({ pollMs: 50, waitLimitMs: 100 }), BASE).pollMs).toBe(50);
+    expect(parseRehearsalConfig(anvilConfig({ pollMs: 1_999 }), BASE).pollMs).toBe(1_999);
   });
 
   // P9-4 decision 5 (runner part): the fee ceiling of a local account is a field of the runner's config, a number or a decimal string of wei per gas, with the rail's own

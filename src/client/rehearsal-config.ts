@@ -395,6 +395,17 @@ export function parseRehearsalConfig(value: unknown, baseDir: string, file = "")
   }
 
   const pollMs = top.pollMs === undefined ? DEFAULT_POLL_MS : requireInt(top.pollMs, "pollMs", MIN_POLL_MS, MAX_POLL_MS);
+  // P94-PIN-03 (P9-FIXES-R4 decision 7, spec rule 3: every chain read stays bounded and works on the public endpoint): every wait for finality reads the chain once per `pollMs`
+  // (one to three requests a poll), and a finality wait on Base Sepolia lasts at least the 80-minute budget, so a 50 ms poll would ask the public endpoint 20 to 60 times a second
+  // for that long. On a chain with a block time of its own (Base Sepolia: the policy's `blockTimeMs`, 2 s) the poll may not be faster than a block; anvil keeps its 50 ms floor.
+  if (evm.pin.chainId === BASE_SEPOLIA_PIN.chainId) {
+    const blockMs = evmLocalPolicyFor(evm.pin.chainId).blockTimeMs;
+    if (pollMs < blockMs) {
+      throw new RehearsalConfigError(
+        `pollMs ${pollMs} is below the block time of ${evm.pin.name} (${blockMs} ms): every wait for finality asks the public endpoint once per poll for the whole wait, so the poll must be at least one block`,
+      );
+    }
+  }
   const waitLimitMs = top.waitLimitMs === undefined ? DEFAULT_WAIT_LIMIT_MS : requireInt(top.waitLimitMs, "waitLimitMs", pollMs, MAX_WAIT_LIMIT_MS);
   // P9-4 decision 9 (the finality budget bounds every wait): on Base Sepolia the late-claim wait, the never-locked verdict wait and the recovered-lock wait are
   // each bounded by `waitLimitMs`, so a limit under one finality budget could give up on a finalized block that is only a normal stand-still behind. Anvil's

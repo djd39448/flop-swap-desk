@@ -1321,7 +1321,7 @@ describe("bad configs and a failing endpoint", () => {
   // P9-4 decision 9, through the command's front door: a Base Sepolia run whose waitLimitMs is under one finality budget is refused before the chain is read.
   it("P9-4 d9: a Base Sepolia config with a waitLimitMs under the 80-minute finality budget exits 2 naming waitLimitMs, in every mode, before the endpoint is touched; the budget itself passes", async () => {
     for (const mode of ["dry", "yes", "resume", "refund"] as const) {
-      const rig = await makeRig({ configExtra: { pollMs: 250, waitLimitMs: 4_799_999 } });
+      const rig = await makeRig({ configExtra: { pollMs: 2_000, waitLimitMs: 4_799_999 } });
       const result = await run(rig, mode);
       expect(result.code, mode).toBe(EXIT.config);
       expect(result.stderr, mode).toContain("waitLimitMs 4799999 is below the finality budget of base-sepolia (4800000 ms, 80 min)");
@@ -1334,6 +1334,27 @@ describe("bad configs and a failing endpoint", () => {
     expect(passed.stderr).not.toContain("waitLimitMs");
     expect(passed.code).toBe(EXIT.ok); // the config is accepted, and the Base Sepolia pair passes the pre-flight
     expect(exact.chain.methods.length).toBeGreaterThan(0); // and the chain was read
+  });
+
+  // P94-PIN-03, through the command's front door: a Base Sepolia poll faster than a block is refused before the chain is read; anvil's fast poll is not.
+  it("P94-PIN-03: a Base Sepolia config with a pollMs under the 2,000 ms block time exits 2 naming pollMs, in every mode, before the endpoint is touched; 2,000 passes; anvil keeps 50", async () => {
+    for (const mode of ["dry", "yes", "resume", "refund"] as const) {
+      const rig = await makeRig({ configExtra: { pollMs: 1_999 } });
+      const result = await run(rig, mode);
+      expect(result.code, mode).toBe(EXIT.config);
+      expect(result.stderr, mode).toContain("pollMs 1999 is below the block time of base-sepolia (2000 ms)");
+      expect(result.stdout, mode).toBe("");
+      expect(rig.chain.methods, mode).toEqual([]);
+      expect(await exists(rig.stateDir), mode).toBe(false);
+    }
+    const exact = await makeRig({ configExtra: { pollMs: 2_000 } });
+    const passed = await run(exact);
+    expect(passed.stderr).not.toContain("pollMs");
+    expect(passed.code).toBe(EXIT.ok);
+    const anvil = await makeRig({ anvil: true, configExtra: { pollMs: 50 } });
+    const fast = await run(anvil);
+    expect(fast.stderr).not.toContain("pollMs");
+    expect(fast.code).toBe(EXIT.ok);
   });
 
   // P9-4 decision 3, through the command's front door.
@@ -1659,15 +1680,15 @@ describe("R2-FUND-03: a recovered lock is read before it is waited for, and the 
 // Sepolia whatever pollMs says, and the poll interval elsewhere), so the runner hands the config's pollMs to each party's rail. The rail's pause itself is
 // tests/evm-lookup-pause.test.ts; here the runner's wiring is read from the options it builds the two parties' rails with.
 describe("P9-4 d10: the runner builds each party's rail with the config's pollMs", () => {
-  it("--refund (which builds both parties' rails before it reads the Buyer's store) hands pollMs 777 to the Buyer's and the Seller's rail, and none to the policy-only placeholder", async () => {
-    const rig = await makeRig({ configExtra: { pollMs: 777 } });
+  it("--refund (which builds both parties' rails before it reads the Buyer's store) hands pollMs 2777 to the Buyer's and the Seller's rail, and none to the policy-only placeholder", async () => {
+    const rig = await makeRig({ configExtra: { pollMs: 2_777 } }); // Base Sepolia: the poll may not be faster than a block (P94-PIN-03)
     await writeRun(rig, {}, true);
     railOptions.seen.length = 0;
     const result = await run(rig, "refund");
     expect(result.stderr).toContain("holds no record"); // past the pre-flight and the rails' construction, at the Buyer's empty store
     const withAccount = railOptions.seen.filter((options) => typeof options.account === "object");
     expect(withAccount).toHaveLength(2); // the Buyer's and the Seller's: each a local account
-    for (const options of withAccount) expect(options.pollMs).toBe(777);
+    for (const options of withAccount) expect(options.pollMs).toBe(2_777);
     const placeholder = railOptions.seen.filter((options) => typeof options.account === "string");
     expect(placeholder.length).toBeGreaterThanOrEqual(1);
     for (const options of placeholder) expect(options.pollMs).toBeUndefined(); // only its policy is read: nothing connects through it
