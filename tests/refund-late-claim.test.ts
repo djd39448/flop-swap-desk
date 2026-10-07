@@ -15,11 +15,10 @@
 import { decodeFunctionData, encodeFunctionData, encodeFunctionResult, type Hex } from "viem";
 import { describe, expect, it } from "vitest";
 
-import { parseRehearsalConfig } from "../src/client/rehearsal-config.js";
 import { refundDoorwayText, refundLegAWaiting, type FinalityWorld } from "../src/client/rehearsal-run.js";
-import { ANVIL_LOCAL_PIN } from "../src/rails/evm-htlc.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { EvmMockNode } from "./helpers/evm-mock-node.js";
+import { finalityWorld } from "./helpers/finality-world.js";
 import { evmWorldWith } from "./helpers/matrix-worlds.js";
 import { buyerRecordOf, resumedBuyer, started, type Started } from "./helpers/resume-world.js";
 
@@ -30,9 +29,9 @@ interface Script {
   lag: boolean;
   /** `refundLegA` calls made so far through `ask`. */
   calls: number;
-  /** The log lines the runner wrote. */
+  /** The log lines the runner wrote (the same array the world logs to). */
   logs: string[];
-  /** The sleeps the runner made, in ms. */
+  /** The sleeps the runner made, in ms (the same array the world's sleep fills). */
   sleeps: number[];
 }
 
@@ -65,7 +64,7 @@ async function lateClaim(options: { waitLimitMs?: number; claim?: boolean } = {}
     expect(mock.rows.get(key)?.status).toBe(2);
   }
 
-  const script: Script = { lag: true, calls: 0, logs: [], sleeps: [] };
+  const script: Script = { lag: true, calls: 0, logs: [], sleeps: [] }; // `logs` and `sleeps` are replaced by the world's own arrays below
   const patched = mock as unknown as { handle: (method: string, params: readonly unknown[]) => unknown };
   const original = patched.handle.bind(mock);
   patched.handle = (method, params) => {
@@ -83,33 +82,10 @@ async function lateClaim(options: { waitLimitMs?: number; claim?: boolean } = {}
   };
 
   s.w.setTime(s.w.refundAt.legA + 1);
-  const config = parseRehearsalConfig(
-    {
-      rails: { evm: { pin: ANVIL_LOCAL_PIN, endpoint: "http://mock-evm", contract: mock.railContract, assets: { USDC: mock.token } } },
-      buyerKeyFile: "b.key",
-      sellerKeyFile: "s.key",
-      amount: "1000000",
-      out: "bundle",
-      pollMs: POLL_MS,
-      ...(options.waitLimitMs === undefined ? {} : { waitLimitMs: options.waitLimitMs }),
-    },
-    "/base",
-  );
-  const world: FinalityWorld = {
-    config,
-    env: {
-      now: () => s.w.clockRef.ms,
-      sleep: async (ms) => {
-        script.sleeps.push(ms);
-        s.w.clockRef.ms += ms;
-      },
-      out: () => undefined,
-      err: () => undefined,
-    },
-    rpc: mock.rpc(),
-    log: (line) => void script.logs.push(line),
-    pollMs: POLL_MS,
-  };
+  const probe = finalityWorld(s, mock, { pollMs: POLL_MS, ...(options.waitLimitMs === undefined ? {} : { waitLimitMs: options.waitLimitMs }) });
+  script.logs = probe.logs;
+  script.sleeps = probe.sleeps;
+  const world = probe.world;
   const buyer: Rig["buyer"] = async (onCall) => {
     const resumed = await resumedBuyer(s);
     const ask = resumed.flow.refundLegA.bind(resumed.flow);

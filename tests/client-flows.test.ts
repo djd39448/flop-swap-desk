@@ -783,9 +783,10 @@ describe("BuyerFlow.lockLegA — E3 (records its lock before sending it)", () =>
       },
       // G7: `refundLegA` now checks the evidence reader itself before ever reporting success —
       // `verifyLockFinal`'s own capture needs a finalized-tag block and a `locks()` read showing
-      // Refunded (status 3) with every field matching this swap's own terms.
+      // Refunded (status 3) with every field matching this swap's own terms. R3-FUND-02: the lock is recorded as landed only from a row AT the finalized block,
+      // whose number and timestamp the Buyer reads first; the block carries a timestamp (leg A's refund time), as every real block does.
       eth_getBlockByNumber: (params) => {
-        if (params[0] === "finalized") return { result: { number: "0x6", hash: BLOCK_HASH } };
+        if (params[0] === "finalized") return { result: { number: "0x6", hash: BLOCK_HASH, timestamp: `0x${Math.floor(legADeadlines(T0).refundAfterMs / 1000).toString(16)}` } };
         throw new Error(`test setup: unexpected eth_getBlockByNumber(${String(params[0])})`);
       },
       eth_call: () => ({

@@ -110,6 +110,14 @@
 //    refuses a lock in any block at or past the refund time; no lock and no such finalized block yet throws `RefundNotFinalYetError` (its text
 //    says "not final yet"), records nothing and sends nothing: call again later. Other rails keep their own refund paths unchanged.
 //
+// P9 review round 3 (P9-FIXES-R3.md), what a runner can rely on (the Buyer's items):
+//  - R3-FUND-02: a lock is recorded as landed (R2-FUND-01's `lockAbsence`) only from a row AT THE FINALIZED block. A row seen only at the latest block is
+//    not final and gives the typed "not final yet" answer: a lock recorded as landed from an unsafe block that a reorg then removes could never be refunded
+//    (the refund reverts on an unknown lock and the verdict can no longer be reached), and a lock cannot land again at or past the refund time.
+//  - R3-FUND-03: the verdict rests on the finalized tag alone: a transient error on the tag read is "not final yet" (never the fallback block), see
+//    `EvmHtlcRail.readLockAbsence`. And a recorded verdict is no longer answered with no read: `refundLegA` reads `locks(hashLock)` at the latest block once
+//    and, if a lock of THIS payer exists after all, throws the typed `LockExistsAfterVerdictError` (nothing is sent; a person refunds it by hand).
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B3, B5;
 // P22-P24-EVM-FIXES-R2.md C2, C4; P22-P24-EVM-FIXES-R3.md E1, E3; P4-BTC-SPEC.md §7a;
 // P6-SOL-SPEC.md sections 3-5; P8-RESUME-SPEC.md.
@@ -250,6 +258,24 @@ export class LockPendingError extends Error {
 
 /** The text `refundLegA` throws when leg A was never locked (the runner recognises it: `FLOW_MESSAGE.neverLocked`). */
 const NEVER_LOCKED = "buyer: leg A was never locked, nothing to refund";
+
+/**
+ * R3-FUND-03 (b): the Buyer's record holds the verdict that leg A's lock attempt NEVER LANDED, yet a lock of this Buyer's account exists under the hash lock
+ * (a verdict reached on a block that was not final, or through another endpoint, or a lock that mined late; it can only be a mistake of the read that
+ * recorded it). The verdict is permanent and `next` says `done`, so the flow cannot refund it: nothing is sent, and a person refunds the lock by hand
+ * (the escrow's `refund(hashLock)` from the Buyer's account, once it reads Locked). The text names the hash lock and is NOT the never-locked text.
+ */
+export class LockExistsAfterVerdictError extends Error {
+  readonly ref: string;
+  constructor(ref: string) {
+    super(
+      `buyer: a lock exists under hash lock ${ref} although the recorded verdict said leg A's lock attempt never landed; nothing was sent; ` +
+        "refund it by hand: call refund(hashLock) on the escrow from the Buyer's account (R3-FUND-03)",
+    );
+    this.name = "LockExistsAfterVerdictError";
+    this.ref = ref;
+  }
+}
 
 /**
  * R2-FUND-01: `refundLegA` found no lock for a lock attempt that has no evidence, but the chain's finalized block is not yet at or past leg A's
@@ -1735,10 +1761,37 @@ export class BuyerFlow {
     }
   }
 
+  /**
+   * R3-FUND-03 (b): with the verdict "never landed" on record, one read of `locks(hashLock)` at the latest block (a rail that can reach the verdict, `evm-htlc`:
+   * the rail that implements `lockAbsence`). A lock of THIS payer there is `LockExistsAfterVerdictError`. A row of another payer cannot be this Buyer's lock
+   * (`recoverLock` refuses it as `lock-conflict`): the verdict stands. A failed read propagates (the verdict is not answered from a read that did not happen).
+   */
+  private async refuseIfLockExistsAfterVerdict(): Promise<void> {
+    const prepared = this.preparedLock;
+    const accounts = this.lockedAccounts;
+    if (prepared === undefined || accounts === undefined) return;
+    const { offerA, acceptA } = this.requirePaired();
+    const connected = await this.rail.connect(offerAcceptLockTerms(offerA, acceptA), accounts);
+    if (connected.lockAbsence === undefined) return;
+    let outcome: LockRecoveryOutcome;
+    try {
+      outcome = await connected.recoverLock(prepared);
+    } catch (error) {
+      if (error instanceof RailRecoveryRefusedError) return;
+      throw error;
+    }
+    if (outcome === "landed") throw new LockExistsAfterVerdictError(prepared.ref);
+  }
+
   private async refundLegAUnlatched(): Promise<RailWriteEvidence> {
     const { offerA, acceptA } = this.requirePaired();
-    // R2-FUND-01: a recorded verdict ends it for good, with no read: the same text every time.
-    if (this.lockedHashLock === undefined || this.lockNeverLanded) throw new Error(NEVER_LOCKED);
+    // R2-FUND-01: a recorded verdict ends it for good: the same text every time. R3-FUND-03 (b): after one read of `locks(hashLock)` at the latest block, which
+    // may show that the verdict was wrong (a lock of THIS payer exists): then a typed refusal for a person, nothing sent.
+    if (this.lockedHashLock === undefined) throw new Error(NEVER_LOCKED);
+    if (this.lockNeverLanded) {
+      await this.refuseIfLockExistsAfterVerdict();
+      throw new Error(NEVER_LOCKED);
+    }
     if (this.clock() < offerA.refundAfterMs) {
       throw new Error("buyer: refusing to refund leg A before its refundAfterMs");
     }
@@ -1784,7 +1837,8 @@ export class BuyerFlow {
     }
     // R2-FUND-01: a lock attempt with no evidence may never have landed (the lock guard refused it after the approve, a signer refusal, a dropped
     // lock, a kill between the approve and the lock), and a refund of an unknown lock reverts for ever. On a rail that can say (evm-htlc), the chain
-    // is read BEFORE anything is sent: a lock found is recorded as landed and the refund goes ahead; no lock and a FINALIZED block at or past leg A's
+    // is read BEFORE anything is sent: a lock found AT THE FINALIZED BLOCK (R3-FUND-02: never a row seen only at the latest block) is recorded as landed
+    // and the refund goes ahead; no lock and a FINALIZED block at or past leg A's
     // refund time is the verdict "never locked" (the escrow refuses a lock in any block at or past that time, so none can appear later), recorded so
     // `next` stops naming this step; no lock and no such block yet is a typed "not final yet", recording nothing.
     if (this.legALockAttempted && this.lockEvidence === undefined && this.legARefundEvidence === undefined && connected.lockAbsence !== undefined) {

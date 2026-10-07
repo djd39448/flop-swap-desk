@@ -56,7 +56,7 @@ import {
   type EvmSignerRefusedError,
   type EvmSignerWatch,
 } from "./evm-signer.js";
-import { verifiedExchangeBytes, type CapturingRpc } from "./rpc-capture.js";
+import { RpcCaptureError, verifiedExchangeBytes, type CapturingRpc } from "./rpc-capture.js";
 
 export { EVM_DEFAULT_MAX_FEE_PER_GAS_WEI, EVM_MAX_GAS_PER_WRITE, EvmSignerRefusedError } from "./evm-signer.js";
 
@@ -519,11 +519,12 @@ export interface EvmBlockHead {
 }
 
 /**
- * R2-FUND-01: what `readLockAbsence` found for a lock that was attempted and has no evidence. `landed`: a row exists (at the latest block,
- * or at the finalized one), whoever owns it. `never-locked`: no row at the latest block or at the finalized block, and that finalized block
- * is at or past `refundAfterMs`; the contract refuses a lock in any block whose timestamp is at or past `refundAfterMs`, so no later block
- * can carry one and the attempt can never land. `not-final`: no row yet, but no finalized block at or past `refundAfterMs` has been read
- * (or none could be read), so a lock still cannot be ruled out: ask again later.
+ * R2-FUND-01: what `readLockAbsence` found for a lock that was attempted and has no evidence. `landed`: a row exists AT THE FINALIZED BLOCK
+ * (R3-FUND-02: a row seen only at the latest block is not final and is never evidence), whoever owns it. `never-locked`: no row at the finalized
+ * block, that finalized block is at or past `refundAfterMs`, and no row at the latest block either; the contract refuses a lock in any block
+ * whose timestamp is at or past `refundAfterMs`, so no later block can carry one and the attempt can never land. `not-final`: no verdict can be
+ * given yet: no finalized block could be read, or it is before `refundAfterMs`, or a row is visible only at the latest block (a lock that is not
+ * final yet, or an inconsistent read): ask again later.
  */
 export type EvmLockAbsence = { kind: "landed"; row: EvmLockRecord } | { kind: "never-locked"; finalized: EvmBlockHead } | { kind: "not-final" };
 
@@ -1291,21 +1292,47 @@ export class EvmHtlcRail {
   }
 
   /**
-   * R2-FUND-01: has the lock this account tried to make under `hashLock` landed, or can it no longer land? Only reads; nothing is sent. The
-   * finalized block is read FIRST and the lock second, so a lock in any block up to the finalized one is visible to the second read (a
-   * block is an ancestor of every later head). Then: a row at the latest block is `landed`. No row, and a finalized block whose timestamp is at
-   * or past `refundAfterMs`: the contract's own `lock` requires `block.timestamp * 1000 < refundAfterMs` (contracts/EvmHashRail.sol), so a lock
-   * could only ever sit in a block BEFORE that finalized one; the row is read once more at that block, itself, so a node that lags the one
-   * that named the finalized block cannot turn a lock that landed into "never" (it answers an error, which propagates, or the row), and an
-   * absent row there is `never-locked`. Otherwise `not-final`. A transport failure or a malformed answer propagates and is never read as "absent".
+   * R3-FUND-03 (P9 review round 3): the finalized block for the PERMANENT verdict of `readLockAbsence`. `finalizedBlock()` falls back to the
+   * `fallbackConfirmations` block on ANY error or malformed answer to the tag read, which suits a reader that only waits and asks again; the verdict
+   * is recorded for good, and one transient error (a rate limit, a 5xx) must not turn a block a few blocks below the head into "the finalized one"
+   * while the real one is far behind. Here an error or a malformed answer to the tag read is "no finalized block" (`null`: not final, ask again), and
+   * the fallback applies only when the node SAYS it does not serve the tag: a JSON-RPC error with code -32601 or -32602, or a `null` result. Confirmations
+   * mode is read as `finalizedBlock()` reads it (an error there propagates).
+   */
+  private async finalizedBlockForVerdict(): Promise<EvmBlockHead | null> {
+    const finality = this.config.pin.finality;
+    if (finality.mode === "confirmations") return this.numberedBlock(finality.confirmations);
+    const fallback = (): Promise<EvmBlockHead | null> => (finality.fallbackConfirmations === undefined ? Promise.resolve(null) : this.numberedBlock(finality.fallbackConfirmations));
+    let answer: unknown;
+    try {
+      answer = await this.rpc.request({ method: "eth_getBlockByNumber", params: [finality.tag, false] });
+    } catch (error) {
+      return error instanceof RpcCaptureError && (error.code === -32601 || error.code === -32602) ? fallback() : null;
+    }
+    if (answer === null) return fallback();
+    return blockHeadOf(answer);
+  }
+
+  /**
+   * R2-FUND-01: has the lock this account tried to make under `hashLock` landed, or can it no longer land? Only reads; nothing is sent. The verdict
+   * is permanent once recorded, so it rests on the FINALIZED block alone. R3-FUND-02 (P9 review round 3): `landed`, which the Buyer records as
+   * evidence, is answered only from a row AT the finalized block; a row present only at the latest block is not final (an unsafe block can be
+   * reorged away, and a lock cannot land again at or past the refund time) and gives `not-final`, which the runner waits out as it waits for the
+   * typed error. With no row at the finalized block and that block's timestamp at or past `refundAfterMs`, the contract's own `lock` requires
+   * `block.timestamp * 1000 < refundAfterMs` (contracts/EvmHashRail.sol), so a lock could only ever sit in a block BEFORE the finalized one, and the
+   * decision is made by the row at that block alone: absent is `never-locked`. A row present only at latest there is an inconsistent read (no lock
+   * can sit above the finalized block) and gives `not-final`. A finalized block before `refundAfterMs`, or none (R3-FUND-03: also an error or a
+   * malformed answer to the tag read, see `finalizedBlockForVerdict`), is `not-final`. The latest row is read BEFORE the finalized one and is only ever
+   * a hint, never evidence. A transport failure or a malformed answer to a row read propagates and is never read as "absent".
    */
   async readLockAbsence(hashLock: Hex, refundAfterMs: number): Promise<EvmLockAbsence> {
-    const finalized = await this.finalizedBlock();
+    const finalized = await this.finalizedBlockForVerdict();
+    if (finalized === null) return { kind: "not-final" };
     const latest = await this.readLock(hashLock);
-    if (latest !== null) return { kind: "landed", row: latest };
-    if (finalized === null || finalized.timestampMs < refundAfterMs) return { kind: "not-final" };
     const atFinalized = await this.readLock(hashLock, finalized.number);
     if (atFinalized !== null) return { kind: "landed", row: atFinalized };
+    if (finalized.timestampMs < refundAfterMs) return { kind: "not-final" };
+    if (latest !== null) return { kind: "not-final" };
     return { kind: "never-locked", finalized };
   }
 

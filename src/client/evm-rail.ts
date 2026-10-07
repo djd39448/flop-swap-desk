@@ -221,9 +221,11 @@ class ConnectedEvmCounterRail implements ConnectedCounterAssetRail {
 
   /**
    * R2-FUND-01: what became of a lock attempt that has no evidence, read BEFORE `BuyerFlow.refundLegA` sends anything (see
-   * `EvmHtlcRail.readLockAbsence`). A row owned by this account is `landed` (the flow records it and refunds as before); a row owned by
-   * another payer is the same `lock-conflict` refusal `recoverLock` gives, never "landed" and never "never locked"; no row with a finalized
-   * block at or past `refundAfterMs` is `never-locked` (the contract refuses a lock in any later block); no row otherwise is `not-final`.
+   * `EvmHtlcRail.readLockAbsence`). A row AT THE FINALIZED BLOCK owned by this account is `landed` (the flow records it and refunds as before;
+   * R3-FUND-02: a row seen only at the latest block is not final and is never `landed`); a row there owned by another payer is the same
+   * `lock-conflict` refusal `recoverLock` gives, never "landed" and never "never locked"; no row with a finalized block at or past `refundAfterMs`
+   * is `never-locked` (the contract refuses a lock in any later block); anything else, including a row seen only at the latest block and an
+   * error on the finalized-tag read (R3-FUND-03), is `not-final`.
    */
   async lockAbsence(ref: string, refundAfterMs: number): Promise<LockAbsence> {
     const found = await this.rail.readLockAbsence(ref as Hex, refundAfterMs);

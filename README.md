@@ -551,17 +551,32 @@ written down instead of hidden.
   no evidence leaves nothing to refund, and the escrow's `refund` of an unknown lock reverts for ever, so the Buyer used to be stuck:
   `next` named `refundLegA`, the refund reverted on every call, the runner's `--refund` exited 4 each time, and the Seller's leg B was
   never refunded. Now `BuyerFlow.refundLegA` reads the chain BEFORE it sends anything (EVM only: the optional rail member
-  `lockAbsence`; the other rails keep their own refund paths). A row for the hash lock, at the latest block or at the finalized one, is a
+  `lockAbsence`; the other rails keep their own refund paths). A row for the hash lock AT THE FINALIZED BLOCK is a
   lock that landed: it is recorded and the refund goes ahead as before (a row whose payer is another account is the `lock-conflict`
-  refusal, never "landed" and never "never locked"). No row, and a finalized block whose own timestamp is at or past leg A's
-  `refundAfterMs`, is the verdict, because the contract refuses a lock in any block at or past that time and so none can ever appear:
+  refusal, never "landed" and never "never locked"). **A row seen only at the latest block is not evidence (R3-FUND-02, P9 review round 3):**
+  an unsafe block can be reorged away, a lock cannot land again at or past the refund time, and a lock recorded as landed from such a read
+  would leave a refund that reverts for ever with the verdict out of reach. It is "not final yet": the runner waits for the finalized block
+  as it does for the typed error, which costs a refund of a lock that landed within one finality lag of the refund time a wait for it to be
+  final (no deadline applies after the refund time). No row at the finalized block, and a finalized block whose own timestamp is at or past
+  leg A's `refundAfterMs`, is decided by the row at that block alone, and is the verdict, because the contract refuses a lock in any block at or
+  past that time and so none can ever appear (a row visible only at the latest block there is an inconsistent read, "not final yet"):
   `refundLegA` throws the text `buyer: leg A was never locked, nothing to refund`, records `lock.neverLanded` in the Buyer's flow
   record, and from then on `next` says `done` and `lockLegA` refuses. **A lock attempt that never landed is therefore reported as never
   locked once leg A's refund time is final, and the runner then refunds leg B** (the Seller's paper note) and the bundle replays to
   `refunded-b`. No row and no such finalized block yet is the typed `RefundNotFinalYetError` ("the lock read is not final yet"): nothing
   is sent or recorded, and `--refund` waits for the finalized block (see "The runner"). The finalized block is read under the rail's own
-  finality setting, and a finalized block that cannot be read is "not final yet", never "final". `tests/refund-never-landed.test.ts`,
-  `tests/evm-lock-absence.test.ts`.
+  finality setting, and a finalized block that cannot be read is "not final yet", never "final". **The permanent verdict never rests on a
+  fallback block taken after a transient error (R3-FUND-03):** an error or a malformed answer to the `finalized` tag read (a rate limit, a
+  5xx, a reset socket) is "not final yet"; the `fallbackConfirmations` block is used only when the node says outright that it does not
+  serve the tag (a JSON-RPC error with code -32601 or -32602, or a `null` result). (The evidence reader and the waits keep their own,
+  older fallback: they only wait and ask again.) **And a recorded verdict is no longer answered with no read:** every `refundLegA` after it
+  reads `locks(hashLock)` at the latest block once. If a lock of the Buyer's own account exists after all (a verdict reached on a block
+  that was not final, or through another endpoint), the run does not report "never locked": `--refund` and `--resume` exit 4 with `buyer: a
+  lock exists under hash lock <hash lock> although the recorded verdict said leg A's lock attempt never landed; nothing was sent; refund it by
+  hand`. **Refund it by hand:** once leg A's refund time has passed and the lock reads Locked, call the escrow's `refund(hashLock)` from a
+  wallet that holds the Buyer's key (the runner never prints one); if it reads Claimed instead, the Seller was paid and the secret is on the
+  chain, and a person decides. The runner never clears the verdict or sends that refund itself. A row owned by another payer cannot be this
+  Buyer's lock and leaves the verdict standing. `tests/refund-never-landed.test.ts`, `tests/evm-lock-absence.test.ts`.
 - **A restart costs gas at most.** After a crash a repeated `approve`, `lock`, `claim` or `refund` is refused by the
   contract (a duplicate hash lock, a spent status), so a resumed EVM flow cannot lock or pay twice; the price of
   the repeat is gas (see "Resume").
@@ -2125,7 +2140,7 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
   the record shows as landed is never posted again, so this applies only to lines whose landing reply was lost.
 - **After leg A's refund time `next` can name `refundLegA` for a lock that never reached the chain.** The record
   alone cannot tell a lock that was prepared and never sent from one that landed. On EVM (R2-FUND-01) `refundLegA` then
-  reads the chain before it sends anything and the attempt ends in a verdict: a lock that landed is recorded and refunded,
+  reads the chain before it sends anything and the attempt ends in a verdict: a lock that is final (a row at the finalized block) is recorded and refunded,
   and no lock at a finalized block at or past leg A's refund time is reported as never locked, recorded (`lock.neverLanded`)
   so that `next` says `done` from then on (the Buyer has nothing to refund and the Seller refunds its own leg B); a
   finalized block that is not that late yet is a typed "not final yet" error that sends and records nothing (see "Known
