@@ -97,6 +97,15 @@ export const BASE_SEPOLIA_POLICY: EvmLocalPolicy = Object.freeze({
   blockTimeMs: 2_000,
 });
 
+/**
+ * P94-FUND-05 (P9-FIXES-R4 decision 6): what a lock needs, besides the chain's own finalized lag (`finalityAMs`), to be mined and read final: its approve and lock
+ * transactions, their receipts and the first polls, 10 minutes. The pre-flight's finality row adds it to the budget (`LOCK_SETTLE_ALLOWANCE_MS` there, the same
+ * number, kept equal by a test), and on Base Sepolia the Buyer's lock guard applies the same arithmetic at the clock of the lock: a lock attempted when
+ * leg A's claim-by is less than `finalityAMs + LOCK_SETTLE_ALLOWANCE_MS` away may not read final in time for the Seller to claim it, so it is refused before
+ * anything is signed. Declared here because the flows must see it without importing the rehearsal runner.
+ */
+export const LOCK_SETTLE_ALLOWANCE_MS = 10 * 60_000;
+
 /** P9-4 decision 1: no deadline policy exists for this EVM chain id (only anvil, 31337, and Base Sepolia, 84532, have one). Thrown by
  *  `evmLocalPolicyFor`, by the EVM rail's `policy` and by its `connect()`, so a rail pinned to any other chain refuses before it reads or
  *  sends anything. The message names the chain id only (a number), never any text a config supplied. */

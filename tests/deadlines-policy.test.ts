@@ -18,14 +18,16 @@ import { describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
 import { SellerFlow } from "../src/client/seller.js";
-import { BASE_SEPOLIA_POLICY, EVM_LOCAL_POLICY, KNOWN_GOOD_DEADLINES_BY_CHAIN, EvmPolicyUnavailableError, knownGoodDeadlinesFor, type KnownGoodDeadlineMinutes } from "../src/client/policy.js";
+import { BASE_SEPOLIA_POLICY, EVM_LOCAL_POLICY, KNOWN_GOOD_DEADLINES_BY_CHAIN, EvmPolicyUnavailableError, LOCK_SETTLE_ALLOWANCE_MS as POLICY_LOCK_SETTLE_ALLOWANCE_MS, knownGoodDeadlinesFor, type KnownGoodDeadlineMinutes } from "../src/client/policy.js";
 import { KNOWN_GOOD_DEADLINES, LOCK_ESTIMATE_MS } from "../src/client/rehearsal-config.js";
 import { LOCK_SETTLE_ALLOWANCE_MS } from "../src/client/rehearsal-preflight.js";
 import { checkSwapDeadlines } from "../src/deadlines.js";
 import { DEFAULT_RPC_TIMEOUT_MS } from "../src/rails/rpc-capture.js";
 import type { DeadlinePolicy } from "../src/types.js";
-import { Controller } from "./helpers/crash-matrix.js";
+import { Controller, PREFIX } from "./helpers/crash-matrix.js";
+import type { EvmMockNode, SendKind } from "./helpers/evm-mock-node.js";
 import { evmWorldWith } from "./helpers/matrix-worlds.js";
+import { started } from "./helpers/resume-world.js";
 import { buildLegA, buildLegB } from "./helpers/offers.js";
 
 const MIN = 60_000;
@@ -245,5 +247,74 @@ describe("P9-4 decision 2: why the earlier sets are not Base Sepolia's", () => {
     expect(slack.finalityRow).toBe(0);
     expect(slack.pipeline).toBeLessThan(0); // and the claim pipeline does not fit once the budget, not the observed maximum, is the lag
     expect(slack.pipelineAtSampleMax).toBeGreaterThan(5); // it would against the sample's own maximum
+  });
+});
+
+describe("P94-FUND-05: on Base Sepolia the Buyer's lock guard asks for the finality budget plus the lock allowance before leg A's claim-by, at the clock of the lock", () => {
+  /** The flows' copy of the allowance is the pre-flight's own number (the flows cannot import the runner, so it is declared twice and pinned equal). */
+  it("the lock allowance the flows see is the pre-flight row's 10 minutes", () => {
+    expect(POLICY_LOCK_SETTLE_ALLOWANCE_MS).toBe(LOCK_SETTLE_ALLOWANCE_MS);
+    expect(POLICY_LOCK_SETTLE_ALLOWANCE_MS).toBe(10 * MIN);
+  });
+
+  /** A world on `chainId` through the pairing; the clock then moves to `afterMin` minutes from the run's start and the Buyer locks. */
+  async function lockAt(chainId: 31337 | 84532, afterMin: number, moveAfterApproveMin?: number) {
+    let node: EvmMockNode | undefined;
+    const s = await started(
+      evmWorldWith((n) => {
+        n.chainId = chainId;
+        node = n;
+      }),
+      PREFIX,
+    );
+    const start = s.w.lockTimeMs;
+    s.w.setTime(start + afterMin * MIN);
+    if (moveAfterApproveMin !== undefined) {
+      const world = node!.hook!;
+      let last: SendKind | undefined;
+      node!.hook = {
+        begin: (kind, from) => {
+          last = kind;
+          return world.begin(kind, from);
+        },
+        end: (token) => {
+          world.end(token);
+          if (last === "approve") s.w.setTime(start + moveAfterApproveMin * MIN);
+        },
+      };
+    }
+    const outcome = await s.c.buyer.lockLegA().then(
+      () => "locked",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+    return { outcome, approves: node!.count("approve"), locks: node!.count("lock") };
+  }
+
+  it("Base Sepolia: a lock attempted 24 or 25 minutes in (115 - 25 = 90 = budget + allowance, the edge) goes out; one at 26 is refused before anything is signed, with the lock-guard error and one more clause", async () => {
+    for (const at of [0, 10, 24, 25]) {
+      const done = await lockAt(84532, at);
+      expect(done, `lock ${at} min after the start`).toEqual({ outcome: "locked", approves: 1, locks: 1 });
+    }
+    const refused = await lockAt(84532, 26);
+    expect(refused.outcome).toMatch(/^buyer: refusing to lock leg A .{1,3} deadlines are no longer safe at lock time \(B3\): finality: leg A's claim-by is 5340000 ms after the lock time, less than the 5400000 ms/);
+    expect(refused.outcome).toContain("(finality budget 4800000 ms plus lock allowance 600000 ms)");
+    expect(refused.outcome).not.toMatch(/rule 1/); // the SPEC 3.5 rules still pass at 26: the new clause is the only reason
+    expect(refused.approves, "refused before signing: no approve").toBe(0);
+    expect(refused.locks).toBe(0);
+  });
+
+  it("Base Sepolia: the guard runs again after the approve's receipt: a lock whose approve took it from +24 to +26 is not sent (the approve stands, no lock)", async () => {
+    const refused = await lockAt(84532, 24, 26);
+    expect(refused.outcome).toMatch(/deadlines are no longer safe at lock time \(B3\): finality: leg A's claim-by is 5340000 ms/);
+    expect(refused.approves).toBe(1);
+    expect(refused.locks).toBe(0);
+  });
+
+  it("anvil is unchanged: a lock at +40 goes out (its 20-minute budget plus the allowance would have wanted it before +30), and one at +46 is refused by rule 1 alone, with no finality clause", async () => {
+    expect(await lockAt(31337, 40)).toEqual({ outcome: "locked", approves: 1, locks: 1 });
+    const refused = await lockAt(31337, 46);
+    expect(refused.outcome).toMatch(/deadlines are no longer safe at lock time \(B3\): rule 1: reveal window/);
+    expect(refused.outcome).not.toMatch(/finality:/);
+    expect(refused.approves).toBe(0);
   });
 });
