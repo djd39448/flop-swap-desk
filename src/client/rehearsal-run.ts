@@ -775,7 +775,7 @@ export async function refundLegAWaiting(w: FinalityWorld, buyer: Pick<BuyerFlow,
 const LATE_CLAIM_LOG = "leg A's lock was claimed; waiting for the claim to be final, then --resume finishes the swap";
 
 /** R3-FUND-01: the end of `--refund` once the flow read the claim final and routed the Buyer to `learnSecret`: the refund is refused, and `--resume` is the way on. */
-const LEG_A_CLAIMED_REFUSAL = "leg A's lock was claimed and the claim is final, so the refund is refused and nothing was sent; run --resume, which learns the secret, claims leg B and finishes the swap";
+const LEG_A_CLAIMED_REFUSAL = "leg A's lock was claimed and the claim is final, so leg A is not refunded (the contract has paid the Seller); run --resume, which learns the secret, claims leg B and finishes the swap";
 
 /** R3-FUND-01: the late-claim wait ran out of `waitLimitMs`; nothing was sent, and `--refund` waits again from the start. */
 const LATE_CLAIM_NOT_FINAL = (waitedSeconds: number): string =>

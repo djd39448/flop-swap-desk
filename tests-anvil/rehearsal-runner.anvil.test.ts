@@ -968,7 +968,7 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       }
       expect(mined).toBeGreaterThanOrEqual(8); // the finalized block (8 below the head) had to pass the head the wait started at
       expect(refunded.code).toBe(4);
-      expect(refunded.stderr).toMatch(/leg A's lock was claimed and the claim is final, so the refund is refused and nothing was sent; run --resume/);
+      expect(refunded.stderr).toMatch(/leg A's lock was claimed and the claim is final, so leg A is not refunded \(the contract has paid the Seller\); run --resume/);
       expect(refunded.stderr).not.toMatch(/reverted|refund refused/);
       expect(await chainFacts(hand, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 }); // nothing was sent
       const recordKey = flowKey("buyer", (await readRun(rig)).swapId);

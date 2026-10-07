@@ -768,7 +768,7 @@ venue and a local paper-note file, signing with the two local key files. Modes (
   the Seller refunds leg B (the paper note) once its own has, then the bundle and `--expect <swapId>=refunded` (`refunded-b` when
   leg A was never locked). A refund time that has not come is reported (exit 5) and the command can be repeated later; `--wait` waits
   for it here instead. The runner waits until the refund is final before it writes the bundle. If the Seller already claimed, the Buyer's flow refuses
-  the refund and the run ends (exit 4) with "leg A's lock was claimed and the claim is final, so the refund is refused and nothing was sent; run
+  the refund and the run ends (exit 4) with "leg A's lock was claimed and the claim is final, so leg A is not refunded (the contract has paid the Seller); run
   --resume"; `--resume` learns the secret and claims leg B. **A claim that landed within one finality lag of leg A's refund time is not final yet when
   `--refund` comes (R3-FUND-01, P9 review round 3)**: the refund reverts (the lock reads Claimed at the latest block) while the finalized block still reads
   Locked, and the flow routes only on a final read. `--refund` then reads `locks(hashLock)` at the latest block and at the finalized block (two reads,

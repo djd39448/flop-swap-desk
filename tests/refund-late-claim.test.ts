@@ -140,7 +140,12 @@ describe("R3-FUND-01: a late claim of leg A that is not final yet is waited for,
     const r = await lateClaim();
     r.script.lag = false;
     const { flow } = await r.buyer();
-    await expect(refundLegAWaiting(r.world, flow, r.hashLock)).rejects.toThrow(/leg A's lock was claimed and the claim is final.*run --resume/);
+    const refusal = await refundLegAWaiting(r.world, flow, r.hashLock).then(
+      () => undefined,
+      (caught: unknown) => caught as Error,
+    );
+    expect(refusal?.message).toMatch(/leg A's lock was claimed and the claim is final.*run --resume/);
+    expect(refusal?.message, "a refund that lost the race to a claim WAS sent (and reverted): the text never says that nothing was").not.toMatch(/nothing was sent/);
     expect(r.script.sleeps).toEqual([]);
     expect(r.script.logs.filter((line) => line === SENTENCE)).toEqual([]);
     expect((await resumedBuyer(r.s)).next).toBe("learnSecret");
