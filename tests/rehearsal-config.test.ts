@@ -513,6 +513,31 @@ describe("parseRehearsalConfig", () => {
     expect(parseRehearsalConfig(anvilConfig({ pollMs: 250, waitLimitMs: 3_000 }), BASE).waitLimitMs).toBe(3_000);
   });
 
+  // P9-4 decision 3: Base Sepolia pins finality to the chain's `finalized` tag. The rail's own check refuses confirmations mode and a fallback there; the runner's config
+  // names the field, and never a value.
+  it("P9-4 d3: on Base Sepolia confirmations mode and any fallbackConfirmations are refused by field name (and never echoed); anvil keeps both", () => {
+    const confirmations = refusal(baseSepoliaConfig({ pin: { ...BASE_SEPOLIA_PIN, finality: { mode: "confirmations", confirmations: 12 } } }));
+    expect(confirmations).toContain('rails.evm.pin.finality.mode is "confirmations", which base-sepolia (84532) refuses');
+    const fallback = refusal(baseSepoliaConfig({ pin: { ...BASE_SEPOLIA_PIN, finality: { mode: "tag", tag: "finalized", fallbackConfirmations: 200 } } }));
+    expect(fallback).toContain("rails.evm.pin.finality.fallbackConfirmations is set, which base-sepolia (84532) refuses");
+    expect(fallback).not.toContain("200");
+    // A value that is not even a number is refused the same way and never quoted.
+    const secret = `0x${"c0ffee".repeat(10)}c0ff`;
+    const odd = refusal(baseSepoliaConfig({ pin: { ...BASE_SEPOLIA_PIN, finality: { mode: "tag", tag: "finalized", fallbackConfirmations: secret } } }));
+    expect(odd).toContain("rails.evm.pin.finality.fallbackConfirmations is set");
+    expect(odd).not.toContain(secret);
+    expect(odd).not.toContain("c0ffee");
+    // The plain tag pin is what the README shows, and it passes.
+    expect(parseRehearsalConfig(baseSepoliaConfig({ pin: { ...BASE_SEPOLIA_PIN, finality: { mode: "tag", tag: "finalized" } } }), BASE).rails.evm.pin.finality).toEqual({ mode: "tag", tag: "finalized" });
+    // Anvil keeps both (its local node has no finalized block of its own to rely on in every suite).
+    const anvilWith = (finality: Record<string, unknown>): Record<string, unknown> => ({
+      ...anvilConfig(),
+      rails: { evm: { pin: { ...ANVIL_LOCAL_PIN, finality }, endpoint: "http://127.0.0.1:8545", contract: CONTRACT, assets: { USDC: TOKEN } } },
+    });
+    expect(parseRehearsalConfig(anvilWith({ mode: "confirmations", confirmations: 12 }), BASE).rails.evm.pin.finality).toEqual({ mode: "confirmations", confirmations: 12 });
+    expect(parseRehearsalConfig(anvilWith({ mode: "tag", tag: "finalized", fallbackConfirmations: 200 }), BASE).rails.evm.pin.finality).toEqual({ mode: "tag", tag: "finalized", fallbackConfirmations: 200 });
+  });
+
   it("refuses a config that is not an object, and rails that are not", () => {
     expect(refusal(null)).toContain("the config must be an object");
     expect(refusal([])).toContain("the config must be an object");

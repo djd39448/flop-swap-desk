@@ -256,6 +256,21 @@ function cleanEvmConfig(value: unknown): EvmRailConfig {
   }
   const finality = requireObject(pin.finality, "rails.evm.pin.finality");
   closed(finality, finality.mode === "confirmations" ? CONFIRMATIONS_FINALITY_FIELDS : TAG_FINALITY_FIELDS, "rails.evm.pin.finality");
+  // P9-4 decision 3 (the rail's own check refuses the same two things; this names the FIELD): on Base Sepolia finality is the chain's `finalized` tag, with no
+  // confirmations mode and no fallback, so that the Buyer's permanent never-locked verdict and every read a flow routes on never rest on a block a fixed
+  // number of confirmations below the head. Anvil keeps both. Neither message quotes a value.
+  if (pin.chainId === BASE_SEPOLIA_PIN.chainId) {
+    if (finality.mode === "confirmations") {
+      throw new RehearsalConfigError(
+        `rails.evm.pin.finality.mode is "confirmations", which base-sepolia (84532) refuses: pin finality to the chain's own finalized block ({ "mode": "tag", "tag": "finalized" }), so that no read a flow routes on rests on a block a fixed number of confirmations below the head`,
+      );
+    }
+    if (finality.fallbackConfirmations !== undefined) {
+      throw new RehearsalConfigError(
+        "rails.evm.pin.finality.fallbackConfirmations is set, which base-sepolia (84532) refuses: a fallback replaces the finalized tag with a block a fixed number of confirmations below the head when the tag fails, and that block is not final; remove it",
+      );
+    }
+  }
   const assets = requireObject(evm.assets, "rails.evm.assets");
   // KR2-1: an asset name is quoted by the rail's refusals, printed by the runner and written into the bundle's rails.json, so every name is held to a short
   // plain name BEFORE anything else reads the config (a key pasted as a name must not ride along with a valid address). The name is never shown.

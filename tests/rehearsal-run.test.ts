@@ -1196,6 +1196,26 @@ describe("bad configs and a failing endpoint", () => {
     expect(exact.chain.methods.length).toBeGreaterThan(0); // and the chain was read
   });
 
+  // P9-4 decision 3, through the command's front door.
+  it("P9-4 d3: a Base Sepolia config with confirmations mode or a fallbackConfirmations exits 2 naming the field, in every mode, before the endpoint is touched", async () => {
+    const pins = [
+      ["rails.evm.pin.finality.mode", { ...BASE_SEPOLIA_PIN, finality: { mode: "confirmations", confirmations: 12 } }],
+      ["rails.evm.pin.finality.fallbackConfirmations", { ...BASE_SEPOLIA_PIN, finality: { mode: "tag", tag: "finalized", fallbackConfirmations: 200 } }],
+    ] as const;
+    for (const [field, pin] of pins) {
+      for (const mode of ["dry", "yes", "resume", "refund"] as const) {
+        const rig = await makeRig({ evmExtra: { pin } });
+        const result = await run(rig, mode);
+        expect(result.code, `${field} ${mode}`).toBe(EXIT.config);
+        expect(result.stderr, `${field} ${mode}`).toContain(`${field} is`);
+        expect(result.stderr, `${field} ${mode}`).toContain("which base-sepolia (84532) refuses");
+        expect(result.stdout, `${field} ${mode}`).toBe("");
+        expect(rig.chain.methods, `${field} ${mode}`).toEqual([]);
+        expect(await exists(rig.stateDir), `${field} ${mode}`).toBe(false);
+      }
+    }
+  });
+
   it("exits 2 on a config file that is missing", async () => {
     const rig = await makeRig();
     const out: string[] = [];
