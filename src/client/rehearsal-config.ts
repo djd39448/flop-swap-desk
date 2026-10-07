@@ -32,7 +32,8 @@ import { dirname, isAbsolute, resolve } from "node:path";
 
 import { english } from "viem/accounts";
 
-import { ASSET_NAME_SHAPE, checkEvmRailConfig, PIN_TEXT_SHAPE, type EvmFinality, type EvmRailConfig } from "../rails/evm-htlc.js";
+import { ASSET_NAME_SHAPE, BASE_SEPOLIA_PIN, checkEvmRailConfig, PIN_TEXT_SHAPE, type EvmFinality, type EvmRailConfig } from "../rails/evm-htlc.js";
+import { evmLocalPolicyFor } from "./policy.js";
 
 /** One leg's three deadlines, in minutes after the run's start (t0). */
 export interface LegDeadlineMinutes {
@@ -86,7 +87,7 @@ export interface RehearsalConfig {
   readonly clock: RehearsalClockMode;
   /** How often a wait polls the chain, in ms. */
   readonly pollMs: number;
-  /** The longest one wait for finality may last, in ms. */
+  /** The longest one wait for finality may last, in ms. On Base Sepolia (P9-4 decision 9) at least the policy's finality budget (`BASE_SEPOLIA_POLICY.finalityAMs`, 80 minutes). */
   readonly waitLimitMs: number;
 }
 
@@ -366,6 +367,17 @@ export function parseRehearsalConfig(value: unknown, baseDir: string, file = "")
 
   const pollMs = top.pollMs === undefined ? DEFAULT_POLL_MS : requireInt(top.pollMs, "pollMs", MIN_POLL_MS, MAX_POLL_MS);
   const waitLimitMs = top.waitLimitMs === undefined ? DEFAULT_WAIT_LIMIT_MS : requireInt(top.waitLimitMs, "waitLimitMs", pollMs, MAX_WAIT_LIMIT_MS);
+  // P9-4 decision 9 (the finality budget bounds every wait): on Base Sepolia the late-claim wait, the never-locked verdict wait and the recovered-lock wait are
+  // each bounded by `waitLimitMs`, so a limit under one finality budget could give up on a finalized block that is only a normal stand-still behind. Anvil's
+  // short limits (the suites run at a few seconds) are unchanged.
+  if (evm.pin.chainId === BASE_SEPOLIA_PIN.chainId) {
+    const budgetMs = evmLocalPolicyFor(evm.pin.chainId).finalityAMs;
+    if (waitLimitMs < budgetMs) {
+      throw new RehearsalConfigError(
+        `waitLimitMs ${waitLimitMs} is below the finality budget of ${evm.pin.name} (${budgetMs} ms, ${budgetMs / 60_000} min): every wait for finality is bounded by it, so it must be at least one budget`,
+      );
+    }
+  }
 
   return Object.freeze({
     file,

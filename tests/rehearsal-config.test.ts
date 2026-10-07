@@ -14,6 +14,7 @@ import { english, generateMnemonic, generatePrivateKey } from "viem/accounts";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
+import { BASE_SEPOLIA_POLICY } from "../src/client/policy.js";
 import {
   absoluteDeadlines,
   endpointHost,
@@ -492,6 +493,24 @@ describe("parseRehearsalConfig", () => {
     const config = parseRehearsalConfig(anvilConfig({ pollMs: 250, waitLimitMs: 60_000 }), BASE);
     expect(config.pollMs).toBe(250);
     expect(config.waitLimitMs).toBe(60_000);
+  });
+
+  // P9-4 decision 9: the late-claim wait, the never-locked verdict wait and the recovered-lock wait are all bounded by waitLimitMs, so on Base Sepolia it may not be
+  // under one finality budget (BASE_SEPOLIA_POLICY.finalityAMs, 80 minutes). Anvil keeps its short limits (the suites run at a few seconds).
+  it("P9-4 d9: on Base Sepolia waitLimitMs may not be below the policy's finality budget (80 min), refused by field name; the default and the budget itself pass; anvil is unchanged", () => {
+    expect(BASE_SEPOLIA_POLICY.finalityAMs).toBe(4_800_000);
+    const below = refusal(baseSepoliaConfig({}, { waitLimitMs: BASE_SEPOLIA_POLICY.finalityAMs - 1 }));
+    expect(below).toContain("waitLimitMs 4799999 is below the finality budget of base-sepolia (4800000 ms, 80 min)");
+    expect(refusal(baseSepoliaConfig({}, { waitLimitMs: 60_000, pollMs: 250 }))).toContain("waitLimitMs 60000 is below the finality budget");
+    expect(refusal(baseSepoliaConfig({}, { waitLimitMs: 1_200_000 }))).toContain("waitLimitMs 1200000 is below the finality budget"); // the anvil budget (20 min) is not enough there
+    expect(parseRehearsalConfig(baseSepoliaConfig({}, { waitLimitMs: BASE_SEPOLIA_POLICY.finalityAMs }), BASE).waitLimitMs).toBe(4_800_000);
+    expect(parseRehearsalConfig(baseSepoliaConfig({}, { waitLimitMs: 6 * 60 * 60_000 }), BASE).waitLimitMs).toBe(21_600_000);
+    expect(parseRehearsalConfig(baseSepoliaConfig(), BASE).waitLimitMs).toBeGreaterThanOrEqual(BASE_SEPOLIA_POLICY.finalityAMs); // the default holds the floor
+    // The field's own shape refusals come first and are unchanged.
+    expect(refusal(baseSepoliaConfig({}, { waitLimitMs: "4800000" }))).toContain("waitLimitMs must be an integer from");
+    // Anvil: no floor (a short wait limit is what the live suites use).
+    expect(parseRehearsalConfig(anvilConfig({ pollMs: 50, waitLimitMs: 100 }), BASE).waitLimitMs).toBe(100);
+    expect(parseRehearsalConfig(anvilConfig({ pollMs: 250, waitLimitMs: 3_000 }), BASE).waitLimitMs).toBe(3_000);
   });
 
   it("refuses a config that is not an object, and rails that are not", () => {

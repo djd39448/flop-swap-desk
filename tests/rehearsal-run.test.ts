@@ -25,7 +25,7 @@ import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, EXIT, F
 import { RefundNotFinalYetError } from "../src/client/buyer.js";
 import { encodeFlowRecord, newBuyerRecord, newSellerRecord } from "../src/client/flow-record.js";
 import { FileFlowStore, flowKey } from "../src/client/flow-store.js";
-import { parseRehearsalConfig } from "../src/client/rehearsal-config.js";
+import { parseRehearsalConfig, type RehearsalConfig } from "../src/client/rehearsal-config.js";
 import { loadOrCreateIdentity } from "../src/client/rehearsal-world.js";
 import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
@@ -144,6 +144,11 @@ async function exists(path: string): Promise<boolean> {
 }
 
 const WRITES = ["eth_sendRawTransaction", "eth_sendTransaction"];
+
+/** A parsed config with its waitLimitMs set directly (the unit worlds of the wait functions use limits of a minute, below the floor a real Base Sepolia config has). */
+function limitWait(config: RehearsalConfig, waitLimitMs: number | undefined): RehearsalConfig {
+  return waitLimitMs === undefined ? config : { ...config, waitLimitMs };
+}
 
 describe("the dry run (the default mode) against a fake read-only chain", () => {
   it("prints the table with both addresses, no key and no URL, writes nothing, sends nothing, exits 0", async () => {
@@ -892,7 +897,7 @@ describe("R2-FUND-01: the --refund loop waits for the finalized block, and a --r
         return { number: hex(900_000n), timestamp: hex(BigInt(Math.floor(finalizedMs() / 1000))) }; // the finalized tag, or its number
       },
     } as unknown as CapturingRpc;
-    const config = parseRehearsalConfig(
+    const parsed = parseRehearsalConfig(
       {
         rails: { evm: { pin: BASE_SEPOLIA_PIN, endpoint: "https://sepolia.base.org", contract: CONTRACT, assets: { USDC: TOKEN }, contractCodeHash: FAKE_ESCROW_CODE_HASH } },
         buyerKeyFile: "b.key",
@@ -900,10 +905,11 @@ describe("R2-FUND-01: the --refund loop waits for the finalized block, and a --r
         amount: "1000000",
         out: "bundle",
         pollMs,
-        ...(options.waitLimitMs === undefined ? {} : { waitLimitMs: options.waitLimitMs }),
       },
       "/base",
     );
+    // P9-4 decision 9: a real Base Sepolia config may not carry a waitLimitMs under the finality budget, so a short limit is set on the parsed config directly.
+    const config = limitWait(parsed, options.waitLimitMs);
     const env: RehearsalEnv = { now: () => state.t, sleep: async (ms) => void (state.sleeps.push(ms), (state.t += ms)), out: () => undefined, err: () => undefined };
     return { world: { config, env, rpc, log: (line) => void state.logs.push(line), pollMs }, state };
   }
@@ -1172,6 +1178,24 @@ describe("bad configs and a failing endpoint", () => {
     expect(rig.chain.methods).toEqual([]); // the endpoint was never touched
   });
 
+  // P9-4 decision 9, through the command's front door: a Base Sepolia run whose waitLimitMs is under one finality budget is refused before the chain is read.
+  it("P9-4 d9: a Base Sepolia config with a waitLimitMs under the 80-minute finality budget exits 2 naming waitLimitMs, in every mode, before the endpoint is touched; the budget itself passes", async () => {
+    for (const mode of ["dry", "yes", "resume", "refund"] as const) {
+      const rig = await makeRig({ configExtra: { pollMs: 250, waitLimitMs: 4_799_999 } });
+      const result = await run(rig, mode);
+      expect(result.code, mode).toBe(EXIT.config);
+      expect(result.stderr, mode).toContain("waitLimitMs 4799999 is below the finality budget of base-sepolia (4800000 ms, 80 min)");
+      expect(result.stdout, mode).toBe("");
+      expect(rig.chain.methods, mode).toEqual([]);
+      expect(await exists(rig.stateDir), mode).toBe(false);
+    }
+    const exact = await makeRig({ configExtra: { waitLimitMs: 4_800_000 } });
+    const passed = await run(exact);
+    expect(passed.stderr).not.toContain("waitLimitMs");
+    expect(passed.code).not.toBe(EXIT.config); // the config is accepted: whatever the pre-flight says next is another matter
+    expect(exact.chain.methods.length).toBeGreaterThan(0); // and the chain was read
+  });
+
   it("exits 2 on a config file that is missing", async () => {
     const rig = await makeRig();
     const out: string[] = [];
@@ -1283,7 +1307,7 @@ describe("R1-FUND-07: a lock with no block number on record is waited for, not g
         return { number: hex(options.finalized + options.step * BigInt(state.sleeps.length)) }; // the "finalized" tag moves up by `step` blocks at every poll (every sleep)
       },
     } as unknown as CapturingRpc;
-    const config = parseRehearsalConfig(
+    const parsed = parseRehearsalConfig(
       {
         rails: { evm: { pin: BASE_SEPOLIA_PIN, endpoint: "https://sepolia.base.org", contract: CONTRACT, assets: { USDC: TOKEN }, contractCodeHash: FAKE_ESCROW_CODE_HASH } },
         buyerKeyFile: "b.key",
@@ -1291,10 +1315,11 @@ describe("R1-FUND-07: a lock with no block number on record is waited for, not g
         amount: "1000000",
         out: "bundle",
         pollMs,
-        ...(options.waitLimitMs === undefined ? {} : { waitLimitMs: options.waitLimitMs }),
       },
       "/base",
     );
+    // P9-4 decision 9: a real Base Sepolia config may not carry a waitLimitMs under the finality budget, so a short limit is set on the parsed config directly.
+    const config = limitWait(parsed, options.waitLimitMs);
     const env: RehearsalEnv = {
       now: () => t,
       sleep: async (ms) => void (state.sleeps.push(ms), (t += ms), (state.waitedMs += ms)),
@@ -1367,7 +1392,7 @@ describe("R2-FUND-03: a recovered lock is read before it is waited for, and the 
         throw new Error(`unexpected ${method}`);
       },
     } as unknown as CapturingRpc;
-    const config = parseRehearsalConfig(
+    const parsed = parseRehearsalConfig(
       {
         rails: { evm: { pin: BASE_SEPOLIA_PIN, endpoint: "https://sepolia.base.org", contract: CONTRACT, assets: { USDC: TOKEN }, contractCodeHash: FAKE_ESCROW_CODE_HASH } },
         buyerKeyFile: "b.key",
@@ -1375,10 +1400,11 @@ describe("R2-FUND-03: a recovered lock is read before it is waited for, and the 
         amount: "1000000",
         out: "bundle",
         pollMs,
-        ...(options.waitLimitMs === undefined ? {} : { waitLimitMs: options.waitLimitMs }),
       },
       "/base",
     );
+    // P9-4 decision 9: a real Base Sepolia config may not carry a waitLimitMs under the finality budget, so a short limit is set on the parsed config directly.
+    const config = limitWait(parsed, options.waitLimitMs);
     const env: RehearsalEnv = { now: () => clock.t, sleep: async (ms) => void (state.sleeps.push(ms), (clock.t += ms)), out: () => undefined, err: () => undefined };
     return { world: { config, env, rpc, log: (line) => void state.logs.push(line), pollMs }, state, clock, waited: () => clock.t - clock.t0 };
   }
