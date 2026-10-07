@@ -11,7 +11,7 @@
 import { execFile } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,6 +58,8 @@ interface RigOptions {
   /** F3 (P9 review round 1): Base Sepolia still runs under the anvil policy, so a NEW swap on it is refused until P9-4. The rigs that want every row of a healthy
    *  dry run use the anvil pin (31337) on the same fake chain, with maxLogRange 500 so the log rows read the same. */
   anvil?: boolean;
+  /** With `anvil`: the config's maxLogRange (default 500). */
+  maxLogRange?: number;
   chain?: FakeChainOptions;
   codeHash?: string;
   skipSellerKey?: boolean;
@@ -91,7 +93,7 @@ async function makeRig(options: RigOptions = {}): Promise<Rig> {
         contract: CONTRACT,
         assets: { USDC: TOKEN },
         contractCodeHash: options.codeHash ?? FAKE_ESCROW_CODE_HASH,
-        ...(options.anvil === true ? { maxLogRange: 500 } : {}),
+        ...(options.anvil === true ? { maxLogRange: options.maxLogRange ?? 500 } : {}),
       },
     },
     buyerKeyFile: "keys/buyer.key",
@@ -195,6 +197,25 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     expect(refunded.stdout).not.toContain("a check it needs failed");
     expect(refunded.code).toBe(EXIT.refused); // past the pre-flight, it stops at the Buyer's empty store: nothing to refund
     expect(refunded.stderr).toContain("holds no record");
+  });
+
+  // F1 runner part (P9 review round 1): 100 calls of maxLogRange blocks must reach as far as leg A's window is long, or a late claim cannot be found.
+  it("a dry run with a cap of 300 and a 26-hour leg A window at 2-second blocks exits 3 on the log scan reach row, printing both numbers; at 500 the same window passes (F1)", async () => {
+    const deadlines = {
+      legA: { claimByMin: 1500, refundAfterMin: 1570, expiresMin: 30 }, // the lock is expected 10 minutes in: the window is 26 hours
+      legB: { claimByMin: 3000, refundAfterMin: 6000, expiresMin: 40 },
+    };
+    const low = await makeRig({ anvil: true, maxLogRange: 300, chain: { logCap: 300 }, configExtra: { deadlines } });
+    const refused = await run(low);
+    expect(refused.code).toBe(EXIT.preflight);
+    expect(refused.stdout.match(/^ {2}FAIL {2}.{1,20}?(?= {2})/gm)).toEqual(["  FAIL  log scan reach"]); // the only failure
+    expect(refused.stdout).toMatch(/FAIL\s+log scan reach\s+100 calls of maxLogRange 300 read 30000 blocks above a marker .*; leg A's window needs 47056 blocks \(1560\.0 min from the lock to the refund time at 2\.0 s a block, plus 256 of marker margin\)/);
+    expect(refused.stdout).toContain("raise maxLogRange (to at least 471) if the endpoint allows it, or shorten leg A's window");
+    expect(refused.stdout).toContain("Nothing was sent. Fix the failed checks");
+    const wide = await makeRig({ anvil: true, maxLogRange: 500, chain: { logCap: 500 }, configExtra: { deadlines } });
+    const passed = await run(wide);
+    expect(passed.code).toBe(EXIT.ok);
+    expect(passed.stdout).toMatch(/OK\s+log scan reach\s+100 calls of maxLogRange 500 read 50000 blocks above a marker .*needs 47056 blocks/);
   });
 
   it("exits 3 and says nothing was sent when a check fails (a wrong code pin, a Buyer short of tokens, no finalized tag)", async () => {
@@ -441,6 +462,7 @@ describe("K1: a key pasted into a key-file field is never printed back", () => {
     const key = generatePrivateKey();
     const path = join(dir, "open.key");
     await writeFile(path, `${key}\n`, { mode: 0o644 });
+    await chmod(path, 0o644); // whatever the umask was (a no-op on Windows, where the loader's mode check is skipped by its own rule)
     const lines: string[] = [];
     const loaded = await loadRunnerAccount(path, "buyerKeyFile", (line) => void lines.push(line), "linux");
     if (!("account" in loaded)) throw new Error("the key file did not load");

@@ -32,6 +32,7 @@ Modes (at most one):
                a second lock or claim. A run started with --stop-after lock stops at the lock again.
   --refund     Drive the refund path: the Buyer refunds leg A once its refund time has come, the Seller refunds leg B (the paper
                note) once its own has, then the bundle and --expect <swapId>=refunded (refunded-b when leg A was never locked).
+               The Seller's key file is not needed for a refund (nothing of the Seller's moves on the chain): a missing one is a warning.
                --wait  wait here for a refund time that has not come (otherwise it is reported, exit 5, and the run can be repeated).
 
 Options:
