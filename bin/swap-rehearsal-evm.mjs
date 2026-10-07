@@ -38,6 +38,9 @@ Options:
                    (the local venue and paper notes). Secret-grade (it holds the Seller's swap secret). Default .state/rehearsal-evm.
   -h, --help       Show this message and exit 0.
 
+A key pasted where a path belongs is refused (exit 2) and never echoed: the config path, --state-dir, and the config's key files, out,
+asset names and endpoint host are all held to the same rule (a run of 32 or more hex digits, or a phrase of 11 or more words).
+
 The config is one JSON file (see README, "Deploying EvmHashRail to Base Sepolia"): rails.evm (an EvmRailConfig with contractCodeHash
 and maxLogRange), buyerKeyFile, sellerKeyFile, deadlines, amount, out, and a few optional fields. Relative paths are relative to
 the config file.

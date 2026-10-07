@@ -1607,6 +1607,7 @@ describe("bin/swap-rehearsal-evm.mjs (needs a build: npm test builds first)", ()
     expect(help.code).toBe(0);
     expect(help.stdout).toContain("Usage: node bin/swap-rehearsal-evm.mjs <config.json>");
     expect(help.stdout).toContain("DRY RUN");
+    expect(help.stdout).toContain("A key pasted where a path belongs is refused (exit 2) and never echoed: the config path, --state-dir"); // KR2-1
     for (const args of [
       [],
       ["a.json", "b.json"],
