@@ -5,7 +5,7 @@ repo's `vendor/tclk` git submodule object store as local refs. Every hash below 
 the exact git blob bytes (`git -C vendor/tclk show <rev>:<path> | sha256sum`) — never a working
 copy, which can be rewritten by a checkout's autocrlf settings.
 
-## tclk#21 — `EvmHashRail.sol` and its Foundry test (vendored byte-identical)
+## tclk#21 — `EvmHashRail.sol` and its Foundry test (vendored byte-identical, except `foundry.toml`: see below the table)
 
 Source: fork `pplmaverick/tclk`, PR #21, head commit `d6477ac0aba7827a23bc77c72980dfc154c24e76`.
 **PR #21 was closed unmerged on 2026-09-06** — sv's review comment was that tclk/1 should not
@@ -19,8 +19,17 @@ useful and will never land in tclk/1 proper.
 | `contracts/IERC20.sol` | `contracts/IERC20.sol` | `4ffc7e1988143c914e16d0c3e1e0ddd80066bfb3` | `3b556fe033f26e20caae76a917bd8294ccea9f7d5ff1abc8e96cef5e80abd374` |
 | `contracts/mocks/MockERC20.sol` | `contracts/mocks/MockERC20.sol` | `efea86f5afa1378654508ca6fc4da2c6a8a054d1` | `0a8740a17930206f7459003e1fd9a4ade11e31fc71592063aa7029362fc671a7` |
 | `test/EvmHashRail.t.sol` | `test/EvmHashRail.t.sol` | `33f7396524b4f787190f2176c18c9121a9e60b8d` | `ee7a52cd285f05140c0ac7ad185378552667f2c0717db5e24cdbcc0a6af18a29` |
-| `foundry.toml` | `foundry.toml` | `8dedbc4aab0d608cfd79f69a9a9a91d3d2a302da` | `cb358a2815a47a19a2fe7203e90c01beb351ab122b67f08122d5a3b57f93ce22` |
+| `foundry.toml` (MODIFIED by F6, see below) | `foundry.toml` | origin `8dedbc4aab0d608cfd79f69a9a9a91d3d2a302da`; now `5834eb07f9600b6d6982df72a900f6bd7eb009a0` | origin `cb358a2815a47a19a2fe7203e90c01beb351ab122b67f08122d5a3b57f93ce22`; now `dd0e2d2cffce1ef6e2f7fdfe809e7800eb47d69581c604fb66867123b62aa0a8` |
 | `foundry.lock` | `foundry.lock` | `31b0fe2e253592e6f72dca5a7f07b070da9d02ce` | `6b182f57b5c5615131465941411dac80a778d554bd4a796bd28749b9b752d6f0` |
+
+**`foundry.toml` is the one row that is no longer byte-identical to its source (F6, P9 review round 1, commit `f4f0232`; R2-DOC-PROV22).**
+F6 added three settings under `[profile.default]`, `evm_version = "cancun"`, `bytecode_hash = "ipfs"` and `cbor_metadata = true`, so that
+the built bytes no longer depend on a forge version's defaults (see "The toolchain, written down" under the runtime code hash). The
+`origin` hashes in the row are the upstream file's at tclk#21 `d6477ac`. The `now` hashes are those of this repository's current file,
+taken over the git blob (`git show HEAD:foundry.toml | sha256sum`; the id is `git rev-parse HEAD:foundry.toml`), never the working
+copy: a checkout's autocrlf can rewrite a working copy, and this repository's `.gitattributes` keeps text LF in the blob. A reader who
+hashes `foundry.toml` from a checkout and finds `dd0e2d2c...` instead of `cb358a28...` is looking at F6, not at a tampered file. The
+other five rows are byte-identical to their source.
 
 `foundry.lock` pins `lib/forge-std` to `bf647bd6046f2f7da30d0c2bf435e5c76a780c1b` (tag
 `v1.16.2`); it is vendored here as a git submodule at that exact commit, not a blob copy.
@@ -480,6 +489,40 @@ control: the same copy with `evm_version = "shanghai"` gives a different runtime
 pins the bytes. No test pins this (a test cannot run another forge); the check is the clean build and the hash above, which the gate
 repeats.
 
+**How the hash is taken, and the gate's recipe (P2R2-PIN-02, P9 review round 2).** The runtime hash is the keccak256 of
+`deployedBytecode.object` read as hex. That object is a string that ALREADY starts with `0x`, so it is hashed as it is: never
+`"0x" + object` (viem's `keccak256` does not read `0x0x6080...` as hex and hashes the UTF-8 text instead, which gives
+`0xf3b41084...3ad7fd`, and counting `object.length / 2` then counts the prefix as a byte: 3,417), and never `json.deployedBytecode`,
+which is the wrapper object (the string is its `.object`). The byte count is `(length - 2) / 2`. The gate's earlier failed rebuild step
+was exactly that bug in its own hashing script; the build it hashed was correct and gives the recorded value. **Compare the HASH, not
+only the length:** a copy of the sources without `lib/forge-std` (no remapping: `remappings []` in the metadata) builds the same 3,416
+bytes with another hash, `0x92eb8b1d...734b`, because the metadata hash covers the settings. The recipe, in Git Bash, from a fresh
+scratch directory (never `/tmp`: Windows `node` reads `/tmp` as `C:/tmp`), writing nothing to the worktree:
+
+```bash
+export PATH=/c/Users/<user>/.foundry/bin:$PATH
+W=<the worktree>; S=<a fresh scratch directory>/forge
+rm -rf "$S" && mkdir -p "$S"
+cp -r "$W/contracts" "$S/contracts"; cp "$W/foundry.toml" "$S/foundry.toml"
+cp -r "$W/lib" "$S/lib"        # required: without lib/forge-std the remapping is [] and the hash changes at the same length
+cd "$S" && forge --version && forge build --offline        # forge 1.8.3 (cae51ad), solc 0.8.24
+NODE_PATH="$W/node_modules" node <scratch>/hash.cjs "$S/out/EvmHashRail.sol/EvmHashRail.json"
+```
+
+with `hash.cjs` a script FILE (not `node -e`: shell quoting mangles it):
+
+```js
+const fs = require('fs'); const { keccak256 } = require('viem');
+const j = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+for (const k of ['deployedBytecode', 'bytecode']) { const o = j[k].object; if (!/^0x[0-9a-fA-F]+$/.test(o)) throw new Error(k + ': object is not 0x-hex'); console.log(k, keccak256(o), (o.length - 2) / 2); }
+```
+
+It must print exactly `deployedBytecode 0x6ab36fa334036370445c22ca9f7999872ae56777d3c969438fb4b2414152da27 3416` and `bytecode
+0xb068f157be227cd9fef6611b4e9549aab69f8d8c334cc6375e40914edc754c7f 3445`. (`cast keccak <the deployedBytecode.object string>` is
+equivalent: `cast` reads a `0x`-prefixed argument as bytes.) The controls, all reproduced when this recipe was written: the same copy
+without `lib/` gives `0x92eb8b1d...734b` over 3,416 bytes; hashing `"0x" + object` gives `0xf3b41084...3ad7fd` and a count of 3,417. The
+`foundry.toml` of `56103b5` (before F6) builds the same bytes as the current one (rebuilt and hashed with this recipe).
+
 ## First-party code-pin and log-scan files (P9-2, P9-3) - unaudited, testnet-only
 
 Not vendored: original to this repo. No key material in any of them.
@@ -638,7 +681,7 @@ Every code fix has a test that was watched to fail with the fix disabled.
 | R1-FUND-02 | the guarded local account and the in-process answer to `eth_fillTransaction` (`src/rails/evm-signer.ts`) | `tests/evm-signer.test.ts`, `tests/evm-local-signer.test.ts`, `tests-anvil/local-signer.anvil.test.ts` |
 | F1 with R1-FUND-03 | oldest range first from the marker; `maxLogRange` of at least 257; `claimPaidOut`; `evmLogScanCoverage` and the `log scan reach` row | `tests/evm-log-scan.test.ts`, `tests/flow-resume-sell.test.ts`, `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts`, `tests-anvil/log-scan.anvil.test.ts` |
 | F7 | the write-evidence lookup floors its tip at the receipt's block and re-plans up to 3 times | `tests/evm-log-scan.test.ts` |
-| R1-FUND-07 | a lock with no block number on record is waited for until the finalized block passes the head (`waitLockFinal`) | `tests/rehearsal-run.test.ts`, `tests-anvil/rehearsal-runner.anvil.test.ts` |
+| R1-FUND-07 | a lock with no block number on record is waited for until the finalized block passes the head (`waitLockFinal`); amended by R2-FUND-03 (read before waited for, the target kept across resumes: see the round-2 table) | `tests/rehearsal-run.test.ts`, `tests-anvil/rehearsal-runner.anvil.test.ts` |
 | R1-FUND-08 | the lock's deadline guard runs again after the approve's receipt | `tests/evm-lock-guard.test.ts` |
 | F3 with R1-FUND-06 | interim: a new swap on 84532 under the anvil policy fails the `deadlines` row (P9-4 replaces it) | `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts` |
 | F9 | an answer of `0x` to the state read at the finalized hash says "not final yet" | `tests/rehearsal-preflight.test.ts` |
@@ -654,3 +697,47 @@ What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-
 byte-identical to `56103b5`; no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no new fixture; the
 runtime code hash is the one in the table above. The hermetic count after the pass: 116 files, 3629 passed, 7 skipped (before it, at
 the end of P9-7: 114 files, 3517 passed, 7 skipped).
+
+## P9 review round 2 fix pass (handoff/P9-FIXES-R2.md) - the item list
+
+Not vendored: original to this repo. The second review round of P9 (head `9dcac37`; three lenses and a synthesis) closed all fourteen
+round-1 items, found no leak of a key that the code loads from its file, and found no route by which an honest party loses value in
+G1 (leg B is paper, both keys are Dave's). It found the operator-mistake key-echo class of K1 and K2 still open for five more places
+a key can be pasted into (KR2-1), three medium items that become value routes once leg B carries value (R2-FUND-01, R2-FUND-02,
+R2-FUND-03), one more in the pre-flight sizing (R2-FUND-04) and lows. The pass changed the files named below; this table names each
+item once, with its test, so that none is missing. Every code fix has a test that was watched to fail with the fix disabled.
+
+| item | fix | pinned by |
+|---|---|---|
+| KR2-1 | one helper, `looksLikeKeyMaterial` in `src/client/rehearsal-config.ts` (32 or more hex digits in a run, or 11 or more words of letters), judges `out`, every `rails.evm.assets` name and the `asset` field (also held to `ASSET_NAME_SHAPE`, exported from `src/rails/evm-htlc.ts`, whose own refusals now quote an asset name only when it is a short plain name), the endpoint's host, and, at the top of `runRehearsal` before anything is read, written or printed, the config path and `--state-dir` (the command line passes `--state-dir` as typed; the usage text names the guarded values); each refusal names the field or the argument and never the value | `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts`, `tests/evm-htlc.test.ts` |
+| R2-FUND-01 | Buyer: `refundLegA`, for a lock attempt with no evidence, reads the chain before it sends anything (`ConnectedCounterAssetRail.lockAbsence`, implemented by evm-htlc only; `EvmHtlcRail.finalizedBlock` and `readLockAbsence`): a row is recorded as landed and refunded as before, no row and a finalized block at or past leg A's `refundAfterMs` is the verdict "never locked" (recorded as the optional, strictly decoded record field `lock.neverLanded`; `next` says `done` and `lockLegA` refuses), no row and no such block yet is the typed `RefundNotFinalYetError` (nothing sent or recorded). Runner: `refundLegAWaiting` waits for the finalized block, `buyerLockNeverLanded`, and a `--resume` of a run holding the verdict continues as `--refund` | `tests/refund-never-landed.test.ts` (new), `tests/evm-lock-absence.test.ts` (new), `tests/flow-record.test.ts`, `tests/rehearsal-run.test.ts`, `tests-anvil/rehearsal-runner.anvil.test.ts` |
+| R2-FUND-02 | the fee ceiling is judged before `eth_estimateGas`: a `fees.estimateFeesPerGas` hook on the local wallet client's chain (`guardEstimateFeesPerGas` in `src/rails/evm-signer.ts`, wired in `EvmHtlcRail.connect`) computes viem's own caps and throws the typed `fee` refusal above the ceiling, so a claim refused for its fee sends nothing that carries the preimage; the sign-time guard stays as the second line; the gas ceiling still follows the estimate (README says so); the call list after the last deadline guard is unchanged | `tests/evm-signer.test.ts`, `tests/evm-local-signer.test.ts` (a comment only; the order it pins is unchanged) |
+| R2-FUND-03 | `waitLockFinal(world, blockNumber, { hashLock, swapId, stateDir })`: a recovered lock (no block number on record) is read at the finalized block first and returns at once on any status but none; otherwise it waits for the head read at the first wait, kept in `<state dir>/lockfinal.json`, and reads the row at every poll | `tests/rehearsal-run.test.ts` |
+| R2-FUND-04 | `PreflightInput.sellerSends` (`claim` or `nothing`; the runner reads it in `--resume` from the Seller's record, `sellerSendsOnRecord`, or from `locks(hashLock)` reading Claimed) and `buyerEthShort` (`fail` or `warn`; `--refund` passes `warn`) | `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts`, `tests-anvil/rehearsal-runner.anvil.test.ts` |
+| R2-FUND-05 | the `log scan reach` row measures leg A's window from the run's start (`input.nowMs`) to its refund time, not from the lock estimate ten minutes later | `tests/rehearsal-preflight.test.ts`, `tests/evm-log-scan.test.ts` |
+| R2-NOTE-a | `EvmContractCodeError.expected` holds the 10-character short form (`shortPinnedHash`, now exported from `src/rails/evm-code-pin.ts`), so `util.inspect` and `JSON.stringify` of the error carry no pasted key | `tests/evm-code-pin.test.ts` |
+| P2R2-PIN-06 | `run.json` gained the optional `maxLogRange` (the effective cap at the fresh start, strictly parsed); `--resume` refuses a smaller effective cap by field name | `tests/rehearsal-run.test.ts` |
+| R2-FUND-06, P2R2-PIN-04, P2R2-PIN-05 | README only: the known limit for a refund the signer refuses, the resumed Seller's call count (a prompt claim lies in the first range at 500 and in the second at the 257 floor), and the leg-linking rule that the known-good deadline set breaks as soon as the finality budget exceeds 30 minutes | none |
+| P2R2-PIN-02, R2-DOC-PROV22 | this file only: how the runtime hash is taken and the gate's recipe with its two controls (see "How the hash is taken, and the gate's recipe"), and the `foundry.toml` row of the vendor table marked modified by F6 | none (the recipe is the check; it was run when it was written) |
+
+New files: `tests/refund-never-landed.test.ts` and `tests/evm-lock-absence.test.ts`. Helper: `tests/helpers/evm-mock-node.ts` gained two
+default-off knobs, `finalizedLagMs` (the finalized block's timestamp lags the chain's time by that many milliseconds) and a `requests`
+log (every method the node was asked, in order). Live test: `tests-anvil/rehearsal-runner.anvil.test.ts` gained two runner cases, a lock
+attempt that never landed (the signer refuses the lock after the approve; `--refund` waits for the finalized block, refunds leg B and
+replays to `refunded-b`, and `--resume` continues the same way) and a `--refund` Buyer below the pre-flight's ceiling-sized reservation
+(a warning, and the refund goes ahead). Extended first-party files: `src/client/buyer.ts` (`RefundNotFinalYetError`, the verdict),
+`src/client/counter-rail.ts` (`LockAbsence`, the optional `lockAbsence`), `src/client/evm-rail.ts` (`lockAbsence`),
+`src/client/flow-record.ts` (`lock.neverLanded`), `src/rails/evm-htlc.ts`, `src/rails/evm-signer.ts`, `src/rails/evm-code-pin.ts`,
+`src/client/rehearsal-config.ts`, `src/client/rehearsal-preflight.ts`, `src/client/rehearsal-run.ts` and `bin/swap-rehearsal-evm.mjs`.
+No key material in any of them: every key in the new tests is generated at test time and scanned for, never printed.
+
+Routed on, not done here (P9-4): P2R2-PIN-07 (a pause of about one block time between the write lookup's re-plans), P2R2-PIN-08 (a
+pre-flight row comparing viem's fee with the ceiling) and the runner field `maxFeePerGasWei` with a floor on 84532 (also R2-FUND-06's
+code), the option of a `waitLimitMs` floor at the finality budget on 84532, and the Base Sepolia fee ceiling value, to be chosen with
+R2-FUND-02's pre-estimate fee check in place.
+
+What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/` and `package.json` are
+byte-identical to `9dcac37`; no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no new fixture; the
+runtime code hash is the one in the table above. `tests-anvil/` stays outside `npm run typecheck` with its two older diagnostics
+(`tests-anvil/client-flows.anvil.test.ts`, unchanged by this pass). The hermetic count after the pass: 118 files, 3714 passed, 7
+skipped (before it, at `9dcac37`: 116 files, 3629 passed, 7 skipped).
