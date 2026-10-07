@@ -19,10 +19,11 @@ import { fileURLToPath } from "node:url";
 import { generateHashLock } from "@flop-labs/tclk";
 import { encodeFunctionResult } from "viem";
 import { english, generateMnemonic, generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, EXIT, FLOW_MESSAGE, LATE_REVEAL_SENTENCE, loadRunnerAccount, parseRunRecord, refundTimeReached, refundLegAWaiting, revealCameAfterWindow, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
-import { RefundNotFinalYetError } from "../src/client/buyer.js";
+import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, EXIT, FLOW_MESSAGE, LATE_REVEAL_SENTENCE, loadRunnerAccount, parseRunRecord, pendingWriteRefusal, refundTimeReached, refundLegAWaiting, revealCameAfterWindow, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { LockPendingError, RefundNotFinalYetError } from "../src/client/buyer.js";
+import { ClaimPendingError } from "../src/client/seller.js";
 import { encodeFlowRecord, newBuyerRecord, newSellerRecord } from "../src/client/flow-record.js";
 import { FileFlowStore, flowKey } from "../src/client/flow-store.js";
 import { parseRehearsalConfig, type RehearsalConfig } from "../src/client/rehearsal-config.js";
@@ -32,6 +33,19 @@ import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { decimalKeyScanner, keyScanner, phraseScanner, strippedKeyScanner } from "./helpers/evm-local.js";
 import { fakeChain, FAKE_ESCROW_CODE_HASH, serveFakeChain, type FakeChain, type FakeChainOptions } from "./helpers/fake-chain.js";
+
+// P9-4 decision 10: a pass-through spy on the counter rail's factory, so a test can read the options the runner builds each party's rail with.
+const railOptions = vi.hoisted(() => ({ seen: [] as Array<Record<string, unknown>> }));
+vi.mock("../src/client/evm-rail.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../src/client/evm-rail.js")>();
+  return {
+    ...original,
+    createEvmCounterRail: (options: Parameters<typeof original.createEvmCounterRail>[0]) => {
+      railOptions.seen.push({ ...options });
+      return original.createEvmCounterRail(options);
+    },
+  };
+});
 
 const REPO_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const BIN = join(REPO_ROOT, "bin", "swap-rehearsal-evm.mjs");
@@ -1618,6 +1632,76 @@ describe("R2-FUND-03: a recovered lock is read before it is waited for, and the 
   });
 });
 
+// P9-4 decision 10 (runner part): the write lookup of the EVM rail pauses about one block between its re-plans (builder 1's rail part: the policy's block time, 2 s, on Base
+// Sepolia whatever pollMs says, and the poll interval elsewhere), so the runner hands the config's pollMs to each party's rail. The rail's pause itself is
+// tests/evm-lookup-pause.test.ts; here the runner's wiring is read from the options it builds the two parties' rails with.
+describe("P9-4 d10: the runner builds each party's rail with the config's pollMs", () => {
+  it("--refund (which builds both parties' rails before it reads the Buyer's store) hands pollMs 777 to the Buyer's and the Seller's rail, and none to the policy-only placeholder", async () => {
+    const rig = await makeRig({ configExtra: { pollMs: 777 } });
+    await writeRun(rig, {}, true);
+    railOptions.seen.length = 0;
+    const result = await run(rig, "refund");
+    expect(result.stderr).toContain("holds no record"); // past the pre-flight and the rails' construction, at the Buyer's empty store
+    const withAccount = railOptions.seen.filter((options) => typeof options.account === "object");
+    expect(withAccount).toHaveLength(2); // the Buyer's and the Seller's: each a local account
+    for (const options of withAccount) expect(options.pollMs).toBe(777);
+    const placeholder = railOptions.seen.filter((options) => typeof options.account === "string");
+    expect(placeholder.length).toBeGreaterThanOrEqual(1);
+    for (const options of placeholder) expect(options.pollMs).toBeUndefined(); // only its policy is read: nothing connects through it
+  });
+
+  it("the default poll interval (5 s) is handed on when the config names none", async () => {
+    const rig = await makeRig();
+    await writeRun(rig, {}, true);
+    railOptions.seen.length = 0;
+    await run(rig, "refund");
+    const withAccount = railOptions.seen.filter((options) => typeof options.account === "object");
+    expect(withAccount.map((options) => options.pollMs)).toEqual([5_000, 5_000]);
+  });
+});
+
+// P9-4 decision 7 (the rail part is builder 1's): a lock or claim write whose receipt wait timed out is asked about by its hash before it is sent again, and the flows end
+// with LockPendingError or ClaimPendingError while the node still holds it. The runner refuses (exit 4) with a sentence in its own terms, and never loops or sends on them.
+describe("P9-4 d7 (runner part): LockPendingError and ClaimPendingError end the run with a sentence that names --resume", () => {
+  const HASH = `0x${"ab".repeat(32)}`;
+
+  it("each typed error becomes a fixed sentence that says nothing new was signed or sent and names --resume; any other error is not one", () => {
+    const lock = pendingWriteRefusal(new LockPendingError(HASH));
+    expect(lock).toContain("a lock this run sent earlier is not decided yet");
+    expect(lock).toContain("nothing new was signed or sent; run --resume again in a few minutes");
+    for (const status of ["pending", "success"] as const) {
+      const claim = pendingWriteRefusal(new ClaimPendingError(HASH, status));
+      expect(claim, status).toContain("a claim this run sent earlier is not decided yet");
+      expect(claim, status).toContain("nothing new was signed or sent; run --resume again in a few minutes");
+      expect(claim, status).toContain("if leg A's refund time comes first, --resume and --refund say what to do");
+    }
+    for (const text of [lock, pendingWriteRefusal(new ClaimPendingError(HASH, "pending"))]) {
+      expect(text).not.toContain(HASH); // fixed text: no hash, no value
+      expect(text).not.toContain("lockLegA()"); // the flows' own API-level wording
+      expect(text).not.toContain("claimLegA()");
+      expect(/^[\x20-\x7e]+$/.test(text ?? "")).toBe(true);
+    }
+    expect(pendingWriteRefusal(new Error("buyer: the lock for x is not decided on chain yet"))).toBeUndefined();
+    expect(pendingWriteRefusal(new RefundNotFinalYetError(HASH, 1_790_005_400_000))).toBeUndefined();
+    expect(pendingWriteRefusal("LockPendingError")).toBeUndefined();
+    expect(pendingWriteRefusal(undefined)).toBeUndefined();
+  });
+
+  it("runRehearsal's catch uses it before the generic refusal and ends with the refusal exit code (code order); the runner has no loop on these errors", async () => {
+    const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
+    const at = (needle: string): number => text.indexOf(needle);
+    const order = ["const pending = pendingWriteRefusal(error);", "errLine(`rehearsal: ${pending}`);", "errLine(`rehearsal: refused: ${error instanceof Error"].map(at);
+    expect(order.every((position) => position > 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    const block = text.slice(at("const pending = pendingWriteRefusal(error);"), at("errLine(`rehearsal: refused: ${error instanceof Error"));
+    expect(block).toContain("return EXIT.refused;");
+    // The only places the runner names the two classes are the helper's two tests: nothing catches them to try again.
+    expect(text.match(/instanceof LockPendingError/g)?.length).toBe(1);
+    expect(text.match(/instanceof ClaimPendingError/g)?.length).toBe(1);
+    expect(text.match(/catch \(\w+\) \{\s*if \(\w+ instanceof (Lock|Claim)PendingError/g)).toBeNull();
+  });
+});
+
 // P9-4 decision 13: after a late claim (R3-FUND-01: it landed within a finality lag of leg A's refund time, so --refund waited for it and named --resume) the following
 // --resume finishes the swap on chain, but the Seller's reveal frame can only be posted after leg A's refund time, which tclk's machine rejects ("refund window is open"):
 // the replay grades the bundle `revealed`, not `settled`. The runner now expects `revealed` for that path, decided from the reveal frame's own stamp, and exits 0 with one
@@ -2034,6 +2118,8 @@ describe("bin/swap-rehearsal-evm.mjs (needs a build: npm test builds first)", ()
     expect(help.stdout).toContain("Usage: node bin/swap-rehearsal-evm.mjs <config.json>");
     expect(help.stdout).toContain("DRY RUN");
     expect(help.stdout).toContain("is settled on the chain but replays to revealed: the"); // P9-4 decision 13
+    expect(help.stdout).toContain("maxFeePerGasWei, the fee ceiling of a local account: 50 gwei on Base Sepolia when omitted"); // P9-4 decision 5
+    expect(help.stdout).toContain('deadlines ("known-good" is the set of the pinned chain)'); // P9-4 decision 2
     expect(help.stdout).toContain("A key pasted where a path belongs is refused (exit 2) and never echoed: the config path, --state-dir"); // KR2-1
     for (const args of [
       [],

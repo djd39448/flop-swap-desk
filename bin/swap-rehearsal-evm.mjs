@@ -44,8 +44,9 @@ A key pasted where a path belongs is refused (exit 2) and never echoed: the conf
 asset names and endpoint host are all held to the same rule (a run of 32 or more hex digits, or a phrase of 11 or more words).
 
 The config is one JSON file (see README, "Deploying EvmHashRail to Base Sepolia"): rails.evm (an EvmRailConfig with contractCodeHash
-and maxLogRange), buyerKeyFile, sellerKeyFile, deadlines, amount, out, and a few optional fields. Relative paths are relative to
-the config file.
+and maxLogRange, and optionally maxFeePerGasWei, the fee ceiling of a local account: 50 gwei on Base Sepolia when omitted), buyerKeyFile,
+sellerKeyFile, deadlines ("known-good" is the set of the pinned chain), amount, out, and a few optional fields. Relative paths are
+relative to the config file.
 
 Exit codes: 0 done (or a clean dry run); 2 bad arguments, config or state; 3 pre-flight failed (nothing was sent); 4 a step refused
 (its reason is printed); 5 not yet (a refund time has not come); 6 the bundle was written but audit-export did not accept it.

@@ -59,7 +59,7 @@ import { effectiveMaxLogRange, evmLogScanCoverage, MAX_LOG_SCAN_CHUNKS } from ".
 import { CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../vendor/evm-hash-rail.js";
 import { writeBundle, type BundleEvidenceSummary } from "./bundle.js";
-import { BuyerFlow, RefundNotFinalYetError, type BuyerNextStep } from "./buyer.js";
+import { BuyerFlow, LockPendingError, RefundNotFinalYetError, type BuyerNextStep } from "./buyer.js";
 import type { CounterAssetRail, RailWriteEvidence } from "./counter-rail.js";
 import { describeKeyFileProblem, EvmKeyFileError, loadEvmLocalAccount } from "./evm-key-file.js";
 import { createEvmCounterRail } from "./evm-rail.js";
@@ -77,7 +77,7 @@ import {
 import { describeFailure, renderPreflight, runPreflight, type BuyerSends, type PreflightReport, type PreflightRow, type SellerSends } from "./rehearsal-preflight.js";
 import { acquireRunLock, DurableNoteStore, DurableVenue, loadOrCreateIdentity, RehearsalWorldError, RunLockedError, writeFileDurable, type RehearsalIdentity } from "./rehearsal-world.js";
 import { evmLocalPolicyFor } from "./policy.js";
-import { CLAIM_MARKER_REORG_MARGIN_EVM, SellerFlow, type SellerNextStep } from "./seller.js";
+import { ClaimPendingError, CLAIM_MARKER_REORG_MARGIN_EVM, SellerFlow, type SellerNextStep } from "./seller.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -312,6 +312,23 @@ export const LATE_REVEAL_SENTENCE =
  */
 export function revealCameAfterWindow(reveal: { readonly timestampMs: number } | undefined, refundAfterMs: number): boolean {
   return reveal !== undefined && reveal.timestampMs >= refundAfterMs;
+}
+
+/**
+ * P9-4 decision 7 (the rail part: a lock or claim write whose receipt wait timed out is asked about by its hash before it is sent again): the two typed refusals that
+ * come of it, `LockPendingError` (the Buyer's lock) and `ClaimPendingError` (the Seller's claim), mean the node still holds that transaction or the endpoint's reads do not
+ * show it yet, and that nothing new was signed or sent. The runner does not loop on them (a refusal is preferred to any new outward action): it ends with a fixed sentence
+ * that says what to do, in the runner's own terms (the flows' own text says "call lockLegA() again later", which a person cannot do). The text carries no hash and no value.
+ * `undefined` for any other error. Exported for its own tests.
+ */
+export function pendingWriteRefusal(error: unknown): string | undefined {
+  if (error instanceof LockPendingError) {
+    return "a lock this run sent earlier is not decided yet (the node still holds its transaction, or the endpoint's reads do not show it yet): nothing new was signed or sent; run --resume again in a few minutes";
+  }
+  if (error instanceof ClaimPendingError) {
+    return "a claim this run sent earlier is not decided yet (the node still holds its transaction, or the endpoint's reads do not show it yet): nothing new was signed or sent; run --resume again in a few minutes (if leg A's refund time comes first, --resume and --refund say what to do)";
+  }
+  return undefined;
 }
 
 // --- small helpers --------------------------------------------------------------------------------------------------------------
@@ -1309,7 +1326,8 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
       role: "buyer" | "seller",
       account: LocalAccount | Address,
     ): Promise<{ rail: CounterAssetRail; store: FileFlowStore; identity: Promise<RehearsalIdentity> }> => ({
-      rail: createEvmCounterRail({ config: evm, rpc: new CapturingRpc({ endpoint: evm.endpoint, clock }), account, clock }),
+      // P9-4 decision 10: the write lookup pauses about one block between its re-plans: the policy's block time on Base Sepolia, this poll interval elsewhere (anvil).
+      rail: createEvmCounterRail({ config: evm, rpc: new CapturingRpc({ endpoint: evm.endpoint, clock }), account, clock, pollMs: config.pollMs }),
       store: new FileFlowStore(join(stateDir, role, "flows")),
       identity: loadOrCreateIdentity(join(stateDir, role, "ed25519.seed")),
     });
@@ -1463,6 +1481,11 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
     }
     if (error instanceof RunnerRefusal) {
       errLine(`rehearsal: ${error.message}`);
+      return EXIT.refused;
+    }
+    const pending = pendingWriteRefusal(error);
+    if (pending !== undefined) {
+      errLine(`rehearsal: ${pending}`);
       return EXIT.refused;
     }
     errLine(`rehearsal: refused: ${error instanceof Error ? error.name : "Error"}: ${describeFailure(error, redact)}`);
