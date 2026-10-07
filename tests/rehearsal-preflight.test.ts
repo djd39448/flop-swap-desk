@@ -204,17 +204,19 @@ describe("finality", () => {
     expect(run.report.ok).toBe(false);
   });
 
-  it("warns (and goes on) when the tag is missing but the config names a fallback in confirmations", async () => {
-    const withFallback = config({ pin: { ...BASE_SEPOLIA_PIN, finality: { mode: "tag", tag: "finalized", fallbackConfirmations: 200 } } });
-    const run = await preflight({ noFinalizedTag: true }, withFallback);
+  // P9-4 decision 3: a fallback and confirmations mode are refused for chain 84532 by the config check, so these two rows are exercised on anvil (31337), where
+  // both are still allowed.
+  it("warns (and goes on) when the tag is missing but the config names a fallback in confirmations (anvil: Base Sepolia refuses a fallback)", async () => {
+    const withFallback = config({ pin: { ...ANVIL_LOCAL_PIN, finality: { mode: "tag", tag: "finalized", fallbackConfirmations: 200 } }, contractCodeHash: undefined });
+    const run = await preflight({ noFinalizedTag: true, chainId: 31337 }, withFallback);
     expect(status(run, "finalized")).toBe("warn");
     expect(row(run, "finalized").detail).toContain("falls back to 200 confirmations");
     expect(run.report.ok).toBe(true);
   });
 
-  it("reads a confirmations pin by block number", async () => {
-    const confirmations = config({ pin: { ...BASE_SEPOLIA_PIN, finality: { mode: "confirmations", confirmations: 12 } } });
-    const run = await preflight({}, confirmations);
+  it("reads a confirmations pin by block number (anvil: Base Sepolia refuses confirmations mode)", async () => {
+    const confirmations = config({ pin: { ...ANVIL_LOCAL_PIN, finality: { mode: "confirmations", confirmations: 12 } }, contractCodeHash: undefined });
+    const run = await preflight({ chainId: 31337 }, confirmations);
     expect(status(run, "finalized")).toBe("ok");
     expect(row(run, "finalized").detail).toContain("12 confirmations");
     expect(run.report.ok).toBe(true);

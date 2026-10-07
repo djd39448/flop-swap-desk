@@ -83,7 +83,10 @@ export interface EvmRailConfig {
    * `EvmReceiptTimeoutError`. Omitted: viem's own default, `VIEM_RECEIPT_TIMEOUT_MS` (180 s). A slower public chain
    * raises it; it never makes a write safer or less safe (the transaction is already broadcast when the wait starts),
    * it only decides how long this process waits before reporting "no receipt yet". A positive integer, at most
-   * `MAX_RECEIPT_TIMEOUT_MS`.
+   * `MAX_RECEIPT_TIMEOUT_MS`. P9-4 decision 8: when `pin.chainId` is 84532 it must lie between
+   * `BASE_SEPOLIA_MIN_RECEIPT_TIMEOUT_MS` (10,000) and `BASE_SEPOLIA_MAX_RECEIPT_TIMEOUT_MS` (3,600,000), a floor under which a normal
+   * 2-second-block inclusion would be reported as "no receipt" and a cap past which a stuck write holds a run for more than an hour;
+   * anvil is unconstrained (the short timeout tests keep their values).
    */
   receiptTimeoutMs?: number;
   /**
@@ -109,11 +112,26 @@ export interface EvmRailConfig {
    * R1-FUND-02 (P9 fix pass): the highest fee, in wei per gas, a LOCAL account may sign for (`maxFeePerGas`, `maxPriorityFeePerGas` and
    * `gasPrice` of every transaction are each held to it; a transaction without a fee cap is refused too). A positive integer, given as
    * a number or as a string of decimal digits (a wei amount can outgrow a JSON number). Omitted: `EVM_DEFAULT_MAX_FEE_PER_GAS_WEI`
-   * (1,000 gwei), which anvil passes; the Base Sepolia value is set by P9-4. It binds only a local account (the node signs for a JSON-RPC
-   * one), together with the pinned chain id and `EVM_MAX_GAS_PER_WRITE` (see src/rails/evm-signer.ts).
+   * (1,000 gwei) on anvil, which it passes, and (P9-4 decision 5) `BASE_SEPOLIA_DEFAULT_MAX_FEE_PER_GAS_WEI` (50 gwei) when `pin.chainId`
+   * is 84532: Base Sepolia's base fee is under a gwei, so 50 gwei leaves two orders of magnitude for a spike while refusing an absurd fill.
+   * On 84532 a configured value below `BASE_SEPOLIA_MIN_MAX_FEE_PER_GAS_WEI` (1 gwei) is refused: a ceiling under the chain's own fee would
+   * refuse every write. It binds only a local account (the node signs for a JSON-RPC one), together with the pinned chain id and
+   * `EVM_MAX_GAS_PER_WRITE` (see src/rails/evm-signer.ts).
    */
   maxFeePerGasWei?: number | string;
 }
+
+/** P9-4 decision 5: the default fee ceiling (wei per gas) for a local account on Base Sepolia: 50 gwei (anvil keeps `EVM_DEFAULT_MAX_FEE_PER_GAS_WEI`, 1,000 gwei). */
+export const BASE_SEPOLIA_DEFAULT_MAX_FEE_PER_GAS_WEI = 50_000_000_000n;
+
+/** P9-4 decision 5: the lowest `maxFeePerGasWei` a Base Sepolia config may carry: 1 gwei. */
+export const BASE_SEPOLIA_MIN_MAX_FEE_PER_GAS_WEI = 1_000_000_000n;
+
+/** P9-4 decision 8: the lowest `receiptTimeoutMs` a Base Sepolia config may carry: 10 seconds. */
+export const BASE_SEPOLIA_MIN_RECEIPT_TIMEOUT_MS = 10_000;
+
+/** P9-4 decision 8: the highest `receiptTimeoutMs` a Base Sepolia config may carry: one hour. */
+export const BASE_SEPOLIA_MAX_RECEIPT_TIMEOUT_MS = 3_600_000;
 
 /** P9-3: the public Base Sepolia endpoint refuses `eth_getLogs` over more than 500 blocks (measured 2026-10-05,
  *  `handoff/G1-PREP-2026-10-05.md` section 2); the default `maxLogRange` for chain 84532. */
@@ -244,6 +262,43 @@ export function validateEvmRailConfig(config: EvmRailConfig): void {
     }
   }
   validateFinality(config.pin.finality);
+  if (config.pin.chainId === BASE_SEPOLIA_CHAIN_ID) validateBaseSepoliaKnobs(config);
+}
+
+/**
+ * P9-4 decisions 3, 5 and 8: the knobs a Base Sepolia (84532) config may not set loosely. Anvil is untouched by every one of them.
+ *   3. finality is the `finalized` tag with no `fallbackConfirmations`: confirmations mode and any fallback are refused, so the Buyer's permanent
+ *      never-locked verdict (and every read a flow routes on) never rests on a block a fixed number of confirmations below the head, which
+ *      a reorg or a transient tag error could leave far ahead of the chain's real finalized block (R3-FUND-03).
+ *   5. `maxFeePerGasWei`, when configured, is at least 1 gwei.
+ *   8. `receiptTimeoutMs`, when configured, is between 10,000 and 3,600,000 ms.
+ * The messages name a field and a number that already passed the shape check, never any other text of the config.
+ */
+function validateBaseSepoliaKnobs(config: EvmRailConfig): void {
+  const finality = config.pin.finality;
+  if (finality.mode === "confirmations") {
+    throw new Error(
+      `evm-htlc: base-sepolia (${BASE_SEPOLIA_CHAIN_ID}) must pin finality to the finalized tag: confirmations mode is refused there (every final read, and the Buyer's permanent never-locked verdict, must rest on the chain's own finalized block, never on a block a fixed number of confirmations below the head)`,
+    );
+  }
+  if (finality.fallbackConfirmations !== undefined) {
+    throw new Error(
+      `evm-htlc: base-sepolia (${BASE_SEPOLIA_CHAIN_ID}) must pin finality to the finalized tag with no fallbackConfirmations: a block a fixed number of confirmations below the head is not a final one`,
+    );
+  }
+  if (config.receiptTimeoutMs !== undefined && (config.receiptTimeoutMs < BASE_SEPOLIA_MIN_RECEIPT_TIMEOUT_MS || config.receiptTimeoutMs > BASE_SEPOLIA_MAX_RECEIPT_TIMEOUT_MS)) {
+    throw new Error(
+      `evm-htlc: receiptTimeoutMs ${config.receiptTimeoutMs} is outside ${BASE_SEPOLIA_MIN_RECEIPT_TIMEOUT_MS} to ${BASE_SEPOLIA_MAX_RECEIPT_TIMEOUT_MS} ms, the range allowed on base-sepolia (${BASE_SEPOLIA_CHAIN_ID})`,
+    );
+  }
+  if (config.maxFeePerGasWei !== undefined) {
+    const ceiling = maxFeePerGasWeiOf(config.maxFeePerGasWei);
+    if (ceiling !== undefined && ceiling < BASE_SEPOLIA_MIN_MAX_FEE_PER_GAS_WEI) {
+      throw new Error(
+        `evm-htlc: maxFeePerGasWei ${ceiling} is below the ${BASE_SEPOLIA_MIN_MAX_FEE_PER_GAS_WEI} wei (1 gwei) floor on base-sepolia (${BASE_SEPOLIA_CHAIN_ID}): a ceiling under the chain's own fee would refuse every write`,
+      );
+    }
+  }
 }
 
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -367,9 +422,12 @@ function maxFeePerGasWeiOf(value: unknown): bigint | undefined {
   return undefined;
 }
 
-/** R1-FUND-02: the fee ceiling in force for `config`: the configured `maxFeePerGasWei`, else `EVM_DEFAULT_MAX_FEE_PER_GAS_WEI`. */
+/** R1-FUND-02: the fee ceiling in force for `config`: the configured `maxFeePerGasWei`, else the chain's default (P9-4 decision 5:
+ *  `BASE_SEPOLIA_DEFAULT_MAX_FEE_PER_GAS_WEI`, 50 gwei, on 84532; `EVM_DEFAULT_MAX_FEE_PER_GAS_WEI`, 1,000 gwei, elsewhere). */
 export function effectiveMaxFeePerGasWei(config: EvmRailConfig): bigint {
-  if (config.maxFeePerGasWei === undefined) return EVM_DEFAULT_MAX_FEE_PER_GAS_WEI;
+  if (config.maxFeePerGasWei === undefined) {
+    return config.pin.chainId === BASE_SEPOLIA_CHAIN_ID ? BASE_SEPOLIA_DEFAULT_MAX_FEE_PER_GAS_WEI : EVM_DEFAULT_MAX_FEE_PER_GAS_WEI;
+  }
   const configured = maxFeePerGasWeiOf(config.maxFeePerGasWei);
   // Never a silent fall back to the (higher) default for a value that is not valid: a config that reaches here passed `checkEvmRailConfig`.
   if (configured === undefined) throw new Error("evm-htlc: maxFeePerGasWei must be a positive integer");

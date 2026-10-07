@@ -35,7 +35,7 @@ import { RpcCaptureError } from "./rpc-capture.js";
 /** The most gas any one write of this rail may ask for. Above every measured write on anvil (approve 44k, lock 214k, claim 65k). */
 export const EVM_MAX_GAS_PER_WRITE = 500_000n;
 
-/** The default `EvmRailConfig.maxFeePerGasWei`: 1,000 gwei. Anvil's fees are a few gwei, so it passes there; the Base Sepolia value is P9-4's. */
+/** The default `EvmRailConfig.maxFeePerGasWei`: 1,000 gwei. Anvil's fees are a few gwei, so it passes there; Base Sepolia's default is lower (P9-4 decision 5: `BASE_SEPOLIA_DEFAULT_MAX_FEE_PER_GAS_WEI`, 50 gwei, in src/rails/evm-htlc.ts). */
 export const EVM_DEFAULT_MAX_FEE_PER_GAS_WEI = 1_000_000_000_000n;
 
 /** Which signing rule refused. */
