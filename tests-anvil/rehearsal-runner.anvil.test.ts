@@ -41,6 +41,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { decodeFlowRecord, encodeFlowRecord } from "../src/client/flow-record.js";
 import { FileFlowStore, flowDigest, flowKey } from "../src/client/flow-store.js";
+import { LATE_REVEAL_SENTENCE } from "../src/client/rehearsal-run.js";
 import { ANVIL_LOCAL_PIN } from "../src/rails/evm-htlc.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { keyScanner } from "../tests/helpers/evm-local.js";
@@ -918,7 +919,7 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       await writeFile(rig.configPath, `${JSON.stringify({ ...config, waitLimitMs }, null, 2)}\n`);
     }
 
-    it("--refund waits for the claim (logs it, sends nothing), ends with the refusal that names --resume; with waitLimitMs below the wait it says nothing was sent and names --refund; --resume says what to do, then finishes the swap (it replays to revealed: the reveal frame is late) (R3-FUND-01)", async () => {
+    it("--refund waits for the claim (logs it, sends nothing), ends with the refusal that names --resume; with waitLimitMs below the wait it says nothing was sent and names --refund; --resume says what to do, then finishes the swap (it replays to revealed, exits 0 with the late-reveal sentence: the reveal frame is late) (R3-FUND-01, P9-4 decision 13)", async () => {
       const rig = await makeRig(hand, { clock: "chain", confirmations: 8, waitLimitMs: 3_000 });
       const first = startRunner(rig, ["--yes"]);
       await first.waitForLine(/step buyer\.lockLegA done/);
@@ -977,9 +978,10 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(buyerRecord.role === "buyer" && buyerRecord.refund.claimSeen, "the flow routed the Buyer to learnSecret on a FINAL claim").toBe(true);
 
       // --resume now: the secret is read (the Seller's claim is found on the chain), leg B is claimed and nothing new is sent: the swap's value has moved as it should.
-      // The bundle replays to `revealed`, not `settled`, and the runner exits 6: the claim's outcome was not saved, so the Seller's reveal and receipt frames could only be
-      // posted now, stamped AFTER leg A's refund time, and tclk's machine refuses a reveal once the refund window is open ("legA step 4: refund window is open", the fold says
-      // "leg A claimed on chain but its reveal frame was not recorded"). That is the protocol's own rule for a claim whose frames were not posted in time, not the wait's.
+      // The Seller's reveal and receipt frames could only be posted now, stamped AFTER leg A's refund time (the claim's outcome was not saved), and tclk's machine refuses a
+      // reveal once the refund window is open ("legA step 4: refund window is open"; the fold says "leg A claimed on chain but its reveal frame was not recorded"), so the
+      // bundle replays to `revealed`, not `settled`. P9-4 decision 13: the runner expects `revealed` for that path (from the reveal frame's own stamp), exits 0 and says in one
+      // fixed sentence that the swap is settled on chain and the reveal came after the window (it used to expect `settled` and exit 6).
       await setWaitLimit(rig, 120_000);
       const finishing = startRunner(rig, ["--resume"]);
       const miner2 = setInterval(() => void hand.anvil.rpcCall("anvil_mine", ["0x1"]).catch(() => undefined), 100); // the final wait for the claim to be final needs the chain to move
@@ -989,13 +991,29 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       } finally {
         clearInterval(miner2);
       }
-      expect(resumed.code).toBe(6);
-      expect(resumed.stderr).toContain("did not accept settled");
-      expect(resumed.stderr).toMatch(/= settled, got revealed/);
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).not.toContain("did not accept");
+      expect(resumed.stderr).not.toMatch(/= settled, got revealed/);
+      expect(resumed.stdout).toContain("audit: node examples/audit-export.mjs --root <bundle> --expect <swap>=revealed");
+      expect(resumed.stdout).toContain("audit: the bundle replays offline to revealed");
+      expect(resumed.stdout).toMatch(/done: swap 0x[0-9a-f]{64} revealed; bundle /);
+      expect(resumed.stdout).toContain(LATE_REVEAL_SENTENCE);
       expect(resumed.stdout).toContain("step seller.claimLegA done");
       expect(resumed.stdout).toContain("step buyer.learnSecret done");
       expect(resumed.stdout).toContain("step buyer.claimLegB done");
       expect(await chainFacts(hand, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 }); // one lock and one claim, no refund, nothing sent by the resume
+      const outcome = JSON.parse(await readFile(join(rig.stateDir, "outcome.json"), "utf8")) as { outcome?: unknown };
+      expect(outcome.outcome).toBe("revealed");
+
+      // A repeated --resume only reports the finished run (and says the same sentence); --refund says the run settled.
+      const again = await run(rig, ["--resume"]);
+      expect(again.code).toBe(0);
+      expect(again.stdout).toMatch(/this run already ended: swap 0x[0-9a-f]{64} revealed; bundle /);
+      expect(again.stdout).toContain(LATE_REVEAL_SENTENCE);
+      const afterwards = await run(rig, ["--refund"]);
+      expect(afterwards.code).toBe(4);
+      expect(afterwards.stderr).toContain("the run settled, so there is nothing to refund");
+      expect(await chainFacts(hand, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 });
       await expectCleanAndReplays(rig, { ...resumed, stdout: killed.stdout + limited.stdout + early.stdout + refunded.stdout + resumed.stdout, stderr: killed.stderr + limited.stderr + early.stderr + refunded.stderr + resumed.stderr }, "revealed");
     }, 240_000);
   });

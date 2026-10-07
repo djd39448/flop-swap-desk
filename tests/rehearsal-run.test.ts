@@ -21,7 +21,7 @@ import { encodeFunctionResult } from "viem";
 import { english, generateMnemonic, generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, EXIT, FLOW_MESSAGE, loadRunnerAccount, parseRunRecord, refundTimeReached, refundLegAWaiting, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, EXIT, FLOW_MESSAGE, LATE_REVEAL_SENTENCE, loadRunnerAccount, parseRunRecord, refundTimeReached, refundLegAWaiting, revealCameAfterWindow, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
 import { RefundNotFinalYetError } from "../src/client/buyer.js";
 import { encodeFlowRecord, newBuyerRecord, newSellerRecord } from "../src/client/flow-record.js";
 import { FileFlowStore, flowKey } from "../src/client/flow-store.js";
@@ -1618,6 +1618,84 @@ describe("R2-FUND-03: a recovered lock is read before it is waited for, and the 
   });
 });
 
+// P9-4 decision 13: after a late claim (R3-FUND-01: it landed within a finality lag of leg A's refund time, so --refund waited for it and named --resume) the following
+// --resume finishes the swap on chain, but the Seller's reveal frame can only be posted after leg A's refund time, which tclk's machine rejects ("refund window is open"):
+// the replay grades the bundle `revealed`, not `settled`. The runner now expects `revealed` for that path, decided from the reveal frame's own stamp, and exits 0 with one
+// fixed sentence. The end-to-end run is tests-anvil/rehearsal-runner.anvil.test.ts (a real node mined by hand); here the decision itself and the way it is wired are pinned.
+describe("P9-4 d13: a reveal that came after leg A's window is expected to replay to revealed, and the run exits 0 with one fixed sentence", () => {
+  const REFUND_AFTER = 1_790_005_400_000;
+
+  it("revealCameAfterWindow is tclk's own rule (the record's stamp at or after the refund time), and an absent reveal is never late", () => {
+    expect(revealCameAfterWindow({ timestampMs: REFUND_AFTER - 1 }, REFUND_AFTER)).toBe(false);
+    expect(revealCameAfterWindow({ timestampMs: REFUND_AFTER }, REFUND_AFTER)).toBe(true); // `nowMs >= refundAfterMs` rejects
+    expect(revealCameAfterWindow({ timestampMs: REFUND_AFTER + 1 }, REFUND_AFTER)).toBe(true);
+    expect(revealCameAfterWindow({ timestampMs: 0 }, REFUND_AFTER)).toBe(false);
+    expect(revealCameAfterWindow(undefined, REFUND_AFTER)).toBe(false);
+  });
+
+  it("the rule is the machine's: the vendored tclk machine rejects a reveal exactly when the record's stamp is at or after the refund time", async () => {
+    const text = await readFile(join(REPO_ROOT, "vendor", "tclk", "src", "machine.ts"), "utf8");
+    expect(text).toContain('if (nowMs >= state.offer.refundAfterMs) return reject(state, "refund window is open");');
+  });
+
+  it("the fixed sentence says the swap is settled on chain and the reveal frame came after the window; it is one sentence of plain text with no value in it", () => {
+    expect(LATE_REVEAL_SENTENCE).toContain("the swap is settled on chain");
+    expect(LATE_REVEAL_SENTENCE).toContain("the Seller's reveal frame came after leg A's refund time");
+    expect(LATE_REVEAL_SENTENCE).toContain("replays offline to revealed and not settled");
+    expect(LATE_REVEAL_SENTENCE).toContain("the on-chain evidence is the proof");
+    expect(/^[\x20-\x7e]+$/.test(LATE_REVEAL_SENTENCE)).toBe(true);
+    expect(LATE_REVEAL_SENTENCE.includes(". ")).toBe(false); // one sentence
+    expect(LATE_REVEAL_SENTENCE.endsWith(".")).toBe(false);
+    expect(/0x[0-9a-fA-F]{8}|[0-9]{3}/.test(LATE_REVEAL_SENTENCE)).toBe(false); // no hash, no number
+  });
+
+  it("driveSettle expects revealed exactly when the frame came late, from the claim's own reveal record and leg A's refund time, and writeAndAudit prints the sentence only for revealed (code order)", async () => {
+    const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
+    expect(text).toContain("const lateReveal = revealCameAfterWindow(claimed.reveal, run.deadlines.legA.refundAfterMs);");
+    expect(text).toContain('outcome: lateReveal ? "revealed" : "settled",');
+    expect(text).toContain('if (parts.outcome === "revealed") w.log(LATE_REVEAL_SENTENCE);');
+    const at = (needle: string): number => text.indexOf(needle);
+    const order = ["await buyer.claimLegB(secret);", "const lateReveal = revealCameAfterWindow(", 'outcome: lateReveal ? "revealed" : "settled",'].map(at);
+    expect(order.every((position) => position > 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // No retry with another expectation: the audit is asked once, for the one status chosen before it runs.
+    expect(text.match(/await auditBundle\(/g)?.length).toBe(1);
+    expect(text).toContain("if (!(await auditBundle(w, out, parts.outcome))) return EXIT.audit;");
+  });
+
+  it("a finished run that ended revealed is reported by --resume as a success with the sentence (exit 0), and --refund says the run settled; a settled run does not print the sentence", async () => {
+    const finished = async (outcome: string): Promise<Rig> => {
+      const rig = await makeRig();
+      await writeRun(rig, {}, true);
+      await writeFile(join(rig.stateDir, "outcome.json"), `${JSON.stringify({ v: 1, swapId: `0x${"11".repeat(32)}`, outcome, bundle: "somewhere" })}\n`);
+      return rig;
+    };
+    const revealed = await finished("revealed");
+    const resumed = await run(revealed, "resume");
+    expect(resumed.code).toBe(EXIT.ok);
+    expect(resumed.stdout).toContain(`this run already ended: swap 0x${"11".repeat(32)} revealed; bundle somewhere`);
+    expect(resumed.stdout).toContain(LATE_REVEAL_SENTENCE);
+    expect(resumed.stderr).toBe("");
+    const refund = await run(revealed, "refund");
+    expect(refund.code).toBe(EXIT.refused);
+    expect(refund.stderr).toContain("the run settled, so there is nothing to refund");
+    const settled = await finished("settled");
+    const again = await run(settled, "resume");
+    expect(again.code).toBe(EXIT.ok);
+    expect(again.stdout).toContain("this run already ended: swap");
+    expect(again.stdout).not.toContain("replays offline to revealed");
+  });
+
+  it("an outcome record that holds revealed is read (it is a status this build writes), and one that holds an unknown status is still refused", async () => {
+    const rig = await makeRig();
+    await writeRun(rig, {}, true);
+    await writeFile(join(rig.stateDir, "outcome.json"), `${JSON.stringify({ v: 1, swapId: `0x${"11".repeat(32)}`, outcome: "mystery", bundle: "somewhere" })}\n`);
+    const refused = await run(rig, "resume");
+    expect(refused.code).toBe(EXIT.config);
+    expect(refused.stderr).toContain("is not an outcome record this build reads");
+  });
+});
+
 describe("K3: every failure text the runner prints is redacted before it is cut", () => {
   it("no describeFailure call in the runner is given an identity redactor (the claim, re-read and lock read-back messages use the endpoint redactor)", async () => {
     const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
@@ -1955,6 +2033,7 @@ describe("bin/swap-rehearsal-evm.mjs (needs a build: npm test builds first)", ()
     expect(help.code).toBe(0);
     expect(help.stdout).toContain("Usage: node bin/swap-rehearsal-evm.mjs <config.json>");
     expect(help.stdout).toContain("DRY RUN");
+    expect(help.stdout).toContain("is settled on the chain but replays to revealed: the"); // P9-4 decision 13
     expect(help.stdout).toContain("A key pasted where a path belongs is refused (exit 2) and never echoed: the config path, --state-dir"); // KR2-1
     for (const args of [
       [],

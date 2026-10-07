@@ -24,7 +24,9 @@ Modes (at most one):
   (none)       Dry run: pre-flight only; no transaction, no file written.
   --yes        Run the swap: bid, accept, account lines, leg B on paper, leg A on chain (approve and lock), wait for the finalized
                read (real waiting), claim, learn the secret, claim leg B, write the bundle, replay it with audit-export
-               (--expect <swapId>=settled). Runs the pre-flight first and refuses to broadcast unless it passes.
+               (--expect <swapId>=settled). Runs the pre-flight first and refuses to broadcast unless it passes. A swap whose Seller's reveal
+               frame came after leg A's refund time (a late claim, finished by --resume) is settled on the chain but replays to revealed: the
+               runner expects revealed for it, exits 0 and says so in one sentence.
                --stop-after lock  ends after the lock: the Seller never claims (the first half of a refund rehearsal).
   --resume     Continue the run in --state-dir after a stop or a kill: both roles are rebuilt from their records, and a repeated lock
                or claim is refused by the contract and costs only gas. A run started with --stop-after lock stops at the lock again.

@@ -8,7 +8,8 @@
 //                          post, no file written. Exit 0 only if every check that is needed holds.
 //   --yes                  runs the same pre-flight, then the choreography tests-anvil/client-flows.anvil.test.ts runs: bid, accept,
 //                          account lines, lock B on paper, lock A on chain, wait for the finalized read, claim, learn the secret,
-//                          claim B; then the bundle and `examples/audit-export.mjs --expect <swapId>=settled`. Real waiting on the
+//                          claim B; then the bundle and `examples/audit-export.mjs --expect <swapId>=settled` (P9-4 decision 13: `=revealed`, and exit 0 with one fixed
+//                          sentence, when the Seller's reveal frame was stamped at or after leg A's refund time: the late-claim path below). Real waiting on the
 //                          chain's clock. `--stop-after lock` ends after the lock (the Seller never claims: the first half of a refund rehearsal).
 //   --resume               a fresh process continues the run from the state directory: the P8 flow records (both roles), the durable
 //                          venue and paper notes (src/client/rehearsal-world.ts) and run.json. Each step reads what it needs from
@@ -25,6 +26,10 @@
 //                          (bounded by `waitLimitMs`). A `--resume` of a run whose Buyer record holds that verdict has no settle to resume and continues as `--refund`.
 //                          R3-FUND-01: a Seller's claim of leg A that landed but is not FINAL yet when the Buyer refunds (it landed within one finality lag of leg A's
 //                          refund time) is waited for (bounded by `waitLimitMs`), never routed on; the run then ends with the claimed-lock refusal that names `--resume`.
+//                          P9-4 decision 13: the following `--resume` finishes the swap on chain (one lock, one claim, leg B claimed), but the Seller's reveal frame can only be posted now,
+//                          after leg A's refund time, which tclk's machine rejects ("refund window is open"): the bundle replays to `revealed`, not `settled`. That is the protocol's own grade
+//                          for a reveal that came late, not a lost swap, so the runner expects `revealed` for that path (decided from the reveal frame's own stamp, never by trying
+//                          `settled` first), writes the bundle, and exits 0 with `LATE_REVEAL_SENTENCE`; the on-chain evidence is the proof.
 //
 // The only network the runner speaks to is `rails.evm.endpoint`. It posts to no HTTP venue and never opens any other socket;
 // the venue and the paper notes are two local files. The one thing it launches is `examples/audit-export.mjs`, offline.
@@ -103,7 +108,7 @@ export interface RehearsalOptions {
 export const EXIT = Object.freeze({ ok: 0, config: 2, preflight: 3, refused: 4, notYet: 5, audit: 6 });
 
 /** The statuses `examples/audit-export.mjs --expect` is asked for. */
-type Outcome = "settled" | "refunded" | "refunded-b";
+type Outcome = "settled" | "revealed" | "refunded" | "refunded-b";
 
 // --- run.json -------------------------------------------------------------------------------------------------------------------
 
@@ -240,7 +245,7 @@ async function readOutcome(stateDir: string): Promise<OutcomeRecord | null> {
     v.v !== 1 ||
     typeof v.swapId !== "string" ||
     typeof v.bundle !== "string" ||
-    (v.outcome !== "settled" && v.outcome !== "refunded" && v.outcome !== "refunded-b")
+    (v.outcome !== "settled" && v.outcome !== "revealed" && v.outcome !== "refunded" && v.outcome !== "refunded-b")
   ) {
     throw new RehearsalWorldError(`${path} is not an outcome record this build reads`);
   }
@@ -292,6 +297,21 @@ export function logScanWindowTooLong(run: RunRecord, config: RehearsalConfig): s
     `(${(windowMs / 60_000).toFixed(1)} min from the run's start to leg A's refund time at ${(blockMs / 1000).toFixed(1)} s a block, plus ${CLAIM_MARKER_REORG_MARGIN_EVM} of marker margin): ` +
     `a claim that lands late in the window could be beyond the scan, so resume with maxLogRange ${Math.ceil(needBlocks / MAX_LOG_SCAN_CHUNKS)} or more`
   );
+}
+
+/**
+ * P9-4 decision 13: the one sentence a run that ends `revealed` prints (and a repeated `--resume` of it prints again). The swap is settled on the chain, and the bundle's transcript
+ * grades it `revealed` because the Seller's reveal frame was posted at or after leg A's refund time, where tclk's machine refuses a reveal. Fixed text: no number, no value.
+ */
+export const LATE_REVEAL_SENTENCE =
+  "the swap is settled on chain (leg A was claimed by the Seller and leg B by the Buyer), and the Seller's reveal frame came after leg A's refund time, so the bundle replays offline to revealed and not settled: the on-chain evidence is the proof, and the transcript's grade says only that the reveal was late";
+
+/**
+ * P9-4 decision 13: whether the Seller's reveal frame was stamped at or after leg A's refund time, which is exactly tclk's rule for refusing it (`nowMs >= refundAfterMs`, with the
+ * record's own stamp as `nowMs`). The runner then expects `revealed` from the audit. A reveal that is absent (it is only ever absent when a test asks the Seller to skip it) is not late.
+ */
+export function revealCameAfterWindow(reveal: { readonly timestampMs: number } | undefined, refundAfterMs: number): boolean {
+  return reveal !== undefined && reveal.timestampMs >= refundAfterMs;
 }
 
 // --- small helpers --------------------------------------------------------------------------------------------------------------
@@ -966,6 +986,7 @@ async function writeAndAudit(w: World, parts: BundleParts): Promise<number> {
   const record: OutcomeRecord = { v: 1, swapId: w.run.swapId, outcome: parts.outcome, bundle: out };
   await writeFileDurable(join(w.stateDir, OUTCOME_FILE), `${JSON.stringify(record, null, 2)}\n`);
   w.log(`done: swap ${w.run.swapId} ${parts.outcome}; bundle ${out}`);
+  if (parts.outcome === "revealed") w.log(LATE_REVEAL_SENTENCE);
   return EXIT.ok;
 }
 
@@ -1061,8 +1082,11 @@ async function driveSettle(w: World): Promise<number> {
   step("buyer", "claimLegB", "paper note");
 
   await waitFinalized(w, await blockNumberNow(w.rpc), "claim of leg A");
+  // P9-4 decision 13: a reveal frame that came after leg A's window (the late-claim path: the claim landed within a finality lag of the refund time, or its frames were posted
+  // by a later --resume) is graded `revealed` by the replay; the swap itself is settled on chain. Decided from the frame's own stamp, the machine's own rule.
+  const lateReveal = revealCameAfterWindow(claimed.reveal, run.deadlines.legA.refundAfterMs);
   return writeAndAudit(w, {
-    outcome: "settled",
+    outcome: lateReveal ? "revealed" : "settled",
     acceptAContract: accepted.acceptA.contract,
     acceptBContract: paired.acceptB.contract,
     hashLock: lockA.hashLock,
@@ -1304,8 +1328,10 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
       // A finished run is only reported: nothing on the chain or in the state directory is touched again.
       const finished = await readOutcome(stateDir);
       if (finished !== null) {
-        const wanted = mode === "resume" ? finished.outcome === "settled" : finished.outcome !== "settled";
+        const settleOutcome = finished.outcome === "settled" || finished.outcome === "revealed";
+        const wanted = mode === "resume" ? settleOutcome : !settleOutcome;
         out(`this run already ended: swap ${finished.swapId} ${finished.outcome}; bundle ${finished.bundle}`);
+        if (finished.outcome === "revealed") out(LATE_REVEAL_SENTENCE);
         if (wanted) return EXIT.ok;
         throw new RunnerRefusal(mode === "resume" ? `the run ended as ${finished.outcome}, so there is nothing to resume` : "the run settled, so there is nothing to refund");
       }
