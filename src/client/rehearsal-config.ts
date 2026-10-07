@@ -196,11 +196,16 @@ function holdsSeedPhrase(value: string): boolean {
  * P9-4 decision 14 (spec rule 1, no key in a log or a capture): the two phrase tests also run on the value with every format character (`\p{Cf}`) removed, so
  * a phrase with an invisible character inside each word (`aban<U+200B>don`) is the words again. Both readings are tried (the value as it is, and with the
  * format characters removed), because a zero-width character BETWEEN two words with no space is a separator in the first and a join in the second.
+ *
+ * KEYS-P94-01 (P9-4 review, P9-FIXES-R4 decision 8): "format characters" is every INVISIBLE one a terminal draws as nothing: category Cf AND the other default-ignorable
+ * code points (`\p{Default_Ignorable_Code_Point}`: the variation selectors U+FE00 to U+FE0F, the combining grapheme joiner U+034F, the Hangul fillers U+115F, U+1160, U+3164 and
+ * U+FFA0, the Mongolian free variation selectors, the tag characters and the like), which are not all in Cf. The hex reading removes whitespace and both classes, the phrase
+ * reading removes both classes (and keeps the whitespace, which separates words). Visible-but-blank separators (U+2800, the braille blank, and the like) are still not seen.
  */
 export function looksLikeKeyMaterial(value: string): boolean {
   if (/[0-9a-fA-F]{32}/.test(value)) return true;
-  if (/[0-9a-fA-F]{32}/.test(value.replace(/[\s\p{Cf}]/gu, ""))) return true;
-  const withoutFormat = value.replace(/\p{Cf}/gu, "");
+  if (/[0-9a-fA-F]{32}/.test(value.replace(/[\s\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, ""))) return true;
+  const withoutFormat = value.replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
   for (const text of withoutFormat === value ? [value] : [value, withoutFormat]) {
     const words = text.trim().split(/\s+/);
     if (words.length >= 11 && words.every((word) => /^[a-z]+$/i.test(word))) return true;

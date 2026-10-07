@@ -718,8 +718,9 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
     const words = generateMnemonic(english).split(" ");
     const phrase = words.join(" ");
     const scanPhrase = phraseScanner(words);
-    // P9-4 decision 14: a phrase with an invisible format character inside each word. The plain scanner cannot see it, so this scan takes the characters out first.
-    const scanMarked = (text: string): boolean => scanPhrase(text.replace(/\p{Cf}/gu, ""));
+    // P9-4 decision 14: a phrase with an invisible format character inside each word. The plain scanner cannot see it, so this scan takes the characters out first
+    // (KEYS-P94-01: every invisible one, category Cf and the other default-ignorable code points).
+    const scanMarked = (text: string): boolean => scanPhrase(text.replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, ""));
     const marked = (mark: string): string => words.map((word) => `${word.slice(0, 2)}${mark}${word.slice(2)}`).join(" ");
     return [
       { label: "a phrase with U+200B inside each word", value: marked("\u200b"), scan: scanMarked },
@@ -727,6 +728,12 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
       { label: "a key in groups of 4 separated by spaces", value: `0x${cutInto(bare, 4, " ")}`, scan: scanKey },
       { label: "a key with U+200B every 15 characters", value: `0x${cutInto(bare, 15, "\u200b")}`, scan: scanKey },
       { label: "a key with U+00AD every 15 characters", value: `0x${cutInto(bare, 15, "\u00ad")}`, scan: scanKey },
+      // KEYS-P94-01: the invisible code points that are not in category Cf (a variation selector, the combining grapheme joiner, a Hangul filler)
+      { label: "a key with U+FE0F every 15 characters", value: `0x${cutInto(bare, 15, "\u{FE0F}")}`, scan: scanKey },
+      { label: "a key with U+034F every 15 characters", value: `0x${cutInto(bare, 15, "\u{34F}")}`, scan: scanKey },
+      { label: "a key with U+3164 every 15 characters", value: `0x${cutInto(bare, 15, "\u{3164}")}`, scan: scanKey },
+      { label: "a phrase with U+034F inside each word", value: marked("\u{34F}"), scan: scanMarked },
+      { label: "a phrase with U+FE0F inside each word, after a directory", value: `bundles/${marked("\u{FE0F}")}`, scan: scanMarked },
       { label: "a numbered phrase", value: words.map((word, index) => `${index + 1}. ${word}`).join(" "), scan: scanPhrase },
       { label: "a labelled phrase", value: `Phrase: ${phrase}`, scan: scanPhrase },
       { label: "a phrase with commas", value: words.join(","), scan: scanPhrase },
@@ -744,6 +751,22 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
         await expectRefused(rig, result, scan, "out looks like key material", `out (${label}), ${mode}`);
         expect(await exists(rig.stateDir), `out (${label}), ${mode}`).toBe(false);
       }
+    }
+  });
+
+  // KEYS-P94-01 (P9-4 review, P9-FIXES-R4 decision 8): a dry run on the 84532 fake chain with out = bundles/<the key with U+FE0F every 15 characters> exited 0 and showed
+  // the key, as a terminal draws it, in the bundle-directory row and the plan. It is now refused by field name with nothing printed, written or read from the chain.
+  it("KEYS-P94-01: out as bundles/<a key with U+FE0F every 15 characters> exits 2 in a dry run and in --yes on Base Sepolia: nothing printed, written or sent, no window of the key in any output", async () => {
+    for (const mode of ["dry", "yes"] as const) {
+      const key = generatePrivateKey();
+      const scan = strippedKeyScanner(key);
+      const value = `bundles/${cutInto(key.slice(2), 15, "\u{FE0F}")}`;
+      expect(scan(value), `${mode}: the value must hold the key, or this test proves nothing`).toBe(true);
+      expect(keyScanner(key)(value), `${mode}: the plain scanner must not see it (the mark is what hides it)`).toBe(false);
+      const rig = await makeRig({ configExtra: { out: value } }); // the default rig: Base Sepolia (84532)
+      const result = await run(rig, mode);
+      await expectRefused(rig, result, scan, "out looks like key material", `out (U+FE0F), ${mode}, 84532`);
+      expect(await exists(rig.stateDir), `out (U+FE0F), ${mode}, 84532`).toBe(false);
     }
   });
 

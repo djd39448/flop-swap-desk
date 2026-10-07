@@ -38,12 +38,12 @@ export function keyScanner(key: Hex): (text: string) => boolean {
 
 /**
  * KR3-2: `keyScanner` for output that may show the key cut by separators: `scan(text)` answers whether `text` holds a 16-hex-digit window of the key as it
- * stands OR once every whitespace and format character (`\p{Cf}`: U+200B, U+00AD and the like) is removed, which is how a terminal shows a key written in
- * groups or with invisible separators. A superset of `keyScanner`; a boolean only.
+ * stands OR once every whitespace and invisible character (`\p{Cf}`: U+200B, U+00AD and the like, and, KEYS-P94-01, the other default-ignorable code points: U+FE0F, U+034F,
+ * the Hangul fillers) is removed, which is how a terminal shows a key written in groups or with invisible separators. A superset of `keyScanner`; a boolean only.
  */
 export function strippedKeyScanner(key: Hex): (text: string) => boolean {
   const plain = keyScanner(key);
-  return (text) => plain(text) || plain(text.replace(/[\s\p{Cf}]/gu, ""));
+  return (text) => plain(text) || plain(text.replace(/[\s\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, ""));
 }
 
 /**

@@ -25,7 +25,7 @@ import {
   parseRehearsalConfig,
   RehearsalConfigError,
 } from "../src/client/rehearsal-config.js";
-import { decimalKeyScanner, phraseScanner, strippedKeyScanner } from "./helpers/evm-local.js";
+import { decimalKeyScanner, keyScanner, phraseScanner, strippedKeyScanner } from "./helpers/evm-local.js";
 
 const CONTRACT = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
@@ -471,8 +471,80 @@ describe("parseRehearsalConfig", () => {
     }
   });
 
+  // KEYS-P94-01 (P9-4 review, P9-FIXES-R4 decision 8): the rule stripped whitespace and category Cf only, so a key or a phrase cut by one of the other invisible
+  // (default-ignorable) code points, which a terminal also draws as nothing, was printed back by out, --state-dir and the config path. Every key and phrase here is
+  // generated now; the assertions print labels and booleans only.
+  it("KEYS-P94-01: a key cut by U+FE0F, U+034F or U+3164 every 15 characters and a phrase with U+034F or U+FE0F inside each word are refused by field name and never quoted; a UUID, paths, hosts and an emoji with U+FE0F still pass", () => {
+    const key = generatePrivateKey();
+    const bare = key.slice(2);
+    const words = generateMnemonic(english).split(" ");
+    const cut = (size: number, separator: string): string => bare.match(new RegExp(`.{1,${size}}`, "g"))!.join(separator);
+    const inside = (word: string, mark: string): string => `${word.slice(0, 2)}${mark}${word.slice(2)}`;
+    const marked = (mark: string): string => words.map((word) => inside(word, mark)).join(" ");
+    // What a terminal draws: every code point of the two invisible classes is nothing.
+    const drawn = (text: string): string => text.replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
+    const scanKey = strippedKeyScanner(key);
+    const scanPhrase = phraseScanner(words);
+    // The scanner the test helpers share sees the key through these marks (and the plain scanner does not: the marks are what hid it).
+    for (const mark of ["\u{FE0F}", "\u{34F}", "\u{3164}"]) {
+      expect(scanKey(`0x${cut(15, mark)}`), `U+${mark.codePointAt(0)!.toString(16).toUpperCase()}`).toBe(true);
+      expect(keyScanner(key)(`0x${cut(15, mark)}`), `U+${mark.codePointAt(0)!.toString(16).toUpperCase()}`).toBe(false);
+    }
+    const refused: Array<[string, string, (text: string) => boolean]> = [
+      ["a key with U+FE0F (variation selector-16) every 15 characters", `0x${cut(15, "\u{FE0F}")}`, scanKey],
+      ["a key with U+034F (combining grapheme joiner) every 15 characters", `0x${cut(15, "\u{34F}")}`, scanKey],
+      ["a key with U+3164 (Hangul filler) every 15 characters", `0x${cut(15, "\u{3164}")}`, scanKey],
+      ["a key with U+115F (Hangul choseong filler) every 11 characters", cut(11, "\u{115F}"), scanKey],
+      ["a key with U+FFA0 (halfwidth Hangul filler) every 9 characters", cut(9, "\u{FFA0}"), scanKey],
+      ["a key with U+180B (Mongolian free variation selector) every 15 characters", cut(15, "\u{180B}"), scanKey],
+      ["a key with U+FE0F every 15 characters inside a path", `bundles/${cut(15, "\u{FE0F}")}/run`, scanKey],
+      ["a key in groups of 4 with U+034F between the groups and spaces", `0x${cut(4, " \u{34F}")}`, scanKey],
+      ["a phrase with U+034F inside each word", marked("\u{34F}"), scanPhrase],
+      ["a phrase with U+FE0F inside each word", marked("\u{FE0F}"), scanPhrase],
+      ["a phrase with U+3164 inside each word", marked("\u{3164}"), scanPhrase],
+      ["a phrase with U+FE0F inside each word as a path segment", `bundles/${marked("\u{FE0F}")}`, scanPhrase],
+      ["a numbered phrase with U+034F inside each word", words.map((word, index) => `${index + 1}. ${inside(word, "\u{34F}")}`).join(" "), scanPhrase],
+      ["eleven words of the phrase with U+FE0F inside each", words.slice(0, 11).map((word) => inside(word, "\u{FE0F}")).join(" "), scanPhrase],
+    ];
+    for (const [label, value, scan] of refused) {
+      expect(drawn(value), `${label}: the invisible characters are what hid it`).not.toBe(value);
+      expect(scan(drawn(value)) || scan(value), `${label}: the value must hold the key or the phrase, or this test proves nothing`).toBe(true);
+      expect(looksLikeKeyMaterial(value), label).toBe(true);
+      for (const field of ["buyerKeyFile", "sellerKeyFile", "out"] as const) {
+        const message = refusal(anvilConfig({ [field]: value }));
+        expect(message, `${field}: ${label}`).toContain(`${field} looks like key material`);
+        expect(scan(drawn(message)) || scan(message), `${field}: ${label}: the refusal must not quote any window of it`).toBe(false);
+      }
+    }
+    // The same through an asset name, which shares the rule.
+    expect(refusal({ ...anvilConfig(), rails: { evm: { pin: ANVIL_LOCAL_PIN, endpoint: "http://127.0.0.1:8545", contract: CONTRACT, assets: { [marked("\u{34F}")]: TOKEN } } } })).toContain("rails.evm.assets");
+    // Ordinary text with one of these characters is still ordinary: a UUID, paths and hosts, an emoji with its variation selector, a hyphen-grouped key (documented as unseen
+    // on purpose: it cannot be told from a UUID), ten words of the phrase with a mark inside each, and a 31-digit run cut by U+FE0F (two runs of 15 and 16 digits).
+    for (const value of [
+      "97811a09-a70d-4b56-ad4f-e4c4e7e05f8a",
+      "bundles/run-2026-10-07",
+      "C:\\Users\\someone\\AppData\\Local\\Temp\\rh-run-a1B2c3",
+      "/home/someone/bundles/the-first-swap-of-the-week-on-base-sepolia",
+      "sepolia.base.org",
+      "127.0.0.1:8545",
+      "bundles/run \u{1F600}\u{FE0F} first swap",
+      "bundles/caf\u00e9-\u{1F600}\u{FE0F}-run",
+      "\u{2764}\u{FE0F} bundles",
+      "bundles/run\u{FE0F}-2026-10-07",
+      "C:\\Users\\someone\u{34F}\\out",
+      words.slice(0, 10).map((word) => inside(word, "\u{FE0F}")).join(" "),
+      `${"ab".repeat(7)}\u{FE0F}${"cd".repeat(8)}`,
+      "my first swap of the whole week on base sepolia",
+    ]) {
+      expect(looksLikeKeyMaterial(value), value).toBe(false);
+    }
+    // Still unseen, as the README says: visible-but-blank separators (U+2800, the braille blank, is a visible character in category So).
+    expect(looksLikeKeyMaterial(`0x${cut(15, "\u{2800}")}`)).toBe(false);
+    expect(parseRehearsalConfig(anvilConfig({ out: "bundles/\u{1F600}\u{FE0F}-97811a09-a70d-4b56-ad4f-e4c4e7e05f8a" }), BASE).out).toContain("a70d");
+  });
+
   it("accepts explicit deadlines and refuses malformed ones", () => {
-    const explicit = { legA: { claimByMin: 40, refundAfterMin: 50, expiresMin: 20 }, legB: { claimByMin: 70, refundAfterMin: 110, expiresMin: 30 } };
+    const explicit ={ legA: { claimByMin: 40, refundAfterMin: 50, expiresMin: 20 }, legB: { claimByMin: 70, refundAfterMin: 110, expiresMin: 30 } };
     const config = parseRehearsalConfig(anvilConfig({ deadlines: explicit }), BASE);
     expect(config.deadlinesSource).toBe("explicit");
     expect(config.deadlines).toEqual(explicit);
