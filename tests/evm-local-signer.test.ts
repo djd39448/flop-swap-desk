@@ -182,6 +182,9 @@ describe("EvmHtlcRail with a LocalAccount: every write is eth_sendRawTransaction
     // wire or into the capture, and viem takes the chain id from the pinned chain and reads the individual fields below.
     expect(methodsOf(sellerWire.rpc)).not.toContain("eth_fillTransaction");
     expect(sellerWire.calls).not.toContain("eth_fillTransaction");
+    // R2-FUND-02: the wallet client's chain hook (`guardEstimateFeesPerGas`) judges the fee caps from the same reads viem makes itself (the block it
+    // already took, then the tip), so this list is unchanged: the fee ceiling is checked between the tip read and the estimate, adding no call.
+    // tests/evm-signer.test.ts pins the other side: a claim refused for its fee never reaches `eth_estimateGas`.
     expect(after.slice(0, 5)).toEqual([
       "eth_getTransactionCount",
       "eth_getBlockByNumber",

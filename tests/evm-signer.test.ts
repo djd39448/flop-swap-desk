@@ -25,7 +25,7 @@ import {
   checkEvmRailConfig,
   effectiveMaxFeePerGasWei,
 } from "../src/rails/evm-htlc.js";
-import { guardLocalAccount, refuseFillTransaction, signingRefusal, type EvmSignerWatch, type EvmSigningLimits } from "../src/rails/evm-signer.js";
+import { guardEstimateFeesPerGas, guardLocalAccount, refuseFillTransaction, signingRefusal, type EvmSignerWatch, type EvmSigningLimits } from "../src/rails/evm-signer.js";
 import type { AddressBook } from "../src/vendor/evm-hash-rail.js";
 import { EvmMockNode } from "./helpers/evm-mock-node.js";
 import { localSigningRpc, makeLocalAccount, makeLocalAccountWithScan } from "./helpers/evm-local.js";
@@ -397,5 +397,136 @@ describe("R1-FUND-02 through the rail: an endpoint cannot make a local account s
     await rail.approve("USDC", "5");
     expect(rpc.exchanges().map((exchange) => exchange.method)).toContain("eth_sendTransaction");
     expect(node.count("approve")).toBe(1);
+  });
+});
+
+// R2-FUND-02 (P9 review round 2, decision 4): the sign-time fee refusal above fires in `signTransaction`, which viem calls only AFTER
+// `eth_estimateGas`, and a claim's estimate carries `claim(hashLock, preimage)`. A claim refused for its fee therefore sent nothing to
+// broadcast but had already shown the secret to the endpoint, and every retry showed it again. The wallet client's chain now carries a
+// `fees.estimateFeesPerGas` hook (`guardEstimateFeesPerGas`) that computes viem's own caps and refuses above the ceiling before the estimate.
+describe("R2-FUND-02: the fee ceiling is judged before any request that carries the preimage leaves", () => {
+  const hexOf = (wei: bigint): string => `0x${wei.toString(16)}`;
+  const carrying = (wire: ReturnType<typeof localSigningRpc>, preimage: string): string[] => {
+    const bare = preimage.slice(2).toLowerCase();
+    return wire.rpc.exchanges().filter((exchange) => exchange.requestBody.toLowerCase().includes(bare)).map((exchange) => exchange.method);
+  };
+
+  async function lockedWorld(config: Partial<{ maxFeePerGasWei: number | string }> = {}) {
+    const { node, clock } = rig();
+    node.configExtras = config;
+    const buyer = await makeLocalAccount();
+    const seller = await makeLocalAccount();
+    const buyerWire = localSigningRpc(node);
+    const sellerWire = localSigningRpc(node);
+    const book = bookFor(buyer.address, seller.address);
+    const buyerRail = await EvmHtlcRail.connect({ config: node.config(), rpc: buyerWire.rpc, account: buyer, addressBook: book, clock });
+    const sellerRail = await EvmHtlcRail.connect({ config: node.config(), rpc: sellerWire.rpc, account: seller, addressBook: book, clock });
+    const secret = generateHashLock();
+    await buyerRail.approve("USDC", "1000000");
+    await buyerRail.lock(termsFor(secret.hash), 0);
+    return { node, sellerWire, sellerRail, secret };
+  }
+
+  it("the review's case: a 1,001 gwei priority fee refuses the claim (typed, rule fee) and NO request carrying the preimage is sent, on every retry", async () => {
+    const { node, sellerWire, sellerRail, secret } = await lockedWorld();
+    sellerWire.answers.set("eth_maxPriorityFeePerGas", hexOf(1_001n * GWEI));
+    const estimates: string[] = [];
+    sellerWire.answers.set("eth_estimateGas", (params: readonly unknown[]) => {
+      estimates.push(JSON.stringify(params));
+      return "0x30d40";
+    });
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const error = await sellerRail.claim(secret.hash as Hex, secret.preimage as Hex, T0 + 80 * 60_000).then(() => undefined, (caught: unknown) => caught);
+      expect(error, `attempt ${attempt}`).toBeInstanceOf(EvmSignerRefusedError);
+      expect((error as EvmSignerRefusedError).rule).toBe("fee");
+      expect((error as EvmSignerRefusedError).limit).toBe("1000000000000");
+    }
+    expect(estimates, "no eth_estimateGas reached the endpoint for a refused claim").toEqual([]);
+    expect(sellerWire.calls).not.toContain("eth_estimateGas");
+    expect(sellerWire.calls).not.toContain("eth_fillTransaction");
+    expect(carrying(sellerWire, secret.preimage), "no exchange of the Seller's capture carries the preimage").toEqual([]);
+    expect(sellerWire.rawSends).toEqual([]);
+    expect(node.count("claim")).toBe(0);
+
+    // the fee market calms down: the same rail claims, and only now does the preimage reach a wire (the estimate, then the broadcast)
+    sellerWire.answers.delete("eth_maxPriorityFeePerGas");
+    const claimed = await sellerRail.claim(secret.hash as Hex, secret.preimage as Hex, T0 + 80 * 60_000);
+    expect(claimed.event).toBe("Claimed");
+    expect(estimates).toHaveLength(1);
+    expect(carrying(sellerWire, secret.preimage)).toEqual(["eth_estimateGas", "eth_sendRawTransaction"]);
+    expect(node.count("claim")).toBe(1);
+  });
+
+  it("a refusal on a claim leaves the Seller's own error free of the preimage, whichever way it is rendered", async () => {
+    const { sellerWire, sellerRail, secret } = await lockedWorld();
+    sellerWire.answers.set("eth_maxPriorityFeePerGas", hexOf(10_000n * GWEI));
+    const error = await sellerRail.claim(secret.hash as Hex, secret.preimage as Hex, T0 + 80 * 60_000).then(() => undefined, (caught: unknown) => caught);
+    expect(error).toBeInstanceOf(EvmSignerRefusedError);
+    const bare = secret.preimage.slice(2).toLowerCase();
+    const renderings = [String((error as Error).message), (error as Error).stack ?? "", inspect(error, { showHidden: true, depth: 10 }), JSON.stringify(error, Object.getOwnPropertyNames(error as object))];
+    for (const rendering of renderings) expect(rendering.toLowerCase().includes(bare)).toBe(false);
+    expect(carrying(sellerWire, secret.preimage)).toEqual([]);
+  });
+
+  it("the ceiling itself signs and one wei above it refuses before the estimate (base fee 7 wei x 1.2 rounds to 8, plus the tip)", async () => {
+    const ceiling = 5n * GWEI;
+    const at = await lockedWorld({ maxFeePerGasWei: ceiling.toString() });
+    at.sellerWire.answers.set("eth_maxPriorityFeePerGas", hexOf(ceiling - 8n)); // maxFeePerGas = ceiling exactly
+    const claimed = await at.sellerRail.claim(at.secret.hash as Hex, at.secret.preimage as Hex, T0 + 80 * 60_000);
+    expect(claimed.event).toBe("Claimed");
+
+    const over = await lockedWorld({ maxFeePerGasWei: ceiling.toString() });
+    over.sellerWire.answers.set("eth_maxPriorityFeePerGas", hexOf(ceiling - 7n)); // maxFeePerGas = ceiling + 1
+    const error = await over.sellerRail.claim(over.secret.hash as Hex, over.secret.preimage as Hex, T0 + 80 * 60_000).then(() => undefined, (caught: unknown) => caught);
+    expect(error).toBeInstanceOf(EvmSignerRefusedError);
+    expect((error as EvmSignerRefusedError).limit).toBe(ceiling.toString());
+    expect(over.sellerWire.calls).not.toContain("eth_estimateGas");
+    expect(carrying(over.sellerWire, over.secret.preimage)).toEqual([]);
+  });
+
+  it("a priority fee alone above the ceiling refuses too (the hook judges both caps)", async () => {
+    const { sellerWire, sellerRail, secret } = await lockedWorld({ maxFeePerGasWei: (2n * GWEI).toString() });
+    sellerWire.answers.set("eth_maxPriorityFeePerGas", hexOf(2n * GWEI + 1n));
+    const error = await sellerRail.claim(secret.hash as Hex, secret.preimage as Hex, T0 + 80 * 60_000).then(() => undefined, (caught: unknown) => caught);
+    expect(error).toBeInstanceOf(EvmSignerRefusedError);
+    expect((error as EvmSignerRefusedError).rule).toBe("fee");
+    expect(sellerWire.calls).not.toContain("eth_estimateGas");
+  });
+
+  it("the call order of a signed claim is unchanged by the hook: nonce, tip, estimate, broadcast", async () => {
+    const { sellerWire, sellerRail, secret } = await lockedWorld();
+    await sellerRail.claim(secret.hash as Hex, secret.preimage as Hex, T0 + 80 * 60_000);
+    const order = sellerWire.calls.filter((method) => ["eth_getTransactionCount", "eth_maxPriorityFeePerGas", "eth_estimateGas", "eth_sendRawTransaction", "eth_gasPrice", "eth_feeHistory"].includes(method));
+    expect(order).toEqual(["eth_getTransactionCount", "eth_maxPriorityFeePerGas", "eth_estimateGas", "eth_sendRawTransaction"]);
+  });
+});
+
+describe("R2-FUND-02 guardEstimateFeesPerGas on its own", () => {
+  const multiply = (value: bigint): bigint => (value * 12n) / 10n;
+  const block = (baseFeePerGas: bigint | undefined) => ({ baseFeePerGas }) as never;
+  const clientOf = (answers: Record<string, string>) => ({ request: async ({ method }: { method: string }) => answers[method] ?? "0x0" }) as never;
+
+  it("EIP-1559: returns exactly viem's default caps (base fee x 1.2 plus the tip) when they are within the ceiling", async () => {
+    const hook = guardEstimateFeesPerGas(10n * GWEI);
+    const fees = await hook({ block: block(100n), client: clientOf({ eth_maxPriorityFeePerGas: "0x3b9aca00" }), multiply, request: undefined, type: "eip1559" } as never);
+    expect(fees).toEqual({ maxFeePerGas: 120n + GWEI, maxPriorityFeePerGas: GWEI });
+  });
+
+  it("EIP-1559: the request's own caps are honoured as viem honours them, and still judged", async () => {
+    const hook = guardEstimateFeesPerGas(10n * GWEI);
+    const given = { maxFeePerGas: 3n * GWEI, maxPriorityFeePerGas: 2n * GWEI };
+    expect(await hook({ block: block(100n), client: clientOf({}), multiply, request: given, type: "eip1559" } as never)).toEqual(given);
+    const watch: EvmSignerWatch = { refused: undefined };
+    const tight = guardEstimateFeesPerGas(GWEI, watch);
+    await expect(tight({ block: block(100n), client: clientOf({}), multiply, request: given, type: "eip1559" } as never)).rejects.toBeInstanceOf(EvmSignerRefusedError);
+    expect(watch.refused?.rule).toBe("fee");
+    expect(watch.refused?.limit).toBe(GWEI.toString());
+  });
+
+  it("legacy: the gas price times the multiplier is judged; a chain without a base fee returns null so viem's own refusal follows", async () => {
+    const hook = guardEstimateFeesPerGas(10n * GWEI);
+    expect(await hook({ block: block(undefined), client: clientOf({ eth_gasPrice: "0x3b9aca00" }), multiply, request: undefined, type: "legacy" } as never)).toEqual({ gasPrice: (GWEI * 12n) / 10n });
+    await expect(hook({ block: block(undefined), client: clientOf({ eth_gasPrice: `0x${(20n * GWEI).toString(16)}` }), multiply, request: undefined, type: "legacy" } as never)).rejects.toBeInstanceOf(EvmSignerRefusedError);
+    expect(await hook({ block: block(undefined), client: clientOf({}), multiply, request: undefined, type: "eip1559" } as never)).toBeNull();
   });
 });

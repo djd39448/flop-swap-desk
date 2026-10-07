@@ -4,7 +4,7 @@
 // sign, this process does, and viem takes the nonce, the gas limit and the fee caps from whatever the endpoint answers (one
 // `eth_fillTransaction` where the node has it, else the individual reads). Before this module nothing bounded those answers: an
 // endpoint that said "chain 31337" to `eth_chainId` could still fill chain id 8453, a 500,000 gas limit and a fee cap of
-// 10,000 gwei, and viem signed it. Two defences, both here and both refusals (nothing in this module ever sends anything):
+// 10,000 gwei, and viem signed it. Three defences, all here and all refusals (nothing in this module ever sends anything):
 //
 //   1. `guardLocalAccount`: the account handed to viem is a sealed wrapper (the same `sealLocalAccount` the key-file loader uses:
 //      `address` and `type` are the only enumerable members, JSON, `String()` and `util.inspect` show nothing else) whose
@@ -13,11 +13,21 @@
 //   2. `refuseFillTransaction`: the transport the wallet client uses answers `eth_fillTransaction` with a JSON-RPC
 //      method-not-found error without asking the endpoint, so viem takes the chain id from the pinned chain and reads nonce, gas
 //      and fees one by one (each of those answers then meets the guard above).
+//   3. R2-FUND-02, `guardEstimateFeesPerGas`: the fee caps are judged BEFORE `eth_estimateGas`. viem prepares a local transaction in
+//      this order: nonce, block, fee caps, gas estimate, then `signTransaction`. For a claim the estimate's calldata is
+//      `claim(hashLock, preimage)`, so a fee refusal that fires only at signing (rule 1 above) has already shown the preimage to the
+//      endpoint, and every retry shows it again. The wallet client's chain therefore carries a `fees.estimateFeesPerGas` hook (viem
+//      calls it in `prepareTransactionRequest`, after the block read and before the estimate) that computes viem's own caps and throws
+//      the same typed `fee` refusal above the ceiling, so nothing carrying the preimage leaves. The sign-time guard stays as the second
+//      line. The GAS ceiling cannot move earlier (it judges the estimate, which is the first call that carries the calldata): only an
+//      endpoint that already holds the preimage, or a claim far larger than any measured one, can trigger it.
 //
 // The refusal error carries no transaction field at all (no `data`, which for a claim holds the preimage, no gas, no fee): only
 // which rule fired and the configured limit. Nothing here ever sees, stores or prints a key.
 
+import { estimateMaxPriorityFeePerGas, getBlock, getGasPrice } from "viem/actions";
 import type { LocalAccount } from "viem/accounts";
+import type { ChainEstimateFeesPerGasFnParameters, EstimateFeesPerGasReturnType } from "viem";
 
 import { sealLocalAccount } from "../client/evm-key-file.js";
 import { RpcCaptureError } from "./rpc-capture.js";
@@ -122,6 +132,37 @@ export function guardLocalAccount(account: LocalAccount, limits: EvmSigningLimit
     signTransaction,
   };
   return sealLocalAccount(wrapped as unknown as LocalAccount);
+}
+
+/**
+ * R2-FUND-02: the `fees.estimateFeesPerGas` hook of the wallet client's chain. viem calls it from `prepareTransactionRequest` once the
+ * block is read and the request has no fee caps, BEFORE `eth_estimateGas`, and uses what it returns. This one computes exactly what
+ * viem's own default computes (EIP-1559: the base fee times viem's multiplier plus the priority fee read through the same transport,
+ * or the request's own values when it carries them; legacy: the gas price times the multiplier) and refuses with the typed `fee`
+ * `EvmSignerRefusedError` when any cap is above `maxFeePerGas`, so a claim whose fee is refused never sends the estimate that carries
+ * its preimage. The refusal is also recorded in `watch` (when given), like the sign-time one, so the rail throws the typed error after
+ * viem has wrapped it. Otherwise the caps are returned unchanged and viem uses exactly them. A chain without a base fee returns `null`
+ * (viem's own default then answers, with its own refusal), and the sign-time guard judges whatever transaction is finally signed.
+ */
+export function guardEstimateFeesPerGas(maxFeePerGas: bigint, watch?: EvmSignerWatch): (args: ChainEstimateFeesPerGasFnParameters) => Promise<EstimateFeesPerGasReturnType | null> {
+  const refuse = (): never => {
+    const refused = new EvmSignerRefusedError("fee", String(maxFeePerGas));
+    if (watch !== undefined) watch.refused = refused;
+    throw refused;
+  };
+  return async ({ block, client, multiply, request, type }) => {
+    if (type === "legacy") {
+      const gasPrice = request?.gasPrice ?? multiply(await getGasPrice(client));
+      if (gasPrice > maxFeePerGas) return refuse();
+      return { gasPrice } as EstimateFeesPerGasReturnType;
+    }
+    const head = block ?? (await getBlock(client, {}));
+    if (typeof head.baseFeePerGas !== "bigint") return null;
+    const maxPriorityFeePerGas = typeof request?.maxPriorityFeePerGas === "bigint" ? request.maxPriorityFeePerGas : await estimateMaxPriorityFeePerGas(client);
+    const maxFee = request?.maxFeePerGas ?? multiply(head.baseFeePerGas) + maxPriorityFeePerGas;
+    if (maxFee > maxFeePerGas || maxPriorityFeePerGas > maxFeePerGas) return refuse();
+    return { maxFeePerGas: maxFee, maxPriorityFeePerGas } as EstimateFeesPerGasReturnType;
+  };
 }
 
 /** The provider shape viem's `custom` transport takes: just `request`. */

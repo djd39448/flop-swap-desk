@@ -49,6 +49,7 @@ import { captureEvmLeg, evmEvidence, EVM_RAIL_ID, hashLockRefMismatch, type EvmA
 import {
   EVM_DEFAULT_MAX_FEE_PER_GAS_WEI,
   EVM_MAX_GAS_PER_WRITE,
+  guardEstimateFeesPerGas,
   guardLocalAccount,
   refuseFillTransaction,
   type EvmSignerRefusedError,
@@ -749,17 +750,16 @@ export class EvmHtlcRail {
     // and of a fee cap above the configured ceiling), and its transport answers `eth_fillTransaction` itself, with method-not-found, so
     // the chain id comes from the pinned chain and every other field from an individual read that the guard then judges.
     // A JSON-RPC account (an address) signs on the node and is unchanged.
+    // R2-FUND-02: the same fee ceiling is also judged BEFORE `eth_estimateGas` (the call that carries a claim's preimage), by a `fees.estimateFeesPerGas`
+    // hook on the wallet client's chain (and only there: the public client's chain has none). The sign-time guard above is the second line.
     const local = typeof options.account === "string" ? undefined : options.account;
+    const maxFeePerGas = effectiveMaxFeePerGasWei(options.config);
     const walletClient =
       local === undefined
         ? createWalletClient({ account: options.account as Address, chain, transport })
         : createWalletClient({
-            account: guardLocalAccount(
-              local,
-              { chainId: options.config.pin.chainId, maxGas: EVM_MAX_GAS_PER_WRITE, maxFeePerGas: effectiveMaxFeePerGasWei(options.config) },
-              signerWatch,
-            ),
-            chain,
+            account: guardLocalAccount(local, { chainId: options.config.pin.chainId, maxGas: EVM_MAX_GAS_PER_WRITE, maxFeePerGas }, signerWatch),
+            chain: { ...chain, fees: { estimateFeesPerGas: guardEstimateFeesPerGas(maxFeePerGas, signerWatch) } },
             transport: custom(refuseFillTransaction(options.rpc), { retryCount: 0 }),
           });
 
@@ -953,7 +953,13 @@ export class EvmHtlcRail {
       // asked of the endpoint, R1-FUND-02), then `eth_sendRawTransaction`. The estimate carries
       // the real preimage in its calldata, as the broadcast does a moment later: the endpoint is
       // trusted with it either way, and nothing carries it before this guard
-      // (tests/evm-local-signer.test.ts pins that). That is a handful of calls, not an
+      // (tests/evm-local-signer.test.ts pins that). R2-FUND-02: the FEE ceiling is judged before
+      // that estimate (the wallet client's chain hook, `guardEstimateFeesPerGas`, throws the typed
+      // `fee` refusal while the request still carries no calldata of the secret), so a claim refused
+      // for its fee has sent nothing that holds the preimage; the sign-time guard is the second line.
+      // The GAS ceiling can only follow the estimate (it judges the estimate), so a gas refusal has
+      // already shown the preimage to the endpoint: only an endpoint that holds it anyway, or a claim
+      // far larger than any measured one, triggers it. That is a handful of calls, not an
       // unbounded wait, and the policy's claimInclusionMarginMs is sized to cover it.
       await this.assertBeforeNotAfterMsOrThrow(notAfterMs);
       await this.viaVendoredRail(() => this.rail.claim(hashLock, secret));
