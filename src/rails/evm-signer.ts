@@ -158,7 +158,10 @@ export function guardEstimateFeesPerGas(maxFeePerGas: bigint, watch?: EvmSignerW
     }
     const head = block ?? (await getBlock(client, {}));
     if (typeof head.baseFeePerGas !== "bigint") return null;
-    const maxPriorityFeePerGas = typeof request?.maxPriorityFeePerGas === "bigint" ? request.maxPriorityFeePerGas : await estimateMaxPriorityFeePerGas(client);
+    // The block and the request ride along exactly as viem's own default passes them (its internal call takes both): a node that cannot answer
+    // `eth_maxPriorityFeePerGas` then gets viem's own fallback (gas price minus this block's base fee) with no second block read.
+    const maxPriorityFeePerGas =
+      typeof request?.maxPriorityFeePerGas === "bigint" ? request.maxPriorityFeePerGas : await estimateMaxPriorityFeePerGas(client, { block: head, request } as never);
     const maxFee = request?.maxFeePerGas ?? multiply(head.baseFeePerGas) + maxPriorityFeePerGas;
     if (maxFee > maxFeePerGas || maxPriorityFeePerGas > maxFeePerGas) return refuse();
     return { maxFeePerGas: maxFee, maxPriorityFeePerGas } as EstimateFeesPerGasReturnType;

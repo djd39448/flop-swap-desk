@@ -493,6 +493,31 @@ describe("R2-FUND-02: the fee ceiling is judged before any request that carries 
     expect(sellerWire.calls).not.toContain("eth_estimateGas");
   });
 
+  it("a node that cannot answer the tip read gets viem's own fallback (gas price minus the base fee) from the SAME block: no second block read, and the fee is still judged", async () => {
+    const { sellerWire, sellerRail, secret } = await lockedWorld();
+    sellerWire.answers.set("eth_maxPriorityFeePerGas", () => {
+      throw new Error("the method eth_maxPriorityFeePerGas is not available");
+    });
+    await sellerRail.claim(secret.hash as Hex, secret.preimage as Hex, T0 + 80 * 60_000);
+    const exchanges = sellerWire.rpc.exchanges();
+    const counted = exchanges.findIndex((exchange) => exchange.method === "eth_getTransactionCount");
+    const estimated = exchanges.findIndex((exchange) => exchange.method === "eth_estimateGas");
+    const latestReads = exchanges.slice(counted, estimated).filter((exchange) => exchange.method === "eth_getBlockByNumber" && JSON.stringify(exchange.params) === JSON.stringify(["latest", false]));
+    expect(latestReads, "the fee caps are computed from the one block viem already read").toHaveLength(1);
+    expect(sellerWire.calls).toContain("eth_gasPrice"); // the fallback ran
+
+    // and with that fallback the ceiling still bites before the estimate: the gas price read is above it
+    const refused = await lockedWorld({ maxFeePerGasWei: (2n * GWEI).toString() });
+    refused.sellerWire.answers.set("eth_maxPriorityFeePerGas", () => {
+      throw new Error("the method eth_maxPriorityFeePerGas is not available");
+    });
+    refused.sellerWire.answers.set("eth_gasPrice", hexOf(5n * GWEI));
+    const error = await refused.sellerRail.claim(refused.secret.hash as Hex, refused.secret.preimage as Hex, T0 + 80 * 60_000).then(() => undefined, (caught: unknown) => caught);
+    expect(error).toBeInstanceOf(EvmSignerRefusedError);
+    expect(refused.sellerWire.calls).not.toContain("eth_estimateGas");
+    expect(carrying(refused.sellerWire, refused.secret.preimage)).toEqual([]);
+  });
+
   it("the call order of a signed claim is unchanged by the hook: nonce, tip, estimate, broadcast", async () => {
     const { sellerWire, sellerRail, secret } = await lockedWorld();
     await sellerRail.claim(secret.hash as Hex, secret.preimage as Hex, T0 + 80 * 60_000);
