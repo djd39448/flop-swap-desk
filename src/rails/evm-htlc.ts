@@ -621,6 +621,9 @@ export interface EvmLockRecord {
   refundAfterMs: bigint;
 }
 
+/** P9-4 decision 7: which write of the rail a receipt wait belongs to (`EvmReceiptTimeoutError.write`). */
+export type EvmWriteKind = "approve" | "lock" | "claim" | "refund";
+
 /**
  * P9-1: a receipt wait gave up (`EvmRailConfig.receiptTimeoutMs`, else viem's 180 s). The transaction named by `hash`
  * WAS broadcast (the node accepted it and returned the hash) and may still be mined; this error says only that this
@@ -631,8 +634,6 @@ export interface EvmLockRecord {
  * it), so a flow saves only the hash of a lock or a claim, and a resumed flow asks the node about that hash (`EvmHtlcRail.transactionStatus`)
  * before it sends the write again.
  */
-export type EvmWriteKind = "approve" | "lock" | "claim" | "refund";
-
 export class EvmReceiptTimeoutError extends Error {
   readonly hash: Hex;
   readonly timeoutMs: number;

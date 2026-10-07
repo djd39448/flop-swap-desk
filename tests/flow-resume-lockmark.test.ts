@@ -60,9 +60,10 @@ describe("P9-4 decision 4: the Buyer's lock marker is saved with a reorg margin 
     expect(node.logQueries[0], "the scan starts at the saved marker").toBe(rawMarker - 256n);
   });
 
-  it("a claim a reorg re-included 200 blocks below the marker (and so 200 below the tip the lock saw) is still found by the resumed Buyer", async () => {
+  it("a lock and its claim a reorg re-included 200 blocks below the marker (the tip the lock saw) are still found by the resumed Buyer", async () => {
     const { s, node, statement, rawMarker } = await claimedWithoutReveal(far);
-    node.reorgLog("Claimed", statement, rawMarker - 200n);
+    node.reorgLog("Locked", statement, rawMarker - 201n); // the lock sits below the marker...
+    node.reorgLog("Claimed", statement, rawMarker - 200n); // ...and the claim after it, still below the marker, above the saved one (the marker minus 256)
     expect(await learnedByResumedBuyer(s, statement)).toBe(true);
   });
 

@@ -783,3 +783,39 @@ byte-identical to `87a3b96`; no new dependency; no environment variable is read 
 runtime code hash is the one in the table above. `tests-anvil/` stays outside `npm run typecheck` with its two older diagnostics
 (`tests-anvil/client-flows.anvil.test.ts`, unchanged by this pass). The hermetic count after the pass: 120 files, 3751 passed, 7 skipped (before it, at `87a3b96`:
 118 files, 3714 passed, 7 skipped).
+
+## P9-4 part 1: the Base Sepolia policy and the EVM rail (handoff/P9-4-DECISIONS-2026-10-07.md decisions 1 to 5, 7, 8 and 10) - the item list
+
+Not vendored: original to this repo. The first build of P9-4 (base: the round-3 fixed head `270cf47`) sets the Base Sepolia policy from the
+24-hour finality sample and changes the EVM rail and the two flows only where a decision says so. The runner (`src/client/rehearsal-*.ts`,
+`bin/`), the README and the pre-flight rows are the second build's (decisions 5 runner part, 6, 9, 11 to 15). Every code change below has a
+test that was watched to fail with the change disabled.
+
+The sample, read by a short read-only script (`handoff/research/base-sepolia-finality-2026-10-06.jsonl`, 288 samples every 5 minutes from
+2026-10-06T09:30:03Z to 2026-10-07T09:29:01Z, 23.98 hours, no sample with an error): finalized lag minimum 868 s, median 1,156 s, p90 1,348 s
+(nearest rank), maximum 3,086 s (51.4 minutes, at 2026-10-07T02:02:31Z); the longest stand-still of the finalized block was 8 consecutive samples
+on block 47783591 (first seen 2026-10-07T01:27:25Z, last 02:02:31Z, so 35.1 to 45.1 minutes); safe-head lag 6 to 98 blocks (median 51.5, p90 82);
+block time 2.0 s in every sample; the `finalized` tag and the state read at the finalized block's hash answered in 288 of 288 samples.
+
+| decision | change | pinned by |
+|---|---|---|
+| 1 | `BASE_SEPOLIA_POLICY` in `src/client/policy.ts` (finality budget 80 minutes = 3,086 s x 1.5 rounded up to 5 minutes, claim margin 10 minutes, reveal window 45 minutes, block time 2 s), `evmLocalPolicyFor(chainId)`, the typed `EvmPolicyUnavailableError`; the EVM rail selects the policy by the pin's chain id (31337 keeps `EVM_LOCAL_POLICY`) and refuses any other chain id at `connect()` before one request; never a constructor option | `tests/evm-policy.test.ts` (new) |
+| 2 | `KNOWN_GOOD_DEADLINES_BY_CHAIN` and `knownGoodDeadlinesFor`: anvil +60/+90/+120/+180, Base Sepolia leg A claim by +115 and refund +135, leg B claim by +225 and refund +285 (a refund rehearsal ends at +285 minutes, 4 h 45 min); the slack of every rule and the claim-pipeline arithmetic (6 x 45 s calls + 45 s = 5.25 minutes against the 10-minute margin) | `tests/deadlines-policy.test.ts` (new) |
+| 3 | `checkEvmRailConfig` refuses confirmations mode and any `fallbackConfirmations` when the pin is chain 84532 | `tests/evm-base-knobs.test.ts` (new) |
+| 4 | the Buyer's EVM lock marker is saved as the tip minus `LOCK_MARKER_REORG_MARGIN_EVM` (256), floored at 0 (`lock.fromBlock` keeps its meaning) | `tests/flow-resume-lockmark.test.ts` (new) |
+| 5 (rail part), 8 | the fee ceiling of a local account defaults to 50 gwei on 84532 (1,000 gwei on anvil) and a configured value below 1 gwei is refused there; `receiptTimeoutMs` on 84532 lies between 10,000 and 3,600,000 ms | `tests/evm-base-knobs.test.ts` |
+| 7 | `EvmReceiptTimeoutError.write`; `EvmHtlcRail.transactionStatus` (`eth_getTransactionByHash`, then the receipt); the hash of a timed-out LOCK write in `lock.prepared.recovery = { chain: "evm", txHash }` and of a timed-out CLAIM write in the Seller's `claimTxHash` (two strictly decoded optional record fields, extended in place, version unchanged); `recoverLock` answers pending for a held (or mined-but-not-visible) lock, the resumed Seller ends with the typed `ClaimPendingError`; reverted and unknown go on as before | `tests/evm-pending-write.test.ts` (new), `tests/flow-record.test.ts`, `tests-anvil/pending-write.anvil.test.ts` (new, real anvil with its automine switched off) |
+| 10 | `lookupPauseMs` and an injectable `sleep` on `EvmHtlcRail`; the write lookup pauses before each re-plan; `createEvmCounterRail` passes the policy's block time on Base Sepolia (2 s) and `pollMs` (else 1 s) elsewhere | `tests/evm-lookup-pause.test.ts` (new) |
+
+Helpers: `tests/helpers/evm-mock-node.ts` gained default-off knobs (`logLagBlocks` and `advance`, `holdNextSend` with `releaseHeld`, `failHeld` and
+`dropHeld`, `answerTxByHash`); `tests/helpers/evm-local.ts` gained `byHash` (default "hidden", as before) and counts a pooled send in the account's
+nonce; `tests/helpers/matrix-worlds.ts` gives the EVM world the known-good set of its node's chain. Existing tests that depended on the old shape
+moved with it: `tests/rehearsal-run.test.ts` (the dry run on 84532 with the anvil set now fails on rule 2 of the real policy, not on the interim row) and two
+`tests/rehearsal-preflight.test.ts` finality-row cases (a fallback and confirmations mode, which 84532 now refuses, run on the anvil pin).
+
+Extended first-party files: `src/client/policy.ts`, `src/client/evm-rail.ts`, `src/client/counter-rail.ts` (the `evm` recovery shape and the optional
+`transactionStatus`), `src/client/buyer.ts`, `src/client/seller.ts`, `src/client/flow-record.ts`, `src/rails/evm-htlc.ts`, `src/rails/evm-signer.ts` (a comment).
+No key material in any of them: every key in the new tests is generated at test time and never printed.
+
+What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/`, `fixtures/` and `package.json` are byte-identical to
+`270cf47`; no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no new fixture.
