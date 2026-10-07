@@ -753,7 +753,14 @@ venue and a local paper-note file, signing with the two local key files. Modes (
   the Seller refunds leg B (the paper note) once its own has, then the bundle and `--expect <swapId>=refunded` (`refunded-b` when
   leg A was never locked). A refund time that has not come is reported (exit 5) and the command can be repeated later; `--wait` waits
   for it here instead. The runner waits until the refund is final before it writes the bundle. If the Seller already claimed, the Buyer's flow refuses
-  the refund (the lock was claimed); use `--resume`, which learns the secret and claims leg B. The Buyer's ETH row reserves the refund
+  the refund and the run ends (exit 4) with "leg A's lock was claimed and the claim is final, so the refund is refused and nothing was sent; run
+  --resume"; `--resume` learns the secret and claims leg B. **A claim that landed within one finality lag of leg A's refund time is not final yet when
+  `--refund` comes (R3-FUND-01, P9 review round 3)**: the refund reverts (the lock reads Claimed at the latest block) while the finalized block still reads
+  Locked, and the flow routes only on a final read. `--refund` then reads `locks(hashLock)` at the latest block (a read, nothing is sent), says "leg A's
+  lock was claimed; waiting for the claim to be final, then --resume finishes the swap", waits for the finalized block to pass the head (real polling,
+  bounded by `waitLimitMs`), asks again, and ends with the refusal above. Past the bound it exits 4 with "nothing was sent; run --refund again to keep
+  waiting". A `--resume` that finds the refund time come and the lock Claimed at the latest block says "run --refund, which waits for the claim to be
+  final, then --resume" instead of the bare "use --refund". Any other refund failure is a real refusal. The Buyer's ETH row reserves the refund
   only (the approve and the lock are already spent) and, if short, is a warning and not a stop (R2-FUND-04: see the table), and the
   Seller's key file is not needed: a refund moves nothing of the Seller's on
   the chain, so a missing or unreadable Seller key file is shown as a warning (the run's recorded Seller account stands in), though a Seller
@@ -821,7 +828,10 @@ for a refund, shows a row that only a claim or a log scan uses as a warning, so 
   Seller's claim window has closed, so no new claim is sent" and says leg A goes back to the Buyer, but a claim that was sent before the
   window closed may still be pending and can still land until leg A's refund time. If it lands, the lock reads Claimed, `--refund` is
   refused (the contract has paid the Seller) and `--resume` learns the secret and claims leg B; if it does not, leg A is refundable once
-  its refund time has come. So run `--refund` once leg A's refund time has come, and `--resume` if it is refused because the lock was claimed.
+  its refund time has come. So once leg A's refund time has come run `--resume` first: while the Buyer's `next` is `learnSecret` it finishes the
+  swap at once if that claim landed (the secret is on the chain from the claim on, final or not), and says "the Seller's claim window has closed"
+  again if it did not. Then run `--refund`. If the claim landed within one finality lag of the refund time, `--refund` waits for it to be final and
+  tells you to run `--resume` (R3-FUND-01); it never sends a refund for a lock that reads Claimed.
 - **The Buyer's ETH row does not count Base's L1 data fee**, and the gas ceilings were measured on anvil with the mock token, never
   against the real Base Sepolia USDC (a proxied FiatToken). Both are P9-4's; the ceilings are 2 to 3 times the anvil figures.
 - **The log scan reach row uses the block time at dry-run time.** A chain whose block time changes later is not re-checked.

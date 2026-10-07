@@ -23,6 +23,8 @@
 //                          the two) ends in a verdict, never a loop: once leg A's refund time is FINALIZED with no lock on the chain the Buyer's record says
 //                          so, the Seller's leg B is refunded and the bundle replays to `refunded-b`; before that finalized block the run waits for it
 //                          (bounded by `waitLimitMs`). A `--resume` of a run whose Buyer record holds that verdict has no settle to resume and continues as `--refund`.
+//                          R3-FUND-01: a Seller's claim of leg A that landed but is not FINAL yet when the Buyer refunds (it landed within one finality lag of leg A's
+//                          refund time) is waited for (bounded by `waitLimitMs`), never routed on; the run then ends with the claimed-lock refusal that names `--resume`.
 //
 // The only network the runner speaks to is `rails.evm.endpoint`. It posts to no HTTP venue and never opens any other socket;
 // the venue and the paper notes are two local files. The one thing it launches is `examples/audit-export.mjs`, offline.
@@ -327,6 +329,11 @@ export const FLOW_MESSAGE = Object.freeze({
   refundUnconfirmed: /not yet confirmed/,
   /** `refundLegA`: leg A was never locked, so the Buyer has nothing at stake on the chain. */
   neverLocked: /never locked, nothing to refund/,
+  /**
+   * R3-FUND-01, `refundLegA`: the lock was claimed, read FINAL by the flow's own evidence reader, and the Buyer is routed to `learnSecret`
+   * (`next` says so from then on). Every one of the flow's four routing refusals ends in this sentence.
+   */
+  legAClaimed: /call learnSecret\(\) then claimLegB\(\) instead of refundLegA\(\)/,
 });
 
 /** A refund is attempted only once the local clock AND the chain's head are both at or past the refund time (the contract judges the chain's). */
@@ -403,6 +410,22 @@ export async function buyerLockNeverLanded(stateDir: string, swapId: string): Pr
     return record.role === "buyer" && record.lock.neverLanded === true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * R3-FUND-01: the hash lock of leg A, read from the Buyer's flow record in `stateDir` (`lock.hashLock`). Reads the record only; a missing or damaged record, or one
+ * with no hash lock yet, reads `undefined` (the caller then says what it always said).
+ */
+export async function buyerHashLockOnRecord(stateDir: string, swapId: string): Promise<string | undefined> {
+  try {
+    const key = flowKey("buyer", swapId);
+    const bytes = await new FileFlowStore(join(stateDir, "buyer", "flows")).load(key);
+    if (bytes === null) return undefined;
+    const record = decodeFlowRecord(bytes, key);
+    return record.role === "buyer" ? record.lock.hashLock : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -626,8 +649,18 @@ export async function waitLockFinal(w: FinalityWorld, blockNumber: bigint | unde
   return waitFinalized(w, target, "lock of leg A (recovered: its block is not on record, so the head read at the first wait)", () => lockReadsFinal(w, lock.hashLock));
 }
 
-/** Waits (real polling) until the finalized block is at least `minBlock` (or `alsoDone` says so): the transaction mined at or below it is then final. */
-async function waitFinalized(w: FinalityWorld, minBlock: bigint | undefined, what: string, alsoDone?: () => Promise<boolean>): Promise<void> {
+/**
+ * Waits (real polling) until the finalized block is at least `minBlock` (or `alsoDone` says so): the transaction mined at or below it is then final. Past
+ * `waitLimitMs` it refuses with "run --resume to keep waiting", or with the text `refusal` builds from the seconds waited (R3-FUND-01: the late-claim wait of
+ * `--refund` is kept up by running `--refund` again, and `--resume` would only say so).
+ */
+async function waitFinalized(
+  w: FinalityWorld,
+  minBlock: bigint | undefined,
+  what: string,
+  alsoDone?: () => Promise<boolean>,
+  refusal?: (waitedSeconds: number) => string,
+): Promise<void> {
   if (minBlock === undefined) return;
   const startedMs = w.env.now();
   let lastLogMs = 0;
@@ -637,7 +670,8 @@ async function waitFinalized(w: FinalityWorld, minBlock: bigint | undefined, wha
     if (alsoDone !== undefined && (await alsoDone())) return;
     const elapsed = w.env.now() - startedMs;
     if (elapsed > w.config.waitLimitMs) {
-      throw new RunnerRefusal(`the ${what} (block ${minBlock}) was not final after ${Math.round(elapsed / 1000)} s (waitLimitMs); run --resume to keep waiting`);
+      const seconds = Math.round(elapsed / 1000);
+      throw new RunnerRefusal(refusal !== undefined ? refusal(seconds) : `the ${what} (block ${minBlock}) was not final after ${seconds} s (waitLimitMs); run --resume to keep waiting`);
     }
     if (w.env.now() - lastLogMs >= 30_000) {
       w.log(`waiting for the ${what} to be final: block ${minBlock}, the finalized block is ${finalized === null ? "unreadable" : finalized}`);
@@ -682,10 +716,20 @@ async function waitFinalizedTime(w: FinalityWorld, refundAfterMs: number): Promi
  * only once the finalized block passes the one it landed in (waited for, bounded by `waitLimitMs`). R2-FUND-01 (P9 review round 2): a lock ATTEMPT with no evidence is
  * read on the chain first; while no finalized block is at or past leg A's refund time the Buyer says (a typed `RefundNotFinalYetError`) that a lock cannot be ruled
  * out yet, and this loop waits for that finalized block and asks again; once it is, the verdict "never locked" ends the loop with `undefined` (the Buyer has nothing
- * on the chain, and the caller refunds the Seller's leg B). Anything else is a real refusal and is thrown.
+ * on the chain, and the caller refunds the Seller's leg B).
+ *
+ * R3-FUND-01 (P9 review round 3): a Seller's claim that was mined within one finality lag of leg A's refund time is not FINAL yet when the Buyer comes to refund. The refund
+ * then reverts (the row is Claimed at the latest block) and the flow's own evidence reader, which reads the finalized block, still says Locked, so the revert used to be thrown
+ * raw, `next` flipped to `refundLegA`, and both `--refund` and `--resume` stalled for up to a whole finality lag. Now, when the refund fails with anything but the cases
+ * above and `locks(hashLock)` reads Claimed at the LATEST block (a read, nothing is sent), the loop waits (bounded by `waitLimitMs`) for the finalized block to pass the head
+ * and asks `refundLegA` again, so that the FLOW routes on a FINAL claim (it saves that and `next` says `learnSecret`); the run then ends with the claimed-lock refusal that
+ * names `--resume`. The read at the latest block only decides to wait: nothing is ever routed on a read that is not final (a claim that a reorg removes after leg A's refund
+ * time can never land again, and a Buyer routed away on it would hold a refundable lock `next` no longer names). Past the bound it refuses with "nothing was sent; run
+ * --refund again to keep waiting". Every other failure is a real refusal and is thrown.
  */
-export async function refundLegAWaiting(w: FinalityWorld, buyer: Pick<BuyerFlow, "refundLegA">): Promise<RailWriteEvidence | undefined> {
+export async function refundLegAWaiting(w: FinalityWorld, buyer: Pick<BuyerFlow, "refundLegA">, hashLock: string): Promise<RailWriteEvidence | undefined> {
   const startedMs = w.env.now();
+  let announced = false;
   for (;;) {
     try {
       return await buyer.refundLegA();
@@ -704,11 +748,57 @@ export async function refundLegAWaiting(w: FinalityWorld, buyer: Pick<BuyerFlow,
         await w.env.sleep(w.pollMs); // the Buyer reads the chain itself: never ask again in a tight loop if its read and this one disagree
         continue;
       }
-      if (!FLOW_MESSAGE.refundUnconfirmed.test(message) || w.env.now() - startedMs > w.config.waitLimitMs) throw error;
-      // The refund was signed and sent; it reads final only once the finalized block passes the one it landed in. The tip now is above it.
-      w.log("the refund of leg A is not final yet; waiting for the finalized block to pass the current head");
-      await waitFinalized(w, await blockNumberNow(w.rpc), "refund of leg A");
+      if (FLOW_MESSAGE.legAClaimed.test(message)) throw new RunnerRefusal(LEG_A_CLAIMED_REFUSAL); // the flow read the claim FINAL and routed the Buyer to learnSecret
+      if (FLOW_MESSAGE.refundUnconfirmed.test(message)) {
+        if (w.env.now() - startedMs > w.config.waitLimitMs) throw error;
+        // The refund was signed and sent; it reads final only once the finalized block passes the one it landed in. The tip now is above it.
+        w.log("the refund of leg A is not final yet; waiting for the finalized block to pass the current head");
+        await waitFinalized(w, await blockNumberNow(w.rpc), "refund of leg A");
+        continue;
+      }
+      // R3-FUND-01: any other failure is a real refusal, unless the lock reads Claimed at the latest block: a claim that is not final yet. Wait for it, then ask again.
+      if (!(await lockClaimedAtLatest(w, hashLock))) throw error;
+      const elapsed = w.env.now() - startedMs;
+      if (elapsed > w.config.waitLimitMs) throw new RunnerRefusal(LATE_CLAIM_NOT_FINAL(Math.round(elapsed / 1000)));
+      if (!announced) {
+        w.log(LATE_CLAIM_LOG);
+        announced = true;
+      }
+      await waitFinalized(w, await blockNumberNow(w.rpc), "claim of leg A", undefined, LATE_CLAIM_NOT_FINAL);
+      await w.env.sleep(w.pollMs); // the Buyer reads the finalized block by its hash: never ask again in a tight loop if its read and this one disagree
     }
+  }
+}
+
+/** R3-FUND-01: the one sentence logged while a claim of leg A that is not final yet is waited for. */
+const LATE_CLAIM_LOG = "leg A's lock was claimed; waiting for the claim to be final, then --resume finishes the swap";
+
+/** R3-FUND-01: the end of `--refund` once the flow read the claim final and routed the Buyer to `learnSecret`: the refund is refused, and `--resume` is the way on. */
+const LEG_A_CLAIMED_REFUSAL = "leg A's lock was claimed and the claim is final, so the refund is refused and nothing was sent; run --resume, which learns the secret, claims leg B and finishes the swap";
+
+/** R3-FUND-01: the late-claim wait ran out of `waitLimitMs`; nothing was sent, and `--refund` waits again from the start. */
+const LATE_CLAIM_NOT_FINAL = (waitedSeconds: number): string =>
+  `leg A's lock was claimed, but the claim was not final after ${waitedSeconds} s (waitLimitMs); nothing was sent; run --refund again to keep waiting (once the claim is final it says to run --resume)`;
+
+/**
+ * R3-FUND-01: what `--resume` says when the Buyer's `next` is `refundLegA` (leg A's refund time has come and the refund path is the way on). Normally "use --refund". When
+ * `locks(hashLock)` reads Claimed at the latest block the claim may not be final yet (a refund attempt that was cut short while it waited, or one that reverted before this
+ * fix): `--refund` then waits for the claim to be final and hands over to `--resume`, and the text says so. One read, nothing is sent.
+ */
+export async function refundDoorwayText(w: Pick<FinalityWorld, "config" | "rpc">, hashLock: string | undefined): Promise<string> {
+  if (await lockClaimedAtLatest(w, hashLock)) {
+    return "leg A's lock was claimed and the claim may not be final yet: run --refund, which waits for the claim to be final, then --resume";
+  }
+  return "leg A's refund time has come; use --refund";
+}
+
+/** R3-FUND-01: whether `locks(hashLock)` reads Claimed at the LATEST block. One read, nothing is sent; any failure reads false (the refund's own failure is then thrown as it was). It only decides to WAIT. */
+async function lockClaimedAtLatest(w: Pick<FinalityWorld, "config" | "rpc">, hashLock: string | undefined): Promise<boolean> {
+  if (hashLock === undefined) return false;
+  try {
+    return (await lockStatusAt(w.rpc, w.config.rails.evm.contract, hashLock, "latest")) === 2;
+  } catch {
+    return false;
   }
 }
 
@@ -860,7 +950,7 @@ async function driveSettle(w: World): Promise<number> {
   if (bRank < 0 || sRank < 0) {
     throw new RunnerRefusal("the swap was abandoned (an offer expired before the pairing finished); nothing is locked on either leg; start a new swap in a new state directory");
   }
-  if (buyerOpen.next === "refundLegA") throw new RunnerRefusal("leg A's refund time has come; use --refund");
+  if (buyerOpen.next === "refundLegA") throw new RunnerRefusal(await refundDoorwayText(w, await buyerHashLockOnRecord(w.stateDir, run.swapId)));
   if (sellerOpen?.next === "refundLegB") throw new RunnerRefusal("leg B's refund has begun; use --refund");
   const buyer = buyerOpen.flow;
   const seller = sellerOpen === null ? newSeller(w) : sellerOpen.flow;
@@ -924,7 +1014,7 @@ async function driveSettle(w: World): Promise<number> {
       const message = messageOf(error);
       if (FLOW_MESSAGE.claimWindowClosed.test(message)) {
         throw new RunnerRefusal(
-          `${describeFailure(error, w.redact)}; the Seller's claim window has closed, so no new claim is sent, but a claim this run sent earlier may still be pending and can land until leg A's refund time ${iso(run.deadlines.legA.refundAfterMs)}: once it has come, run --refund (leg A goes back to the Buyer unless that claim landed; if the lock was claimed --refund is refused and --resume finishes the swap)`,
+          `${describeFailure(error, w.redact)}; the Seller's claim window has closed, so no new claim is sent, but a claim this run sent earlier may still be pending and can land until leg A's refund time ${iso(run.deadlines.legA.refundAfterMs)}: once it has come, run --resume first (if that earlier claim landed, --resume finishes the swap), and if --resume stops here again, run --refund (leg A goes back to the Buyer; if the lock was claimed after all, --refund waits for the claim to be final and then tells you to run --resume)`,
         );
       }
       if (!FLOW_MESSAGE.lockNotFinal.test(message) || attempt >= CLAIM_REREAD_ATTEMPTS || w.env.now() - claimStartedMs > w.config.waitLimitMs) throw error;
@@ -1033,7 +1123,7 @@ async function driveRefund(w: World, wait: boolean): Promise<number> {
     });
   if (!(await waitFor("leg A", run.deadlines.legA.refundAfterMs, true))) return EXIT.notYet;
 
-  const refundA: RailWriteEvidence | undefined = await refundLegAWaiting(w, buyer);
+  const refundA: RailWriteEvidence | undefined = await refundLegAWaiting(w, buyer, accepted.acceptA.statement);
   if (refundA === undefined) step("buyer", "refundLegA", "leg A was never locked: nothing to refund on chain");
   else step("buyer", "refundLegA", evidenceTx(refundA));
 

@@ -21,7 +21,7 @@ import { encodeFunctionResult } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { buyerLockNeverLanded, buyerLockOnRecord, EXIT, FLOW_MESSAGE, loadRunnerAccount, parseRunRecord, refundTimeReached, refundLegAWaiting, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, EXIT, FLOW_MESSAGE, loadRunnerAccount, parseRunRecord, refundTimeReached, refundLegAWaiting, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
 import { RefundNotFinalYetError } from "../src/client/buyer.js";
 import { encodeFlowRecord, newBuyerRecord, newSellerRecord } from "../src/client/flow-record.js";
 import { FileFlowStore, flowKey } from "../src/client/flow-store.js";
@@ -784,6 +784,7 @@ describe("R1-FUND-01: --refund and --resume size the Buyer's ETH row by what is 
 describe("R2-FUND-01: the --refund loop waits for the finalized block, and a --resume of a never-landed run is the refund path", () => {
   const hex = (n: bigint): string => `0x${n.toString(16)}`;
   const REFUND_AFTER = 1_790_005_400_000; // leg A's refund time in ms
+  const HASH_LOCK_A = `0x${"ab".repeat(32)}`; // leg A's hash lock: the late-claim read (R3-FUND-01) asks the chain about it, and the stub chain here answers no call
 
   /** A chain whose finalized block is `lagMs` behind the clock: its own timestamp reaches `REFUND_AFTER` at `REFUND_AFTER + lagMs`. */
   function waitWorld(options: { startMs: number; lagMs: number; waitLimitMs?: number; pollMs?: number }): { world: FinalityWorld; state: { t: number; sleeps: number[]; logs: string[] } } {
@@ -827,7 +828,7 @@ describe("R2-FUND-01: the --refund loop waits for the finalized block, and a --r
         throw neverLocked();
       },
     };
-    expect(await refundLegAWaiting(world, buyer)).toBeUndefined();
+    expect(await refundLegAWaiting(world, buyer, HASH_LOCK_A)).toBeUndefined();
     expect(asked).toHaveLength(2); // once at the start, once after the wait: never in a tight loop
     expect(state.t).toBeGreaterThanOrEqual(REFUND_AFTER + 20 * 60_000); // not before the finalized block got there
     expect(state.logs.some((line) => line.includes("a lock cannot be ruled out until the finalized block has passed leg A's refund time") && line.includes("not final yet"))).toBe(true);
@@ -836,19 +837,19 @@ describe("R2-FUND-01: the --refund loop waits for the finalized block, and a --r
 
   it("a verdict at once (the finalized block is already past the refund time) is returned with no wait; any other error is thrown as it is", async () => {
     const { world, state } = waitWorld({ startMs: REFUND_AFTER + 3_600_000, lagMs: 60_000 });
-    expect(await refundLegAWaiting(world, { refundLegA: async () => Promise.reject(neverLocked()) })).toBeUndefined();
+    expect(await refundLegAWaiting(world, { refundLegA: async () => Promise.reject(neverLocked()) }, HASH_LOCK_A)).toBeUndefined();
     expect(state.sleeps).toEqual([]);
     const evidence = { ref: "0x01", raw: [] };
-    expect(await refundLegAWaiting(world, { refundLegA: async () => evidence })).toBe(evidence);
-    await expect(refundLegAWaiting(world, { refundLegA: async () => Promise.reject(new Error("buyer: refusing to refund leg A before its refundAfterMs")) })).rejects.toThrow("before its refundAfterMs");
-    await expect(refundLegAWaiting(world, { refundLegA: async () => Promise.reject(new Error("tclk: The contract function \"refund\" reverted")) })).rejects.toThrow("reverted");
+    expect(await refundLegAWaiting(world, { refundLegA: async () => evidence }, HASH_LOCK_A)).toBe(evidence);
+    await expect(refundLegAWaiting(world, { refundLegA: async () => Promise.reject(new Error("buyer: refusing to refund leg A before its refundAfterMs")) }, HASH_LOCK_A)).rejects.toThrow("before its refundAfterMs");
+    await expect(refundLegAWaiting(world, { refundLegA: async () => Promise.reject(new Error("tclk: The contract function \"refund\" reverted")) }, HASH_LOCK_A)).rejects.toThrow("reverted");
   });
 
   it("is bounded by waitLimitMs: a finalized block that never gets there, or a Buyer that keeps saying 'not final yet', ends in a refusal that says nothing was sent and names --refund", async () => {
     const stuck = waitWorld({ startMs: REFUND_AFTER + 60_000, lagMs: 10 * 24 * 3_600_000, waitLimitMs: 60_000 }); // a finalized block ten days behind
     let calls = 0;
     const buyer = { refundLegA: async () => (calls += 1, Promise.reject(new RefundNotFinalYetError(`0x${"ab".repeat(32)}`, REFUND_AFTER))) };
-    await expect(refundLegAWaiting(stuck.world, buyer)).rejects.toThrow(/the finalized block has not reached leg A's refund time .* after \d+ s \(waitLimitMs\).*nothing was sent or recorded; run --refund again to keep waiting/);
+    await expect(refundLegAWaiting(stuck.world, buyer, HASH_LOCK_A)).rejects.toThrow(/the finalized block has not reached leg A's refund time .* after \d+ s \(waitLimitMs\).*nothing was sent or recorded; run --refund again to keep waiting/);
     expect(calls).toBe(1);
     expect(stuck.state.t - (REFUND_AFTER + 60_000)).toBeGreaterThan(60_000);
     expect(stuck.state.t - (REFUND_AFTER + 60_000)).toBeLessThan(60_000 + 2 * 30_000); // it did not keep waiting far past the limit
@@ -857,7 +858,7 @@ describe("R2-FUND-01: the --refund loop waits for the finalized block, and a --r
     const disagree = waitWorld({ startMs: REFUND_AFTER + 3_600_000, lagMs: 60_000, waitLimitMs: 60_000 });
     let again = 0;
     const stubborn = { refundLegA: async () => (again += 1, Promise.reject(new RefundNotFinalYetError(`0x${"ab".repeat(32)}`, REFUND_AFTER))) };
-    await expect(refundLegAWaiting(disagree.world, stubborn)).rejects.toThrow(/waitLimitMs/);
+    await expect(refundLegAWaiting(disagree.world, stubborn, HASH_LOCK_A)).rejects.toThrow(/waitLimitMs/);
     expect(again).toBeGreaterThan(3);
     expect(again).toBeLessThan(20);
   });
@@ -868,7 +869,7 @@ describe("R2-FUND-01: the --refund loop waits for the finalized block, and a --r
     const evidence = { ref: "0x02", raw: [] };
     const buyer = { refundLegA: async () => (calls += 1) < 2 ? Promise.reject(new Error("buyer: refund signed but not yet confirmed; it may never have been sent; call refundLegA() again later (G7)")) : evidence };
     // The finalized block's number is fixed at 900,000 against a head of 1,000,000: it never passes, so the wait is bounded and ends in the --resume refusal.
-    await expect(refundLegAWaiting(world, buyer)).rejects.toThrow(/was not final after \d+ s \(waitLimitMs\); run --resume to keep waiting/);
+    await expect(refundLegAWaiting(world, buyer, HASH_LOCK_A)).rejects.toThrow(/was not final after \d+ s \(waitLimitMs\); run --resume to keep waiting/);
     expect(state.logs.some((line) => line.includes("the refund of leg A is not final yet; waiting for the finalized block to pass the current head"))).toBe(true);
   });
 
@@ -895,6 +896,19 @@ describe("R2-FUND-01: the --refund loop waits for the finalized block, and a --r
     expect(await buyerLockNeverLanded(rig.stateDir, `0x${"22".repeat(32)}`)).toBe(false);
     await writeFile(join(rig.stateDir, "buyer", "flows", `buyer-${swapId}.json`), "damaged");
     expect(await buyerLockNeverLanded(rig.stateDir, swapId)).toBe(false);
+  });
+
+  it("R3-FUND-01: buyerHashLockOnRecord reads leg A's hash lock from the Buyer's record only: the lock for a record that holds one, nothing for no record, another swap or a damaged file", async () => {
+    const rig = await makeRig();
+    const swapId = `0x${"11".repeat(32)}`;
+    await mkdir(rig.stateDir, { recursive: true });
+    expect(await buyerHashLockOnRecord(rig.stateDir, swapId)).toBeUndefined();
+    expect(await exists(join(rig.stateDir, "buyer"))).toBe(false); // the look created nothing
+    await writeNeverLandedRecord(rig, false, swapId);
+    expect(await buyerHashLockOnRecord(rig.stateDir, swapId)).toBe(HASH_LOCK_A);
+    expect(await buyerHashLockOnRecord(rig.stateDir, `0x${"22".repeat(32)}`)).toBeUndefined();
+    await writeFile(join(rig.stateDir, "buyer", "flows", `buyer-${swapId}.json`), "damaged");
+    expect(await buyerHashLockOnRecord(rig.stateDir, swapId)).toBeUndefined();
   });
 
   it("--resume of a run whose Buyer record holds the verdict continues as --refund (and says so): the refund pre-flight, a missing Seller key file only a warning, the refund path's own steps; an attempt without the verdict stays a --resume", async () => {
@@ -945,7 +959,7 @@ describe("R2-FUND-01: the --refund loop waits for the finalized block, and a --r
 
   it("driveRefund hands the Buyer's step to refundLegAWaiting (no private copy of the loop that could forget the wait)", async () => {
     const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
-    expect(text).toContain("await refundLegAWaiting(w, buyer)");
+    expect(text).toContain("await refundLegAWaiting(w, buyer, accepted.acceptA.statement)");
     expect(text).toContain("error instanceof RefundNotFinalYetError");
     expect(text).toContain("buyerLockNeverLanded(stateDir, existingRun.swapId)");
   });
@@ -1124,6 +1138,29 @@ describe("the runner reacts to the flows' own refusals by their text", () => {
     expect(FLOW_MESSAGE.refundUnconfirmed.test("buyer: leg A was never locked, nothing to refund")).toBe(false);
     expect(FLOW_MESSAGE.neverLocked.test("buyer: refund signed but not yet confirmed")).toBe(false);
     for (const pattern of Object.values(FLOW_MESSAGE)) expect(pattern.test("evm-htlc: connected chain id 1 does not match pin")).toBe(false);
+  });
+
+  it("R3-FUND-01: every routing refusal of the Buyer (a claim read FINAL) ends in the sentence the runner recognises, and no other refusal does", async () => {
+    const buyer = await source("buyer.ts");
+    const sites = buyer.match(/return this\.routeToClaim\(/g)?.length ?? 0;
+    const sentences = buyer.match(/call learnSecret\(\) then claimLegB\(\) instead of refundLegA\(\)/g)?.length ?? 0;
+    expect(sites).toBeGreaterThanOrEqual(4);
+    expect(sentences, "one sentence per routing site").toBe(sites);
+    for (const text of [
+      "buyer: refusing to refund leg A \u2014 the lock has been claimed (on chain or already broadcast); call learnSecret() then claimLegB() instead of refundLegA() (K2)",
+      "buyer: refusing to refund leg A - the lock was claimed (seen after the refund failed); call learnSecret() then claimLegB() instead of refundLegA() (R3-8)",
+      "buyer: refusing to report leg A refunded - the lock was claimed instead (the refund lost the race to a claim); call learnSecret() then claimLegB() instead of refundLegA() (G7)",
+    ]) {
+      expect(FLOW_MESSAGE.legAClaimed.test(text), text).toBe(true);
+      expect(FLOW_MESSAGE.refundUnconfirmed.test(text) || FLOW_MESSAGE.neverLocked.test(text), text).toBe(false);
+    }
+    for (const text of [
+      "buyer: refund signed but not yet confirmed; it may never have been sent; call refundLegA() again later (G7)",
+      "buyer: leg A was never locked, nothing to refund",
+      "tclk: The contract function \"refund\" reverted with the following reason: execution reverted: EvmHashRail: refund refused",
+    ]) {
+      expect(FLOW_MESSAGE.legAClaimed.test(text), text).toBe(false);
+    }
   });
 });
 
@@ -1369,6 +1406,10 @@ describe("R1-FUND-04: the runner's own texts do not promise that a resume sends 
     expect(reaction).toMatch(/--refund/);
     expect(reaction).toMatch(/--resume/);
     expect(reaction).not.toMatch(/leg A will go back to the Buyer:/);
+    // R3-FUND-01: a claim that may have landed is met by --resume FIRST (it finishes the swap while next is learnSecret); --refund after a late claim waits and hands over
+    expect(reaction.indexOf("--resume first")).toBeGreaterThan(-1);
+    expect(reaction.indexOf("--resume first")).toBeLessThan(reaction.indexOf("run --refund"));
+    expect(reaction).toMatch(/--refund waits for the claim to be final and then tells you to run --resume/);
   });
 });
 
