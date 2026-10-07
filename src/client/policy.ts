@@ -44,6 +44,10 @@ export interface EvmLocalPolicy extends DeadlinePolicy {
   /** B2: the minimum `refundAfterMs - now` (wall-clock at accept time; chain time at claim
    *  time) this build will accept before refusing a leg A offer, or refusing to send a claim. */
   claimInclusionMarginMs: number;
+  /** P9-4 decision 10 (P2R2-PIN-07): the chain's block time in ms. The write-evidence lookup pauses about this long between its re-plans (a
+   *  tip or a log read that is a block behind the write is answered by waiting one block, not by reading again at once), and a resume check
+   *  measures leg A's window in blocks with it. */
+  blockTimeMs: number;
 }
 
 export const EVM_LOCAL_POLICY: EvmLocalPolicy = Object.freeze({
@@ -51,7 +55,122 @@ export const EVM_LOCAL_POLICY: EvmLocalPolicy = Object.freeze({
   minRevealWindowMs: 45 * 60_000,
   finalityAMs: 20 * 60_000,
   claimInclusionMarginMs: 5 * 60_000,
+  blockTimeMs: 1_000,
 });
+
+// P9-4 decision 1 (P9-G1-READINESS-SPEC.md package P9-4, rule 3: the finality budget is set from the measured lag, not from anvil): the Base
+// Sepolia twin of `EVM_LOCAL_POLICY`, selected by the pin's chain id (84532) on the rail object (`evmLocalPolicyFor`, used by
+// `createEvmCounterRail`), never a constructor option and never taken from a config.
+//
+// Where the numbers come from. `handoff/research/base-sepolia-finality-2026-10-06.jsonl` is a one-day sample of the public endpoint
+// (https://sepolia.base.org) taken every 5 minutes: 288 samples from 2026-10-06T09:30:03Z to 2026-10-07T09:29:01Z (86,338 s, 23.98 hours),
+// no sample with an error. Each sample reads the `latest`, `safe` and `finalized` heads and one state read pinned by the finalized block's
+// hash. What the full file shows (the build read it with a short read-only script, and every number here is from that read):
+//   - finalized lag (the latest head's timestamp minus the finalized head's): minimum 868 s (14.5 min, 434 blocks), median 1,156 s (19.3 min,
+//     578 blocks), p90 1,348 s (22.5 min, 674 blocks; nearest rank), MAXIMUM 3,086 s (51.4 min, 1,543 blocks), seen at 2026-10-07T02:02:31Z.
+//     13 samples lie above 30 min, 3 above 40 min, 1 above 50 min.
+//   - stand-stills: the finalized head does not advance for long stretches. The longest was 8 consecutive samples on the same finalized block
+//     (47783591): first seen 2026-10-07T01:27:25Z, last 2026-10-07T02:02:31Z, so it stood still for at least 2,106 s (35.1 min) and, with the
+//     samples on either side showing other blocks, at most 2,706 s (45.1 min); the maximum above is the end of that stand-still. Two stretches of
+//     5 samples (at least 1,200 s, 2026-10-06T13:00Z and 13:55Z) and four of 4 samples (at least 900 s) were the next longest.
+//   - safe-head lag (latest minus safe): minimum 6, median 51.5, p90 82, MAXIMUM 98 blocks (196 s).
+//   - block time: 2.0 s in every sample (the timestamp gap over the block gap, for both heads).
+//   - the `finalized` tag answered in 288 of 288 samples, and the state read at the finalized block's hash (EIP-1898) answered `ok` in 288 of 288.
+//
+// `finalityAMs` = 80 minutes (4,800,000 ms): the maximum finalized lag (3,086 s) x 1.5 = 4,629 s, rounded UP to a multiple of 5 minutes. It is the
+// bound the leg-linking rule uses (`legB.claimByMs >= legA.refundAfterMs + finalityAMs`, SPEC 3.5 rule 2), so it is also the Buyer's time to
+// claim leg B after a claim of leg A that landed just before leg A's refund time turns final. IT IS A BOUND FROM ONE DAY OF DATA, not a
+// guarantee: the sampler read every 5 minutes, so the true peak may have been higher than the maximum seen (the stand-still above ended
+// between two samples), and the chain's behaviour on another day is not covered. A longer stand-still than the budget leaves the budget
+// exceeded: the checks that use it (the deadline rules, the pre-flight's finality row) then refuse or wait, and nothing is routed on a read
+// that is not final.
+//
+// `claimInclusionMarginMs` = 10 minutes: the proven worst case between the claim's last deadline guard and its broadcast is about 5.25 minutes
+// (six single-attempt calls of at most `DEFAULT_RPC_TIMEOUT_MS` = 45 s each, plus up to 45 s of staleness in the guard's own pending read), so
+// 10 minutes covers it with room (tests/deadlines-policy.test.ts writes the arithmetic). `minRevealWindowMs` = 45 minutes, as for anvil.
+// `blockTimeMs` = 2,000 (the sample's 2.0 s).
+export const BASE_SEPOLIA_POLICY: EvmLocalPolicy = Object.freeze({
+  ...DEFAULT_POLICY_EXAMPLE,
+  minRevealWindowMs: 45 * 60_000,
+  finalityAMs: 80 * 60_000,
+  claimInclusionMarginMs: 10 * 60_000,
+  blockTimeMs: 2_000,
+});
+
+/** P9-4 decision 1: no deadline policy exists for this EVM chain id (only anvil, 31337, and Base Sepolia, 84532, have one). Thrown by
+ *  `evmLocalPolicyFor`, by the EVM rail's `policy` and by its `connect()`, so a rail pinned to any other chain refuses before it reads or
+ *  sends anything. The message names the chain id only (a number), never any text a config supplied. */
+export class EvmPolicyUnavailableError extends Error {
+  readonly chainId: number;
+  constructor(chainId: number) {
+    // Only a safe integer is ever shown: a pin handed in as untyped data could hold any text there (a key pasted into the wrong field).
+    const shown = typeof chainId === "number" && Number.isSafeInteger(chainId) ? String(chainId) : "(not an integer)";
+    super(`evm-rail: no deadline policy exists for chain id ${shown} (31337 anvil-local and 84532 base-sepolia are the only chains with one); refusing`);
+    this.name = "EvmPolicyUnavailableError";
+    this.chainId = typeof chainId === "number" && Number.isSafeInteger(chainId) ? chainId : Number.NaN;
+  }
+}
+
+/** One leg's deadlines as the runner's config states them: minutes from the run's start. */
+export interface KnownGoodLegMinutes {
+  readonly claimByMin: number;
+  readonly refundAfterMin: number;
+  readonly expiresMin: number;
+}
+
+/** A known-good pair of legs, in minutes from the run's start (leg A is the EVM USDC leg, leg B the FLOP paper leg). */
+export interface KnownGoodDeadlineMinutes {
+  readonly legA: KnownGoodLegMinutes;
+  readonly legB: KnownGoodLegMinutes;
+}
+
+/**
+ * P9-4 decision 2: the known-good deadline set of each EVM chain, in minutes from the run's start, the one set per chain that satisfies every
+ * rule under that chain's own policy (SPEC 3.5 rules 1 to 3, the claim margin, the pre-flight's finality row) with at least 5 minutes to spare on each.
+ * tests/deadlines-policy.test.ts derives both with `checkSwapDeadlines`, pins them, and prints the slack of every rule; the runner's config reads
+ * its default from here by the pin's chain id.
+ *
+ * 31337 (anvil): leg A claim by +60, refund from +90; leg B claim by +120, refund from +180 (the set the anvil suites have always run).
+ *
+ * 84532 (Base Sepolia, under `BASE_SEPOLIA_POLICY`: finality budget 80 min, claim margin 10 min, reveal window 45 min; lock expected within 10 min
+ * of the start): leg A claim by +115, refund from +135; leg B claim by +225, refund from +285. Why those numbers:
+ *   - leg A's claim-by leaves 10 min (the lock estimate) + 80 min (the finality budget) + 10 min (the lock allowance) + about 5.25 min (the claim
+ *     pipeline after the Seller's last guard) = 105.25 min, with 9.75 min to spare (and 25 min against the pre-flight's finality row, which needs
+ *     budget + 10 min = 90 min);
+ *   - leg A's refund time is 20 min after its claim-by (the claim margin is 10 min): the Seller's claim-by binds, not the margin, and a claim sent
+ *     just before it lands about 14.75 min before refunds open;
+ *   - leg B's claim-by is 90 min after leg A's refund time (rule 2: the budget, 80 min, plus 10 min to spare): the Buyer's time to claim leg B after a
+ *     claim of leg A that landed just before leg A's refund time turns final;
+ *   - leg B's refund time is 60 min after its claim-by, and 150 min after leg A's refund (rule 3 needs 60 min: the FLOP stall allowance of 3,600 blocks
+ *     dominates the 20 % margin), so rule 3 holds with 90 min to spare;
+ *   - rule 1 (reveal window 45 min after a lock at +10 min) holds with 80 min to spare.
+ * The wall-clock cost of a refund rehearsal on this set is 285 minutes (4 h 45 min) from the run's start to leg B's refund time, which ends it; a
+ * settled run takes the lock's finalized lag (14 to 52 min in the sample) plus a few minutes.
+ */
+export const KNOWN_GOOD_DEADLINES_BY_CHAIN: Readonly<Record<31337 | 84532, KnownGoodDeadlineMinutes>> = Object.freeze({
+  31337: Object.freeze({
+    legA: Object.freeze({ claimByMin: 60, refundAfterMin: 90, expiresMin: 30 }),
+    legB: Object.freeze({ claimByMin: 120, refundAfterMin: 180, expiresMin: 40 }),
+  }),
+  84532: Object.freeze({
+    legA: Object.freeze({ claimByMin: 115, refundAfterMin: 135, expiresMin: 30 }),
+    legB: Object.freeze({ claimByMin: 225, refundAfterMin: 285, expiresMin: 40 }),
+  }),
+});
+
+/** P9-4 decision 2: the known-good deadline set of a pinned chain id (`KNOWN_GOOD_DEADLINES_BY_CHAIN`); throws `EvmPolicyUnavailableError` for any other. */
+export function knownGoodDeadlinesFor(chainId: number): KnownGoodDeadlineMinutes {
+  if (chainId === 31337 || chainId === 84532) return KNOWN_GOOD_DEADLINES_BY_CHAIN[chainId];
+  throw new EvmPolicyUnavailableError(chainId);
+}
+
+/** P9-4 decision 1: the EVM deadline policy of a pinned chain id: `EVM_LOCAL_POLICY` (the very same object) for 31337, `BASE_SEPOLIA_POLICY` for
+ *  84532. Throws `EvmPolicyUnavailableError` for any other id rather than guess a policy for it. */
+export function evmLocalPolicyFor(chainId: number): EvmLocalPolicy {
+  if (chainId === 31337) return EVM_LOCAL_POLICY;
+  if (chainId === 84532) return BASE_SEPOLIA_POLICY;
+  throw new EvmPolicyUnavailableError(chainId);
+}
 
 // P4-BTC-SPEC.md §7 ("Bitcoin deadline policy"): the Bitcoin-local twin of `EVM_LOCAL_POLICY`,
 // sized for this build's own regtest pin (`BTC_REGTEST_PIN`, 1 confirmation) rather than a real

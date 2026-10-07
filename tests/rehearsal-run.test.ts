@@ -176,12 +176,15 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     expect(rig.chain.methods).toContain("eth_getCode");
   });
 
-  // F3 with R1-FUND-06 (P9 review round 1): Base Sepolia still runs under the anvil deadline policy, so a NEW swap there is refused until P9-4.
+  // F3 with R1-FUND-06 (P9 review round 1), moved by P9-4 decision 1: the rail now selects BASE_SEPOLIA_POLICY by the pin's chain id, so the interim
+  // "no Base Sepolia policy yet" row can no longer fire through the runner (its code stays in rehearsal-preflight.ts, unit-tested there with an explicit
+  // anvil policy, for the runner builder to remove). The runner's default deadline set is still the anvil one, which breaks the leg-linking rule under the
+  // new 80-minute finality budget (rule 2): a NEW swap on 84532 with it is still refused at the deadlines row, now for the real numbers.
   it("a dry run on Base Sepolia (chain 84532) with the known-good deadlines exits 3 on the deadlines row, and --yes refuses; --refund is not blocked by it (F3)", async () => {
     const dry = await makeRig();
     const result = await run(dry);
     expect(result.code).toBe(EXIT.preflight);
-    expect(result.stdout).toMatch(/FAIL\s+deadlines\s+no Base Sepolia policy yet \(P9-4\)/);
+    expect(result.stdout).toMatch(/FAIL\s+deadlines\s+rule 2: legB\.claimByMs \d+ < required \d+ ms \(legA\.refundAfterMs \d+ \+ finalityAMs 4800000\)/);
     expect(result.stdout).toContain("Nothing was sent. Fix the failed checks");
     expect(result.stdout).not.toContain("This was a dry run");
     expect(result.stdout).toMatch(/OK\s+chain id\s+84532 matches the pin base-sepolia/); // everything else about the chain is fine
@@ -191,7 +194,7 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     const refused = await run(yes, "yes");
     expect(refused.code).toBe(EXIT.preflight);
     expect(refused.stdout).toContain("--yes refuses to broadcast unless every needed check holds");
-    expect(refused.stdout).toMatch(/FAIL\s+deadlines\s+no Base Sepolia policy yet/);
+    expect(refused.stdout).toMatch(/FAIL\s+deadlines\s+rule 2: legB\.claimByMs/);
     expect(await exists(join(yes.stateDir, "run.json"))).toBe(false);
     expect(yes.chain.methods.filter((m) => WRITES.includes(m))).toEqual([]);
 
@@ -199,7 +202,7 @@ describe("the dry run (the default mode) against a fake read-only chain", () => 
     const refund = await makeRig();
     await writeRun(refund, {}, true);
     const refunded = await run(refund, "refund");
-    expect(refunded.stdout).not.toContain("no Base Sepolia policy yet");
+    expect(refunded.stdout).not.toContain("rule 2: legB.claimByMs");
     expect(refunded.stdout).not.toMatch(/deadlines/);
     expect(refunded.stdout).not.toContain("a check it needs failed");
     expect(refunded.code).toBe(EXIT.refused); // past the pre-flight, it stops at the Buyer's empty store: nothing to refund

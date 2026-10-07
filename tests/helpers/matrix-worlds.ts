@@ -19,6 +19,7 @@ import { LockPendingError, type BidParams } from "../../src/client/buyer.js";
 import { createEvmCounterRail } from "../../src/client/evm-rail.js";
 import { decodeFlowRecord } from "../../src/client/flow-record.js";
 import { MemoryFlowStore, flowKey } from "../../src/client/flow-store.js";
+import { knownGoodDeadlinesFor } from "../../src/client/policy.js";
 import { sellerKeyOf } from "./seller-key.js";
 import { createNearCounterRail } from "../../src/client/near-rail.js";
 import { MemoryVenue } from "../../src/client/venue.js";
@@ -80,12 +81,15 @@ export const evmWorldWith =
   (ctl): World => {
     const buyerKey = evmSigner(0x411);
     const sellerKey = evmSigner(0x412);
-    const legA = { claimByMs: T0 + 60 * 60_000, refundAfterMs: T0 + 90 * 60_000, expiresMs: T0 + 30 * 60_000 };
-    const legB = { claimByMs: T0 + 120 * 60_000, refundAfterMs: T0 + 180 * 60_000, expiresMs: T0 + 40 * 60_000 };
     const clockRef = { ms: T0 };
     const clock = (): number => clockRef.ms;
     const node = new EvmMockNode(clock, evmAddress("matrix-evm-rail"), evmAddress("matrix-evm-usdc"), [buyerKey, sellerKey]);
     configure?.(node);
+    // P9-4 decision 2: the deadlines are the known-good set of the node's own chain (84532 runs under BASE_SEPOLIA_POLICY, whose 80-minute finality budget
+    // the anvil set breaks: rule 2); anvil's set is the one this world has always used.
+    const minutes = knownGoodDeadlinesFor(node.chainId);
+    const legA = { claimByMs: T0 + minutes.legA.claimByMin * 60_000, refundAfterMs: T0 + minutes.legA.refundAfterMin * 60_000, expiresMs: T0 + minutes.legA.expiresMin * 60_000 };
+    const legB = { claimByMs: T0 + minutes.legB.claimByMin * 60_000, refundAfterMs: T0 + minutes.legB.refundAfterMin * 60_000, expiresMs: T0 + minutes.legB.expiresMin * 60_000 };
     const venue = new MemoryVenue(clock);
     const noteStore = new MemoryNoteStore();
     const base = common(ctl, clockRef, venue, noteStore);

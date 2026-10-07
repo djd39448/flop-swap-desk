@@ -33,7 +33,7 @@ import {
   type RailRefundOptions,
   type RailWriteEvidence,
 } from "./counter-rail.js";
-import { EVM_LOCAL_POLICY, type RailLocalPolicy } from "./policy.js";
+import { evmLocalPolicyFor, type EvmLocalPolicy } from "./policy.js";
 
 export interface EvmCounterRailOptions {
   config: EvmRailConfig;
@@ -267,8 +267,14 @@ export function evmDeploymentId(config: EvmRailConfig): string {
 class EvmCounterRail implements CounterAssetRail {
   readonly railId: string = EVM_RAIL_ID;
   readonly caip2: string;
-  /** G5: frozen, never a constructor option — see `CounterAssetRail.policy`'s own doc. */
-  readonly policy: RailLocalPolicy = EVM_LOCAL_POLICY;
+  /** P9-4 decision 1: the pin's chain id, kept to select the policy (never printed: a config that is not a number here is not echoed). */
+  private readonly chainId: number;
+  /** G5: frozen, never a constructor option (see `CounterAssetRail.policy`'s own doc). P9-4 decision 1: selected by the pin's chain id
+   *  (`evmLocalPolicyFor`): `EVM_LOCAL_POLICY` for anvil (31337), `BASE_SEPOLIA_POLICY` for Base Sepolia (84532); any other chain id has no
+   *  policy and this throws `EvmPolicyUnavailableError` (so does `connect()`, before anything is read or sent). */
+  get policy(): EvmLocalPolicy {
+    return evmLocalPolicyFor(this.chainId);
+  }
   /** R1-05: the escrow contract and the token addresses. The lock is found by its hash lock AT this contract, so a
    *  record resumed against another contract would read "no row" as "never landed" and lock again. */
   readonly deploymentId: string;
@@ -277,6 +283,7 @@ class EvmCounterRail implements CounterAssetRail {
   constructor(options: EvmCounterRailOptions) {
     this.options = options;
     this.caip2 = options.config.pin.caip2;
+    this.chainId = options.config.pin.chainId;
     this.deploymentId = evmDeploymentId(options.config);
   }
 
@@ -314,6 +321,8 @@ class EvmCounterRail implements CounterAssetRail {
   }
 
   async connect(terms: LockTerms, accounts: RailAccounts): Promise<ConnectedCounterAssetRail> {
+    // P9-4 decision 1: a chain with no deadline policy is refused before anything is read or sent (the typed `EvmPolicyUnavailableError`).
+    void this.policy;
     const addressBook = addressBookFor(terms, accounts, addressOf(this.options.account));
     const rail = await EvmHtlcRail.connect({
       config: this.options.config,
