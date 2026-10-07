@@ -16,7 +16,7 @@ import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 import { accountProofMessage, formatAccountLine, resolveAccounts } from "../rails/account-line.js";
 import { eip191Verifier, type AccountProof } from "../rails/account-proof.js";
 import { EVM_RAIL_ID, type EvmAccounts } from "../rails/evm-evidence.js";
-import { EvmHtlcRail, type EvmRailConfig } from "../rails/evm-htlc.js";
+import { EvmHtlcRail, MAX_LOOKUP_PAUSE_MS, type EvmRailConfig } from "../rails/evm-htlc.js";
 import type { CapturingRpc, Exchange } from "../rails/rpc-capture.js";
 import type { AddressBook } from "../vendor/evm-hash-rail.js";
 import {
@@ -47,6 +47,13 @@ export interface EvmCounterRailOptions {
    */
   account: Address | LocalAccount;
   clock: () => number;
+  /**
+   * P9-4 decision 10: the runner's poll interval (ms). On a chain other than Base Sepolia the write lookup pauses this long between its re-plans
+   * (1 s, the anvil policy's block time, when omitted); on Base Sepolia the pause is the policy's block time (2 s) whatever this says.
+   */
+  pollMs?: number;
+  /** P9-4 decision 10: the pause itself (a timer by default); a test injects one that records the pauses. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** The address of either kind of account. */
@@ -287,6 +294,15 @@ class EvmCounterRail implements CounterAssetRail {
     this.deploymentId = evmDeploymentId(options.config);
   }
 
+  /** P9-4 decision 10: the pause before each re-plan of the write lookup: the policy's block time on Base Sepolia (2 s), else the runner's poll interval,
+   *  else the policy's block time (anvil: 1 s). */
+  private lookupPauseMs(): number {
+    const policy = this.policy;
+    if (this.chainId === 84532) return policy.blockTimeMs;
+    const poll = this.options.pollMs;
+    return poll !== undefined && Number.isSafeInteger(poll) && poll >= 0 ? Math.min(poll, MAX_LOOKUP_PAUSE_MS) : policy.blockTimeMs;
+  }
+
   formatAccountLine(address: string): string {
     return formatAccountLine({ railId: this.railId, caip2: this.caip2, address });
   }
@@ -330,6 +346,8 @@ class EvmCounterRail implements CounterAssetRail {
       account: this.options.account,
       addressBook,
       clock: this.options.clock,
+      lookupPauseMs: this.lookupPauseMs(),
+      ...(this.options.sleep === undefined ? {} : { sleep: this.options.sleep }),
     });
     return new ConnectedEvmCounterRail(rail, this.options.rpc, this.options.account, this.caip2);
   }

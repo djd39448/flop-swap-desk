@@ -145,8 +145,12 @@ export const MAX_LOG_SCAN_CHUNKS = 100;
 
 /** F7: how many times the write-evidence lookup re-plans (a fresh tip read, the whole range read again) when it finds no log before it
  *  gives up with "found 0". A load-balanced endpoint can answer the receipt from one node and the tip or the logs from another that has
- *  not seen the block yet; the write is on chain, so a bounded re-read is the answer, never a second write. */
+ *  not seen the block yet; the write is on chain, so a bounded re-read is the answer, never a second write. P9-4 decision 10: each re-plan
+ *  is preceded by a pause of about one block (`EvmHtlcRailOptions.lookupPauseMs`). */
 export const EVM_WRITE_LOOKUP_REPLANS = 3;
+
+/** P9-4 decision 10: the largest `lookupPauseMs` a rail accepts: one minute (a larger number is a typo for something else). */
+export const MAX_LOOKUP_PAUSE_MS = 60_000;
 
 /** R1-FUND-03: the smallest `maxLogRange` a config may carry: the resumed Seller's claim marker sits `CLAIM_MARKER_REORG_MARGIN_EVM` (256)
  *  blocks below the tip it read, so a range of at least 257 blocks keeps that margin inside one call. */
@@ -779,6 +783,16 @@ export interface EvmHtlcRailOptions {
    *  `resolveAccounts` in the client, out of this Stage's scope. */
   addressBook: AddressBook;
   clock?: () => number;
+  /**
+   * P9-4 decision 10 (P2R2-PIN-07): how long (ms) the write-evidence lookup pauses BEFORE each of its re-plans (a lookup that found no log re-reads the tip
+   * and the whole range, at most `EVM_WRITE_LOOKUP_REPLANS` times). A log or a tip read a block behind the write's own receipt (a load-balanced endpoint)
+   * is answered by waiting about one block, not by four reads in a row against the same stale view. A non-negative integer of at most
+   * `MAX_LOOKUP_PAUSE_MS`. Omitted: no pause (the lookup re-plans at once, as before this option). `createEvmCounterRail` passes the chain's block time
+   * (2 s on Base Sepolia, from its policy). A lookup that finds its log at once never pauses.
+   */
+  lookupPauseMs?: number;
+  /** The pause itself: a timer by default; a test injects one that records the pauses (and, for a mock, lets a block pass). */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -795,6 +809,9 @@ export class EvmHtlcRail {
   private readonly clock: () => number;
   private readonly receiptWatch: ReceiptWatch;
   private readonly signerWatch: EvmSignerWatch;
+  /** P9-4 decision 10: the pause before each re-plan of the write lookup (ms), and how it is made. */
+  private readonly lookupPauseMs: number;
+  private readonly sleep: (ms: number) => Promise<void>;
 
   private constructor(
     config: EvmRailConfig,
@@ -805,6 +822,8 @@ export class EvmHtlcRail {
     clock: () => number,
     receiptWatch: ReceiptWatch,
     signerWatch: EvmSignerWatch,
+    lookupPauseMs: number,
+    sleep: (ms: number) => Promise<void>,
   ) {
     this.config = config;
     this.rpc = rpc;
@@ -814,6 +833,8 @@ export class EvmHtlcRail {
     this.clock = clock;
     this.receiptWatch = receiptWatch;
     this.signerWatch = signerWatch;
+    this.lookupPauseMs = lookupPauseMs;
+    this.sleep = sleep;
   }
 
   /**
@@ -836,6 +857,10 @@ export class EvmHtlcRail {
     const configCheck = checkEvmRailConfig(options.config);
     if (!configCheck.ok) {
       throw new Error(`evm-htlc: refusing to connect — ${configCheck.reason}`);
+    }
+    const lookupPauseMs = options.lookupPauseMs ?? 0;
+    if (typeof lookupPauseMs !== "number" || !Number.isSafeInteger(lookupPauseMs) || lookupPauseMs < 0 || lookupPauseMs > MAX_LOOKUP_PAUSE_MS) {
+      throw new Error(`evm-htlc: refusing to connect - lookupPauseMs must be an integer from 0 to ${MAX_LOOKUP_PAUSE_MS}`);
     }
 
     const chain = chainFromPin(options.config.pin);
@@ -924,7 +949,18 @@ export class EvmHtlcRail {
     // see (a write's `WriteEvidence.raw` must hold only that write's own exchanges).
     options.rpc.drain();
 
-    return new EvmHtlcRail(options.config, options.rpc, publicClient, walletClient, rail, options.clock ?? Date.now, receiptWatch, signerWatch);
+    return new EvmHtlcRail(
+      options.config,
+      options.rpc,
+      publicClient,
+      walletClient,
+      rail,
+      options.clock ?? Date.now,
+      receiptWatch,
+      signerWatch,
+      lookupPauseMs,
+      options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+    );
   }
 
   /** Runs one write through the vendored rail, which re-wraps every failure as `tclk: <reason>`: a receipt timeout recorded
@@ -1229,6 +1265,9 @@ export class EvmHtlcRail {
     if (plan.unread !== undefined) throw this.logScanBoundError(fromBlock, plan);
     let logs = await this.readWriteLogs(event, hashLock, plan);
     for (let replans = 0; logs.length === 0 && replans < EVM_WRITE_LOOKUP_REPLANS; replans += 1) {
+      // P9-4 decision 10 (P2R2-PIN-07): about one block passes before the next read, so a view that is a block behind the write catches up instead of being read
+      // four times in a row.
+      if (this.lookupPauseMs > 0) await this.sleep(this.lookupPauseMs);
       plan = await this.planLogScan(fromBlock, this.receiptWatch.receiptBlock);
       if (plan.unread !== undefined) throw this.logScanBoundError(fromBlock, plan);
       logs = await this.readWriteLogs(event, hashLock, plan);

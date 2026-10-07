@@ -101,6 +101,9 @@ export class EvmMockNode {
   refuseLogs = false;
   /** F7: the next this-many `eth_getLogs` calls answer an empty list whatever the filter (a load-balanced node that has not seen the block yet). */
   emptyLogQueries = 0;
+  /** P9-4 decision 10: `eth_getLogs` hides every log whose block is within this many blocks of the tip (a node whose log index is that far behind its own head):
+   *  with 1, a log in the tip block shows only once the chain has moved one block on (`advance`). 0 = no lag, the default. */
+  logLagBlocks = 0;
   /** F7: after an `eth_getTransactionReceipt` is answered, the next this-many `eth_blockNumber` answers are one block BEHIND the chain (a tip read that a
    *  node lagging the one that answered the receipt gives). */
   lagTipReads = 0;
@@ -164,6 +167,11 @@ export class EvmMockNode {
     log.blockNumber = blockNumber;
     log.raw.blockNumber = numberToHex(blockNumber);
     log.raw.blockHash = this.blockHash(blockNumber);
+  }
+
+  /** P9-4 decision 10: time passes on the chain: `blocks` empty blocks are mined (a lagging log index catches up). */
+  advance(blocks = 1n): void {
+    this.blockNumber += blocks;
   }
 
   count(fn: SendKind): number {
@@ -279,6 +287,7 @@ export class EvmMockNode {
     if (this.hideLogs) return [];
     return this.logs
       .filter((log) => log.blockNumber >= from && (to === undefined || log.blockNumber <= to))
+      .filter((log) => log.blockNumber <= this.blockNumber - BigInt(this.logLagBlocks))
       .filter((log) => (log.raw.topics as string[])[0] === topic0)
       .filter((log) => topic1 === undefined || topic1 === null || (log.raw.topics as string[])[1] === topic1)
       .map((log) => log.raw);
