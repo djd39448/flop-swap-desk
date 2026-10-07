@@ -513,6 +513,44 @@ describe("parseRehearsalConfig", () => {
     expect(parseRehearsalConfig(anvilConfig({ pollMs: 250, waitLimitMs: 3_000 }), BASE).waitLimitMs).toBe(3_000);
   });
 
+  // P9-4 decision 5 (runner part): the fee ceiling of a local account is a field of the runner's config, a number or a decimal string of wei per gas, with the rail's own
+  // floor of 1 gwei on Base Sepolia; the pre-flight's fee row reads it (tests/rehearsal-preflight.test.ts).
+  it("P9-4 d5: rails.evm.maxFeePerGasWei is a number or a decimal string, carried through to the rail's config; Base Sepolia refuses under 1 gwei, anvil takes any positive integer", () => {
+    for (const value of [1_000_000_000, "1000000000", "50000000000", 7_000_000_000]) {
+      const config = parseRehearsalConfig(baseSepoliaConfig({ maxFeePerGasWei: value }), BASE);
+      expect(config.rails.evm.maxFeePerGasWei, String(value)).toBe(value);
+    }
+    expect(parseRehearsalConfig(baseSepoliaConfig(), BASE).rails.evm.maxFeePerGasWei).toBeUndefined(); // absent: the rail's own default (50 gwei on 84532)
+    expect("maxFeePerGasWei" in parseRehearsalConfig(baseSepoliaConfig(), BASE).rails.evm).toBe(false);
+    // Below the floor on Base Sepolia: refused, naming the field and the floor.
+    for (const value of [999_999_999, "999999999", 1, "1"]) {
+      const message = refusal(baseSepoliaConfig({ maxFeePerGasWei: value }));
+      expect(message, String(value)).toContain("maxFeePerGasWei");
+      expect(message, String(value)).toContain("below the 1000000000 wei (1 gwei) floor on base-sepolia");
+    }
+    // Anvil has no floor.
+    expect(parseRehearsalConfig(anvilConfig({ rails: { evm: { pin: ANVIL_LOCAL_PIN, endpoint: "http://127.0.0.1:8545", contract: CONTRACT, assets: { USDC: TOKEN }, maxFeePerGasWei: 1 } } }), BASE).rails.evm.maxFeePerGasWei).toBe(1);
+    // Anything that is not a positive integer is refused by field name, with no value in the message.
+    for (const value of [0, -5, 1.5, "0", "01", "1.5", "abc", "1e9", null, true, [], {}]) {
+      const message = refusal(baseSepoliaConfig({ maxFeePerGasWei: value }));
+      expect(message, JSON.stringify(value)).toContain("maxFeePerGasWei must be a positive integer");
+    }
+  });
+
+  it("P9-4 d5: a decimal string that looks like key material is refused by field name and never quoted; a 31-digit ceiling is only a large ceiling", () => {
+    const key = generatePrivateKey();
+    const decimal = BigInt(key).toString(10);
+    const scan = decimalKeyScanner(key);
+    for (const value of [decimal, decimal.slice(0, 40), `1${"0".repeat(31)}`]) {
+      expect(looksLikeKeyMaterial(value), "the shape under test").toBe(true);
+      const message = refusal(baseSepoliaConfig({ maxFeePerGasWei: value }));
+      expect(message).toContain("rails.evm.maxFeePerGasWei looks like key material");
+      expect(scan(message), "no window of the pasted key may be quoted").toBe(false);
+      expect(message).not.toContain(value.slice(0, 12));
+    }
+    expect(parseRehearsalConfig(baseSepoliaConfig({ maxFeePerGasWei: `1${"0".repeat(30)}` }), BASE).rails.evm.maxFeePerGasWei).toBe(`1${"0".repeat(30)}`);
+  });
+
   // P9-4 decision 2 (runner part): "known-good" (and an absent deadlines) resolves by the pin's chain id, to the set that satisfies every rule under THAT chain's policy.
   it("P9-4 d2: known-good deadlines resolve by the pin's chain id: anvil +60/+90/+120/+180, Base Sepolia +115/+135/+225/+285; an explicit set is the person's own", () => {
     expect(Object.keys(KNOWN_GOOD_DEADLINES).sort()).toEqual(["31337", "84532"]);

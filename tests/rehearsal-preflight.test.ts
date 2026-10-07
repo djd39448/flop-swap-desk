@@ -128,7 +128,7 @@ describe("a healthy chain (every needed check holds)", () => {
 
   it("only reads: no write method is ever asked of the node", async () => {
     const run = await preflight();
-    const allowed = new Set(["eth_chainId", "eth_getCode", "eth_getBlockByNumber", "eth_call", "eth_getLogs", "eth_gasPrice", "eth_getBalance"]);
+    const allowed = new Set(["eth_chainId", "eth_getCode", "eth_getBlockByNumber", "eth_call", "eth_getLogs", "eth_gasPrice", "eth_getBalance", "eth_maxPriorityFeePerGas"]);
     expect(run.methods.length).toBeGreaterThan(10);
     expect(run.methods.filter((m) => !allowed.has(m))).toEqual([]);
   });
@@ -422,6 +422,105 @@ describe("the accounts", () => {
     expect(row(run, "buyer account").detail).toBe(problem);
     expect(run.report.rows.some((r) => r.check === "buyer ETH")).toBe(false);
     expect(run.report.ok).toBe(false);
+  });
+});
+
+// P9-4 decision 5: a LOCAL account signs only under rails.evm.maxFeePerGasWei (50 gwei by default on Base Sepolia, 1,000 gwei on anvil), so a ceiling under the fee viem would
+// compute is found at the dry run: the row reads the latest block's base fee and the priority fee the endpoint answers, forms viem's own fee (base fee x 1.2 + priority fee),
+// puts a 2x cushion on it and sets it against the effective ceiling. A fresh run FAILS when the ceiling is below it; --resume and --refund only WARN.
+describe("the fee ceiling row (P9-4 decision 5)", () => {
+  const GWEI = 1_000_000_000n;
+  const high = (baseGwei: bigint, tipGwei: bigint): FakeChainOptions => ({ baseFeePerGasWei: baseGwei * GWEI, priorityFeeWei: tipGwei * GWEI });
+
+  it("the default ceiling passes on Base Sepolia's own fees (a sub-gwei base fee), printing the fee viem would sign, the cushioned fee and the ceiling", async () => {
+    const run = await preflight();
+    expect(status(run, "fee ceiling")).toBe("ok");
+    const detail = row(run, "fee ceiling").detail;
+    expect(detail).toContain("the fee viem would sign for now is 0.0007 gwei (base fee 0.0005 gwei x 1.2 + priority fee 0.0001 gwei)");
+    expect(detail).toContain("0.0014 gwei with the 2x cushion");
+    expect(detail).toContain("the effective ceiling is 50 gwei (the default of this chain)");
+    expect(run.report.ok).toBe(true);
+  });
+
+  it("a base fee above the ceiling fails the row on a fresh run, printing both numbers and the field to raise", async () => {
+    // base fee 100 gwei x 1.2 + 1 gwei = 121 gwei, 242 gwei with the cushion: over the 50-gwei default.
+    const run = await preflight(high(100n, 1n));
+    expect(status(run, "fee ceiling")).toBe("fail");
+    const detail = row(run, "fee ceiling").detail;
+    expect(detail).toContain("the fee viem would sign for now is 121 gwei (base fee 100 gwei x 1.2 + priority fee 1 gwei), 242 gwei with the 2x cushion");
+    expect(detail).toContain("the effective ceiling is 50 gwei (the default of this chain)");
+    expect(detail).toContain("the ceiling is below it, so the signer would refuse to sign a write at this fee (nothing would be sent)");
+    expect(detail).toContain("raise rails.evm.maxFeePerGasWei to at least 242000000000 (242 gwei)");
+    expect(run.report.ok).toBe(false);
+  });
+
+  it("a configured ceiling is used and named; it passes at exactly the cushioned fee and fails one wei under it", async () => {
+    // base fee 0.5 gwei x 1.2 + 0.5 gwei = 1.1 gwei; with the cushion 2.2 gwei.
+    const fees: FakeChainOptions = { baseFeePerGasWei: 500_000_000n, priorityFeeWei: 500_000_000n };
+    const exact = await preflight(fees, config({ maxFeePerGasWei: "2200000000" }));
+    expect(status(exact, "fee ceiling")).toBe("ok");
+    expect(row(exact, "fee ceiling").detail).toContain("the effective ceiling is 2.2 gwei (rails.evm.maxFeePerGasWei)");
+    const under = await preflight(fees, config({ maxFeePerGasWei: "2199999999" }));
+    expect(status(under, "fee ceiling")).toBe("fail");
+    expect(row(under, "fee ceiling").detail).toContain("2.2 gwei with the 2x cushion");
+    expect(row(under, "fee ceiling").detail).toContain("the effective ceiling is 2.199999999 gwei (rails.evm.maxFeePerGasWei)");
+    // A number works as well as a string.
+    expect(status(await preflight(fees, config({ maxFeePerGasWei: 3_000_000_000 })), "fee ceiling")).toBe("ok");
+  });
+
+  it("with no priority fee from the endpoint the row does what viem does: gas price minus base fee, never below zero", async () => {
+    const stand = await preflight({ priorityFeeWei: null, baseFeePerGasWei: 500_000n, gasPriceWei: 1_000_000n });
+    expect(status(stand, "fee ceiling")).toBe("ok");
+    expect(row(stand, "fee ceiling").detail).toContain("priority fee 0.0005 gwei, gas price minus base fee: the endpoint answers no priority fee");
+    const floor = await preflight({ priorityFeeWei: null, baseFeePerGasWei: 2_000_000n, gasPriceWei: 1_000_000n });
+    expect(row(floor, "fee ceiling").detail).toContain("priority fee 0 gwei");
+  });
+
+  it("a chain whose blocks carry no base fee, or a head that cannot be read, fails a fresh run's row and says why", async () => {
+    const noBase = await preflight({ baseFeePerGasWei: null });
+    expect(status(noBase, "fee ceiling")).toBe("fail");
+    expect(row(noBase, "fee ceiling").detail).toContain("the head block carries no baseFeePerGas");
+    const chain = fakeChain({ headTimestampSec: HEAD_SEC, tokenBalances: { [buyerAddress.toLowerCase()]: 100_000_000n } });
+    const { rpc } = scriptedRpc({ ...chain.handlers, eth_getBlockByNumber: () => ({ error: { code: -32000, message: "no head" } }) });
+    const report = await runPreflight({
+      config: config(),
+      rpc,
+      buyer: { address: buyerAddress },
+      seller: { address: sellerAddress },
+      nowMs: NOW_MS,
+      fresh: true,
+      deadlines: { absolute: absoluteDeadlines(BASE_SET, NOW_MS), lockTimeMs: NOW_MS + LOCK_ESTIMATE_MS },
+      policy: BASE_SEPOLIA_POLICY,
+      redact: (t) => t,
+    });
+    const found = report.rows.find((r) => r.check === "fee ceiling");
+    expect(found?.status).toBe("fail");
+    expect(found?.detail).toContain("the head is unknown");
+  });
+
+  it("anvil's default ceiling is 1,000 gwei: the same 100-gwei base fee passes there", async () => {
+    const anvil = config({ contractCodeHash: undefined }, {}, ANVIL_LOCAL_PIN);
+    const run = await preflight({ chainId: 31337, ...high(100n, 1n) }, anvil);
+    expect(status(run, "fee ceiling")).toBe("ok");
+    expect(row(run, "fee ceiling").detail).toContain("the effective ceiling is 1000 gwei (the default of this chain)");
+  });
+
+  it("--resume and --refund (fresh = false) only WARN, with the same numbers: a prediction never stands between an honest party and a deadline-bound step", async () => {
+    for (const buyerSends of ["approve-lock-refund", "refund"] as const) {
+      const run = await preflight(high(100n, 1n), config(), { fresh: false, buyerSends });
+      expect(status(run, "fee ceiling"), buyerSends).toBe("warn");
+      expect(row(run, "fee ceiling").detail, buyerSends).toContain("242 gwei with the 2x cushion");
+      expect(row(run, "fee ceiling").detail, buyerSends).toContain("the effective ceiling is 50 gwei");
+      expect(run.report.ok, buyerSends).toBe(true);
+    }
+    const noBase = await preflight({ baseFeePerGasWei: null }, config(), { fresh: false });
+    expect(status(noBase, "fee ceiling")).toBe("warn");
+  });
+
+  it("the row reads (eth_maxPriorityFeePerGas, the latest block) and sends nothing", async () => {
+    const run = await preflight();
+    expect(run.methods).toContain("eth_maxPriorityFeePerGas");
+    expect(run.methods.filter((m) => m === "eth_sendRawTransaction" || m === "eth_sendTransaction")).toEqual([]);
   });
 });
 

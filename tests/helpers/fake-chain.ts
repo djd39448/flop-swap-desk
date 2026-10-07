@@ -43,6 +43,10 @@ export interface FakeChainOptions {
   logCap?: number | null;
   /** The gas price in wei. Default 1,000,000 (0.001 gwei). */
   gasPriceWei?: bigint;
+  /** P9-4 decision 5: the base fee per gas every block carries, in wei (Base Sepolia's is far under a gwei). Default 500,000 (0.0005 gwei); `null`: blocks carry no `baseFeePerGas` (a chain without EIP-1559). */
+  baseFeePerGasWei?: bigint | null;
+  /** P9-4 decision 5: what `eth_maxPriorityFeePerGas` answers, in wei. Default 100,000 (0.0001 gwei); `null`: the node answers an error (viem then falls back to gas price minus base fee). */
+  priorityFeeWei?: bigint | null;
   /** Native balances by address (lower case). Default: every account holds 1 ETH. */
   ethBalances?: Record<string, bigint>;
   /** Token balances and allowances by address (lower case). */
@@ -75,7 +79,13 @@ export function fakeChain(options: FakeChainOptions = {}): FakeChain {
   const methods: string[] = [];
   const logRanges: Array<[bigint, bigint]> = [];
 
-  const block = (number: bigint, tsSec: number): Record<string, unknown> => ({ number: hex(number), hash: hashOf(number), timestamp: hex(BigInt(tsSec)) });
+  const baseFee = options.baseFeePerGasWei === undefined ? 500_000n : options.baseFeePerGasWei;
+  const block = (number: bigint, tsSec: number): Record<string, unknown> => ({
+    number: hex(number),
+    hash: hashOf(number),
+    timestamp: hex(BigInt(tsSec)),
+    ...(baseFee === null ? {} : { baseFeePerGas: hex(baseFee) }),
+  });
   const blockByTag = (tag: unknown): { result?: unknown; error?: { code: number; message: string } } => {
     if (tag === "latest") return { result: block(head, headTs) };
     if (tag === "finalized") {
@@ -121,6 +131,10 @@ export function fakeChain(options: FakeChainOptions = {}): FakeChain {
     eth_gasPrice: () => {
       methods.push("eth_gasPrice");
       return { result: hex(options.gasPriceWei ?? 1_000_000n) };
+    },
+    eth_maxPriorityFeePerGas: () => {
+      methods.push("eth_maxPriorityFeePerGas");
+      return options.priorityFeeWei === null ? { error: { code: -32601, message: "the method eth_maxPriorityFeePerGas does not exist" } } : { result: hex(options.priorityFeeWei ?? 100_000n) };
     },
     eth_getBalance: (params) => {
       methods.push("eth_getBalance");

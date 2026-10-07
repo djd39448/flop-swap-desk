@@ -4,7 +4,7 @@
 // (bin/swap-rehearsal-evm.mjs). One JSON object names everything a rehearsal needs and nothing else:
 //
 //   {
-//     "rails": { "evm": { <an EvmRailConfig: pin, endpoint, contract, assets, contractCodeHash, maxLogRange, ...> } },
+//     "rails": { "evm": { <an EvmRailConfig: pin, endpoint, contract, assets, contractCodeHash, maxLogRange, maxFeePerGasWei, receiptTimeoutMs> } },
 //     "buyerKeyFile": "<path>", "sellerKeyFile": "<path>",      // loaded by loadEvmLocalAccount; the keys are never in this file
 //     "deadlines": "known-good" | { "legA": {...}, "legB": {...} },
 //     "amount": "1000000", "out": "<bundle directory>",
@@ -100,7 +100,7 @@ export class RehearsalConfigError extends Error {
 
 const TOP_FIELDS = ["rails", "buyerKeyFile", "sellerKeyFile", "deadlines", "amount", "asset", "flopAmount", "out", "clock", "pollMs", "waitLimitMs"] as const;
 const RAILS_FIELDS = ["evm"] as const;
-const EVM_FIELDS = ["pin", "endpoint", "contract", "assets", "receiptTimeoutMs", "contractCodeHash", "maxLogRange"] as const;
+const EVM_FIELDS = ["pin", "endpoint", "contract", "assets", "receiptTimeoutMs", "contractCodeHash", "maxLogRange", "maxFeePerGasWei"] as const;
 const PIN_FIELDS = ["chainId", "name", "caip2", "finality"] as const;
 const TAG_FINALITY_FIELDS = ["mode", "tag", "fallbackConfirmations"] as const;
 const CONFIRMATIONS_FINALITY_FIELDS = ["mode", "confirmations"] as const;
@@ -270,6 +270,14 @@ function cleanEvmConfig(value: unknown): EvmRailConfig {
       );
     }
   }
+  // P9-4 decision 5: the fee ceiling is a number or a decimal string of wei per gas, and the pre-flight prints it, so a string that looks like key material (a key written
+  // in decimal fits the shape up to 40 digits) is refused by field name before anything can carry it, as for amount. Its value is never quoted. The rail's own check holds the
+  // shape (a positive integer) and the 1 gwei floor on Base Sepolia.
+  if (typeof evm.maxFeePerGasWei === "string" && looksLikeKeyMaterial(evm.maxFeePerGasWei)) {
+    throw new RehearsalConfigError(
+      `rails.evm.maxFeePerGasWei looks like key material (${KEY_LIKE_SHAPES}) and not a fee ceiling: it must be a positive integer number of wei per gas (a number, or a decimal string)`,
+    );
+  }
   const assets = requireObject(evm.assets, "rails.evm.assets");
   // KR2-1: an asset name is quoted by the rail's refusals, printed by the runner and written into the bundle's rails.json, so every name is held to a short
   // plain name BEFORE anything else reads the config (a key pasted as a name must not ride along with a valid address). The name is never shown.
@@ -296,6 +304,7 @@ function cleanEvmConfig(value: unknown): EvmRailConfig {
     ...(evm.receiptTimeoutMs === undefined ? {} : { receiptTimeoutMs: evm.receiptTimeoutMs }),
     ...(evm.contractCodeHash === undefined ? {} : { contractCodeHash: evm.contractCodeHash }),
     ...(evm.maxLogRange === undefined ? {} : { maxLogRange: evm.maxLogRange }),
+    ...(evm.maxFeePerGasWei === undefined ? {} : { maxFeePerGasWei: evm.maxFeePerGasWei }),
   };
   const checked = checkEvmRailConfig(candidate);
   if (!checked.ok) throw new RehearsalConfigError(`rails.evm: ${checked.reason}`);

@@ -1196,6 +1196,56 @@ describe("bad configs and a failing endpoint", () => {
     expect(rig.chain.methods).toEqual([]); // the endpoint was never touched
   });
 
+  // P9-4 decision 5, through the command's front door: a ceiling under the fee viem would compute is refused at the dry run and at --yes, before the first signature.
+  it("P9-4 d5: a dry run with a fee ceiling under the chain's fee exits 3 on the fee ceiling row printing both numbers, --yes refuses, and a raised ceiling or the default passes; --refund only warns", async () => {
+    const GWEI = 1_000_000_000n;
+    const dear = { baseFeePerGasWei: 2n * GWEI, priorityFeeWei: 1n * GWEI }; // 2 x 1.2 + 1 = 3.4 gwei, 6.8 gwei with the cushion
+    const low = await makeRig({ chain: dear, evmExtra: { maxFeePerGasWei: "1000000000" } });
+    const refused = await run(low);
+    expect(refused.code).toBe(EXIT.preflight);
+    expect(refused.stdout).toMatch(/FAIL\s+fee ceiling\s+the fee viem would sign for now is 3\.4 gwei \(base fee 2 gwei x 1\.2 \+ priority fee 1 gwei\), 6\.8 gwei with the 2x cushion; the effective ceiling is 1 gwei \(rails\.evm\.maxFeePerGasWei\)/);
+    expect(refused.stdout).toContain("raise rails.evm.maxFeePerGasWei to at least 6800000000 (6.8 gwei)");
+    expect(refused.stdout.match(/^ {2}FAIL {2}.{1,20}?(?= {2})/gm)).toEqual(["  FAIL  fee ceiling"]); // the only failure
+    expect(refused.stdout).toContain("Nothing was sent. Fix the failed checks");
+    expect(low.chain.methods.filter((m) => WRITES.includes(m))).toEqual([]);
+
+    const yes = await makeRig({ chain: dear, evmExtra: { maxFeePerGasWei: "1000000000" } });
+    const stopped = await run(yes, "yes");
+    expect(stopped.code).toBe(EXIT.preflight);
+    expect(stopped.stdout).toContain("--yes refuses to broadcast unless every needed check holds");
+    expect(stopped.stdout).toMatch(/FAIL\s+fee ceiling/);
+    expect(await exists(join(yes.stateDir, "run.json"))).toBe(false);
+
+    // The same chain with the ceiling raised (or left at the 50-gwei default) passes.
+    const raised = await makeRig({ chain: dear, evmExtra: { maxFeePerGasWei: "6800000000" } });
+    const ok = await run(raised);
+    expect(ok.code).toBe(EXIT.ok);
+    expect(ok.stdout).toMatch(/OK\s+fee ceiling\s+the fee viem would sign for now is 3\.4 gwei/);
+    const defaulted = await makeRig({ chain: dear });
+    expect((await run(defaulted)).stdout).toMatch(/OK\s+fee ceiling\s+.*the effective ceiling is 50 gwei \(the default of this chain\)/);
+
+    // --refund (a swap already begun) goes past the pre-flight with a warning, never a failure: the signer's own check at signing time decides.
+    const refund = await makeRig({ chain: dear, evmExtra: { maxFeePerGasWei: "1000000000" } });
+    await writeRun(refund, {}, true);
+    const refunded = await run(refund, "refund");
+    expect(refunded.stdout).toMatch(/WARN\s+fee ceiling\s+the fee viem would sign for now is 3\.4 gwei/);
+    expect(refunded.stdout).not.toMatch(/FAIL\s+fee ceiling/);
+    expect(refunded.stdout).not.toContain("a check it needs failed");
+    expect(refunded.code).toBe(EXIT.refused); // past the pre-flight, it stops at the Buyer's empty store
+    expect(refunded.stderr).toContain("holds no record");
+  });
+
+  it("P9-4 d5: a fee ceiling under 1 gwei on Base Sepolia exits 2 naming maxFeePerGasWei, in every mode, before the endpoint is touched", async () => {
+    for (const mode of ["dry", "yes", "resume", "refund"] as const) {
+      const rig = await makeRig({ evmExtra: { maxFeePerGasWei: 999_999_999 } });
+      const result = await run(rig, mode);
+      expect(result.code, mode).toBe(EXIT.config);
+      expect(result.stderr, mode).toContain("maxFeePerGasWei 999999999 is below the 1000000000 wei (1 gwei) floor on base-sepolia");
+      expect(result.stdout, mode).toBe("");
+      expect(rig.chain.methods, mode).toEqual([]);
+    }
+  });
+
   // P9-4 decision 9, through the command's front door: a Base Sepolia run whose waitLimitMs is under one finality budget is refused before the chain is read.
   it("P9-4 d9: a Base Sepolia config with a waitLimitMs under the 80-minute finality budget exits 2 naming waitLimitMs, in every mode, before the endpoint is touched; the budget itself passes", async () => {
     for (const mode of ["dry", "yes", "resume", "refund"] as const) {

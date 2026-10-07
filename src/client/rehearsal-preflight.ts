@@ -3,7 +3,7 @@
 // P9-6 (rule 4, "nothing public before Dave"): the pre-flight of the EVM rehearsal runner. It reads the chain a swap would run
 // on and answers, row by row, whether the swap can go: the dry run (the runner's default) prints this table and sends nothing,
 // and `--yes` runs the same checks first and refuses to broadcast unless every row that is needed holds. Every call here is a
-// READ (`eth_chainId`, `eth_getCode`, `eth_getBlockByNumber`, `eth_call`, `eth_getLogs`, `eth_getBalance`, `eth_gasPrice`); no
+// READ (`eth_chainId`, `eth_getCode`, `eth_getBlockByNumber`, `eth_call`, `eth_getLogs`, `eth_getBalance`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`); no
 // write method is ever named in this module, and the only network it speaks to is the configured endpoint.
 //
 // The rows (which of them a mode runs is in `PreflightInput.fresh`):
@@ -21,6 +21,8 @@
 //                  long (the run's start to leg A's refund time at the block time measured from the last 100 blocks, plus the 256-block marker
 //                  margin; R2-FUND-05), or a claim that lands late could not be found by the Buyer's scan (F1)
 //   clock          the local clock against the chain's head
+//   fee ceiling    (P9-4 decision 5) the fee viem would sign for now (the latest block's base fee x 1.2 + the priority fee, with a 2x cushion) against the effective
+//                  `maxFeePerGasWei` of a local account (50 gwei by default on Base Sepolia): a ceiling below it fails a fresh run, and warns for --resume and --refund
 //   buyer / seller the addresses (never a key), ETH against the gas still to be sent (generous per-call ceilings times twice the
 //                  node's gas price; both rows are sized by what is left to send, R1-FUND-01 and R2-FUND-04, and a refund's short Buyer row is
 //                  a warning; Base's L1 data fee is not counted), the Buyer's token balance and allowance against the amount
@@ -35,7 +37,7 @@ import type { OfferFrame } from "@flop-labs/tclk";
 import { checkSwapDeadlines } from "../deadlines.js";
 import { EVM_HASH_RAIL_ABI } from "../vendor/evm-hash-rail.js";
 import { describeCodeProblem, judgeRuntimeCode } from "../rails/evm-code-pin.js";
-import { effectiveMaxLogRange, EVM_MIN_LOG_RANGE, evmLogScanCoverage, MAX_LOG_SCAN_CHUNKS } from "../rails/evm-htlc.js";
+import { effectiveMaxFeePerGasWei, effectiveMaxLogRange, EVM_MIN_LOG_RANGE, evmLogScanCoverage, MAX_LOG_SCAN_CHUNKS } from "../rails/evm-htlc.js";
 import type { CapturingRpc } from "../rails/rpc-capture.js";
 import { endpointHost, type RehearsalConfig, type RunDeadlines } from "./rehearsal-config.js";
 import type { RailLocalPolicy } from "./policy.js";
@@ -69,6 +71,15 @@ export const GAS_PRICE_CUSHION = 2n;
 
 /** Said in every ETH row: Base (an OP-stack chain) charges each transaction a layer-1 data fee on top of its gas, and no need here counts it (its allowance is P9-4's). */
 const L1_FEE_NOTE = "Base's L1 data fee is not included";
+
+/**
+ * P9-4 decision 5: the cushion the fee-ceiling row puts on the fee viem would compute now: a base fee can double within a few blocks of a spike, and the ceiling is
+ * checked against what a write sent later could be asked to pay, not against this moment's quote alone.
+ */
+export const FEE_CUSHION = 2n;
+
+/** viem's own multiplier of the latest block's base fee in an EIP-1559 fee (`chain.fees.baseFeeMultiplier` is 1.2 unless set; the signer's guard computes it the same way). */
+const BASE_FEE_MULTIPLIER = { numerator: 12n, denominator: 10n } as const;
 
 /** What a lock needs from the run's start to read final besides the chain's own lag: approve and lock transactions, their receipts and the first polls. */
 export const LOCK_SETTLE_ALLOWANCE_MS = 10 * 60_000;
@@ -125,6 +136,8 @@ interface Block {
   number: bigint;
   timestampMs: number;
   hash: Hex;
+  /** The block's base fee per gas in wei, when the node answers one (P9-4 decision 5 reads it from the latest block). */
+  baseFeePerGas?: bigint;
 }
 
 /** A hash no code has: `judgeRuntimeCode` against it reports the observed hash of whatever code is there. */
@@ -141,7 +154,8 @@ function parseBlock(value: unknown): Block | null {
   if (typeof v.hash !== "string" || !HEX_HASH.test(v.hash)) return null;
   const seconds = BigInt(v.timestamp);
   if (seconds > BigInt(Number.MAX_SAFE_INTEGER) / 1000n) return null;
-  return { number: BigInt(v.number), timestampMs: Number(seconds) * 1000, hash: v.hash as Hex };
+  const baseFee = quantity(v.baseFeePerGas);
+  return { number: BigInt(v.number), timestampMs: Number(seconds) * 1000, hash: v.hash as Hex, ...(baseFee === null ? {} : { baseFeePerGas: baseFee }) };
 }
 
 function quantity(value: unknown): bigint | null {
@@ -410,6 +424,46 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
   const price = priceAnswer.ok ? quantity(priceAnswer.value) : null;
   if (price === null) add("gas price", "fail", priceAnswer.ok ? "eth_gasPrice did not answer a number" : `eth_gasPrice failed: ${priceAnswer.why}`);
   else add("gas price", "info", `${formatUnits(price, 9)} gwei, reserved at ${GAS_PRICE_CUSHION}x`);
+
+  // -- the fee ceiling (P9-4 decision 5) -----------------------------------------------------------------------------------------------
+  // A LOCAL account signs only under `maxFeePerGasWei` (the signer refuses any fee cap above it, before the claim's preimage leaves the process). The row reads the fee viem
+  // would compute now (the latest block's base fee x 1.2 + the priority fee the endpoint answers, or gas price minus base fee when it answers none: viem's own order),
+  // puts the cushion on it, and sets it against the effective ceiling, so a ceiling below the chain's fee is found at the dry run and not at the first signature. A fresh run
+  // (the dry run and --yes) FAILS on it; --resume and --refund only WARN: the cushion is a prediction, the signer's own check at signing time decides, and a prediction must
+  // never stand between an honest party and a deadline-bound step.
+  {
+    const level = input.fresh ? "fail" : "warn";
+    const ceilingWei = effectiveMaxFeePerGasWei(evm);
+    const gwei = (wei: bigint): string => `${formatUnits(wei, 9)} gwei`;
+    const ceilingText = `${gwei(ceilingWei)} (${evm.maxFeePerGasWei === undefined ? "the default of this chain" : "rails.evm.maxFeePerGasWei"})`;
+    const baseFee = "block" in head ? head.block.baseFeePerGas : undefined;
+    if (!("block" in head)) {
+      add("fee ceiling", level, `the head is unknown, so the fee viem would compute cannot be set against the ceiling (${ceilingText})`);
+    } else if (baseFee === undefined) {
+      add("fee ceiling", level, `the head block carries no baseFeePerGas, so the fee viem would compute cannot be set against the ceiling (${ceilingText}); a signer on this chain refuses to price a write`);
+    } else {
+      const tipAnswer = await read("eth_maxPriorityFeePerGas", []);
+      const tipAsked = tipAnswer.ok ? quantity(tipAnswer.value) : null;
+      // viem's fallback when the endpoint answers no priority fee: the gas price minus the base fee, never below zero.
+      const tip = tipAsked ?? (price === null ? null : price > baseFee ? price - baseFee : 0n);
+      if (tip === null) {
+        add("fee ceiling", level, `the priority fee cannot be read (${tipAnswer.ok ? "eth_maxPriorityFeePerGas did not answer a number" : tipAnswer.why}) and neither can the gas price to stand in for it, so the fee viem would compute cannot be set against the ceiling (${ceilingText})`);
+      } else {
+        const quote = (baseFee * BASE_FEE_MULTIPLIER.numerator) / BASE_FEE_MULTIPLIER.denominator + tip;
+        const cushioned = quote * FEE_CUSHION;
+        const shown = `the fee viem would sign for now is ${gwei(quote)} (base fee ${gwei(baseFee)} x 1.2 + priority fee ${gwei(tip)}${tipAsked === null ? ", gas price minus base fee: the endpoint answers no priority fee" : ""}), ${gwei(cushioned)} with the ${FEE_CUSHION}x cushion; the effective ceiling is ${ceilingText}`;
+        if (ceilingWei < cushioned) {
+          add(
+            "fee ceiling",
+            level,
+            `${shown}: the ceiling is below it, so the signer would refuse to sign a write at this fee (nothing would be sent); raise rails.evm.maxFeePerGasWei to at least ${cushioned} (${gwei(cushioned)}), or run when the fee is lower`,
+          );
+        } else {
+          add("fee ceiling", "ok", `${shown}: the ceiling holds`);
+        }
+      }
+    }
+  }
 
   const buyerAddress = "address" in input.buyer ? input.buyer.address : undefined;
   const sellerAddress = "address" in input.seller ? input.seller.address : undefined;
