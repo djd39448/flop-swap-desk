@@ -192,13 +192,21 @@ function holdsSeedPhrase(value: string): boolean {
  * phrase inside a path are still words in a row) and refuses 11 or more CONSECUTIVE words of the BIP-39 English list; the old test (11 or more
  * whitespace-separated tokens made of letters only, any words) stays. Still not seen, as documented: two or more slips, hyphen-grouped keys,
  * and phrases of 10 words or fewer.
+ *
+ * P9-4 decision 14 (spec rule 1, no key in a log or a capture): the two phrase tests also run on the value with every format character (`\p{Cf}`) removed, so
+ * a phrase with an invisible character inside each word (`aban<U+200B>don`) is the words again. Both readings are tried (the value as it is, and with the
+ * format characters removed), because a zero-width character BETWEEN two words with no space is a separator in the first and a join in the second.
  */
 export function looksLikeKeyMaterial(value: string): boolean {
   if (/[0-9a-fA-F]{32}/.test(value)) return true;
   if (/[0-9a-fA-F]{32}/.test(value.replace(/[\s\p{Cf}]/gu, ""))) return true;
-  const words = value.trim().split(/\s+/);
-  if (words.length >= 11 && words.every((word) => /^[a-z]+$/i.test(word))) return true;
-  return holdsSeedPhrase(value);
+  const withoutFormat = value.replace(/\p{Cf}/gu, "");
+  for (const text of withoutFormat === value ? [value] : [value, withoutFormat]) {
+    const words = text.trim().split(/\s+/);
+    if (words.length >= 11 && words.every((word) => /^[a-z]+$/i.test(word))) return true;
+    if (holdsSeedPhrase(text)) return true;
+  }
+  return false;
 }
 
 const KEY_LIKE_SHAPES = "a run of 32 or more hex digits, or a phrase of 11 or more words";

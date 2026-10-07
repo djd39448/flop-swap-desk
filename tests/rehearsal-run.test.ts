@@ -678,7 +678,12 @@ describe("KR2-1: a key pasted into out, --state-dir, the config path, an asset n
     const words = generateMnemonic(english).split(" ");
     const phrase = words.join(" ");
     const scanPhrase = phraseScanner(words);
+    // P9-4 decision 14: a phrase with an invisible format character inside each word. The plain scanner cannot see it, so this scan takes the characters out first.
+    const scanMarked = (text: string): boolean => scanPhrase(text.replace(/\p{Cf}/gu, ""));
+    const marked = (mark: string): string => words.map((word) => `${word.slice(0, 2)}${mark}${word.slice(2)}`).join(" ");
     return [
+      { label: "a phrase with U+200B inside each word", value: marked("\u200b"), scan: scanMarked },
+      { label: "a phrase with U+200D inside each word, after a directory", value: `bundles/${marked("\u200d")}`, scan: scanMarked },
       { label: "a key in groups of 4 separated by spaces", value: `0x${cutInto(bare, 4, " ")}`, scan: scanKey },
       { label: "a key with U+200B every 15 characters", value: `0x${cutInto(bare, 15, "\u200b")}`, scan: scanKey },
       { label: "a key with U+00AD every 15 characters", value: `0x${cutInto(bare, 15, "\u00ad")}`, scan: scanKey },

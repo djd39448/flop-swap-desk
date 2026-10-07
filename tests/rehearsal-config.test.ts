@@ -426,6 +426,50 @@ describe("parseRehearsalConfig", () => {
     expect(refusal(anvilConfig({ flopAmount: "1.5" }))).toContain("flopAmount must be a positive decimal integer string");
   });
 
+  // P9-4 decision 14 (spec rule 1, no key in a log or a capture): a seed phrase with an invisible format character inside each word was the one form the
+  // README listed as unseen. The phrase tests now run on the value with every format character (`\p{Cf}`) removed as well.
+  it("P9-4 d14: a seed phrase with a zero-width or other format character inside each word is refused by field name, and never quoted; ordinary text with such a character is not", () => {
+    const words = generateMnemonic(english).split(" ");
+    const scanPhrase = phraseScanner(words);
+    const noFormat = (text: string): string => text.replace(/\p{Cf}/gu, "");
+    const inside = (word: string, mark: string): string => `${word.slice(0, 2)}${mark}${word.slice(2)}`;
+    const marked = (mark: string, separator = " "): string => words.map((word) => inside(word, mark)).join(separator);
+    const refused: Array<[string, string]> = [
+      ["U+200B (zero-width space) inside each word", marked("\u200b")],
+      ["U+200D (zero-width joiner) inside each word", marked("\u200d")],
+      ["U+00AD (soft hyphen) inside each word", marked("\u00ad")],
+      ["U+FEFF inside each word", marked("\ufeff")],
+      ["U+2060 (word joiner) inside each word, one per line", marked("\u2060", "\n")],
+      ["a numbered phrase with U+200B inside each word", words.map((word, index) => `${index + 1}. ${inside(word, "\u200b")}`).join(" ")],
+      ["a phrase with commas and U+200B inside each word", marked("\u200b", ",")],
+      ["a phrase as a path segment with U+200B inside each word", `bundles/${marked("\u200b")}`],
+      ["eleven words of the phrase with U+200B inside each", words.slice(0, 11).map((word) => inside(word, "\u200b")).join(" ")],
+      ["a phrase with U+200B inside every second word only", words.map((word, index) => (index % 2 === 0 ? inside(word, "\u200b") : word)).join(" ")],
+    ];
+    for (const [label, value] of refused) {
+      expect(noFormat(value), `${label}: the invisible characters are what hid it`).not.toBe(value);
+      expect(scanPhrase(noFormat(value)), `${label}: the value must hold the phrase, or this test proves nothing`).toBe(true);
+      expect(looksLikeKeyMaterial(value), label).toBe(true);
+      for (const field of ["buyerKeyFile", "sellerKeyFile", "out"] as const) {
+        const message = refusal(anvilConfig({ [field]: value }));
+        expect(message, `${field}: ${label}`).toContain(`${field} looks like key material`);
+        expect(scanPhrase(noFormat(message)), `${field}: ${label}: the refusal must not quote any window of the phrase`).toBe(false);
+      }
+    }
+    // The same through an asset name, which shares the rule.
+    const phrase = marked("\u200b");
+    expect(refusal({ ...anvilConfig(), rails: { evm: { pin: ANVIL_LOCAL_PIN, endpoint: "http://127.0.0.1:8545", contract: CONTRACT, assets: { [phrase]: TOKEN } } } })).toContain("rails.evm.assets");
+    // Ordinary text is still ordinary: a format character in a path, ten words (with one inside each), and a plain phrase of ten words.
+    for (const value of [
+      "bundles/run\u200b-2026-10-07",
+      "C:\\Users\\someone\u200b\\out",
+      words.slice(0, 10).map((word) => inside(word, "\u200b")).join(" "),
+      "my first swap of the whole week on base sepolia",
+    ]) {
+      expect(looksLikeKeyMaterial(value), value).toBe(false);
+    }
+  });
+
   it("accepts explicit deadlines and refuses malformed ones", () => {
     const explicit = { legA: { claimByMin: 40, refundAfterMin: 50, expiresMin: 20 }, legB: { claimByMin: 70, refundAfterMin: 110, expiresMin: 30 } };
     const config = parseRehearsalConfig(anvilConfig({ deadlines: explicit }), BASE);
