@@ -101,6 +101,7 @@ const DEADLINE_FIELDS = ["legA", "legB"] as const;
 const LEG_FIELDS = ["claimByMin", "refundAfterMin", "expiresMin"] as const;
 
 const AMOUNT = /^[1-9][0-9]{0,77}$/;
+const PIN_TEXT = /^[A-Za-z0-9:_.-]{1,40}$/;
 const ASSET_NAME = /^[A-Za-z0-9_-]{1,32}$/;
 const ANVIL_CHAIN_ID = 31337;
 
@@ -179,6 +180,14 @@ function cleanEvmConfig(value: unknown): EvmRailConfig {
   closed(evm, EVM_FIELDS, "rails.evm");
   const pin = requireObject(evm.pin, "rails.evm.pin");
   closed(pin, PIN_FIELDS, "rails.evm.pin");
+  // A pin's name and caip2 are short plain texts ("base-sepolia", "eip155:84532") and the rail's own refusals quote them, so one that is not a short plain
+  // text is refused here by field name: a key pasted into either (the same operator mistake as K1 and K2) would otherwise come back in that refusal.
+  for (const field of ["name", "caip2"] as const) {
+    const text = pin[field];
+    if (text !== undefined && (typeof text !== "string" || !PIN_TEXT.test(text))) {
+      throw new RehearsalConfigError(`rails.evm.pin.${field} must be a short plain text (letters, digits and - _ . :), as the README's pin shows it`);
+    }
+  }
   const finality = requireObject(pin.finality, "rails.evm.pin.finality");
   closed(finality, finality.mode === "confirmations" ? CONFIRMATIONS_FINALITY_FIELDS : TAG_FINALITY_FIELDS, "rails.evm.pin.finality");
   const assets = requireObject(evm.assets, "rails.evm.assets");

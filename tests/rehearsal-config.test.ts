@@ -225,6 +225,22 @@ describe("parseRehearsalConfig", () => {
     expect(parseRehearsalConfig(anvilConfig({ buyerKeyFile: `keys/${"ab".repeat(15)}c.key` }), BASE).buyerKeyFile).toContain("c.key");
   });
 
+  it("refuses a pin name or caip2 that is not a short plain text by field name, so a key pasted there is not quoted back by the rail's own refusal", () => {
+    const key = generatePrivateKey();
+    const scan = keyScanner(key);
+    const evm = (anvilConfig().rails as { evm: object }).evm;
+    for (const field of ["name", "caip2"] as const) {
+      for (const value of [key, `x ${key}`, "", "a".repeat(41), 7, null]) {
+        const message = refusal({ ...anvilConfig(), rails: { evm: { ...evm, pin: { ...ANVIL_LOCAL_PIN, [field]: value } } } });
+        expect(message, `${field} ${typeof value}`).toContain(`rails.evm.pin.${field} must be a short plain text`);
+        expect(scan(message), `${field}: no window of the pasted key may be quoted`).toBe(false);
+      }
+    }
+    // The README's pins are plain texts and still pass; the rail's own name check still names a wrong one.
+    expect(parseRehearsalConfig(baseSepoliaConfig(), BASE).rails.evm.pin.name).toBe("base-sepolia");
+    expect(refusal({ ...anvilConfig(), rails: { evm: { ...evm, pin: { ...ANVIL_LOCAL_PIN, name: "base-sepolia" } } } })).toContain("rails.evm:");
+  });
+
   it("names the 32-digit and 11-word rule in the refusal (and no longer says a run of 64)", () => {
     const message = refusal(anvilConfig({ buyerKeyFile: "ab".repeat(16) }));
     expect(message).toContain("a run of 32 or more hex digits");
