@@ -43,6 +43,10 @@ export interface FakeChainOptions {
   logCap?: number | null;
   /** The gas price in wei. Default 1,000,000 (0.001 gwei). */
   gasPriceWei?: bigint;
+  /** P9-4 decision 6: the transaction counts by address (lower case): `latest`, and `pending` (default: the same). An address not listed has count 0 in both. */
+  nonces?: Record<string, { latest: bigint; pending?: bigint }>;
+  /** P9-4 decision 6: `eth_getTransactionCount` answers an error (a node that does not count). */
+  noNonces?: boolean;
   /** P9-4 decision 5: the base fee per gas every block carries, in wei (Base Sepolia's is far under a gwei). Default 500,000 (0.0005 gwei); `null`: blocks carry no `baseFeePerGas` (a chain without EIP-1559). */
   baseFeePerGasWei?: bigint | null;
   /** P9-4 decision 5: what `eth_maxPriorityFeePerGas` answers, in wei. Default 100,000 (0.0001 gwei); `null`: the node answers an error (viem then falls back to gas price minus base fee). */
@@ -62,6 +66,8 @@ export interface FakeChain {
   methods: string[];
   /** Every `eth_getLogs` range asked: [fromBlock, toBlock] as numbers. */
   logRanges: Array<[bigint, bigint]>;
+  /** P9-4 decision 6: every `eth_getTransactionCount` asked, as [address (lower case), block tag]. */
+  nonceReads: Array<[string, string]>;
 }
 
 const hex = (n: bigint): Hex => `0x${n.toString(16)}`;
@@ -78,6 +84,7 @@ export function fakeChain(options: FakeChainOptions = {}): FakeChain {
   const logCap = options.logCap === undefined ? 500 : options.logCap;
   const methods: string[] = [];
   const logRanges: Array<[bigint, bigint]> = [];
+  const nonceReads: Array<[string, string]> = [];
 
   const baseFee = options.baseFeePerGasWei === undefined ? 500_000n : options.baseFeePerGasWei;
   const block = (number: bigint, tsSec: number): Record<string, unknown> => ({
@@ -132,6 +139,15 @@ export function fakeChain(options: FakeChainOptions = {}): FakeChain {
       methods.push("eth_gasPrice");
       return { result: hex(options.gasPriceWei ?? 1_000_000n) };
     },
+    eth_getTransactionCount: (params) => {
+      methods.push("eth_getTransactionCount");
+      const who = String(params[0]).toLowerCase();
+      const tag = String(params[1]);
+      nonceReads.push([who, tag]);
+      if (options.noNonces === true) return { error: { code: -32601, message: "the method eth_getTransactionCount does not exist" } };
+      const entry = options.nonces?.[who];
+      return { result: hex(tag === "pending" ? (entry?.pending ?? entry?.latest ?? 0n) : (entry?.latest ?? 0n)) };
+    },
     eth_maxPriorityFeePerGas: () => {
       methods.push("eth_maxPriorityFeePerGas");
       return options.priorityFeeWei === null ? { error: { code: -32601, message: "the method eth_maxPriorityFeePerGas does not exist" } } : { result: hex(options.priorityFeeWei ?? 100_000n) };
@@ -184,7 +200,7 @@ export function fakeChain(options: FakeChainOptions = {}): FakeChain {
       return { error: { code: -32000, message: "the fake chain is read-only" } };
     },
   };
-  return { handlers, methods, logRanges };
+  return { handlers, methods, logRanges, nonceReads };
 }
 
 /** Serves `handlers` as a JSON-RPC endpoint on 127.0.0.1. `close()` ends it. */

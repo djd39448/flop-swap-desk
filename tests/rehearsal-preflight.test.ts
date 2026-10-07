@@ -64,6 +64,7 @@ interface Run {
   report: PreflightReport;
   methods: string[];
   logRanges: Array<[bigint, bigint]>;
+  nonceReads: Array<[string, string]>;
   text: string;
 }
 
@@ -94,7 +95,7 @@ async function preflight(
     redact: (text) => text.split("sepolia.base.org/secretpath").join("<rpc endpoint>"),
     ...overrides,
   });
-  return { report, methods: chain.methods, logRanges: chain.logRanges, text: renderPreflight(report, "title").join("\n") };
+  return { report, methods: chain.methods, logRanges: chain.logRanges, nonceReads: chain.nonceReads, text: renderPreflight(report, "title").join("\n") };
 }
 
 function row(run: Run, check: string): PreflightRow {
@@ -128,7 +129,7 @@ describe("a healthy chain (every needed check holds)", () => {
 
   it("only reads: no write method is ever asked of the node", async () => {
     const run = await preflight();
-    const allowed = new Set(["eth_chainId", "eth_getCode", "eth_getBlockByNumber", "eth_call", "eth_getLogs", "eth_gasPrice", "eth_getBalance", "eth_maxPriorityFeePerGas"]);
+    const allowed = new Set(["eth_chainId", "eth_getCode", "eth_getBlockByNumber", "eth_call", "eth_getLogs", "eth_gasPrice", "eth_getBalance", "eth_maxPriorityFeePerGas", "eth_getTransactionCount"]);
     expect(run.methods.length).toBeGreaterThan(10);
     expect(run.methods.filter((m) => !allowed.has(m))).toEqual([]);
   });
@@ -422,6 +423,86 @@ describe("the accounts", () => {
     expect(row(run, "buyer account").detail).toBe(problem);
     expect(run.report.rows.some((r) => r.check === "buyer ETH")).toBe(false);
     expect(run.report.ok).toBe(false);
+  });
+});
+
+// P9-4 decision 6: nothing re-prices a transaction that is already out, and the nonce of every write is the endpoint's `pending` count at that moment, so a transaction an
+// account has queued sits ahead of the run's writes (a claim stuck behind it can miss leg A's refund time). A fresh run FAILS when either account's pending nonce differs
+// from its latest nonce, printing both and the account; --resume and --refund only WARN.
+describe("the nonce rows (P9-4 decision 6)", () => {
+  const queued = (account: string, latest: bigint, pending: bigint): FakeChainOptions => ({ nonces: { [account.toLowerCase()]: { latest, pending } } });
+
+  it("a clean account (pending = latest) is OK for both parties, printing the address and both counts; two reads each, latest and pending, and nothing is sent", async () => {
+    const run = await preflight({ nonces: { [buyerAddress.toLowerCase()]: { latest: 4n }, [sellerAddress.toLowerCase()]: { latest: 0n } } });
+    expect(status(run, "buyer nonce")).toBe("ok");
+    expect(row(run, "buyer nonce").detail).toBe(`${buyerAddress}: latest nonce 4, pending nonce 4: nothing is queued`);
+    expect(status(run, "seller nonce")).toBe("ok");
+    expect(row(run, "seller nonce").detail).toContain(sellerAddress);
+    expect(run.nonceReads.filter(([who]) => who === buyerAddress.toLowerCase())).toEqual([[buyerAddress.toLowerCase(), "latest"], [buyerAddress.toLowerCase(), "pending"]]);
+    expect(run.nonceReads.filter(([who]) => who === sellerAddress.toLowerCase())).toEqual([[sellerAddress.toLowerCase(), "latest"], [sellerAddress.toLowerCase(), "pending"]]);
+    expect(run.methods.filter((m) => m === "eth_sendRawTransaction" || m === "eth_sendTransaction")).toEqual([]);
+    expect(run.report.ok).toBe(true);
+  });
+
+  it("a fresh run FAILS when the Buyer's pending nonce is above its latest nonce, naming the account and both numbers; the Seller's row stays OK", async () => {
+    const run = await preflight(queued(buyerAddress, 2n, 3n));
+    expect(status(run, "buyer nonce")).toBe("fail");
+    const detail = row(run, "buyer nonce").detail;
+    expect(detail).toContain(buyerAddress);
+    expect(detail).toContain("the pending nonce 3 is not the latest nonce 2 (1 transaction(s) queued or not yet mined)");
+    expect(detail).toContain("a write of this run would queue behind it");
+    expect(detail).toContain("nothing here re-prices a stuck transaction");
+    expect(detail).not.toContain("this mode goes ahead");
+    expect(status(run, "seller nonce")).toBe("ok");
+    expect(run.report.ok).toBe(false);
+  });
+
+  it("the same for the Seller, whose claim is the write that must not wait behind a queued transaction", async () => {
+    const run = await preflight(queued(sellerAddress, 7n, 9n));
+    expect(status(run, "seller nonce")).toBe("fail");
+    expect(row(run, "seller nonce").detail).toContain(sellerAddress);
+    expect(row(run, "seller nonce").detail).toContain("the pending nonce 9 is not the latest nonce 7 (2 transaction(s) queued or not yet mined)");
+    expect(status(run, "buyer nonce")).toBe("ok");
+    expect(run.report.ok).toBe(false);
+  });
+
+  it("a pending count BELOW the latest count (the endpoint's two answers disagree) is a difference too", async () => {
+    const run = await preflight(queued(buyerAddress, 5n, 4n));
+    expect(status(run, "buyer nonce")).toBe("fail");
+    expect(row(run, "buyer nonce").detail).toContain("the pending nonce 4 is not the latest nonce 5 (the endpoint's two counts disagree)");
+  });
+
+  it("--resume and --refund (fresh = false) show the difference as a WARN with the same numbers, and go ahead", async () => {
+    for (const buyerSends of ["approve-lock-refund", "refund"] as const) {
+      const both: FakeChainOptions = { nonces: { [buyerAddress.toLowerCase()]: { latest: 2n, pending: 3n }, [sellerAddress.toLowerCase()]: { latest: 1n, pending: 2n } } };
+      const run = await preflight(both, config(), { fresh: false, buyerSends });
+      for (const check of ["buyer nonce", "seller nonce"]) {
+        expect(status(run, check), `${buyerSends} ${check}`).toBe("warn");
+        expect(row(run, check).detail, `${buyerSends} ${check}`).toContain("the pending nonce");
+        expect(row(run, check).detail, `${buyerSends} ${check}`).toContain("this mode goes ahead: its writes queue behind it");
+      }
+      expect(run.report.ok, buyerSends).toBe(true);
+    }
+  });
+
+  it("a node that cannot count (or answers no number) fails a fresh run's rows and warns the other modes: a queued transaction cannot be ruled out", async () => {
+    const fresh = await preflight({ noNonces: true });
+    for (const check of ["buyer nonce", "seller nonce"]) {
+      expect(status(fresh, check)).toBe("fail");
+      expect(row(fresh, check).detail).toContain("could not both be read");
+      expect(row(fresh, check).detail).toContain("a queued transaction cannot be ruled out");
+    }
+    expect(fresh.report.ok).toBe(false);
+    const resume = await preflight({ noNonces: true }, config(), { fresh: false });
+    expect(status(resume, "buyer nonce")).toBe("warn");
+    expect(resume.report.ok).toBe(true);
+  });
+
+  it("an account that did not load has no row (its own account row already fails)", async () => {
+    const run = await preflight({}, config(), { seller: { problem: "sellerKeyFile: no such file" } });
+    expect(run.report.rows.map((r) => r.check)).not.toContain("seller nonce");
+    expect(status(run, "buyer nonce")).toBe("ok");
+    expect(run.nonceReads.every(([who]) => who === buyerAddress.toLowerCase())).toBe(true);
   });
 });
 

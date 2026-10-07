@@ -3,7 +3,7 @@
 // P9-6 (rule 4, "nothing public before Dave"): the pre-flight of the EVM rehearsal runner. It reads the chain a swap would run
 // on and answers, row by row, whether the swap can go: the dry run (the runner's default) prints this table and sends nothing,
 // and `--yes` runs the same checks first and refuses to broadcast unless every row that is needed holds. Every call here is a
-// READ (`eth_chainId`, `eth_getCode`, `eth_getBlockByNumber`, `eth_call`, `eth_getLogs`, `eth_getBalance`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`); no
+// READ (`eth_chainId`, `eth_getCode`, `eth_getBlockByNumber`, `eth_call`, `eth_getLogs`, `eth_getBalance`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_getTransactionCount`); no
 // write method is ever named in this module, and the only network it speaks to is the configured endpoint.
 //
 // The rows (which of them a mode runs is in `PreflightInput.fresh`):
@@ -23,6 +23,8 @@
 //   clock          the local clock against the chain's head
 //   fee ceiling    (P9-4 decision 5) the fee viem would sign for now (the latest block's base fee x 1.2 + the priority fee, with a 2x cushion) against the effective
 //                  `maxFeePerGasWei` of a local account (50 gwei by default on Base Sepolia): a ceiling below it fails a fresh run, and warns for --resume and --refund
+//   nonces         (P9-4 decision 6) each account's pending nonce against its latest nonce: a queued transaction would sit ahead of the run's writes, so a fresh run
+//                  fails when they differ and --resume and --refund warn
 //   buyer / seller the addresses (never a key), ETH against the gas still to be sent (generous per-call ceilings times twice the
 //                  node's gas price; both rows are sized by what is left to send, R1-FUND-01 and R2-FUND-04, and a refund's short Buyer row is
 //                  a warning; Base's L1 data fee is not counted), the Buyer's token balance and allowance against the amount
@@ -503,6 +505,34 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     if (input.sellerSends === "nothing") add("seller ETH", "info", `${sellerAddress}: nothing is left for the Seller to send (its claim already landed), so no gas is reserved`);
     else await ethRow("seller ETH", sellerAddress, GAS_CEILING.claim, "the claim");
   }
+
+  // -- the nonces (P9-4 decision 6) ------------------------------------------------------------------------------------------------------
+  // Nothing in this build re-prices or replaces a transaction that is already out, and the nonce of every write is the endpoint's `pending` count at that moment. A
+  // transaction an account has queued (its pending count above its latest count) therefore sits AHEAD of every write this run sends: a claim stuck behind one can miss
+  // leg A's refund time, and the preimage in the claim is public the moment it is in a pool. So a fresh run (the dry run and --yes) FAILS when either account's pending nonce
+  // differs from its latest nonce, printing both and the account; --resume and --refund only WARN (they must go ahead: the run may already hold a lock or a claim in the
+  // pool, and an honest party's deadline-bound step is never held back by a diagnostic). Two reads each, nothing sent.
+  const nonceRow = async (label: string, address: Address): Promise<void> => {
+    const level = input.fresh ? "fail" : "warn";
+    const latestAnswer = await read("eth_getTransactionCount", [address, "latest"]);
+    const pendingAnswer = await read("eth_getTransactionCount", [address, "pending"]);
+    const latest = latestAnswer.ok ? quantity(latestAnswer.value) : null;
+    const pending = pendingAnswer.ok ? quantity(pendingAnswer.value) : null;
+    if (latest === null || pending === null) {
+      const why = !latestAnswer.ok ? latestAnswer.why : !pendingAnswer.ok ? pendingAnswer.why : "the node did not answer a number";
+      add(label, level, `${address}: the latest and pending nonces could not both be read (${why}), so a queued transaction cannot be ruled out`);
+    } else if (pending !== latest) {
+      add(
+        label,
+        level,
+        `${address}: the pending nonce ${pending} is not the latest nonce ${latest} (${pending > latest ? `${pending - latest} transaction(s) queued or not yet mined` : "the endpoint's two counts disagree"}): a write of this run would queue behind it, and nothing here re-prices a stuck transaction (a claim stuck behind one can miss leg A's refund time); wait until it is mined or replace it by hand, then run again${input.fresh ? "" : " (this mode goes ahead: its writes queue behind it)"}`,
+      );
+    } else {
+      add(label, "ok", `${address}: latest nonce ${latest}, pending nonce ${pending}: nothing is queued`);
+    }
+  };
+  if (buyerAddress !== undefined) await nonceRow("buyer nonce", buyerAddress);
+  if (sellerAddress !== undefined) await nonceRow("seller nonce", sellerAddress);
 
   if (input.fresh && buyerAddress !== undefined) {
     const token = evm.assets[config.asset];
