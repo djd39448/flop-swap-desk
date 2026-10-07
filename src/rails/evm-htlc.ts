@@ -576,6 +576,17 @@ export function effectiveMaxLogRange(config: EvmRailConfig): number | undefined 
   return config.pin.chainId === BASE_SEPOLIA_CHAIN_ID ? BASE_SEPOLIA_MAX_LOG_RANGE : undefined;
 }
 
+/**
+ * R1-FUND-03: how many blocks above its start marker ONE scan reaches: `MAX_LOG_SCAN_CHUNKS` calls of `maxLogRange` blocks each, or
+ * `undefined` when no limit is in force (one call to `latest`). Oldest range first, a claim lies in the first ranges above the marker, so the
+ * bound holds exactly when this covers the leg's window: leg A's refund time minus its lock time at the chain's block time, plus the 256-block
+ * claim marker margin. The dry run's pre-flight compares the two (the runner's part of the fix).
+ */
+export function evmLogScanCoverage(config: EvmRailConfig): number | undefined {
+  const limit = effectiveMaxLogRange(config);
+  return limit === undefined ? undefined : limit * MAX_LOG_SCAN_CHUNKS;
+}
+
 /** One `eth_getLogs` call of a scan: `to` is `"latest"` only for the unlimited single call. */
 interface LogRange {
   from: bigint;

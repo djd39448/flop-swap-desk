@@ -25,6 +25,7 @@ import {
   MAX_LOG_SCAN_CHUNKS,
   checkEvmRailConfig,
   effectiveMaxLogRange,
+  evmLogScanCoverage,
   type EvmRailConfig,
 } from "../src/rails/evm-htlc.js";
 import type { AddressBook } from "../src/vendor/evm-hash-rail.js";
@@ -112,6 +113,13 @@ describe("P9-3 config: maxLogRange and its default per chain", () => {
 
   it("the hard bound is 100 calls", () => {
     expect(MAX_LOG_SCAN_CHUNKS).toBe(100);
+  });
+
+  it("R1-FUND-03: one scan reaches 100 x maxLogRange blocks above its marker (50,000 by default on Base Sepolia, 25,700 at the floor, no limit on anvil)", () => {
+    expect(evmLogScanCoverage(sepolia)).toBe(50_000);
+    expect(evmLogScanCoverage({ ...sepolia, maxLogRange: EVM_MIN_LOG_RANGE })).toBe(25_700);
+    expect(evmLogScanCoverage({ ...anvil, maxLogRange: 2_000 })).toBe(200_000);
+    expect(evmLogScanCoverage(anvil)).toBeUndefined();
   });
 
   it.each([257, 258, 500, 10_000, 1_000_000])("a positive integer of at least 257 (%i) is accepted", (value) => {
