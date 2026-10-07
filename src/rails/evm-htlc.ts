@@ -44,7 +44,7 @@ import type { LockTerms } from "@flop-labs/tclk";
 import { verifyHashPreimage } from "@flop-labs/tclk";
 
 import { EVM_HASH_RAIL_ABI, EvmHashRail, type AddressBook, type AssetBook } from "../vendor/evm-hash-rail.js";
-import { CODE_HASH_SHAPE, describeCodeProblem, judgeRuntimeCode } from "./evm-code-pin.js";
+import { CODE_HASH_SHAPE, describeCodeProblem, judgeRuntimeCode, shortPinnedHash } from "./evm-code-pin.js";
 import { captureEvmLeg, evmEvidence, EVM_RAIL_ID, hashLockRefMismatch, type EvmAccounts, type EvmEvidenceResult } from "./evm-evidence.js";
 import {
   EVM_DEFAULT_MAX_FEE_PER_GAS_WEI,
@@ -524,14 +524,17 @@ export class EvmReceiptTimeoutError extends Error {
 /**
  * P9-2 (rule 2): the code at `config.contract` is not the pinned one. `connect()` throws this before any write when the contract's
  * `eth_getCode` is empty (`problem: "empty"`), is not hex (`"malformed"`) or hashes to something other than `config.contractCodeHash`
- * (`"mismatch"`). `expected` and `observed` (absent unless there was code to hash) are keccak256 hashes of public code, safe to print.
+ * (`"mismatch"`). `observed` (absent unless there was code to hash) is the keccak256 hash of public code, safe to print. R2-NOTE-a: `expected`
+ * is the pinned value in its SHORT form only (`0x` and eight hex digits, then `...`: the same text the message shows), never the whole value.
+ * A pinned `contractCodeHash` has the same shape as a private key, so an operator who pasted a key there by mistake must not see it in
+ * `util.inspect`, `console.error` or `JSON.stringify` of this error either (an enumerable field would carry it to every one of those).
  */
 export class EvmContractCodeError extends Error {
   readonly problem: "empty" | "malformed" | "mismatch";
   readonly contract: Address;
-  readonly expected: Hex;
+  readonly expected: string;
   readonly observed: Hex | undefined;
-  constructor(problem: "empty" | "malformed" | "mismatch", contract: Address, expected: Hex, observed: Hex | undefined, text: string) {
+  constructor(problem: "empty" | "malformed" | "mismatch", contract: Address, expected: string, observed: Hex | undefined, text: string) {
     super(`evm-htlc: refusing to connect: ${text}`);
     this.name = "EvmContractCodeError";
     this.problem = problem;
@@ -781,7 +784,7 @@ export class EvmHtlcRail {
         throw new EvmContractCodeError(
           verdict.problem,
           options.config.contract,
-          pinnedCodeHash.toLowerCase() as Hex,
+          shortPinnedHash(pinnedCodeHash),
           verdict.problem === "mismatch" ? verdict.observed : undefined,
           describeCodeProblem(verdict, options.config.contract, pinnedCodeHash),
         );

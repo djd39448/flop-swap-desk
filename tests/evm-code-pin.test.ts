@@ -11,6 +11,7 @@
 
 import type { LockTerms } from "@flop-labs/tclk";
 import { generateHashLock } from "@flop-labs/tclk";
+import { inspect } from "node:util";
 import { getAddress, keccak256, type Address, type Hex } from "viem";
 import { generatePrivateKey } from "viem/accounts";
 import { describe, expect, it } from "vitest";
@@ -160,7 +161,9 @@ describe("P9-2 connect(): the contract's code is read and must hash to the pin",
     const typed = error as EvmContractCodeError;
     expect(typed.problem).toBe("mismatch");
     expect(typed.contract).toBe(RAIL_CONTRACT);
-    expect(typed.expected).toBe(WRONG_HASH);
+    // R2-NOTE-a: the typed error holds the pinned value in its short form only (the same text the message shows), never the whole value.
+    expect(typed.expected).toBe(`${WRONG_HASH.slice(0, 10)}...`);
+    expect(typed.expected).not.toBe(WRONG_HASH);
     expect(typed.observed).toBe(observed);
     // K2: the observed hash is printed in full, the pinned value only as its first 10 characters (a pinned field may hold a pasted key).
     expect(typed.message).toContain(`not the pinned contractCodeHash ${WRONG_HASH.slice(0, 10)}...`);
@@ -489,6 +492,17 @@ describe("K2: a pinned value is never printed in full (a key pasted into contrac
     expect(scan(error.message)).toBe(false);
     expect(error.message).toContain(`${pasted.slice(0, 10)}...`);
     expect(node.sends).toEqual([]);
+    // R2-NOTE-a: no rendering of the error carries the key either: util.inspect (hidden members and depth included), JSON.stringify and
+    // every own property. The typed `expected` field is the short form, so a library caller that logs the error prints no key.
+    expect(error.expected === `${pasted.slice(0, 10)}...`, "expected is the short form").toBe(true); // a boolean: a failure must never print the key
+    const renderings = [
+      inspect(error),
+      inspect(error, { showHidden: true, depth: 10 }),
+      JSON.stringify(error),
+      JSON.stringify(error, Object.getOwnPropertyNames(error)),
+      ...Object.getOwnPropertyNames(error).map((name) => String((error as unknown as Record<string, unknown>)[name])),
+    ];
+    for (const rendering of renderings) expect(scan(rendering), "a 16-digit window of the pasted key is in a rendering of the error").toBe(false);
   });
 
   it("the evidence reader's reason (audit-export) carries no part of a key used as the pin", async () => {

@@ -43,7 +43,7 @@ const PINNED_HASH_SHOWN_CHARS = 10;
  * otherwise see it printed whole by the very first mismatch. A hash cannot be told from a key by its shape, so no pinned value is ever
  * printed in full; a person finds the observed hash (printed in full: it is the hash of public code) and the first characters enough to compare.
  */
-function shortPinnedHash(pinned: string): string {
+export function shortPinnedHash(pinned: string): string {
   return `${pinned.toLowerCase().slice(0, PINNED_HASH_SHOWN_CHARS)}...`;
 }
 
