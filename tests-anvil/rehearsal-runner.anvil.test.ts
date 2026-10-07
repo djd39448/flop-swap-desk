@@ -17,7 +17,9 @@
 //                    refund after the deadlines (`refunded`), and a run killed before leg A was locked (`refunded-b`); a refund whose
 //                    Buyer holds less ETH than the pre-flight's ceiling-sized reservation (a warning, the refund goes ahead; R2-FUND-04);
 //                    and a lock attempt that never landed (the approve landed, the local signer refused the lock) which ends in the
-//                    verdict, waits for the finalized block, refunds leg B and replays to `refunded-b` (R2-FUND-01).
+//                    verdict, waits for the finalized block, refunds leg B and replays to `refunded-b` (R2-FUND-01); and a Seller's claim
+//                    that landed within one finality lag of leg A's refund time (not final yet): --refund waits for it, sends nothing and
+//                    ends with the refusal that names --resume, which then finishes the swap (R3-FUND-01, on a chain mined by hand).
 //
 // Every case scans every file the runner wrote (the bundle and the whole state directory) and its stdout and stderr for BOTH private
 // keys, and the bundle and the output for the two Ed25519 venue seeds too, as booleans only: a failure names a file, never a byte of
@@ -31,6 +33,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
 
 import { encodeFunctionData, keccak256, pad, toEventSelector, type Address, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -39,6 +42,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { decodeFlowRecord, encodeFlowRecord } from "../src/client/flow-record.js";
 import { FileFlowStore, flowDigest, flowKey } from "../src/client/flow-store.js";
 import { ANVIL_LOCAL_PIN } from "../src/rails/evm-htlc.js";
+import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { keyScanner } from "../tests/helpers/evm-local.js";
 import { deployRailContracts, startAnvil, type AnvilHandle } from "./helpers/anvil.js";
 
@@ -65,10 +69,11 @@ interface Chain {
   codeHash: Hex;
 }
 
-async function startChain(): Promise<Chain> {
+async function startChain(options: { byHand?: boolean } = {}): Promise<Chain> {
   // Block time 1 s: the chain moves by itself, which a runner that waits for the finalized block needs. The genesis time is now, so the
   // runner's system clock and the chain's agree (the refund group moves the chain's time on purpose and uses the chain clock).
-  const anvil = await startAnvil({ timestampSeconds: Math.floor(Date.now() / 1000), blockTimeSeconds: 1 });
+  // `byHand` (R3-FUND-01): no block time, a block per transaction and per `anvil_mine`, so a test decides exactly when a claim becomes final.
+  const anvil = await startAnvil({ timestampSeconds: Math.floor(Date.now() / 1000), ...(options.byHand === true ? {} : { blockTimeSeconds: 1 }) });
   const deployer = anvil.accounts[0];
   if (deployer === undefined) throw new Error("test setup: anvil exposed no account");
   const deployed = await deployRailContracts(anvil.endpoint, deployer);
@@ -104,6 +109,8 @@ interface RigOptions {
    *  longer than the receipt polling does, as a public chain's does, so the runner's waits are really needed. */
   confirmations?: number;
   clock?: "chain";
+  /** The config's `waitLimitMs` (default: the runner's own). */
+  waitLimitMs?: number;
   fundBuyerEth?: boolean;
   buyerTokens?: bigint;
   codeHash?: Hex;
@@ -149,6 +156,7 @@ async function makeRig(chain: Chain, options: RigOptions = {}): Promise<Rig> {
     amount: "1000000",
     out: "bundle",
     pollMs: 250,
+    ...(options.waitLimitMs === undefined ? {} : { waitLimitMs: options.waitLimitMs }),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
   };
   const configPath = join(dir, "config.json");
@@ -858,5 +866,137 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
         await proxy.close();
       }
     }, 300_000);
+  });
+
+  // R3-FUND-01 (P9 review round 3): a Seller's claim of leg A that landed within one finality lag of leg A's refund time is not FINAL when the Buyer refunds. The refund
+  // reverts (the lock reads Claimed at the latest block) while the finalized block still reads Locked; --refund used to exit 4 with the raw revert and flip the Buyer's `next`
+  // to the refund, and --resume then said "use --refund". Now --refund waits for the claim to be final, sends nothing, and ends with the refusal that names --resume.
+  // The chain is mined BY HAND (no block time, 8 confirmations) so the test decides exactly when the claim becomes final: the claim sits in the last block but one of the head
+  // for as long as the test wants, which a chain that mines a block a second cannot promise on a slow machine.
+  describe("--refund with a Seller's claim that is not final yet (a chain mined by hand)", () => {
+    let hand: Chain;
+
+    beforeAll(async () => {
+      hand = await startChain({ byHand: true });
+      await hand.anvil.rpcCall("anvil_mine", ["0x20"]); // the finalized block (8 below the head) must be past the escrow's deploy, or the pre-flight's state read fails (F9)
+    }, 60_000);
+
+    afterAll(async () => {
+      await hand?.anvil.stop();
+    });
+
+    /** Moves the chain's own clock to `ms` (the next block carries it), then that block is mined. */
+    async function warpHand(ms: number): Promise<void> {
+      await hand.anvil.rpcCall("evm_setNextBlockTimestamp", [Math.ceil(ms / 1000) + 1]);
+      await hand.anvil.rpcCall("anvil_mine", ["0x1"]);
+    }
+
+    /** What the Seller's own claim transaction is (sent here outside the runner, as a claim that the runner's Seller broadcast and never saw the outcome of). */
+    async function sellerClaims(rig: Rig): Promise<void> {
+      const preimage = await sellerSecret(rig);
+      const hashLock = `0x${createHash("sha256").update(Buffer.from(preimage.slice(2), "hex")).digest("hex")}` as Hex;
+      const data = encodeFunctionData({ abi: EVM_HASH_RAIL_ABI, functionName: "claim", args: [hashLock, preimage] });
+      await hand.anvil.rpcCall("anvil_impersonateAccount", [rig.seller]);
+      await receipt(hand.anvil, await hand.anvil.rpcCall<Hex>("eth_sendTransaction", [{ from: rig.seller, to: hand.contract, data }]));
+      await hand.anvil.rpcCall("anvil_stopImpersonatingAccount", [rig.seller]);
+    }
+
+    /** The Seller's record says its claim was attempted (the flag is saved before the first send), with no outcome: the state a kill after the broadcast leaves. */
+    async function sellerClaimAttempted(rig: Rig): Promise<void> {
+      const store = new FileFlowStore(join(rig.stateDir, "seller", "flows"));
+      const key = (await store.list()).find((candidate) => candidate.startsWith("seller:"));
+      if (key === undefined) throw new Error("test setup: the Seller has no flow record");
+      const bytes = await store.load(key);
+      if (bytes === null) throw new Error("test setup: the Seller's flow record is gone");
+      const record = decodeFlowRecord(bytes, key);
+      if (record.role !== "seller") throw new Error("test setup: not a Seller record");
+      await store.save(key, encodeFlowRecord({ ...record, claimAttempted: true }), flowDigest(bytes));
+    }
+
+    async function setWaitLimit(rig: Rig, waitLimitMs: number): Promise<void> {
+      const config = JSON.parse(await readFile(rig.configPath, "utf8")) as Record<string, unknown>;
+      await writeFile(rig.configPath, `${JSON.stringify({ ...config, waitLimitMs }, null, 2)}\n`);
+    }
+
+    it("--refund waits for the claim (logs it, sends nothing), ends with the refusal that names --resume; with waitLimitMs below the wait it says nothing was sent and names --refund; --resume says what to do, then finishes the swap (it replays to revealed: the reveal frame is late) (R3-FUND-01)", async () => {
+      const rig = await makeRig(hand, { clock: "chain", confirmations: 8, waitLimitMs: 3_000 });
+      const first = startRunner(rig, ["--yes"]);
+      await first.waitForLine(/step buyer\.lockLegA done/);
+      first.kill();
+      const killed = await first.done;
+      expect(killed.code).not.toBe(0);
+      expect(await chainFacts(hand, rig)).toEqual({ locked: 1, claimed: 0, refunded: 0, buyerTxs: 2, sellerTxs: 0 });
+
+      // The Seller's claim lands a minute before leg A's refund time; the clock then moves one second past it (one block, so the claim is the last block but one).
+      const { deadlines } = await readRun(rig);
+      await warpHand(deadlines.legA.refundAfterMs - 60_000);
+      await sellerClaims(rig);
+      await sellerClaimAttempted(rig);
+      await warpHand(deadlines.legA.refundAfterMs + 1_000);
+      expect(await chainFacts(hand, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 });
+
+      // Case 2: waitLimitMs (3 s) is below the wait, and the chain does not move: the refusal says nothing was sent and names --refund. No raw revert, no refund.
+      const limited = await run(rig, ["--refund"]);
+      expect(limited.code).toBe(4);
+      expect(limited.stdout).toContain("leg A's lock was claimed; waiting for the claim to be final, then --resume finishes the swap");
+      expect(limited.stderr).toMatch(/leg A's lock was claimed, but the claim was not final after \d+ s \(waitLimitMs\); nothing was sent; run --refund again to keep waiting/);
+      expect(limited.stderr).not.toMatch(/reverted|refund refused/);
+      expect((await chainFacts(hand, rig)).refunded).toBe(0);
+      expect((await chainFacts(hand, rig)).buyerTxs).toBe(2);
+
+      // --resume, with the refund attempt on record and the claim not final: it says what the refund path will do (it used to say a bare "use --refund").
+      const early = await run(rig, ["--resume"]);
+      expect(early.code).toBe(4);
+      expect(early.stderr).toContain("leg A's lock was claimed and the claim may not be final yet: run --refund, which waits for the claim to be final, then --resume");
+      expect((await chainFacts(hand, rig)).buyerTxs).toBe(2);
+
+      // Case 1: --refund with room to wait. The claim becomes final when the test mines the blocks, after the runner says it is waiting.
+      await setWaitLimit(rig, 120_000);
+      const waiting = startRunner(rig, ["--refund"]);
+      await waiting.waitForLine(/leg A's lock was claimed; waiting for the claim to be final, then --resume finishes the swap/);
+      expect((await chainFacts(hand, rig)).buyerTxs).toBe(2); // it is waiting, and has sent nothing
+      let mined = 0;
+      const miner = setInterval(() => {
+        mined += 1;
+        void hand.anvil.rpcCall("anvil_mine", ["0x1"]).catch(() => undefined);
+      }, 100);
+      let refunded: RunResult;
+      try {
+        refunded = await waiting.done;
+      } finally {
+        clearInterval(miner);
+      }
+      expect(mined).toBeGreaterThanOrEqual(8); // the finalized block (8 below the head) had to pass the head the wait started at
+      expect(refunded.code).toBe(4);
+      expect(refunded.stderr).toMatch(/leg A's lock was claimed and the claim is final, so the refund is refused and nothing was sent; run --resume/);
+      expect(refunded.stderr).not.toMatch(/reverted|refund refused/);
+      expect(await chainFacts(hand, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 }); // nothing was sent
+      const recordKey = flowKey("buyer", (await readRun(rig)).swapId);
+      const buyerStore = new FileFlowStore(join(rig.stateDir, "buyer", "flows"));
+      const buyerRecord = decodeFlowRecord((await buyerStore.load(recordKey))!, recordKey);
+      expect(buyerRecord.role === "buyer" && buyerRecord.refund.claimSeen, "the flow routed the Buyer to learnSecret on a FINAL claim").toBe(true);
+
+      // --resume now: the secret is read (the Seller's claim is found on the chain), leg B is claimed and nothing new is sent: the swap's value has moved as it should.
+      // The bundle replays to `revealed`, not `settled`, and the runner exits 6: the claim's outcome was not saved, so the Seller's reveal and receipt frames could only be
+      // posted now, stamped AFTER leg A's refund time, and tclk's machine refuses a reveal once the refund window is open ("legA step 4: refund window is open", the fold says
+      // "leg A claimed on chain but its reveal frame was not recorded"). That is the protocol's own rule for a claim whose frames were not posted in time, not the wait's.
+      await setWaitLimit(rig, 120_000);
+      const finishing = startRunner(rig, ["--resume"]);
+      const miner2 = setInterval(() => void hand.anvil.rpcCall("anvil_mine", ["0x1"]).catch(() => undefined), 100); // the final wait for the claim to be final needs the chain to move
+      let resumed: RunResult;
+      try {
+        resumed = await finishing.done;
+      } finally {
+        clearInterval(miner2);
+      }
+      expect(resumed.code).toBe(6);
+      expect(resumed.stderr).toContain("did not accept settled");
+      expect(resumed.stderr).toMatch(/= settled, got revealed/);
+      expect(resumed.stdout).toContain("step seller.claimLegA done");
+      expect(resumed.stdout).toContain("step buyer.learnSecret done");
+      expect(resumed.stdout).toContain("step buyer.claimLegB done");
+      expect(await chainFacts(hand, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 }); // one lock and one claim, no refund, nothing sent by the resume
+      await expectCleanAndReplays(rig, { ...resumed, stdout: killed.stdout + limited.stdout + early.stdout + refunded.stdout + resumed.stdout, stderr: killed.stderr + limited.stderr + early.stderr + refunded.stderr + resumed.stderr }, "revealed");
+    }, 240_000);
   });
 });

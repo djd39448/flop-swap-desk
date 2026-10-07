@@ -721,7 +721,7 @@ async function waitFinalizedTime(w: FinalityWorld, refundAfterMs: number): Promi
  * R3-FUND-01 (P9 review round 3): a Seller's claim that was mined within one finality lag of leg A's refund time is not FINAL yet when the Buyer comes to refund. The refund
  * then reverts (the row is Claimed at the latest block) and the flow's own evidence reader, which reads the finalized block, still says Locked, so the revert used to be thrown
  * raw, `next` flipped to `refundLegA`, and both `--refund` and `--resume` stalled for up to a whole finality lag. Now, when the refund fails with anything but the cases
- * above and `locks(hashLock)` reads Claimed at the LATEST block (a read, nothing is sent), the loop waits (bounded by `waitLimitMs`) for the finalized block to pass the head
+ * above and `locks(hashLock)` reads Claimed at the LATEST block but not yet at the finalized block (two reads, nothing is sent), the loop waits (bounded by `waitLimitMs`) for the finalized block to pass the head
  * and asks `refundLegA` again, so that the FLOW routes on a FINAL claim (it saves that and `next` says `learnSecret`); the run then ends with the claimed-lock refusal that
  * names `--resume`. The read at the latest block only decides to wait: nothing is ever routed on a read that is not final (a claim that a reorg removes after leg A's refund
  * time can never land again, and a Buyer routed away on it would hold a refundable lock `next` no longer names). Past the bound it refuses with "nothing was sent; run
@@ -756,8 +756,9 @@ export async function refundLegAWaiting(w: FinalityWorld, buyer: Pick<BuyerFlow,
         await waitFinalized(w, await blockNumberNow(w.rpc), "refund of leg A");
         continue;
       }
-      // R3-FUND-01: any other failure is a real refusal, unless the lock reads Claimed at the latest block: a claim that is not final yet. Wait for it, then ask again.
-      if (!(await lockClaimedAtLatest(w, hashLock))) throw error;
+      // R3-FUND-01: any other failure is a real refusal, unless the lock reads Claimed at the latest block and NOT yet at the finalized block: a claim that is not final yet.
+      // Wait for it, then ask again. (A claim the finalized block already shows is final: the flow would have routed on it, so this failure is another one and is thrown.)
+      if (!(await lateClaimNotFinal(w, hashLock))) throw error;
       const elapsed = w.env.now() - startedMs;
       if (elapsed > w.config.waitLimitMs) throw new RunnerRefusal(LATE_CLAIM_NOT_FINAL(Math.round(elapsed / 1000)));
       if (!announced) {
@@ -790,6 +791,24 @@ export async function refundDoorwayText(w: Pick<FinalityWorld, "config" | "rpc">
     return "leg A's lock was claimed and the claim may not be final yet: run --refund, which waits for the claim to be final, then --resume";
   }
   return "leg A's refund time has come; use --refund";
+}
+
+/**
+ * R3-FUND-01: a claim of leg A that is not final yet: `locks(hashLock)` reads Claimed at the LATEST block and does not read Claimed at the finalized block. Two reads, nothing is
+ * sent; any failure, an unreadable finalized block or a row the node does not answer reads false (the refund's own failure is then thrown as it was). A row that the finalized
+ * block already shows Claimed is a FINAL claim: the flow routes on it by itself, so a refund that still fails then fails for another reason (a refusal it gives before any
+ * read, an RPC outage) and waiting for the claim would only hold that failure back for a whole `waitLimitMs`.
+ */
+async function lateClaimNotFinal(w: Pick<FinalityWorld, "config" | "rpc">, hashLock: string): Promise<boolean> {
+  try {
+    if (!(await lockClaimedAtLatest(w, hashLock))) return false;
+    const finalized = await finalizedNumber(w.rpc, w.config);
+    if (finalized === null) return false;
+    const status = await lockStatusAt(w.rpc, w.config.rails.evm.contract, hashLock, `0x${finalized.toString(16)}`);
+    return status !== null && status !== 2;
+  } catch {
+    return false;
+  }
 }
 
 /** R3-FUND-01: whether `locks(hashLock)` reads Claimed at the LATEST block. One read, nothing is sent; any failure reads false (the refund's own failure is then thrown as it was). It only decides to WAIT. */

@@ -197,6 +197,15 @@ describe("R3-FUND-01: a late claim of leg A that is not final yet is waited for,
     await expect(refundLegAWaiting(raw.world, refused, raw.hashLock)).rejects.toThrow("reverted"); // the row reads Locked: nothing claimed, nothing to wait for
     expect(raw.script.sleeps).toEqual([]);
 
+    // A claim the finalized block already shows is FINAL: a refund that still fails then fails for another reason (here the flow's own refusal after leg B was claimed), and
+    // waiting for the claim would hold that failure back for a whole waitLimitMs (a run whose bundle was refused by the audit, say, and is then asked to --refund).
+    const settled = await lateClaim();
+    settled.script.lag = false;
+    const claimedLegB = { refundLegA: async () => Promise.reject(new Error("buyer: refusing to refund leg A \u2014 this flow already claimed leg B")) };
+    await expect(refundLegAWaiting(settled.world, claimedLegB, settled.hashLock)).rejects.toThrow("already claimed leg B");
+    expect(settled.script.sleeps).toEqual([]);
+    expect(settled.script.logs).toEqual([]);
+
     const broken = await lateClaim();
     const unreadable = { ...broken.world, rpc: { request: async () => Promise.reject(new Error("node is down")) } as unknown as FinalityWorld["rpc"] };
     await expect(refundLegAWaiting(unreadable, refused, broken.hashLock)).rejects.toThrow("reverted"); // the claim read failed: the refund's own failure is thrown as it was

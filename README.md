@@ -771,7 +771,8 @@ venue and a local paper-note file, signing with the two local key files. Modes (
   the refund and the run ends (exit 4) with "leg A's lock was claimed and the claim is final, so the refund is refused and nothing was sent; run
   --resume"; `--resume` learns the secret and claims leg B. **A claim that landed within one finality lag of leg A's refund time is not final yet when
   `--refund` comes (R3-FUND-01, P9 review round 3)**: the refund reverts (the lock reads Claimed at the latest block) while the finalized block still reads
-  Locked, and the flow routes only on a final read. `--refund` then reads `locks(hashLock)` at the latest block (a read, nothing is sent), says "leg A's
+  Locked, and the flow routes only on a final read. `--refund` then reads `locks(hashLock)` at the latest block and at the finalized block (two reads,
+  nothing is sent; Claimed at the first and not at the second is a claim that is not final yet), says "leg A's
   lock was claimed; waiting for the claim to be final, then --resume finishes the swap", waits for the finalized block to pass the head (real polling,
   bounded by `waitLimitMs`), asks again, and ends with the refusal above. Past the bound it exits 4 with "nothing was sent; run --refund again to keep
   waiting". A `--resume` that finds the refund time come and the lock Claimed at the latest block says "run --refund, which waits for the claim to be
@@ -846,7 +847,12 @@ for a refund, shows a row that only a claim or a log scan uses as a warning, so 
   its refund time has come. So once leg A's refund time has come run `--resume` first: while the Buyer's `next` is `learnSecret` it finishes the
   swap at once if that claim landed (the secret is on the chain from the claim on, final or not), and says "the Seller's claim window has closed"
   again if it did not. Then run `--refund`. If the claim landed within one finality lag of the refund time, `--refund` waits for it to be final and
-  tells you to run `--resume` (R3-FUND-01); it never sends a refund for a lock that reads Claimed.
+  tells you to run `--resume` (R3-FUND-01); it never sends a refund for a lock that reads Claimed. **What that `--resume` ends in:** the swap's
+  value has moved (the Seller was paid, the Buyer claims leg B, nothing is sent), but the claim's outcome was not saved, so the Seller's reveal and
+  receipt frames can only be posted now, stamped after leg A's refund time, and the replay refuses a reveal once the refund window is open. The bundle
+  is written and replays to `revealed`, not `settled` (the fold's reasons: "legA step 4: refund window is open" and "leg A claimed on chain but its
+  reveal frame was not recorded"), and the runner exits 6 with "did not accept settled". That is the transcript's grade for a claim whose frames
+  came late, not a lost swap; `tests-anvil/rehearsal-runner.anvil.test.ts` pins it on a real node.
 - **The Buyer's ETH row does not count Base's L1 data fee**, and the gas ceilings were measured on anvil with the mock token, never
   against the real Base Sepolia USDC (a proxied FiatToken). Both are P9-4's; the ceilings are 2 to 3 times the anvil figures.
 - **The log scan reach row uses the block time at dry-run time.** A chain whose block time changes later is not re-checked.
