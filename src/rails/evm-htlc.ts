@@ -993,8 +993,8 @@ export class EvmHtlcRail {
       // trusted with it either way, and nothing carries it before this guard
       // (tests/evm-local-signer.test.ts pins that). R2-FUND-02: the FEE ceiling is judged before
       // that estimate (the wallet client's chain hook, `guardEstimateFeesPerGas`, throws the typed
-      // `fee` refusal while the request still carries no calldata of the secret), so a claim refused
-      // for its fee has sent nothing that holds the preimage; the sign-time guard is the second line.
+      // `fee` refusal before any request that carries the call data has left the process), so a claim
+      // refused for its fee has sent nothing that holds the preimage; the sign-time guard is the second line.
       // The GAS ceiling can only follow the estimate (it judges the estimate), so a gas refusal has
       // already shown the preimage to the endpoint: only an endpoint that holds it anyway, or a claim
       // far larger than any measured one, triggers it. That is a handful of calls, not an
