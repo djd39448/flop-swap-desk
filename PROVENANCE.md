@@ -607,7 +607,7 @@ the operator names and are never printed, stored or inspected; the tests generat
   refund no longer needs the Seller's key file, a lock with no block number is waited for (`waitLockFinal`, R1-FUND-07), failure
   texts are redacted before they are cut (K3), the pre-flight has a `log scan reach` row (F1), the `state at finalized` row says "not
   final yet" for an answer of `0x` (F9) and the `deadlines` row refuses a new swap on 84532 while the rail still runs the anvil
-  policy (F3 with R1-FUND-06, interim until P9-4).
+  policy (F3 with R1-FUND-06, interim until P9-4, which removed it: see "P9-4 part 2" below).
 - Hermetic tests: `tests/rehearsal-config.test.ts`, `tests/rehearsal-world.test.ts`, `tests/rehearsal-preflight.test.ts`,
   `tests/rehearsal-run.test.ts` (the runner and its command line against a fake read-only chain served by a throwaway local HTTP
   server), and the helper `tests/helpers/fake-chain.ts`. Added in the fix pass, all four test files and the helper: K1 (four near-miss
@@ -819,3 +819,67 @@ No key material in any of them: every key in the new tests is generated at test 
 
 What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/`, `fixtures/` and `package.json` are byte-identical to
 `270cf47`; no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no new fixture.
+
+## P9-4 part 2: the runner and the documentation (handoff/P9-4-DECISIONS-2026-10-07.md decisions 1 to 3, 5 to 7, 9 to 15) - the item list
+
+Not vendored: original to this repo. The second build of P9-4 (base: the first build's head `2791eed`; eleven commits, `cf7321f` to `ab041c8`) is the runner
+half: it changed `src/client/rehearsal-config.ts`, `src/client/rehearsal-preflight.ts`, `src/client/rehearsal-run.ts`, `bin/swap-rehearsal-evm.mjs` and the tests
+named below, and no flow, rail or shared file. The third build (decision 15) is documentation only: the README and this file. Every code change below was
+watched to fail its test with the change disabled by the build that made it.
+
+| decision | change | pinned by |
+|---|---|---|
+| 1, 2 (runner part) | the interim "no Base Sepolia policy yet" guard and its imports are removed from `src/client/rehearsal-preflight.ts` (the `deadlines` row now judges the real numbers under the rail's policy); `KNOWN_GOOD_DEADLINES` in `src/client/rehearsal-config.ts` is the per-chain table of `src/client/policy.ts` and `"known-good"` (or an absent `deadlines`) resolves by the pin's chain id; the six interim-guard tests became policy tests | `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts`, `tests/deadlines-policy.test.ts` (the drift test between the two tables) |
+| 3 (runner part) | the runner config names the field when 84532 is given confirmations mode (`rails.evm.pin.finality.mode`) or a `fallbackConfirmations` (`rails.evm.pin.finality.fallbackConfirmations`), before the rail's own check and without echoing a value; anvil keeps both | `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts` |
+| 5 (runner part) | `rails.evm.maxFeePerGasWei` (a number or a decimal string) is a known runner field, carried to the rail and into the bundle's `rails.json`, a key-like string is refused by field name; the new `fee ceiling` pre-flight row (`FEE_CUSHION`, 2x; latest base fee x 1.2 + priority fee, or gas price minus base fee) FAILS a fresh run when the ceiling is below the cushioned fee and WARNS in `--resume` and `--refund` | `tests/rehearsal-config.test.ts`, `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts`, `tests/helpers/fake-chain.ts` |
+| 6 | the new `buyer nonce` and `seller nonce` rows read `eth_getTransactionCount` at `latest` and at `pending` and FAIL a fresh run when they differ, in either direction, or cannot be read (WARN in `--resume` and `--refund`); the by-hand stuck-claim step is README only (no same-nonce replacement code) | `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts`, `tests/helpers/fake-chain.ts` |
+| 7 (runner part), 10 (runner part) | `pendingWriteRefusal` in `src/client/rehearsal-run.ts`: `LockPendingError` and `ClaimPendingError` end the run (exit 4) with a fixed sentence that names `--resume` and signs nothing (no loop, no timer); the runner hands `pollMs: config.pollMs` to each party's rail | `tests/rehearsal-run.test.ts` |
+| 9 | on 84532 the runner config refuses a `waitLimitMs` below `BASE_SEPOLIA_POLICY.finalityAMs` (4,800,000 ms) by field name; the budget itself and the 2-hour default pass; anvil is unchanged | `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts` |
+| 11 | `logRangeShrank` (P2R2-PIN-06's "never a smaller cap") is replaced by the exported `logScanWindowTooLong`: `--resume` is refused only when 100 x the new effective cap is below ceil((leg A's refund time - the run's start) / the policy's block time) + 256, naming both numbers and the cap that would do; a `run.json` without the recorded cap and a config with no cap are not checked | `tests/rehearsal-run.test.ts` |
+| 12 | the `finality budget` row uses the larger of the measured lag and `policy.finalityAMs`, plus `LOCK_SETTLE_ALLOWANCE_MS`, and prints both numbers and the sum; an unknown lag still fails | `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts` |
+| 13 | `revealCameAfterWindow` (the reveal frame's own stamp at or after leg A's refund time: tclk's own rule), decided before the audit; the outcome `revealed` (`audit-export --expect <swap>=revealed`, `outcome.json`, exit 0, the fixed `LATE_REVEAL_SENTENCE`; a repeated `--resume` reports success with the sentence and `--refund` says the run settled); the ordinary path still ends `settled` | `tests/rehearsal-run.test.ts`, `tests-anvil/rehearsal-runner.anvil.test.ts` (the late-claim case on a chain mined by hand now pins exit 0, the sentence and the replay to `revealed`; it pinned exit 6) |
+| 14 | `looksLikeKeyMaterial` runs the two phrase tests (eleven bare letter words, eleven consecutive BIP-39 words) on the value as it stands and again with every `\p{Cf}` character removed, so a phrase with an invisible character inside each word is refused by field name and never quoted | `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts` (`out`, `--state-dir` and the config path) |
+| 15 | `README.md`: the Base Sepolia policy with the full-sample statistics and stand-stills, the per-chain known-good sets with the slack per rule and the wall-clock cost of a refund rehearsal, the finality pin rule, the lock-marker margin, the fee ceiling and its pre-flight row, the nonce rows and the by-hand stuck-claim step, the receipt-timeout bounds, the `waitLimitMs` floor, the lookup pause, the window-based resume check, the `max(lag, budget)` finality row, the late-claim path (`revealed`, exit 0), the Cf stripping, "Deploying EvmHashRail to Base Sepolia" re-read against the final config shape, and no sentence that says a fresh Base Sepolia swap is refused by design; this file | `tests/rehearsal-run.test.ts` (reads the README for the R1-FUND-04 sentence), `tests/utf8.test.ts` |
+
+New tests and helpers of the whole P9-4 package. New test files (all of the first build): `tests/evm-policy.test.ts`, `tests/deadlines-policy.test.ts`, `tests/evm-base-knobs.test.ts`,
+`tests/flow-resume-lockmark.test.ts`, `tests/evm-lookup-pause.test.ts`, `tests/evm-pending-write.test.ts` and `tests-anvil/pending-write.anvil.test.ts`. Extended test files:
+`tests/flow-record.test.ts` (the EVM handle of a timed-out lock write and `claimTxHash`), `tests/rehearsal-config.test.ts`, `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts` and
+`tests-anvil/rehearsal-runner.anvil.test.ts` (the second build). Helpers: `tests/helpers/evm-mock-node.ts` (default-off knobs `logLagBlocks` and `advance`, `holdNextSend` with
+`releaseHeld`, `failHeld` and `dropHeld`, `answerTxByHash`), `tests/helpers/evm-local.ts` (`byHash`; a pooled send counts in the account's nonce), `tests/helpers/matrix-worlds.ts`
+(the known-good set of the node's chain) and, in the second build, `tests/helpers/fake-chain.ts` (a base fee on every block, `eth_maxPriorityFeePerGas`, `eth_getTransactionCount` with
+its `nonceReads` log; the default answers keep every older test unchanged). The tests that moved with the shapes: `tests/rehearsal-preflight.test.ts` builds its policy and deadline set from
+the config's own chain (`evmLocalPolicyFor`, `knownGoodDeadlinesFor`), the 39- and 55-minute finality-lag cases run on the anvil pin with their numbers unchanged, and the unit worlds of
+the wait functions in `tests/rehearsal-run.test.ts` set their one-minute `waitLimitMs` on the parsed config directly (a real 84532 config may not carry it).
+
+Routed on, not done in P9-4: an L1 data-fee allowance in the ETH rows and a re-measurement of the gas ceilings against the real USDC proxy (the README says both are open); a same-nonce
+replacement for a stuck claim (after the first real Base Sepolia rehearsal, with its numbers); the Bitcoin, NEAR and Solana rails' quoting of `pin.name` in refusals that `watch.mjs`
+and `audit-export` print (the Bitcoin and Solana devnet stages); `tests-anvil/` stays outside `npm run typecheck` with its two older diagnostics.
+
+What did not change in the whole package: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/`, `fixtures/`, `package.json` and `package-lock.json` are
+byte-identical to `270cf47` (`git diff 270cf47..HEAD` is empty for them); no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no `Date.now()` is called in a flow
+(the one added line that names it is the rail's existing default for its injected `clock` option, moved onto a line of its own); no new fixture. The hermetic count at the second build's head
+`ab041c8`, before this documentation pass: 126 files, 3898 passed, 7 skipped (at `270cf47`: 120 files, 3751 passed, 7 skipped).
+
+## P9-4 decision index (decision -> files -> tests)
+
+Every decision of `handoff/P9-4-DECISIONS-2026-10-07.md`, with the files that carry it and the tests that pin it; the item lists above say what each change is. A decision that has a runner
+part and a rail part appears once with both.
+
+| decision | files | tests |
+|---|---|---|
+| 1 `BASE_SEPOLIA_POLICY`, chain-id selection, interim guard removed | `src/client/policy.ts`, `src/client/evm-rail.ts`, `src/client/rehearsal-preflight.ts` | `tests/evm-policy.test.ts`, `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts` |
+| 2 known-good deadline set per chain | `src/client/policy.ts`, `src/client/rehearsal-config.ts` | `tests/deadlines-policy.test.ts`, `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts`, `tests/helpers/matrix-worlds.ts` |
+| 3 finality pin on 84532 | `src/rails/evm-htlc.ts`, `src/client/rehearsal-config.ts` | `tests/evm-base-knobs.test.ts`, `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts` |
+| 4 the Buyer's lock-marker margin | `src/client/buyer.ts`, `src/client/flow-record.ts` (a comment) | `tests/flow-resume-lockmark.test.ts` |
+| 5 fee ceiling: rail default and floor, runner field, `fee ceiling` row | `src/rails/evm-htlc.ts`, `src/rails/evm-signer.ts` (a comment), `src/client/rehearsal-config.ts`, `src/client/rehearsal-preflight.ts`, `bin/swap-rehearsal-evm.mjs` | `tests/evm-base-knobs.test.ts`, `tests/rehearsal-config.test.ts`, `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts` |
+| 6 stuck claim: the nonce rows (the by-hand step is README only) | `src/client/rehearsal-preflight.ts`, `README.md` | `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts` |
+| 7 a timed-out lock or claim write is asked about by its hash | `src/rails/evm-htlc.ts`, `src/client/counter-rail.ts`, `src/client/evm-rail.ts`, `src/client/buyer.ts`, `src/client/seller.ts`, `src/client/flow-record.ts`, `src/client/rehearsal-run.ts` | `tests/evm-pending-write.test.ts`, `tests/flow-record.test.ts`, `tests/rehearsal-run.test.ts`, `tests-anvil/pending-write.anvil.test.ts` |
+| 8 `receiptTimeoutMs` bounds on 84532 | `src/rails/evm-htlc.ts` | `tests/evm-base-knobs.test.ts` |
+| 9 `waitLimitMs` floor | `src/client/rehearsal-config.ts` | `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts` |
+| 10 the pause between the write lookup's re-plans | `src/rails/evm-htlc.ts`, `src/client/evm-rail.ts`, `src/client/rehearsal-run.ts` | `tests/evm-lookup-pause.test.ts`, `tests/rehearsal-run.test.ts` |
+| 11 the resume cap check as a window check | `src/client/rehearsal-run.ts` | `tests/rehearsal-run.test.ts` |
+| 12 the finality row `max(lag, budget)` | `src/client/rehearsal-preflight.ts` | `tests/rehearsal-preflight.test.ts`, `tests/rehearsal-run.test.ts` |
+| 13 the late-claim end state | `src/client/rehearsal-run.ts`, `bin/swap-rehearsal-evm.mjs` | `tests/rehearsal-run.test.ts`, `tests-anvil/rehearsal-runner.anvil.test.ts` |
+| 14 the Cf strip before the phrase tests | `src/client/rehearsal-config.ts` | `tests/rehearsal-config.test.ts`, `tests/rehearsal-run.test.ts` |
+| 15 documentation | `README.md`, `PROVENANCE.md` | `tests/rehearsal-run.test.ts`, `tests/utf8.test.ts` |
+| 16 the gate | none (the main loop runs it) | typecheck of both configs, hermetic, forge, the runtime-hash recipe of `P9-FIXES-R2.md` decision 9, anvil, regtest, the key scan; NEAR and Solana rerun by the main loop |
