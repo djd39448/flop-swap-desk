@@ -310,7 +310,8 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     if (!answer.ok) add("state at finalized", "fail", `locks() at the finalized block by its hash failed (${answer.why}); the evidence reader needs exactly this read`);
     else if (answer.value === "0x") {
       // F9 (P9 review round 1): a node answers 0x (no data) for an eth_call at a block where the contract does not exist yet. That is the likely case
-      // within the finalized lag of a deploy (about 40 minutes on Base Sepolia), and "not an ABI-encoded row" would send a person looking in the wrong place.
+      // within the finalized lag of a deploy (up to about 52 minutes on Base Sepolia: the sample's largest finalized lag so far is 51.4 minutes, 3,086 s, after a stand-still of
+      // 30 minutes or more; P9-4 sets the number from the full 24-hour sample), and "not an ABI-encoded row" would send a person looking in the wrong place.
       add(
         "state at finalized",
         "fail",
@@ -481,7 +482,8 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     const checked = checkSwapDeadlines(asOffer(absolute.legA), asOffer(absolute.legB), lockTimeMs, input.policy);
     const violations = [...checked.violations];
     // F3 with R1-FUND-06 (P9 review round 1), an INTERIM guard until P9-4 selects BASE_SEPOLIA_POLICY by chain id: on Base Sepolia the rail still runs under
-    // the anvil policy, whose 20-minute finality budget was a median of the first samples and not a bound (the sample's maximum is 39 minutes) and whose
+    // the anvil policy, whose 20-minute finality budget was a median of the first samples and not a bound (the sample's largest finalized lag so far is 51.4 minutes, 3,086 s, after a
+    // stand-still of 30 minutes or more; the policy rule gives at least 80 minutes, and P9-4 sets the number from the full 24-hour sample) and whose
     // 5-minute claim margin is below the worst case after the claim's last guard. A new swap there is refused (--refund and --resume never read this row).
     if (evm.pin.chainId === BASE_SEPOLIA_PIN.chainId && input.policy === EVM_LOCAL_POLICY) {
       violations.unshift(
