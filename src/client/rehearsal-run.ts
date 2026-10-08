@@ -30,6 +30,8 @@
 //                          after leg A's refund time, which tclk's machine rejects ("refund window is open"): the bundle replays to `revealed`, not `settled`. That is the protocol's own grade
 //                          for a reveal that came late, not a lost swap, so the runner expects `revealed` for that path (decided from the reveal frame's own stamp, never by trying
 //                          `settled` first), writes the bundle, and exits 0 with `LATE_REVEAL_SENTENCE`; the on-chain evidence is the proof.
+//                          P94-FUND-02: the runner checks that proof before it writes the bundle on that path (`lateRevealGate`: leg A must read claimed at the finalized block), and
+//                          otherwise ends with exit 6 and one fixed sentence, no bundle and no `revealed`.
 //                          P94-FUND-01: the claim of leg A is the one write with a deadline a person can still help (a by-hand same-nonce speed-up, README, "A stuck claim is not
 //                          re-priced"), so its hash is printed the moment it is broadcast ("claim of leg A sent: tx <hash>"), then one line a minute while it is not mined, and a
 //                          claim still pending when the wait ends is a refusal (exit 4) whose one sentence names the hash, the minutes left and the by-hand step.
@@ -44,7 +46,7 @@
 //
 // Exit codes: 0 done (or a clean dry run); 2 bad config, arguments or state; 3 pre-flight failed (nothing was sent); 4 a step refused
 // (the first line of its reason is printed); 5 not yet (a refund time has not come; run again then); 6 the bundle was written
-// but `audit-export` did not accept it.
+// but `audit-export` did not accept it (or, P94-FUND-02, a late claim whose leg A does not read claimed at the finalized block: then no bundle was written).
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -463,6 +465,37 @@ export function createClaimWatch(params: { log: (line: string) => void; clock: (
     timer = handle;
   };
   return { onClaimSent, stop };
+}
+
+/**
+ * P94-FUND-02 (P9-FIXES-R4 decision 2): whether `locks(hashLock)` reads Claimed (status 2) at the FINALIZED block the pin names: leg A's claim is on the chain and final. Reads only; any failure
+ * (an unreadable finalized block, a row the node does not answer, a transport error) reads false, so a doubt is never taken for a claim.
+ */
+export async function legAClaimedAtFinalized(w: Pick<FinalityWorld, "config" | "rpc">, hashLock: string): Promise<boolean> {
+  try {
+    const finalized = await finalizedNumber(w.rpc, w.config);
+    if (finalized === null) return false;
+    return (await lockStatusAt(w.rpc, w.config.rails.evm.contract, hashLock, `0x${finalized.toString(16)}`)) === 2;
+  } catch {
+    return false;
+  }
+}
+
+/** P94-FUND-02: the end of a late-claim run whose leg A does not read claimed at the finalized block. Fixed text: no value. */
+export const LATE_REVEAL_NOT_ON_CHAIN =
+  "the Seller's reveal frame came after leg A's refund time, which is how a late claim ends, but leg A's lock does not read claimed at the finalized block (the claim is not final, or the endpoint's reads disagree), so the swap is not reported as settled and no bundle was written; nothing was sent; look at the claim on the chain and run --resume again once it is final";
+
+/**
+ * P94-FUND-02 (P9-FIXES-R4 decision 2): the late-claim exit 0 (`revealed`, P9-4 decision 13) rests on the CHAIN showing the swap settled, not on the transcript's grade, which is `revealed` just as
+ * well when leg A still reads Locked. So before the bundle is written on the late path, leg A is read through the runner's own reads at the finalized block and must be claimed there,
+ * as `settled` requires of the audit. `undefined`: go on (not a late path, so the audit decides as before, or leg A reads claimed and final). Otherwise the fixed refusal is printed and
+ * the exit code is `EXIT.audit`: no bundle, no `outcome.json`, no `LATE_REVEAL_SENTENCE`, and a later `--resume` reads again. Reads only. Exported for its own tests.
+ */
+export async function lateRevealGate(w: FinalityWorld, hashLock: string, lateReveal: boolean): Promise<number | undefined> {
+  if (!lateReveal) return undefined;
+  if (await legAClaimedAtFinalized(w, hashLock)) return undefined;
+  w.env.err(`rehearsal: ${LATE_REVEAL_NOT_ON_CHAIN}`);
+  return EXIT.audit;
 }
 
 // --- small helpers --------------------------------------------------------------------------------------------------------------
@@ -1243,6 +1276,9 @@ async function driveSettle(w: World): Promise<number> {
   // P9-4 decision 13: a reveal frame that came after leg A's window (the late-claim path: the claim landed within a finality lag of the refund time, or its frames were posted
   // by a later --resume) is graded `revealed` by the replay; the swap itself is settled on chain. Decided from the frame's own stamp, the machine's own rule.
   const lateReveal = revealCameAfterWindow(claimed.reveal, run.deadlines.legA.refundAfterMs);
+  // P94-FUND-02: the late path's exit 0 says "settled on chain", so the chain must show it: leg A claimed at the finalized block, read here, before the bundle is written.
+  const notOnChain = await lateRevealGate(w, lockA.hashLock, lateReveal);
+  if (notOnChain !== undefined) return notOnChain;
   return writeAndAudit(w, {
     outcome: lateReveal ? "revealed" : "settled",
     acceptAContract: accepted.acceptA.contract,

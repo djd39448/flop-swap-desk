@@ -17,11 +17,11 @@ import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { generateHashLock } from "@flop-labs/tclk";
-import { encodeFunctionResult } from "viem";
+import { encodeFunctionResult, type Address } from "viem";
 import { english, generateMnemonic, generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, CLAIM_TICK_MS, claimSentLine, claimTickLine, createClaimWatch, EXIT, FLOW_MESSAGE, LATE_REVEAL_SENTENCE, loadRunnerAccount, parseRunRecord, pendingWriteRefusal, refundTimeReached, refundLegAWaiting, revealCameAfterWindow, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, CLAIM_TICK_MS, claimSentLine, claimTickLine, createClaimWatch, EXIT, FLOW_MESSAGE, LATE_REVEAL_NOT_ON_CHAIN, LATE_REVEAL_SENTENCE, lateRevealGate, legAClaimedAtFinalized, loadRunnerAccount, parseRunRecord, pendingWriteRefusal, refundTimeReached, refundLegAWaiting, revealCameAfterWindow, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
 import { LockPendingError, RefundNotFinalYetError } from "../src/client/buyer.js";
 import { ClaimPendingError } from "../src/client/seller.js";
 import { encodeFlowRecord, newBuyerRecord, newSellerRecord } from "../src/client/flow-record.js";
@@ -2058,6 +2058,133 @@ describe("P9-4 d13: a reveal that came after leg A's window is expected to repla
     const refused = await run(rig, "resume");
     expect(refused.code).toBe(EXIT.config);
     expect(refused.stderr).toContain("is not an outcome record this build reads");
+  });
+});
+
+// P94-FUND-02 (P9-FIXES-R4 decision 2): the late-claim exit 0 of P9-4 decision 13 says "the swap is settled on chain". The transcript's grade `revealed` holds just as well when the bundle's
+// leg A observation reads Locked, so the runner now reads leg A at the FINALIZED block before it writes the bundle on that path, and ends with exit 6 and a fixed sentence (no bundle, no
+// outcome.json, no LATE_REVEAL_SENTENCE) unless leg A reads claimed there. (The whole late run on a real node: tests-anvil/rehearsal-runner.anvil.test.ts.)
+describe("P94-FUND-02: the late-claim exit 0 requires the chain: leg A claimed at the finalized block", () => {
+  const HASH_LOCK = `0x${"5a".repeat(32)}`;
+  const zero: Address = "0x0000000000000000000000000000000000000000";
+  const row = (status: number): string => encodeFunctionResult({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", result: [zero, zero, TOKEN as Address, 1n, 1n, 2n, status] });
+  const FINALIZED = "0x64";
+
+  interface Probe {
+    world: FinalityWorld;
+    calls: Array<{ method: string; params: readonly unknown[] }>;
+    errs: string[];
+    logs: string[];
+  }
+
+  /** A chain whose `locks(hashLock)` row reads `statusAt.latest` at the latest block and `statusAt.finalized` at any numbered block; `fault` breaks one read. */
+  function lateWorld(statusAt: { latest: number; finalized: number }, fault?: "no finalized block" | "finalized tag fails" | "row read fails" | "row malformed"): Probe {
+    const probe: Probe = { world: undefined as unknown as FinalityWorld, calls: [], errs: [], logs: [] };
+    const rpc = {
+      request: async ({ method, params }: { method: string; params?: readonly unknown[] }): Promise<unknown> => {
+        probe.calls.push({ method, params: params ?? [] });
+        if (method === "eth_getBlockByNumber") {
+          if (params?.[0] === "finalized") {
+            if (fault === "no finalized block") return null;
+            if (fault === "finalized tag fails") throw new Error("finalized tag: transport down");
+            return { number: FINALIZED, timestamp: "0x1" };
+          }
+          return { number: "0x78", timestamp: "0x1" };
+        }
+        if (method === "eth_call") {
+          if (fault === "row read fails" && params?.[1] !== "latest") throw new Error("eth_call: transport down");
+          if (fault === "row malformed" && params?.[1] !== "latest") return "0x";
+          return row(params?.[1] === "latest" ? statusAt.latest : statusAt.finalized);
+        }
+        throw new Error(`unexpected ${method}`);
+      },
+    } as unknown as CapturingRpc;
+    const config = parseRehearsalConfig(
+      { rails: { evm: { pin: ANVIL_LOCAL_PIN, endpoint: "http://mock", contract: CONTRACT, assets: { USDC: TOKEN } } }, buyerKeyFile: "b.key", sellerKeyFile: "s.key", amount: "1000000", out: "bundle", pollMs: 5_000 },
+      "/base",
+    );
+    probe.world = {
+      config,
+      env: { now: () => 1_800_000_000_000, sleep: async () => undefined, out: (line) => void probe.logs.push(line), err: (line) => void probe.errs.push(line) },
+      rpc,
+      log: (line) => void probe.logs.push(line),
+      pollMs: 5_000,
+    };
+    return probe;
+  }
+
+  it("a late claim whose leg A reads Locked at the finalized block (it is Claimed only at the latest block) exits 6 with the fixed sentence, and never the late-reveal sentence", async () => {
+    const probe = lateWorld({ latest: 2, finalized: 1 });
+    expect(await lateRevealGate(probe.world, HASH_LOCK, true)).toBe(EXIT.audit);
+    expect(EXIT.audit).toBe(6);
+    expect(probe.errs).toEqual([`rehearsal: ${LATE_REVEAL_NOT_ON_CHAIN}`]);
+    expect(probe.logs.some((line) => line.includes(LATE_REVEAL_SENTENCE) || line.includes("settled on chain"))).toBe(false);
+    // The read is at the finalized block's number, never at "latest" (a claim a reorg removes would pass a latest read).
+    const reads = probe.calls.filter((call) => call.method === "eth_call");
+    expect(reads.map((call) => call.params[1])).toEqual([FINALIZED]);
+  });
+
+  it("leg A claimed and final lets the late path go on (the bundle is written and audited as revealed, exit 0: the anvil case end to end); only Claimed passes, whatever the other statuses are", async () => {
+    const claimed = lateWorld({ latest: 2, finalized: 2 });
+    expect(await lateRevealGate(claimed.world, HASH_LOCK, true)).toBeUndefined();
+    expect(claimed.errs).toEqual([]);
+    expect(claimed.calls.filter((call) => call.method === "eth_call").map((call) => call.params[1])).toEqual([FINALIZED]);
+    for (const status of [0, 1, 3]) {
+      const probe = lateWorld({ latest: 2, finalized: status });
+      expect(await lateRevealGate(probe.world, HASH_LOCK, true), `status ${status}`).toBe(EXIT.audit);
+      expect(probe.errs, `status ${status}`).toHaveLength(1);
+    }
+  });
+
+  it("the on-time path is not read at all: a reveal that was in time leaves the audit to decide, as before (no read, no refusal)", async () => {
+    const probe = lateWorld({ latest: 1, finalized: 1 }); // would be refused if it were a late path
+    expect(await lateRevealGate(probe.world, HASH_LOCK, false)).toBeUndefined();
+    expect(probe.calls).toEqual([]);
+    expect(probe.errs).toEqual([]);
+  });
+
+  it("a doubt is not a claim: an unreadable finalized block, a finalized tag that fails, a row read that fails and a malformed row all refuse (exit 6)", async () => {
+    for (const fault of ["no finalized block", "finalized tag fails", "row read fails", "row malformed"] as const) {
+      const probe = lateWorld({ latest: 2, finalized: 2 }, fault);
+      expect(await lateRevealGate(probe.world, HASH_LOCK, true), fault).toBe(EXIT.audit);
+      expect(probe.errs, fault).toEqual([`rehearsal: ${LATE_REVEAL_NOT_ON_CHAIN}`]);
+    }
+    expect(await legAClaimedAtFinalized(lateWorld({ latest: 2, finalized: 2 }).world, "not a hash lock")).toBe(false); // a hash lock the row decoder refuses reads false
+  });
+
+  it("the refusal is one fixed ASCII sentence with no value in it: no number, no hash, no time; it says no bundle was written and what to do", () => {
+    expect(/^[\x20-\x7e]+$/.test(LATE_REVEAL_NOT_ON_CHAIN)).toBe(true);
+    expect(/0x[0-9a-fA-F]|[0-9]/.test(LATE_REVEAL_NOT_ON_CHAIN)).toBe(false);
+    expect(LATE_REVEAL_NOT_ON_CHAIN.includes(". ")).toBe(false);
+    expect(LATE_REVEAL_NOT_ON_CHAIN.endsWith(".")).toBe(false);
+    expect(LATE_REVEAL_NOT_ON_CHAIN).toContain("leg A's lock does not read claimed at the finalized block");
+    expect(LATE_REVEAL_NOT_ON_CHAIN).toContain("no bundle was written; nothing was sent");
+    expect(LATE_REVEAL_NOT_ON_CHAIN).toContain("run --resume again once it is final");
+    expect(LATE_REVEAL_NOT_ON_CHAIN).not.toContain("replays offline to revealed"); // the late-reveal sentence says the swap is settled; this one must not
+    expect(LATE_REVEAL_NOT_ON_CHAIN).not.toContain(LATE_REVEAL_SENTENCE);
+  });
+
+  it("driveSettle reads leg A after the Buyer claimed leg B and before the bundle is written: gate, then the refusal's return, then writeAndAudit; outcome.json is written only after the audit accepted (code order)", async () => {
+    const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
+    const at = (needle: string): number => text.indexOf(needle);
+    const order = [
+      "await buyer.claimLegB(secret);",
+      "const lateReveal = revealCameAfterWindow(",
+      "const notOnChain = await lateRevealGate(w, lockA.hashLock, lateReveal);",
+      "if (notOnChain !== undefined) return notOnChain;",
+      "return writeAndAudit(w, {",
+    ].map(at);
+    expect(order.every((position) => position > 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(text.match(/await lateRevealGate\(/g)?.length).toBe(1);
+    // The gate prints and returns; the bundle, the audit and outcome.json are all in writeAndAudit, which the refusal never reaches.
+    const gate = text.slice(at("export async function lateRevealGate("), at("// --- small helpers"));
+    expect(gate).toContain("return EXIT.audit;");
+    expect(gate).not.toContain("writeAndAudit");
+    expect(gate).not.toContain("OUTCOME_FILE");
+    expect(gate).not.toContain("LATE_REVEAL_SENTENCE");
+    const tail = text.slice(at("async function writeAndAudit("), at("// --- the swap ---"));
+    expect(tail.indexOf("if (!(await auditBundle(w, out, parts.outcome))) return EXIT.audit;")).toBeLessThan(tail.indexOf("await writeFileDurable(join(w.stateDir, OUTCOME_FILE)"));
   });
 });
 

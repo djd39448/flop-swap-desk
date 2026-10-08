@@ -35,13 +35,13 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 
-import { decodeFunctionData, encodeFunctionData, keccak256, pad, parseTransaction, toEventSelector, type Address, type Hex } from "viem";
+import { decodeFunctionData, decodeFunctionResult, encodeFunctionData, encodeFunctionResult, keccak256, pad, parseTransaction, toEventSelector, type Address, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { decodeFlowRecord, encodeFlowRecord } from "../src/client/flow-record.js";
 import { FileFlowStore, flowDigest, flowKey } from "../src/client/flow-store.js";
-import { LATE_REVEAL_SENTENCE } from "../src/client/rehearsal-run.js";
+import { LATE_REVEAL_NOT_ON_CHAIN, LATE_REVEAL_SENTENCE } from "../src/client/rehearsal-run.js";
 import { ANVIL_LOCAL_PIN } from "../src/rails/evm-htlc.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { keyScanner } from "../tests/helpers/evm-local.js";
@@ -226,15 +226,17 @@ interface ChainProxy {
   held: Array<{ hash: Hex; raw: Hex }>;
   /** While true, `eth_getTransactionByHash` of a swallowed claim answers a transaction with no block (the node holds it, unmined); otherwise the node's own answer (it has never seen it). */
   heldArePending: boolean;
+  /** While true, a `locks(hashLock)` read at a NUMBERED block that the node answers Claimed is answered Locked (an endpoint whose finalized block does not show the claim). */
+  lockedAtNumberedBlocks: boolean;
   close: () => Promise<void>;
 }
 
 /**
- * P94-FUND-01: a JSON-RPC proxy in front of the node for the case a real node cannot be told to show: a CLAIM the endpoint accepts and never mines (swallowed, its hash answered,
- * `held`). Everything else is passed to the node unchanged.
+ * P94-FUND-01 / P94-FUND-02: a JSON-RPC proxy in front of the node for the two cases a real node cannot be told to show: a CLAIM the endpoint accepts and never mines (swallowed, its hash
+ * answered, `held`), and a `locks` read at a numbered block that shows Locked while the node says Claimed. Everything else is passed to the node unchanged.
  */
 async function startChainProxy(target: string, escrow: Address): Promise<ChainProxy> {
-  const proxy: ChainProxy = { url: "", holdClaims: false, held: [], heldArePending: false, close: async () => undefined };
+  const proxy: ChainProxy = { url: "", holdClaims: false, held: [], heldArePending: false, lockedAtNumberedBlocks: false, close: async () => undefined };
   const isEscrowCall = (data: Hex | undefined, name: "claim" | "locks"): boolean => {
     if (data === undefined) return false;
     try {
@@ -271,6 +273,18 @@ async function startChainProxy(target: string, escrow: Address): Promise<ChainPr
         }
         const upstream = await fetch(target, { method: "POST", headers: { "content-type": "application/json" }, body });
         const text = await upstream.text();
+        const numbered = typeof call.params?.[1] === "string" && /^0x[0-9a-fA-F]+$/.test(call.params[1]);
+        const callObject = call.params?.[0] as { to?: string; data?: Hex } | undefined;
+        if (call.method === "eth_call" && proxy.lockedAtNumberedBlocks && numbered && callObject?.to?.toLowerCase() === escrow.toLowerCase() && isEscrowCall(callObject.data, "locks")) {
+          const parsed = JSON.parse(text) as { result?: Hex };
+          if (typeof parsed.result === "string") {
+            const row = decodeFunctionResult({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", data: parsed.result }) as readonly [Address, Address, Address, bigint, bigint, bigint, number];
+            if (row[6] === 2) {
+              answer(encodeFunctionResult({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", result: [row[0], row[1], row[2], row[3], row[4], row[5], 1] }));
+              return;
+            }
+          }
+        }
         response.statusCode = upstream.status;
         response.end(text);
       })().catch(() => {
@@ -1156,6 +1170,78 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(afterwards.stderr).toContain("the run settled, so there is nothing to refund");
       expect(await chainFacts(hand, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 });
       await expectCleanAndReplays(rig, { ...resumed, stdout: killed.stdout + limited.stdout + early.stdout + refunded.stdout + resumed.stdout, stderr: killed.stderr + limited.stderr + early.stderr + refunded.stderr + resumed.stderr }, "revealed");
+    }, 240_000);
+
+    // P94-FUND-02 (P9-FIXES-R4 decision 2): the late path's exit 0 says "settled on chain", so the runner reads leg A at the finalized block before it writes the bundle. Here the endpoint (a proxy)
+    // answers the lock row Locked at every numbered block once leg B is claimed, as an endpoint whose finalized block does not show the claim would: the run ends with exit 6 and the fixed
+    // sentence, writes no bundle and no outcome.json and does not say the swap is settled; the next --resume (the endpoint shows the claim) finishes as revealed, exit 0.
+    it("P94-FUND-02: a late claim whose leg A reads Locked at the finalized block ends with exit 6, the fixed sentence, no bundle and no outcome; the next --resume, which sees the claim, finishes as revealed", async () => {
+      const proxy = await startChainProxy(hand.anvil.endpoint, hand.contract);
+      try {
+        const rig = await makeRig(hand, { clock: "chain", confirmations: 8, waitLimitMs: 120_000, endpoint: proxy.url });
+        const first = startRunner(rig, ["--yes"]);
+        await first.waitForLine(/step buyer\.lockLegA done/);
+        first.kill();
+        await first.done;
+        const { deadlines } = await readRun(rig);
+        await warpHand(deadlines.legA.refundAfterMs - 60_000);
+        await sellerClaims(rig);
+        await sellerClaimAttempted(rig);
+        await warpHand(deadlines.legA.refundAfterMs + 1_000);
+
+        // --refund waits for the claim to be final (the test mines the blocks) and hands over to --resume.
+        const waiting = startRunner(rig, ["--refund"]);
+        await waiting.waitForLine(/leg A's lock was claimed; waiting for the claim to be final, then --resume finishes the swap/);
+        const minerA = setInterval(() => void hand.anvil.rpcCall("anvil_mine", ["0x1"]).catch(() => undefined), 100);
+        let handedOver: RunResult;
+        try {
+          handedOver = await waiting.done;
+        } finally {
+          clearInterval(minerA);
+        }
+        expect(handedOver.code).toBe(4);
+        expect(handedOver.stderr).toMatch(/leg A's lock was claimed and the claim is final, so leg A is not refunded/);
+
+        // --resume through the doubting endpoint: the claim is read, leg B is claimed, and only then does the endpoint show leg A Locked at numbered blocks.
+        const doubting = startRunner(rig, ["--resume"]);
+        void doubting.waitForLine(/step buyer\.claimLegB done/).then(() => {
+          proxy.lockedAtNumberedBlocks = true;
+        });
+        const minerB = setInterval(() => void hand.anvil.rpcCall("anvil_mine", ["0x1"]).catch(() => undefined), 100);
+        let refused: RunResult;
+        try {
+          refused = await doubting.done;
+        } finally {
+          clearInterval(minerB);
+        }
+        expect(refused.code).toBe(6);
+        expect(refused.stderr).toContain(`rehearsal: ${LATE_REVEAL_NOT_ON_CHAIN}`);
+        expect(refused.stdout + refused.stderr).not.toContain(LATE_REVEAL_SENTENCE);
+        expect(refused.stdout).toContain("step buyer.claimLegB done");
+        expect(refused.stdout).not.toContain("bundle written to");
+        expect(refused.stdout).not.toMatch(/done: swap 0x[0-9a-f]{64} revealed/);
+        expect(await exists(rig.outDir)).toBe(false);
+        expect(await exists(join(rig.stateDir, "outcome.json"))).toBe(false);
+        expect(await chainFacts(hand, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 }); // the refusal sent nothing
+
+        // A later --resume reads again: the endpoint shows the claim, so the run finishes as revealed, exit 0, with the late-reveal sentence.
+        proxy.lockedAtNumberedBlocks = false;
+        const finishing = startRunner(rig, ["--resume"]);
+        const minerC = setInterval(() => void hand.anvil.rpcCall("anvil_mine", ["0x1"]).catch(() => undefined), 100);
+        let finished: RunResult;
+        try {
+          finished = await finishing.done;
+        } finally {
+          clearInterval(minerC);
+        }
+        expect(finished.code).toBe(0);
+        expect(finished.stdout).toMatch(/done: swap 0x[0-9a-f]{64} revealed; bundle /);
+        expect(finished.stdout).toContain(LATE_REVEAL_SENTENCE);
+        expect((JSON.parse(await readFile(join(rig.stateDir, "outcome.json"), "utf8")) as { outcome?: unknown }).outcome).toBe("revealed");
+        expect(await chainFacts(hand, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 });
+      } finally {
+        await proxy.close();
+      }
     }, 240_000);
   });
 });

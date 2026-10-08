@@ -49,7 +49,8 @@ sellerKeyFile, deadlines ("known-good" is the set of the pinned chain), amount, 
 relative to the config file.
 
 Exit codes: 0 done (or a clean dry run); 2 bad arguments, config or state; 3 pre-flight failed (nothing was sent); 4 a step refused
-(its reason is printed); 5 not yet (a refund time has not come); 6 the bundle was written but audit-export did not accept it.
+(its reason is printed); 5 not yet (a refund time has not come); 6 the bundle was written but audit-export did not accept it (or a
+late claim whose leg A does not read claimed at the finalized block: then no bundle was written).
 `;
 
 function parse(argv) {
