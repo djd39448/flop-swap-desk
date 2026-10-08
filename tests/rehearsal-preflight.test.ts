@@ -43,6 +43,10 @@ const NOW_MS = HEAD_SEC * 1000 + 2_000;
 /** The known-good deadline sets of the two chains (P9-4 decision 2), as the runner's config resolves them. */
 const ANVIL_SET = KNOWN_GOOD_DEADLINES[31337];
 const BASE_SET = KNOWN_GOOD_DEADLINES[84532];
+/** P94-PIN-02: the same set with leg B's claim-by far after leg A's refund time, so the leg-linking slack of the finality row never binds (the tests of the claim-by arithmetic use it). */
+function farLegB(set: DeadlineMinutes): DeadlineMinutes {
+  return { legA: set.legA, legB: { ...set.legB, claimByMin: 900, refundAfterMin: 960 } };
+}
 const buyerAddress = privateKeyToAccount(generatePrivateKey()).address;
 const sellerAddress = privateKeyToAccount(generatePrivateKey()).address;
 
@@ -226,17 +230,18 @@ describe("finality", () => {
   // (an 80-minute budget, claim-by +115) is the subject of the "finality budget row" tests below (P9-4 decision 12).
   it("sets the measured lag against leg A's claim-by (anvil, claim-by +60): 39 minutes fits, 55 minutes does not", async () => {
     const anvil = config({ contractCodeHash: undefined }, {}, ANVIL_LOCAL_PIN);
-    const fits = await preflight({ chainId: 31337, finalizedLagSec: 39 * 60 }, anvil);
+    const set = farLegB(ANVIL_SET); // P94-PIN-02: leg B's claim-by is far, so the leg-linking slack is not what these numbers are about
+    const fits = await preflight({ chainId: 31337, finalizedLagSec: 39 * 60 }, anvil, {}, set);
     expect(status(fits, "finality budget")).toBe("ok");
     expect(row(fits, "finality budget").detail).toContain("to spare");
-    const tooSlow = await preflight({ chainId: 31337, finalizedLagSec: 55 * 60 }, anvil);
+    const tooSlow = await preflight({ chainId: 31337, finalizedLagSec: 55 * 60 }, anvil, {}, set);
     expect(status(tooSlow, "finality budget")).toBe("fail");
     expect(row(tooSlow, "finality budget").detail).toContain("the Seller could not claim in time");
     expect(tooSlow.report.ok).toBe(false);
     // The allowance for landing the lock is part of the sum: a lag of exactly (claim-by - allowance) still fits.
-    const edge = await preflight({ chainId: 31337, finalizedLagSec: (60 * 60_000 - LOCK_SETTLE_ALLOWANCE_MS) / 1000 }, anvil);
+    const edge = await preflight({ chainId: 31337, finalizedLagSec: (60 * 60_000 - LOCK_SETTLE_ALLOWANCE_MS) / 1000 }, anvil, {}, set);
     expect(status(edge, "finality budget")).toBe("ok");
-    const over = await preflight({ chainId: 31337, finalizedLagSec: (60 * 60_000 - LOCK_SETTLE_ALLOWANCE_MS) / 1000 + 1 }, anvil);
+    const over = await preflight({ chainId: 31337, finalizedLagSec: (60 * 60_000 - LOCK_SETTLE_ALLOWANCE_MS) / 1000 + 1 }, anvil, {}, set);
     expect(status(over, "finality budget")).toBe("fail");
   });
 
@@ -262,11 +267,12 @@ describe("finality", () => {
   });
 
   it("P9-4 d12: a lag above the budget is used as it is (105 minutes + 10 fits claim-by +115 exactly, one second more does not); the row says it used the lag", async () => {
-    const exact = await preflight({ finalizedLagSec: 105 * 60 }, config(), {}, BASE_SET);
+    const set = farLegB(BASE_SET); // P94-PIN-02: with the Base set itself a lag this long also breaks the leg-linking slack (the tests below); here only the claim-by sum is exercised
+    const exact = await preflight({ finalizedLagSec: 105 * 60 }, config(), {}, set);
     expect(status(exact, "finality budget")).toBe("ok");
     expect(row(exact, "finality budget").detail).toContain("(105.0 min) and the policy's finality budget (80.0 min), 105.0 min, plus 10.0 min");
     expect(row(exact, "finality budget").detail).toContain("0.0 min to spare");
-    expect(status(await preflight({ finalizedLagSec: 105 * 60 + 1 }, config(), {}, BASE_SET), "finality budget")).toBe("fail");
+    expect(status(await preflight({ finalizedLagSec: 105 * 60 + 1 }, config(), {}, set), "finality budget")).toBe("fail");
   });
 
   it("P9-4 d12: the budget applies on anvil too (20 minutes + 10 needs a claim-by of +30 even when the lag measured is 5 minutes)", async () => {
@@ -278,6 +284,55 @@ describe("finality", () => {
     const exact = await preflight({ chainId: 31337, finalizedLagSec: 5 * 60 }, anvil, {}, claimBy(30));
     expect(status(exact, "finality budget")).toBe("ok");
     expect(row(exact, "finality budget").detail).toContain("0.0 min to spare");
+  });
+
+  // P94-PIN-02 (P9-4 review, P9-FIXES-R4 decision 5, spec rule 3): the row compared max(lag, budget) + 10 min with leg A's claim-by only, and SPEC 3.5 rule 2 (the leg-linking
+  // rule) is checked against the policy's FIXED budget, so a day with a measured lag of 90 to 105 minutes passed every row on the Base Sepolia set with a leg-linking slack of
+  // 0 to -15 minutes. The row now also requires leg B's claim-by to be at least max(lag, budget) after leg A's refund time, failing and printing both numbers.
+  it("P94-PIN-02: the Base Sepolia set (leg B claim-by 90 min after leg A's refund time) with a measured lag of 100 minutes FAILS the finality row naming both numbers; the sample's maximum (51.4 min) passes", async () => {
+    expect(BASE_SET.legB.claimByMin - BASE_SET.legA.refundAfterMin).toBe(90);
+    const slow = await preflight({ finalizedLagSec: 100 * 60 }, config(), {}, BASE_SET);
+    expect(status(slow, "finality budget")).toBe("fail");
+    const failed = row(slow, "finality budget").detail;
+    expect(failed).toContain("leg B's claim-by is 90.0 min after leg A's refund time");
+    expect(failed).toContain("the leg-linking slack must be at least 100.0 min");
+    expect(failed).toContain("(100.0 min) and the policy's finality budget (80.0 min), 100.0 min");
+    expect(failed).not.toContain("the Seller could not claim in time"); // the claim-by sum (100 + 10 against +115) still holds: only the linking slack fails
+    expect(slow.report.ok).toBe(false);
+    expect(slow.text).toContain("RESULT: 1 check(s) failed");
+
+    // the 24-hour sample's maximum lag (3,086 s = 51.4 min) is below the budget: the budget is used and the row passes, with the slack printed
+    const sample = await preflight({ finalizedLagSec: 3_086 }, config(), {}, BASE_SET);
+    expect(status(sample, "finality budget")).toBe("ok");
+    const detail = row(sample, "finality budget").detail;
+    expect(detail).toContain("(51.4 min) and the policy's finality budget (80.0 min), 80.0 min");
+    expect(detail).toContain("leg B's claim-by is 90.0 min after leg A's refund time, 10.0 min above the 80.0 min a late claim needs");
+    expect(sample.report.ok).toBe(true);
+  });
+
+  it("P94-PIN-02: the boundary is exact (a lag of 90 minutes passes, one second more fails), the failure prints both rows' numbers when the claim-by sum fails too, and anvil is judged the same way", async () => {
+    const exact = await preflight({ finalizedLagSec: 90 * 60 }, config(), {}, BASE_SET);
+    expect(status(exact, "finality budget")).toBe("ok");
+    expect(row(exact, "finality budget").detail).toContain("0.0 min above the 90.0 min a late claim needs");
+    const over = await preflight({ finalizedLagSec: 90 * 60 + 1 }, config(), {}, BASE_SET);
+    expect(status(over, "finality budget")).toBe("fail");
+    expect(row(over, "finality budget").detail).toContain("leg B's claim-by is 90.0 min after leg A's refund time");
+    // both problems at once (a lag of 106 minutes: the claim-by sum fails as before, and so does the linking slack): one row, both sentences
+    const both = await preflight({ finalizedLagSec: 106 * 60 }, config(), {}, BASE_SET);
+    expect(status(both, "finality budget")).toBe("fail");
+    expect(row(both, "finality budget").detail).toContain("the Seller could not claim in time");
+    expect(row(both, "finality budget").detail).toContain("the leg-linking slack must be at least 106.0 min");
+    // anvil's set (leg B claims 30 minutes after leg A's refund time, a budget of 20): a 25-minute lag passes, a 31-minute lag fails on the slack and still fits the claim-by sum
+    const anvil = config({ contractCodeHash: undefined }, {}, ANVIL_LOCAL_PIN);
+    expect(ANVIL_SET.legB.claimByMin - ANVIL_SET.legA.refundAfterMin).toBe(30);
+    const fine = await preflight({ chainId: 31337, finalizedLagSec: 25 * 60 }, anvil);
+    expect(status(fine, "finality budget")).toBe("ok");
+    const late = await preflight({ chainId: 31337, finalizedLagSec: 31 * 60 }, anvil);
+    expect(status(late, "finality budget")).toBe("fail");
+    expect(row(late, "finality budget").detail).toContain("leg B's claim-by is 30.0 min after leg A's refund time");
+    // the check only exists where the finality row does: a resume or a refund (fresh = false) never reads it
+    const resumed = await preflight({ finalizedLagSec: 100 * 60 }, config(), { fresh: false });
+    expect(resumed.report.rows.map((r) => r.check)).not.toContain("finality budget");
   });
 
   it("an unknown lag still fails the row (the budget alone is not read as a measurement)", async () => {

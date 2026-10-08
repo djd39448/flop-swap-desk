@@ -12,7 +12,8 @@
 //                  observed hash is printed so a person can pin it
 //   finalized      the `finalized` tag exists, and how far it lags the head in blocks and seconds (the Seller may claim only
 //                  once the lock reads at that block)
-//   finality budget  the larger of the measured lag and the policy's finality budget (P9-4 decision 12), plus the time a lock needs to land, fits before leg A's claim-by
+//   finality budget  the larger of the measured lag and the policy's finality budget (P9-4 decision 12), plus the time a lock needs to land, fits before leg A's claim-by,
+//                  and (P94-PIN-02) leg B's claim-by is at least that larger number after leg A's refund time (the leg-linking slack at the measured lag)
 //   pending        the `pending` tag answers (the claim's last deadline guard reads it)
 //   state at finalized  `locks(hashLock)` can be read at the finalized block by its hash (EIP-1898), which the evidence reader needs
 //   log range      the endpoint's `eth_getLogs` cap against the config's `maxLogRange` (one probe of that many blocks must be
@@ -305,10 +306,29 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
       const needMs = usedMs + LOCK_SETTLE_ALLOWANCE_MS;
       const haveMs = claimBy - input.nowMs;
       const numbers = `the larger of the finalized lag measured now (${minutes(lagMs)}) and the policy's finality budget (${minutes(budgetMs)}), ${minutes(usedMs)}, plus ${minutes(LOCK_SETTLE_ALLOWANCE_MS)} to land it`;
+      // P94-PIN-02 (P9-FIXES-R4 decision 5, spec rule 3): the same larger number also sets the leg-linking slack. A claim that lands just before leg A's refund time is learned by the
+      // Buyer, from the chain, only once it is final (a finalized lag later), and leg B must still be claimable then: leg B's claim-by must be at least that lag after leg A's refund
+      // time. SPEC 3.5 rule 2 checks this slack against the policy's fixed budget; on a day whose lag is above the budget it would pass a set this row has to refuse.
+      const legs = input.deadlines.absolute;
+      const linkMs = legs.legB.claimByMs - legs.legA.refundAfterMs;
+      const linkNumbers = `the larger of the finalized lag measured now (${minutes(lagMs)}) and the policy's finality budget (${minutes(budgetMs)}), ${minutes(usedMs)}`;
+      const problems: string[] = [];
       if (needMs > haveMs) {
-        add("finality budget", "fail", `a lock would read final about ${minutes(needMs)} after the run starts (${numbers}) but leg A's claim-by is in ${minutes(haveMs)}: the Seller could not claim in time`);
+        problems.push(`a lock would read final about ${minutes(needMs)} after the run starts (${numbers}) but leg A's claim-by is in ${minutes(haveMs)}: the Seller could not claim in time`);
+      }
+      if (linkMs < usedMs) {
+        problems.push(
+          `leg B's claim-by is ${minutes(linkMs)} after leg A's refund time but the leg-linking slack must be at least ${minutes(usedMs)} (${linkNumbers}): a claim that lands just before leg A's refund time reads final only that long after, and the Buyer could not claim leg B in time`,
+        );
+      }
+      if (problems.length > 0) {
+        add("finality budget", "fail", problems.join("; "));
       } else {
-        add("finality budget", "ok", `a lock reads final about ${minutes(needMs)} after the run starts (${numbers}); leg A's claim-by is in ${minutes(haveMs)}, ${minutes(haveMs - needMs)} to spare`);
+        add(
+          "finality budget",
+          "ok",
+          `a lock reads final about ${minutes(needMs)} after the run starts (${numbers}); leg A's claim-by is in ${minutes(haveMs)}, ${minutes(haveMs - needMs)} to spare; leg B's claim-by is ${minutes(linkMs)} after leg A's refund time, ${minutes(linkMs - usedMs)} above the ${minutes(usedMs)} a late claim needs`,
+        );
       }
     }
   }
