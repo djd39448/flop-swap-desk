@@ -161,13 +161,14 @@ This builds `dist/` and the contracts, then spawns a real `anvil` node (found vi
 the on-chain `Claimed` log alone when the Seller never posts a reveal frame), and
 `tests-anvil/local-signer.anvil.test.ts` (the settle and refund paths again with both parties' accounts local, keys
 generated at test time; see "Key files"), `tests-anvil/pending-write.anvil.test.ts` (a lock write and a claim write whose transaction the node holds without
-mining it, on a real anvil whose automine is switched off: the flows ask the node by hash and sign nothing new; see "Receipt waits"), and
+mining it, on a real anvil whose automine is switched off: the flows ask the node by hash and sign nothing new, and while the claim's receipt wait still runs its hash is already in the Seller's record and handed to the runner's callback; see "Receipt waits"), and
 `tests-anvil/rehearsal-runner.anvil.test.ts` (the rehearsal runner as a child
 process: the dry run, a settle, a kill and a resume, and the refund paths, among them a refund without the Seller's key file, a resume
 whose Buyer record lost its lock's block number, a lock attempt that never landed (the signer refuses the lock after the approve; the
 runner waits for the finalized block, refunds leg B and replays to `refunded-b`, and a `--resume` continues the same way) and a refund
-for a Buyer below the pre-flight's ceiling-sized reservation (a warning, and the refund goes ahead), and a claim that lands late and is finished by `--resume` (the bundle replays to `revealed`
-and the run exits 0: see "Known limits of the runner"); every output, state file and bundle is scanned for the two keys, the venue seeds and the
+for a Buyer below the pre-flight's ceiling-sized reservation (a warning, and the refund goes ahead), a claim that lands late and is finished by `--resume` (the bundle replays to `revealed`
+and the run exits 0: see "Known limits of the runner"), a late claim whose leg A reads Locked at the finalized block (exit 6, no bundle), and a claim the endpoint accepts and never mines (the runner
+prints its hash at once and ends with the sentence that names the hash, the minutes left and the by-hand step, on `--resume` too with nothing signed; once the held transaction is mined, `--resume` settles); every output, state file and bundle is scanned for the two keys, the venue seeds and the
 key files' directory and names, and the stop-after-lock, resume and refund cases also for the Seller's secret, which may sit only in the
 Seller's own flow record before a reveal; see "Deploying EvmHashRail to Base Sepolia"). `npm test` never
 spawns `anvil` — a missing binary fails `test:anvil` loudly instead.
@@ -248,23 +249,24 @@ never the loader's own message; the group-or-other mode warning is shown the sam
 in `src/client/evm-key-file.ts` is the fixed sentence). The config check is the second defence: a `buyerKeyFile` or
 `sellerKeyFile` value that holds a run of 32 or more hex digits, or a phrase of 11 or more words made of letters, in any letter
 case, is refused by field name before anything is loaded (exit 2; a 64-digit key with one slip always leaves a run of at least 32). Since round 3
-(KR3-2) the rule also sees a key written in groups or cut by invisible characters, a decorated seed phrase and (P9-4 decision 14) a seed phrase with an invisible character inside a word: see the next
-paragraph.
+(KR3-2) the rule also sees a key written in groups or cut by invisible characters (category Cf and the other default-ignorable code points), a decorated seed phrase and (P9-4 decision 14) a seed phrase
+with an invisible character inside a word: see the next paragraph.
 
 **The guarded set is a list, and this is the whole list (KR2-1, P9 review round 2; widened by KR3-1 to KR3-3, round 3).** The key-file fields are not the only places a
 key can be pasted into by mistake, so every other value the runner prints back or writes into the bundle is held to the same rule
 by one helper, `looksLikeKeyMaterial` in `src/client/rehearsal-config.ts`, and every refusal names the field or the argument and never the value.
 **The rule (KR3-2):** a value looks like key material if it holds a run of 32 or more hex digits, in any letter case, either as it stands or with every
-whitespace character and every invisible format character (Unicode category Cf: the zero-width space U+200B, the soft hyphen U+00AD, U+200D and the
-like) taken out of it, so a key written in groups of four or cut by zero-width characters is one run again; hyphens and every other character stay, so a
+whitespace character and every invisible character (Unicode category Cf: the zero-width space U+200B, the soft hyphen U+00AD, U+200D and the
+like; and, since the P9-4 review (KEYS-P94-01), the other default-ignorable code points: the variation selectors such as U+FE0F, the combining grapheme joiner U+034F and
+the Hangul fillers such as U+3164) taken out of it, so a key written in groups of four or cut by zero-width characters is one run again; hyphens and every other character stay, so a
 UUID (runs of at most 12 digits between hyphens) is not refused. A decimal integer is a run of hex digits too, so 32 or more digits are refused (see
 `amount` below). It also looks like key material if it is a phrase of 11 or more words made of letters (any words), or holds 11 or more CONSECUTIVE words of
 the BIP-39 English list (the 2,048 words of the `english` export of `viem/accounts`, a dependency already) once it is cut at every character that is not a
 letter, so a numbered phrase, a labelled one, one with commas and one inside a path are seen. **Both phrase tests run twice (P9-4 decision 14, spec rule 1):
-on the value as it stands and on the value with every format character (Unicode category Cf) taken out of it**, because a zero-width character inside a
-word cuts the word in the first reading and mends it in the second. A BIP-39 phrase with U+200B, U+200D, U+00AD, U+FEFF or U+2060 inside each of its words is
+on the value as it stands and on the value with every invisible character (category Cf and the other default-ignorable code points) taken out of it**, because an invisible character inside a
+word cuts the word in the first reading and mends it in the second. A BIP-39 phrase with U+200B, U+200D, U+00AD, U+FEFF, U+2060, U+034F or U+FE0F inside each of its words is
 therefore refused by field name (the key-file fields, `out`, an asset name, `--state-dir` and the config path), with no word of it quoted; ordinary text that
-holds a format character, and a phrase of ten words, still pass. The guarded values:
+holds an invisible character (an emoji written with U+FE0F, for example), and a phrase of ten words, still pass. The guarded values:
 
 - `buyerKeyFile` and `sellerKeyFile` (above);
 - `amount` and `flopAmount` (KR3-1): a private key written in decimal fits the shape of an amount (up to 78 digits), an amount is printed (the terms row, the
@@ -287,9 +289,11 @@ holds a format character, and a phrase of ten words, still pass. The guarded val
 
 What the check cannot see, stated plainly: the endpoint's PATH (a provider's API-key path looks the same as a key, the path is never
 printed, and the URL, path included, goes into the bundle's `rails.json`, so use a keyless endpoint); and the forms still unseen:
-a key cut into runs of fewer than 32 hex digits by a character that is neither whitespace nor an invisible format character, that is two or more slips (a
-dropped digit or a letter O for a zero, twice or more) or hyphen-grouped (or dot-grouped) keys, which the rule leaves alone so that a UUID passes; a seed
-phrase of 10 words or fewer; and a key in any other encoding (base64, base58). For the key-file fields that is
+a key cut into runs of fewer than 32 hex digits by a character that is neither whitespace nor an invisible character (category Cf or another default-ignorable code point),
+for example U+2800 (the braille blank) and the other visible-but-blank separators; a key with two or more slips (a
+dropped digit or a letter O for a zero, twice or more); hyphen-grouped (or dot-grouped) keys, which the rule leaves alone so that a UUID passes; a seed
+phrase of 10 words or fewer; a seed phrase whose words are joined with no visible separator (glued together, written in CamelCase, or joined by a zero-width character
+while another sits inside each word: on screen it looks like one long word, so a copy slip is unlikely to produce it); and a key in any other encoding (base64, base58). For the key-file fields that is
 harmless, because the runner never prints their value (the first defence). The config path, `--state-dir` and `out` ARE printed in later rows and messages
 (`out` in the bundle-directory row and the plan, in `outcome.json`, and in the names of the bundle directory and its staging sibling), so for those three the shape check is the
 only defence, and a key pasted into them in one of the unseen forms is not caught. The rule errs the other way too (PIN3-03): a directory named
@@ -350,25 +354,31 @@ the EVM leg"; `tests/evm-local-signer.test.ts` pins the order).
 viem's own 180 seconds) bounds every receipt wait of every write, including the vendored rail's. **On Base Sepolia (84532) it must lie between 10,000 and
 3,600,000 ms (P9-4 decision 8; checked by every entry point that validates a config):** under ten seconds a normal inclusion at 2-second blocks would be
 reported as "no receipt", and over an hour a stuck write would hold a run for more than an hour; anvil is unconstrained (the
-short timeout tests keep their values), and an omitted value is allowed on both. When the wait runs out the write throws `EvmReceiptTimeoutError` (`hash`,
+short timeout tests keep their values), and an omitted value is allowed on both. **One exception (P94-FUND-01): on Base Sepolia the claim's own receipt wait ends after at most
+180 seconds (`EVM_CLAIM_RECEIPT_WAIT_MS_BASE_SEPOLIA`) whatever `receiptTimeoutMs` says** (a smaller value is kept). A claim that sits unmined near leg A's refund time can only be
+sped up by hand, and the operator reaches that step only once the run stops waiting; approve, lock and refund keep the configured value, and anvil is unchanged. When the wait runs out the write throws `EvmReceiptTimeoutError` (`hash`,
 `timeoutMs` and `write`, which of approve, lock, claim or refund it was): the transaction was broadcast and may still be mined; nothing was refused. Read
 the chain before sending anything again (the resumed flows do: `readLock`, `verifyLockFinal`, `findClaimedPreimage`). A slower public chain raises the
 number; it changes nothing about safety.
 
 **A write that timed out is asked about by its hash before it is sent again (P9-4 decision 7, R1-FUND-04).** A write that only timed out and is STILL
 PENDING shows nothing to those reads (no lock row, no log yet), which used to read as "never landed" and send a second copy. Now, with a store, the flow
-saves the hash of the timed-out LOCK write in the Buyer's record (`lock.prepared.recovery = { chain: "evm", txHash }`) and the hash of a timed-out CLAIM
-write in the Seller's record (the optional field `claimTxHash`, which needs `claimAttempted`). Both are strictly decoded optional fields added in place:
+saves the hash of the timed-out LOCK write in the Buyer's record (`lock.prepared.recovery = { chain: "evm", txHash }`) and the hash of the CLAIM
+write in the Seller's record (the optional field `claimTxHash`, which needs `claimAttempted`). **The claim's hash is saved the moment the claim is broadcast (P94-FUND-01), before its receipt wait
+starts, not when the wait ends:** the rail tells the flow of every write's hash before it waits for the receipt (`onWriteBroadcast`), and the runner prints it at once (see "A stuck claim is not re-priced").
+Both are strictly decoded optional fields added in place:
 the record version is unchanged and every older record still reads. An approve's hash is not saved (an approve is harmless to repeat) and neither is a
 refund's (a repeated refund is recognised from the lock's own state); the hash is a public value (no key, no preimage) and is saved only after the send,
-because viem returns it only once the node holds the transaction. A resumed Buyer (`recoverLock`) that reads no lock row asks the node
+because viem returns it only once the node holds the transaction. A hash is kept in lower case whatever case the node answers (P94-PIN-01: the records decode a lower-case hash only,
+and a hash saved as an upper-case node wrote it would silently switch this protection off). A resumed Buyer (`recoverLock`) that reads no lock row asks the node
 (`EvmHtlcRail.transactionStatus`: `eth_getTransactionByHash`, then for a mined one its receipt) and gets `pending`, `success`, `reverted` or `unknown`;
 a failed read or a malformed answer throws and is never read as `unknown`. A transaction the node still holds is `pending` and the flow ends with its
 `LockPendingError`, nothing sent; one mined successfully whose row this endpoint's read does not show yet is `pending` too (the endpoint's answers
 disagree, and a lock recorded as landed from a receipt that is not final is the R3-FUND-02 class); one that reverted, or that the node does not know, is
 "never landed" as before. A resumed Seller whose scan finds no claim of its own asks the same question about the saved claim hash and ends with the typed
 `ClaimPendingError` for `pending` or `success`, signing nothing; `reverted` and `unknown` go on to the fully guarded claim as before. The runner turns
-both errors into one fixed sentence that names `--resume` (exit 4, nothing signed or sent: see "Known limits of the runner"). What stays: a write whose hash was never saved (a kill between the
+the lock's error into one fixed sentence that names `--resume`, and a pending claim (this error, or a first run's claim receipt timeout) into one sentence that names the claim's public hash, the minutes left before
+leg A's refund time and the by-hand step (P94-FUND-01); both end the run with exit 4, nothing signed or sent (see "Known limits of the runner"). What stays: a write whose hash was never saved (a kill between the
 broadcast and the timeout, or a flow with no store) is sent again, and the contract refuses whichever copy is mined second, so a repeated lock or claim is refused by the
 contract and costs only gas (see "Known limits of the EVM leg"); and a transaction the node holds but never mines (underpriced) keeps the flow pending
 until leg A's refund time, after which the Buyer's refund path decides by the finalized-block verdict (`readLockAbsence`), not by the hash.
@@ -582,8 +592,11 @@ written down instead of hidden.
   `pending` read can itself be up to 45 s stale, which makes it about 5.25 minutes, and that is more than the anvil policy's
   5-minute claim-inclusion margin (P9 review round 1). It costs nothing on anvil, where every call answers in milliseconds and the known-good set's
   claim-by guard keeps a claim 30 minutes clear of leg A's refund time. **The Base Sepolia policy sets the margin to 10 minutes (P9-4 decision 1),** which covers
-  the 5.25 minutes with 4.75 minutes of room, and its known-good set puts the Seller's claim-by 20 minutes before leg A's refund time, so a claim whose last guard passes just
-  before the claim-by still lands about 14.75 minutes before refunds open; the arithmetic (6 x 45 s + 45 s = 5.25 minutes) is written into
+  the 5.25 minutes with 4.75 minutes of room, and its known-good set puts the Seller's claim-by 20 minutes before leg A's refund time. **Counted from the flow's last claim-by check
+  the way is longer (P94-FUND-03):** up to 13 single-attempt calls of at most 45 s lie between that check and the broadcast (7 from the flow's claim-by read to the rail's
+  `pending` guard, then up to 6 after it), 9.75 minutes, so a claim whose last claim-by check passes just before the claim-by reaches the pool 10.25 minutes before refunds open
+  (20 - 9.75; still above the 10-minute margin). The two sums are different checks: 5.25 minutes (6 x 45 s + 45 s) is the worst case after the rail's guard, the figure the margin
+  is judged against, and 9.75 minutes (13 x 45 s) is the way from the flow's last claim-by check to the broadcast; both are written into
   `tests/deadlines-policy.test.ts`. The real preimage reaches the endpoint only after that guard, first in the gas
   estimate, then in the broadcast (`tests/evm-local-signer.test.ts` pins both facts).
 - **The claim endpoint is trusted with the preimage** at the moment the claim is sent (see
@@ -601,11 +614,15 @@ written down instead of hidden.
   already out, and this build has no same-nonce replacement code (P9-4 decision 6: it waits for the first real rehearsal and its numbers; claims keep viem's 1.2
   base-fee multiplier). Two things stand in for it: the fresh-run pre-flight FAILS when either account has a queued transaction (the `buyer nonce` and
   `seller nonce` rows, because a claim queued behind another transaction is the stuck claim at its worst), and a person speeds a stuck claim up by hand
-  (same nonce, higher fee) from a wallet that holds the key file's key, before leg A's refund time: the steps are under "Known limits of the runner".
+  (same nonce, higher fee) from a wallet that holds the key file's key, before leg A's refund time: the steps are under "Known limits of the runner". So that the person can start
+  at once (P94-FUND-01), the runner prints the claim's public hash the moment the claim is broadcast, then a line a minute while it is not mined, and on Base Sepolia the claim's receipt wait ends
+  after at most 180 s whatever `receiptTimeoutMs` says; the run then ends with a sentence that names the hash, the minutes left and the step.
 - **The lock is not sent behind an unchecked clock.** The Buyer's deadline guard runs before the lock is prepared and again after the
   `approve`'s receipt, right before the lock itself (`commitLock`'s `beforeFinalSend`): the receipt wait can last up to
   `receiptTimeoutMs`, and the contract's own check is only `clock < refundAfterMs`. A reveal window that closed during the approve
   refuses with the usual lock-guard error and no lock goes out (the approve stands: an allowance, no value). `tests/evm-lock-guard.test.ts`.
+  **On Base Sepolia the same guard also asks for the finality budget (P94-FUND-05):** a lock attempted when leg A's claim-by is less than the budget (80 minutes) plus the 10-minute
+  lock allowance away, which is any lock later than t0+25 on the known-good set, is refused before signing (see "Deadlines"); anvil's guard is unchanged.
   That attempt, like one a signer refused, a lock dropped after a receipt timeout, or a kill between the approve and the lock, never
   lands, and it does not stall the Buyer for ever: see the next bullet.
 - **A lock attempt that never landed ends in a verdict, not a loop (R2-FUND-01, P9 review round 2).** A lock that was attempted and left
@@ -645,7 +662,8 @@ written down instead of hidden.
 - **A lock or claim whose hash was saved is asked about; one whose hash was not is sent again (P9-4 decision 7).** A write whose receipt wait timed out
   (`EvmReceiptTimeoutError`) leaves no lock row and no `Claimed` log yet. With a store the flow has saved that transaction's hash (the Buyer's lock write,
   the Seller's claim write: see "Receipt waits"), and the resumed flow asks the node about it before it signs anything: a transaction the node still holds is
-  `pending`, nothing new is sent, and the runner ends with a sentence that names `--resume` (run it again in a few minutes). What remains is the case with no
+  `pending`, nothing new is sent, and the runner ends with a sentence: for a lock, one that names `--resume` (run it again in a few minutes); for a claim, one that names the claim's
+  public hash, the minutes left before leg A's refund time and the by-hand step (P94-FUND-01). What remains is the case with no
   saved hash (the process was killed between the broadcast and the timeout, or the flow has no store) and the case of a hash that reverted or that the node
   does not know: the resumed flow reads "never landed" and signs and sends a new copy. That is the case the contract's refusal exists for, and it is the
   reason the runner does not promise "never a second lock or claim": a repeated lock or claim is refused by the contract and costs only gas. Whichever copy is mined second
@@ -686,7 +704,8 @@ The session that wrote this never sees a key (see "Key files").
    means on Base Sepolia, are in "The config"). One URL serves the whole run: do not switch endpoints between `--yes`, `--resume` and `--refund`.
 5. Run the dry run (no flag), read the table, fix every `FAIL` row, and run it again just before `--yes`: the `fee ceiling` and the two
    nonce rows are readings of the moment, and the `finality budget` row prints the lag of the moment. Then run `--yes`. A settle takes the
-   lock's finalized lag (about 20 minutes, up to about 52 in the sample) plus a few minutes. For the refund path run `--yes --stop-after lock`
+   lock's finalized lag (about 20 minutes, up to about 52 in the sample) plus a few minutes. When the claim is sent the runner prints `claim of leg A sent: tx <hash>` and, while it is not mined, a line a minute: if it
+   stays unmined as leg A's refund time nears, speed it up by hand with that hash (see "A stuck claim is not re-priced" under "Known limits of the runner"). For the refund path run `--yes --stop-after lock`
    (in a NEW state directory and a NEW or empty `out`: one state directory is one swap), then `--refund` (add `--wait` to keep it waiting
    here; wall clock: 4 hours 45 minutes from the run's start, to leg B's refund time, see "Deadlines").
 6. Keep the bundle (`out`): it is the proof, replayed offline by `examples/audit-export.mjs`.
@@ -745,8 +764,7 @@ the list of those fields and the rule they share is under "Key files" (the guard
       "contract": "<the deployed address>",
       "assets": { "USDC": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" },
       "contractCodeHash": "<the keccak256 line of bin/evm-code-hash.mjs>",
-      "maxLogRange": 500,
-      "receiptTimeoutMs": 600000
+      "maxLogRange": 500
     }
   },
   "buyerKeyFile": "flop-swap-desk-keys/base-sepolia.buyer.key",
@@ -757,6 +775,9 @@ the list of those fields and the rule they share is under "Key files" (the guard
 }
 ```
 
+The example leaves `receiptTimeoutMs` out on purpose (P94-FUND-01): on Base Sepolia the claim's own receipt wait is 180 s whatever `receiptTimeoutMs` says, so a long value cannot hold
+back the first report of a stuck claim; approve, lock and refund keep the field's range of 10 seconds to 1 hour.
+
 | field | meaning |
 |---|---|
 | `rails.evm.pin` | the chain pin, as in every `EvmRailConfig` (84532 is tied to the name `base-sepolia`); `finality` must be `{ "mode": "tag", "tag": "finalized" }` on 84532, the one the lag is measured against: confirmations mode and any `fallbackConfirmations` are refused by field name there (P9-4 decision 3), so that no read a flow routes on, and not the Buyer's permanent never-locked verdict, rests on a block a fixed number of confirmations below the head (the tag answered in 288 of 288 samples; anvil keeps both). `name` and `caip2` must be short plain texts (letters, digits and `- _ . :`, at most 40), refused by field name otherwise; the rail's own refusals quote them only when they are such texts (KR3-3) |
@@ -765,13 +786,13 @@ the list of those fields and the rule they share is under "Key files" (the guard
 | `rails.evm.contractCodeHash` | required on 84532 (see above); a mismatch prints the observed hash in full and this value only as its first ten characters |
 | `rails.evm.maxLogRange` | the endpoint's `eth_getLogs` cap in blocks (500 on the public endpoint; the default on 84532; at least 257, a smaller value is refused by field name); the dry run probes it, and for a new swap checks that 100 calls of it cover leg A's window (the `log scan reach` row). A fresh `--yes` records the effective cap in `run.json`, and `--resume` checks that the cap in force still reaches leg A's window (P9-4 decision 11, see "Log scans fit the endpoint's range cap") |
 | `rails.evm.maxFeePerGasWei` | the local signer's fee ceiling in wei per gas, a positive integer given as a number or a decimal string (P9-4 decision 5): omitted, it is the chain's default, 50 gwei (50000000000) on Base Sepolia (1,000 gwei on anvil); a value under 1 gwei is refused on 84532 (a ceiling under the chain's own fee would refuse every write), and a decimal string that looks like key material is refused by field name. The signer refuses any transaction whose fee cap is above it, before a claim's preimage leaves the process. The dry run's `fee ceiling` row sets the fee viem would sign for now against it (see "What the dry-run table means"). Claims keep viem's 1.2 base-fee multiplier. It is carried into the bundle's `rails.json` |
-| `rails.evm.receiptTimeoutMs` | how long one receipt wait lasts (default 180 s; on 84532 between 10,000 and 3,600,000 ms, refused by field name outside it); a timeout is a typed error that says the transaction was sent and may still be mined, the flow saves the hash of a lock or claim that timed out, and `--resume` asks the node about it and reads the chain before it sends anything (see "Receipt waits") |
+| `rails.evm.receiptTimeoutMs` | how long one receipt wait lasts (default 180 s; on 84532 between 10,000 and 3,600,000 ms, refused by field name outside it). **On 84532 the claim's own receipt wait is at most 180 s whatever this says** (a smaller value is kept; approve, lock and refund keep the value: P94-FUND-01). A timeout is a typed error that says the transaction was sent and may still be mined, the flow saves the hash of a lock or claim (the claim's the moment it is broadcast), and `--resume` asks the node about it and reads the chain before it sends anything (see "Receipt waits") |
 | `buyerKeyFile`, `sellerKeyFile` | the two key files, loaded by `loadEvmLocalAccount` (see "Key files"); they must be two different files, and a value that looks like key material (the rule under "Key files": a run of 32 or more hex digits, in any letter case, also with whitespace and invisible characters taken out, or a phrase of 11 or more words) is refused by field name before any message could print it. A key file that does not load is reported as `<field>: <problem>`, and the configured path is never printed (see "Key files") |
 | `deadlines` | `"known-good"` (default: the set of the pin's chain, +115/+135/+225/+285 on Base Sepolia, see "Deadlines") or `{ "legA": { "claimByMin", "refundAfterMin", "expiresMin" }, "legB": { ... } }` in whole minutes after the run's start; the dry run checks the rules with the numbers it is given, under the pin's own policy (the anvil set fails rule 2 on Base Sepolia) |
 | `amount` | leg A's amount in the token's minimal units (USDC has 6 decimals: `"1000000"` is 1 USDC), a decimal integer string of at most 31 digits (a longer one is refused by field name as key material, KR3-1) |
 | `out` | the bundle directory: absent or empty when the bundle is written. A value that looks like key material is refused by field name, because the path is printed and names the bundle's files; that includes a name made of a swap id or any hash with a run of 32 or more hex digits, so name the directory by date or label (PIN3-03) |
 | `asset` (default `"USDC"`), `flopAmount` (default `"52070000"`, FLOP on the paper rail, no value) | which asset-book entry moves (a short plain name, not key material), and leg B's paper amount (a decimal integer string of at most 31 digits, like `amount`: KR3-1) |
-| `clock` (default `"system"`), `pollMs` (5000, from 50 to 60,000), `waitLimitMs` (two hours, at most seven days) | the clock the flows read (`"chain"` follows the chain's head and is for a local anvil node only: it is refused on any other chain), how often a wait polls the chain (on a chain other than Base Sepolia also the pause between the write lookup's re-plans), and the longest one wait for finality may last: on 84532 `waitLimitMs` must be at least the policy's finality budget, 4,800,000 ms (80 minutes), because the late-claim wait, the never-locked verdict's wait and the recovered-lock wait are each bounded by it (P9-4 decision 9) |
+| `clock` (default `"system"`), `pollMs` (5000, from 50 to 60,000; **on 84532 from 2,000 to 60,000**), `waitLimitMs` (two hours, at most seven days) | the clock the flows read (`"chain"` follows the chain's head and is for a local anvil node only: it is refused on any other chain), how often a wait polls the chain (on a chain other than Base Sepolia also the pause between the write lookup's re-plans), and the longest one wait for finality may last. On 84532 `pollMs` may not be below the policy's block time, 2,000 ms, and is refused by field name below it (P94-PIN-03: a finality wait there lasts at least 80 minutes and reads the public endpoint once per poll, so a 50 ms poll would ask it 20 to 60 times a second); anvil keeps its floor of 50. On 84532 `waitLimitMs` must be at least the policy's finality budget, 4,800,000 ms (80 minutes), because the late-claim wait, the never-locked verdict's wait and the recovered-lock wait are each bounded by it (P9-4 decision 9) |
 
 **What an omitted field means on Base Sepolia (84532), and what is refused.** Every object is closed; a field not in this list is refused by name.
 
@@ -782,13 +803,13 @@ the list of those fields and the rule they share is under "Key files" (the guard
 | `rails.evm.contractCodeHash` | the config is refused (required on 84532) | a value that is not `0x` and 64 hex digits; a mismatch at connect |
 | `rails.evm.maxLogRange` | 500 | under 257 |
 | `rails.evm.maxFeePerGasWei` | 50 gwei (50000000000 wei) | under 1 gwei; a decimal string that looks like key material |
-| `rails.evm.receiptTimeoutMs` | viem's 180 s | under 10,000 ms or over 3,600,000 ms |
+| `rails.evm.receiptTimeoutMs` | viem's 180 s | under 10,000 ms or over 3,600,000 ms (and the claim's own wait is at most 180 s whatever the value) |
 | `buyerKeyFile`, `sellerKeyFile` | required | the same file twice; a value that looks like key material |
 | `deadlines` | `"known-good"`: leg A +115 / +135, leg B +225 / +285 | nothing at parse time; the dry run's `deadlines` row judges the numbers |
 | `amount`, `out` | required | key material; an `amount` of more than 31 digits |
 | `asset`, `flopAmount` | `"USDC"`, `"52070000"` | a name that is not a short plain name or looks like key material; an amount that is not a decimal integer of at most 31 digits |
 | `clock` | `"system"` | `"chain"` |
-| `pollMs` | 5,000 ms | outside 50 to 60,000 |
+| `pollMs` | 5,000 ms | under 2,000 ms (the policy's block time) or over 60,000 (anvil: under 50 or over 60,000) |
 | `waitLimitMs` | two hours | under 4,800,000 ms (the finality budget) |
 
 ### The Base Sepolia policy (P9-4)
@@ -824,11 +845,17 @@ finalized block's hash. The full file, read with a short read-only script:
   a claim of leg A that landed just before leg A's refund time turns final. It bounds every wait the runner makes (`waitLimitMs` may not be below it). **It is a bound
   from one day of 5-minute readings, not a guarantee:** the true peak may have been above the 3,086 s seen (the longest stand-still ended between two readings), and
   the chain's behaviour on another day is not covered. A stand-still longer than the budget leaves the budget exceeded: the checks that use it (the deadline rules and the
-  dry run's `finality budget` row) then refuse or wait, and nothing is routed on a read that is not final. The row is also what protects a run on a worse day: it takes the
-  larger of the lag measured at the moment and the budget.
+  dry run's `finality budget` row) then refuse or wait, and nothing is routed on a read that is not final. **What the `finality budget` row checks (a fresh run only; `--resume` and
+  `--refund` never read it):** it takes the larger of the finalized lag measured at that moment and the budget, and holds two things to that larger number. First, a lock must read final
+  and still leave the Seller its claim: the larger number plus a 10-minute lock allowance must fit between the run's start and leg A's claim-by. Second (P94-PIN-02), the leg-linking
+  slack must be at least that number: leg B's claim-by must come that long after leg A's refund time (SPEC 3.5 rule 2 checks the same slack against the fixed budget only, so on a day
+  whose measured lag is above the budget the row refuses a set that rule 2 alone would pass). The row fails naming both numbers, the measured lag and the budget. It judges the
+  moment the run starts and nothing later: a lock attempted late within a run is held to the budget by the Buyer's lock guard at the clock of the lock, and the measured
+  lag of a later day is not covered.
 - **Claim-inclusion margin, 10 minutes.** The proven worst case between the claim's last deadline guard and its broadcast is about 5.25 minutes (six single-attempt calls
   of at most 45 s each, plus up to 45 s of staleness in the guard's own `pending` read), so 10 minutes covers it with 4.75 minutes of room (anvil's 5 minutes is below it and
-  is safe there only because anvil answers in milliseconds and its claim-by binds 30 minutes early).
+  is safe there only because anvil answers in milliseconds and its claim-by binds 30 minutes early). Counted from the flow's last claim-by check instead, the way to the broadcast
+  is up to 13 such calls, 9.75 minutes, so a claim sent as late as the claim-by allows reaches the pool 10.25 minutes before refunds open, still above the margin (P94-FUND-03; see "Deadlines").
 - **Reveal window, 45 minutes**, as on anvil: leg A's refund time minus the lock time must leave the Seller that long.
 - **Block time, 2 seconds** (the sample's 2.0 s): the write lookup's pause between re-plans, and the window check of a `--resume`, use it.
 
@@ -838,7 +865,8 @@ finalized block's hash. The full file, read with a short read-only script:
 |---|---|---|
 | finality | the `finalized` tag, no fallback | the tag with an optional fallback, or confirmations |
 | fee ceiling default | 50 gwei, never configurable below 1 gwei | 1,000 gwei |
-| `receiptTimeoutMs` | omitted (viem's 180 s) or 10,000 to 3,600,000 ms | omitted, or any positive integer up to a day |
+| `receiptTimeoutMs` | omitted (viem's 180 s) or 10,000 to 3,600,000 ms; the claim's own wait is at most 180 s whatever it says | omitted, or any positive integer up to a day |
+| `pollMs` (runner config) | 2,000 to 60,000 ms (the policy's block time is the floor), refused by field name below it | 50 to 60,000 ms |
 | write lookup pause | 2 s (the policy's block time) | the runner's `pollMs` (a library caller's default: 1 s) |
 | `waitLimitMs` | at least 4,800,000 ms | any |
 | Buyer's lock marker | the tip minus 256 blocks | the tip minus 256 blocks |
@@ -863,16 +891,24 @@ with the slack of every rule, in `tests/deadlines-policy.test.ts`. The slack at 
 
 | rule | what it asks | slack on the Base Sepolia set |
 |---|---|---|
-| rule 1, reveal window (SPEC 3.5) | leg A's refund time minus the lock time is at least 45 minutes | 80 minutes (holds for a lock at any minute from 0 to 90 after t0, breaks at 91) |
+| rule 1, reveal window (SPEC 3.5) | leg A's refund time minus the lock time is at least 45 minutes | 80 minutes (rule 1 alone holds for a lock at any minute from 0 to 90 after t0 and breaks at 91; on Base Sepolia the Buyer's lock guard also refuses a lock after t0+25: see below the table) |
 | rule 2, leg-linking (SPEC 3.5) | leg B's claim-by is at least leg A's refund time plus the finality budget (135 + 80 = +215) | 10 minutes (+225 against +215) |
 | rule 3, timelock symmetry (R10.2) | leg B's refund time against what R10.2 asks in FLOP blocks (+195) | 90 minutes (the 3,600-block stall allowance dominates; it cannot bind on a set that passes rule 2, because leg B's refund time must follow its claim-by) |
 | claim margin | leg A's refund time minus its claim-by is at least 10 minutes (the Seller refuses to accept below it) | 10 minutes (20 minutes between them) |
 | the dry run's `finality budget` row | the budget (80) plus the 10-minute lock allowance fits before leg A's claim-by | 25 minutes (+115 against 90) |
 | the claim pipeline | the lock estimate (10) + the budget (80) + the lock allowance (10) + the 5.25-minute claim pipeline fit before leg A's claim-by | 9.75 minutes (38.3 minutes if the lag is the sample's own maximum, 3,086 s, instead of the budget) |
-| a claim sent as late as the claim-by allows | still lands before refunds open | 14.75 minutes before leg A's refund time (the margin is 10) |
+| a claim whose last claim-by check passes just before the claim-by | reaches the pool before refunds open | 10.25 minutes before leg A's refund time (up to 13 calls of 45 s, 9.75 minutes, lie between that check and the broadcast; the margin is 10) |
 
-Why those numbers: leg A's claim-by leaves 10 + 80 + 10 + 5.25 = 105.25 minutes after the start, with 9.75 to spare; leg A's refund time is 20 minutes after its claim-by, so the
-Seller's claim-by binds, not the margin; leg B's claim-by is 90 minutes after leg A's refund time (the budget plus 10 minutes to spare, twice the 5-minute minimum, because rule 2 is the
+**The Buyer's lock guard on Base Sepolia also asks for the finality budget (P94-FUND-05).** Rule 1 alone lets a lock through up to t0+90, but the Seller can claim only a lock that reads
+final before leg A's claim-by, and the budget for that is 80 minutes. The dry run's `finality budget` row asks for that room at the start of a fresh run; the Buyer's lock guard asks for it at
+the clock of the lock (so a slow approve receipt, or a `--resume` after a long stop, is judged too). On Base Sepolia (selected by chain id 84532; anvil's guard is unchanged) a lock attempted when leg A's
+claim-by is less than the finality budget plus the 10-minute lock allowance away (80 + 10 = 90 minutes) is refused before anything is signed: on the Base Sepolia set that is any lock later than t0+25
+(a lock at t0+25 goes out, one at t0+26 is refused, with the existing lock-guard error and one more clause, "finality: ..."). Without it such a lock would be accepted although it may not read final in time for the Seller to claim it:
+the swap would then end in the 4 hour 45 minute refund rehearsal (no value is lost either way).
+
+Why those numbers: leg A's claim-by leaves 10 + 80 + 10 + 5.25 = 105.25 minutes after the start, with 9.75 to spare (the claim pipeline row: a different check from the last row's 13 calls,
+which also add up to 9.75 minutes); leg A's refund time is 20 minutes after its claim-by, so the
+Seller's claim-by binds, not the margin (a claim whose last claim-by check passes just before it reaches the pool 10.25 minutes before refunds open); leg B's claim-by is 90 minutes after leg A's refund time (the budget plus 10 minutes to spare, twice the 5-minute minimum, because rule 2 is the
 fund-safety rule); leg B's refund time is 60 minutes after its claim-by. The Seller may claim only once the lock reads at the finalized block, which on Base Sepolia trailed the head
 by 14.5 to 51.4 minutes in the sample (median 19.3).
 
@@ -896,14 +932,16 @@ venue and a local paper-note file, signing with the two local key files. Modes (
   are readings of the moment, so run the dry run again just before `--yes`.
 - **`--yes`.** Runs the same checks first and refuses (exit 3, nothing sent) unless they hold. Then it runs the choreography the anvil
   suite runs: bid, accept, the leg B lock on paper, both account lines (signed locally), the leg A approve and lock on the chain, a real
-  wait until the lock reads at the finalized block, the claim, the Buyer learning the secret and claiming leg B, a real wait until the
-  claim is final; then it writes the bundle to `out` and replays it with `examples/audit-export.mjs --expect <swapId>=settled` (or `=revealed`, for a reveal frame that came after leg A's refund time: see "Known limits of the runner"). Each
+  wait until the lock reads at the finalized block, the claim (the runner prints `claim of leg A sent: tx <hash>` the moment the claim is broadcast, and, while it is not mined, `still not mined,
+  N min before leg A's refund time` once a minute: P94-FUND-01), the Buyer learning the secret and claiming leg B, a real wait until the
+  claim is final; then it writes the bundle to `out` and replays it with `examples/audit-export.mjs --expect <swapId>=settled` (or `=revealed`, for a reveal frame that came after leg A's refund time,
+  and only after the runner has read leg A claimed at the finalized block: see "Known limits of the runner"). Each
   step prints one `step <role>.<method> done` line. `--stop-after lock` ends after the lock is recorded: the Seller never claims (the
   first half of the refund rehearsal).
 - **`--resume`.** After a stop or a kill, continues the run in `--state-dir`: both roles are rebuilt from their P8 records (see
   "Resume"), the local venue and notes are read back from their files, and each step reads what it needs from the records and the
-  chain, so a repeated lock or claim is refused by the contract and costs only gas (a lock or claim write whose receipt wait timed out is asked about by its saved hash first, and a pending one ends the run with a sentence that names `--resume` and signs
-  nothing; a write with no saved hash is signed and sent again: see "Receipt waits" and "Known limits of the EVM leg"). A run started with `--stop-after lock` stops at the lock
+  chain, so a repeated lock or claim is refused by the contract and costs only gas (a lock or claim write whose receipt wait timed out is asked about by its saved hash first, and a pending lock ends the run with a sentence that names `--resume`, a pending claim with
+  one that names the claim's hash, the minutes left and the by-hand step, and neither signs anything; a write with no saved hash is signed and sent again: see "Receipt waits" and "Known limits of the EVM leg"). A run started with `--stop-after lock` stops at the lock
   again. A lock recovered from the chain that has no block number on record (its receipt wait timed out, or the process was killed
   between the broadcast and the save) is READ before it is waited for (R2-FUND-03, P9 review round 2): a row for its hash lock at the
   finalized block, in any status but none (which covers a lock that is already claimed), is final, and **a recovered lock that is
@@ -926,8 +964,8 @@ venue and a local paper-note file, signing with the two local key files. Modes (
   `--refund` comes (R3-FUND-01, P9 review round 3)**: the refund reverts (the lock reads Claimed at the latest block) while the finalized block still reads
   Locked, and the flow routes only on a final read. `--refund` then reads `locks(hashLock)` at the latest block and at the finalized block (two reads,
   nothing is sent; Claimed at the first and not at the second is a claim that is not final yet), says "leg A's
-  lock was claimed; waiting for the claim to be final, then --resume finishes the swap", waits for the finalized block to pass the head (real polling,
-  bounded by `waitLimitMs`), asks again, and ends with the refusal above. Past the bound it exits 4 with "leg A's lock was claimed, but the claim was not final after N s (waitLimitMs); nothing was sent; run --refund again to keep
+  lock was claimed; waiting for the claim to be final, then --resume finishes the swap", waits until leg A reads Claimed at the finalized block (the claim's own block is final: P94-FUND-04) or the finalized block has
+  passed the head read when the wait started, whichever comes first (real polling, bounded by `waitLimitMs`), asks again, and ends with the refusal above. Past the bound it exits 4 with "leg A's lock was claimed, but the claim was not final after N s (waitLimitMs); nothing was sent; run --refund again to keep
   waiting" (N is the seconds waited). A `--resume` that finds the refund time come and the lock Claimed at the latest block says "run --refund, which waits for the claim to be
   final, then --resume" instead of the bare "use --refund". Any other refund failure is a real refusal. The Buyer's ETH row reserves the refund
   only (the approve and the lock are already spent) and, if short, is a warning and not a stop (R2-FUND-04: see the table), and the
@@ -957,8 +995,8 @@ directory (`out`) and its steps; it never prints a key, and never a key file's p
 
 Exit codes: 0 done (or a clean dry run); 2 bad arguments, config or state; 3 the pre-flight failed (nothing was sent); 4 a step refused
 (the first line of its reason is printed, with the endpoint removed); 5 not yet (a refund time has not come); 6 the bundle was written
-but `audit-export` did not accept it. A run that is settled on the chain but replays to `revealed` (a late claim: see "Known limits of the runner") is not an audit failure:
-it exits 0 and prints one fixed sentence.
+but `audit-export` did not accept it (6 also means a late claim whose leg A does not read claimed at the finalized block: then no bundle was written, P94-FUND-02). A run that is settled on the chain but replays to `revealed` (a late claim: see "Known limits of the runner") is not an audit failure:
+once the runner has read leg A claimed at the finalized block, it exits 0 and prints one fixed sentence.
 
 ### What the dry-run table means
 
@@ -972,7 +1010,7 @@ the two nonce rows are warnings in `--resume` and `--refund` for the same reason
 | `chain id` | `eth_chainId` equals the pin (84532). Another number: the URL is not Base Sepolia |
 | `escrow code` | the keccak of `eth_getCode(contract)` equals `contractCodeHash`. A mismatch or empty code: wrong address, or the deploy has not landed or the node is a block behind (retry). The row prints the observed hash in full and the pinned value only as its first ten characters (`0x6ab36fa3...`), so a key pasted into `contractCodeHash` is never printed back |
 | `finalized` | the `finalized` tag exists and how far it trails the head in blocks and seconds. No tag: no lock would ever read final, so the Seller could never claim (on Base Sepolia there is no `fallbackConfirmations` to fall back on: the config refuses it) |
-| `finality budget` | the LARGER of the finalized lag measured now and the policy's finality budget (20 minutes on anvil, 80 on Base Sepolia), plus ten minutes (the time to land the lock), must fit before leg A's claim-by (P9-4 decision 12). Both numbers and the sum are printed. A quiet moment (a 15-minute lag) does not pass a set that the 80-minute budget would not, because the finalized block stands still for 35 to 45 minutes at times; a lag above the budget is used as it is. A fail: the deadline set is too tight for the chain's lag, so widen leg A's windows (the Base Sepolia known-good set has 25 minutes to spare). An unknown lag fails |
+| `finality budget` | the LARGER of the finalized lag measured now and the policy's finality budget (20 minutes on anvil, 80 on Base Sepolia), plus ten minutes (the time to land the lock), must fit before leg A's claim-by (P9-4 decision 12). The same larger number must also fit in the leg-linking slack: leg B's claim-by must come at least that long after leg A's refund time (P94-PIN-02; the Base Sepolia known-good set has 90 minutes of it against 80 of budget). The row names the measured lag and the budget, the sum and the slack in minutes, and a fail names both numbers. A quiet moment (a 15-minute lag) does not pass a set that the 80-minute budget would not, because the finalized block stands still for 35 to 45 minutes at times; a lag above the budget is used as it is. A fail: the deadline set is too tight for the chain's lag, so widen leg A's windows (the Base Sepolia known-good set has 25 minutes to spare before leg A's claim-by) or move leg B's claim-by later. The row runs on a fresh run only. An unknown lag fails |
 | `pending` | the `pending` tag answers; the claim's last deadline guard reads it |
 | `state at finalized` | `locks()` can be read at the finalized block by its hash (EIP-1898), which the evidence reader needs; a pruned node fails it. An answer of `0x` fails with "the escrow's code or state is not final yet at that block": a contract deployed within the finalized lag (a fresh deploy can take up to about 52 minutes on Base Sepolia to read final: the 24-hour sample's largest finalized lag is 51.4 minutes, and the policy's budget is 80) is not there yet at the finalized block, so wait until the finalized block has passed the deploy and run the dry run again; a hex answer too short to be a row says "not an ABI-encoded row" |
 | `log range` | one `eth_getLogs` probe of `maxLogRange` blocks must be accepted and one of one more block refused; or what the endpoint does is reported (`WARN`: looser than the config, safe; `FAIL`: it refuses even `maxLogRange`, so lower it, but never below the 257-block floor the resumed Seller's marker margin needs: an endpoint that caps `eth_getLogs` lower than that cannot run this swap) |
@@ -1000,8 +1038,10 @@ the two nonce rows are warnings in `--resume` and `--refund` for the same reason
   already public in the pool, so the Buyer can claim leg B with it and refund leg A. What the build does instead is to refuse a start that would queue a claim behind something
   (the fresh-run `buyer nonce` and `seller nonce` rows), to keep the claim's margin at 10 minutes, and to refuse a second claim while the node still holds the first (the next
   bullet). If a claim stays pending and leg A's refund time is near, replace it yourself from a wallet that holds the Seller's key (the key file's key; the runner never prints one):
-  1. Find the pending claim's hash: on a Base Sepolia block explorer, the Seller's address page shows a transaction the node holds, if the explorer shows pending ones; or it is the
-     `claimTxHash` field of the Seller's record, `<state dir>/seller/flows/seller-0x....json` (a public value in a secret-grade file that also holds the swap's secret: open the
+  1. Find the pending claim's hash. The runner prints it the moment the claim is broadcast, in the line `claim of leg A sent: tx <hash>` (P94-FUND-01), and the sentence that ends a run
+     with a claim still pending names it again (`a claim of leg A this run sent (tx <hash>) is not mined yet, N min before leg A's refund time: ...`): these are the first sources, so look
+     in the run's output first. Failing that: on a Base Sepolia block explorer, the Seller's address page shows a transaction the node holds, if the explorer shows pending ones; or it is the
+     `claimTxHash` field of the Seller's record (saved at the broadcast), `<state dir>/seller/flows/seller-0x....json` (a public value in a secret-grade file that also holds the swap's secret: open the
      file in an editor you trust, read that one field, close it without saving, and paste the record nowhere).
   2. `cast tx <claim hash> --rpc-url <endpoint>` prints its `nonce`, `maxFeePerGas`, `maxPriorityFeePerGas` and `input`. The input is the call data of `claim(bytes32,bytes32)`:
      the hash lock and the preimage, public already. `cast decode-calldata "claim(bytes32,bytes32)" <input>` prints the two values.
@@ -1012,12 +1052,17 @@ the two nonce rows are warnings in `--resume` and `--refund` for the same reason
      in a command line. The two transactions share a nonce, so at most one is mined, and a second claim would be refused by the contract anyway.
   4. Run `--resume`: it finds the claim on the chain and finishes the swap. Keep one RPC URL for all of it.
   These steps have not been run against a chain: the call-data decoding was checked offline with `cast calldata` and `cast decode-calldata`, and the send is the form `cast send` documents.
-- **A lock or claim the node still holds ends the run with a sentence, not a wait (P9-4 decision 7).** When a resumed flow finds that the transaction whose hash it saved is
-  still held by the node (or mined and not yet visible to this endpoint's reads), the run exits 4 with one fixed sentence and signs and sends nothing: "a lock this run sent
+- **A lock or claim the node still holds ends the run with a sentence (P9-4 decision 7, P94-FUND-01).** When a resumed flow finds that the transaction whose hash it saved is
+  still held by the node (or mined and not yet visible to this endpoint's reads), the run exits 4 and signs and sends nothing. For a lock the sentence is fixed: "a lock this run sent
   earlier is not decided yet (the node still holds its transaction, or the endpoint's reads do not show it yet): nothing new was signed or sent; run --resume again in a few
-  minutes", or, for a claim, the same words with "a claim" and "(if leg A's refund time comes first, --resume and --refund say what to do)" at the end. There is no loop and
-  no timer: a person runs `--resume` again. A transaction that the node holds and never mines (underpriced) keeps the run here until leg A's refund time: for a lock that is
-  harmless (it can no longer land after that time, and the Buyer's refund path decides by the finalized-block verdict), and for a claim see the bullet above.
+  minutes". **For a claim the sentence carries the claim's public hash, the minutes left and the by-hand step:** "a claim of leg A this run sent (tx <hash>) is not mined yet, N min before
+  leg A's refund time: speed the claim up by hand with the same nonce and a higher fee from a wallet that holds the key file's key, before leg A's refund time at <time> (README, "A stuck
+  claim is not re-priced"), then run --resume again; nothing new was signed". Once leg A's refund time has passed it says the claim can no longer land, that a speed-up cannot help, and to run
+  `--resume` first (if the claim landed in time, it finishes the swap) and then `--refund`; a claim the node says is mined (the endpoint's reads lag) gets the plain "is mined, but the endpoint's
+  reads do not show it yet ... run --resume again in a few minutes", with the hash. A first run's claim ends the same way when its receipt wait runs out (at most 180 s on Base Sepolia).
+  While the claim's receipt wait lasts the runner prints the hash at once (`claim of leg A sent: tx <hash>`) and one line a minute (`still not mined, N min before leg A's refund time`, or
+  `still not mined, leg A's refund time has passed`); the line only informs, nothing is sent, and a person runs `--resume` again. A transaction that the node holds and never mines (underpriced) keeps the run here until leg A's
+  refund time: for a lock that is harmless (it can no longer land after that time, and the Buyer's refund path decides by the finalized-block verdict), and for a claim see the bullet above.
 - **A run is one endpoint (P9-4 decision 7).** There is no failover and no nonce manager, and none is planned: use ONE RPC URL for the whole run, the same one for
   `--resume` and `--refund`. A load balancer that answers `latest` and `pending` (or a nonce read and a send) from different nodes can make a write fail with `nonce too low`
   or replace a transaction that is still pending; the contract refuses a duplicate, so that costs liveness, not value. The `buyer nonce` and `seller nonce` rows fail a fresh
@@ -1035,13 +1080,17 @@ the two nonce rows are warnings in `--resume` and `--refund` for the same reason
   its refund time has come. So once leg A's refund time has come run `--resume` first: while the Buyer's `next` is `learnSecret` it finishes the
   swap at once if that claim landed (the secret is on the chain from the claim on, final or not), and says "the Seller's claim window has closed"
   again if it did not. Then run `--refund`. If the claim landed within one finality lag of the refund time, `--refund` waits for it to be final and
-  tells you to run `--resume` (R3-FUND-01); it does not send a refund for a lock it reads as Claimed (a refund that races a claim into the same block reverts and costs gas, nothing more).
+  tells you to run `--resume` (R3-FUND-01; the wait ends as soon as the claim's own block is final, P94-FUND-04); it does not send a refund for a lock it reads as Claimed (a refund that races a claim into the same block reverts and costs gas, nothing more).
 - **A late claim ends in `revealed`, exit 0, and one sentence (P9-4 decision 13).** What the `--resume` of the bullet above ends in: the swap's value has moved (the Seller was
   paid, the Buyer claims leg B, nothing is sent), but the claim's outcome was not saved, so the Seller's reveal and receipt frames can only be posted now, stamped after leg A's
   refund time, and tclk's machine refuses a reveal once the refund window is open. The bundle therefore replays to `revealed`, not `settled` (the fold's reasons: "legA step 4:
   refund window is open" and "leg A claimed on chain but its reveal frame was not recorded"). The runner decides this BEFORE the audit, from the reveal frame's own stamp (at or
-  after leg A's refund time is exactly tclk's own rule; it never asks for `settled` and falls back), runs `audit-export --expect <swap>=revealed`, writes `revealed` into
-  `outcome.json` and exits 0 with one fixed sentence: "the swap is settled on chain (leg A was claimed by the Seller and leg B by the Buyer), and the Seller's reveal frame came
+  after leg A's refund time is exactly tclk's own rule; it never asks for `settled` and falls back). **Then it checks the chain (P94-FUND-02): it reads leg A at the finalized block and
+  requires it to read Claimed there.** The exit 0 rests on the chain, not on the transcript's grade, which is `revealed` just as well when leg A still reads Locked (a lagging node of a
+  load-balanced endpoint, a claim a reorg dropped). Only when leg A reads claimed at the finalized block does the runner run `audit-export --expect <swap>=revealed`, write `revealed` into
+  `outcome.json` and exit 0 with one fixed sentence; otherwise it exits 6 with one fixed sentence ("... leg A's lock does not read claimed at the finalized block (the claim is not final, or the
+  endpoint's reads disagree), so the swap is not reported as settled and no bundle was written; nothing was sent; look at the claim on the chain and run --resume again once it is final"),
+  writes no bundle and no `outcome.json`, and a later `--resume` reads again. The exit 0 sentence is: "the swap is settled on chain (leg A was claimed by the Seller and leg B by the Buyer), and the Seller's reveal frame came
   after leg A's refund time, so the bundle replays offline to revealed and not settled: the on-chain evidence is the proof, and the transcript's grade says only that the reveal
   was late". A repeated `--resume` reports the finished run as a success and says the same sentence; `--refund` of it says the run settled. Read `revealed` as the transcript's
   grade for a reveal that came late, not as a half-finished swap: one lock, one claim and the claim of leg B are on the chain, and anyone can check them with their own RPC access
@@ -2231,8 +2280,8 @@ the refusal and the latch stay as they were.
   cannot finish (a tip more than 100 ranges past the marker, or an endpoint that refuses the range) fails with the typed
   `EvmLogScanBoundError` or the endpoint's error before anything is sent or posted, and so does every retry; a scan that cannot
   finish is never read as "no claim", and the way out is an endpoint that accepts wider ranges (see "Log scans fit the endpoint's
-  range cap"). A claim that was sent and is still PENDING is not on chain yet, so a scan that finishes reads nothing for it. If its receipt wait timed out, the Seller's
-  record holds its hash (`claimTxHash`, P9-4 decision 7) and the resumed Seller asks the node about it before it signs another claim: a transaction the node
+  range cap"). A claim that was sent and is still PENDING is not on chain yet, so a scan that finishes reads nothing for it. The Seller's
+  record holds its hash (`claimTxHash`, P9-4 decision 7, saved the moment the claim is broadcast: P94-FUND-01, so also when the receipt wait timed out) and the resumed Seller asks the node about it before it signs another claim: a transaction the node
   still holds (or has just mined, with its log not yet visible to this endpoint's reads) ends the call with the typed `ClaimPendingError`, nothing signed; a
   reverted or unknown one goes on to the guarded claim. With no saved hash the resumed Seller sends its claim again, and the contract refuses whichever copy
   is mined second (a spent lock), so the price is gas, not value (see "Known limits of the EVM leg"). **The Buyer's lock marker has the same margin (P9-4

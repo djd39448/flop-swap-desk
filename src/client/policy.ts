@@ -146,8 +146,9 @@ export interface KnownGoodDeadlineMinutes {
  *   - leg A's claim-by leaves 10 min (the lock estimate) + 80 min (the finality budget) + 10 min (the lock allowance) + about 5.25 min (the claim
  *     pipeline after the Seller's last guard) = 105.25 min, with 9.75 min to spare (and 25 min against the pre-flight's finality row, which needs
  *     budget + 10 min = 90 min);
- *   - leg A's refund time is 20 min after its claim-by (the claim margin is 10 min): the Seller's claim-by binds, not the margin, and a claim sent
- *     just before it lands about 14.75 min before refunds open;
+ *   - leg A's refund time is 20 min after its claim-by (the claim margin is 10 min): the Seller's claim-by binds, not the margin. From the flow's last
+ *     claim-by check to the broadcast there are up to 13 single-attempt calls of at most 45 s (9.75 min), so a claim that passes that check just
+ *     before the claim-by reaches the pool 10.25 min before refunds open (P94-FUND-03; still above the 10 min margin);
  *   - leg B's claim-by is 90 min after leg A's refund time (rule 2: the budget, 80 min, plus 10 min to spare): the Buyer's time to claim leg B after a
  *     claim of leg A that landed just before leg A's refund time turns final;
  *   - leg B's refund time is 60 min after its claim-by, and 150 min after leg A's refund (rule 3 needs 60 min: the FLOP stall allowance of 3,600 blocks

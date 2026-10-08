@@ -41,6 +41,14 @@ const SAMPLE_MAX_LAG_MS = 3_086_000;
 const POST_GUARD_CALLS = 6;
 const CLAIM_PIPELINE_MS = POST_GUARD_CALLS * DEFAULT_RPC_TIMEOUT_MS + DEFAULT_RPC_TIMEOUT_MS;
 
+/** P94-FUND-03 (P9-FIXES-R4 decision 9): the calls counted from the flow's LAST claim-by check to the broadcast. The call trace on the mock node shows 7 calls from the flow's
+ *  claim-by read (the chain-time read of the Seller's guard) to the rail's pending guard (the fix list's P94-FUND-03 item), then up to 6 single-attempt calls after that guard
+ *  (nonce, block, priority fee, gas price, estimate, send): 13 calls, each bounded at `DEFAULT_RPC_TIMEOUT_MS`. The rail's own guard checks only leg A's refund time minus the
+ *  claim margin, so the flow's claim-by check is the one that binds, and a claim can reach the pool this long after it. This is NOT `CLAIM_PIPELINE_MS` (a different check: the lock-to-
+ *  claim-by pipeline, counted from the Seller's last guard). */
+const CLAIM_BY_TO_BROADCAST_CALLS = 13;
+const CLAIM_BY_TO_BROADCAST_MS = CLAIM_BY_TO_BROADCAST_CALLS * DEFAULT_RPC_TIMEOUT_MS;
+
 interface Slack {
   ok: boolean;
   violations: string[];
@@ -72,7 +80,7 @@ function slackOf(set: KnownGoodDeadlineMinutes, policy: DeadlinePolicy & { claim
     finalityRow: (claimByFromStart - (policy.finalityAMs + LOCK_SETTLE_ALLOWANCE_MS)) / MIN,
     pipeline: (claimByFromStart - (LOCK_ESTIMATE_MS + policy.finalityAMs + LOCK_SETTLE_ALLOWANCE_MS + CLAIM_PIPELINE_MS)) / MIN,
     pipelineAtSampleMax: (claimByFromStart - (LOCK_ESTIMATE_MS + SAMPLE_MAX_LAG_MS + LOCK_SETTLE_ALLOWANCE_MS + CLAIM_PIPELINE_MS)) / MIN,
-    claimLandsBeforeRefundMargin: (legA.refundAfterMs - (legA.claimByMs + CLAIM_PIPELINE_MS)) / MIN,
+    claimLandsBeforeRefundMargin: (legA.refundAfterMs - (legA.claimByMs + CLAIM_BY_TO_BROADCAST_MS)) / MIN,
   };
 }
 
@@ -133,10 +141,12 @@ describe("P9-4 decision 2: every rule holds under the chain's own policy, with t
     }
   });
 
-  it("the Seller's claim-by binds well before leg A's refund time: a claim whose last guard passes just before it still lands 14.75 minutes before refunds open, more than the 10-minute margin", () => {
+  it("the Seller's claim-by binds well before leg A's refund time: a claim whose last claim-by check passes just before it still lands 10.25 minutes before refunds open (13 calls of 45 s), more than the 10-minute margin", () => {
     expect(BASE.legA.refundAfterMin - BASE.legA.claimByMin).toBe(20);
+    expect(CLAIM_BY_TO_BROADCAST_CALLS).toBe(13);
+    expect(CLAIM_BY_TO_BROADCAST_MS / MIN).toBe(9.75); // 13 x 45 s
     const slack = slackOf(BASE, BASE_SEPOLIA_POLICY);
-    expect(slack.claimLandsBeforeRefundMargin).toBe(14.75);
+    expect(slack.claimLandsBeforeRefundMargin).toBe(10.25); // 20 - 9.75 (P94-FUND-03: not 14.75, which counted only the 6 calls after the rail's guard plus one stale read)
     expect(slack.claimLandsBeforeRefundMargin * MIN).toBeGreaterThan(BASE_SEPOLIA_POLICY.claimInclusionMarginMs);
   });
 
