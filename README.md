@@ -264,8 +264,9 @@ UUID (runs of at most 12 digits between hyphens) is not refused. A decimal integ
 the BIP-39 English list (the 2,048 words of the `english` export of `viem/accounts`, a dependency already) once it is cut at every character that is not a
 letter, so a numbered phrase, a labelled one, one with commas and one inside a path are seen. **Both phrase tests run on three readings (P9-4 decision 14, spec rule 1,
 R5-KEYS-01): the value as it stands, the value with category Cf taken out, and the value with every invisible character (category Cf and the other default-ignorable code
-points) taken out**, because an invisible character inside a word cuts the word in the first reading and mends it in the others, while a Hangul filler, U+034F or U+FE0F
-between the words separates them in the first two readings and would glue them in the third. The word-list test also tries a fourth reading, in which the Hangul fillers
+points) taken out**, because an invisible character inside a word cuts the word in the first reading (a Cf character inside a word is mended in the second and third
+readings, any other invisible character only in the third), while a Hangul filler, U+034F or U+FE0F between the words separates them in the first two readings and would
+glue them in the third. The word-list test also tries a fourth reading, in which the Hangul fillers
 (which a terminal draws as a blank) are word breaks and every other invisible character is taken out. A BIP-39 phrase with U+200B, U+200D, U+00AD, U+FEFF, U+2060, U+034F or U+FE0F inside each of its words is
 therefore refused by field name (the key-file fields, `out`, an asset name, `--state-dir` and the config path), with no word of it quoted; ordinary text that
 holds an invisible character (an emoji written with U+FE0F, for example), and a phrase of ten words, still pass. The guarded values:
@@ -294,8 +295,9 @@ printed, and the URL, path included, goes into the bundle's `rails.json`, so use
 a key cut into runs of fewer than 32 hex digits by a character that is neither whitespace nor an invisible character (category Cf or another default-ignorable code point),
 for example U+2800 (the braille blank) and the other visible-but-blank separators; a key with two or more slips (a
 dropped digit or a letter O for a zero, twice or more); hyphen-grouped (or dot-grouped) keys, which the rule leaves alone so that a UUID passes; a seed
-phrase of 10 words or fewer; a seed phrase whose words are joined with no visible separator (glued together, written in CamelCase, or joined by a zero-width character
-while another sits inside each word: on screen it looks like one long word, so a copy slip is unlikely to produce it); and a key in any other encoding (base64, base58). For the key-file fields that is
+phrase of 10 words or fewer; a seed phrase whose words are joined with no visible separator (glued together, written in CamelCase, or joined by an invisible character
+of the same kind as one inside each word: both in category Cf, or both other default-ignorable code points that are not Hangul fillers; on screen it looks like one long
+word, so a copy slip is unlikely to produce it); a seed phrase with a Hangul filler both inside each word and between the words; and a key in any other encoding (base64, base58). For the key-file fields that is
 harmless, because the runner never prints their value (the first defence). The config path, `--state-dir` and `out` ARE printed in later rows and messages
 (`out` in the bundle-directory row and the plan, in `outcome.json`, and in the names of the bundle directory and its staging sibling), so for those three the shape check is the
 only defence, and a key pasted into them in one of the unseen forms is not caught. The rule errs the other way too (PIN3-03): a directory named

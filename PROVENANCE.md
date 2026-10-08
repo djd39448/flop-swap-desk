@@ -930,4 +930,4 @@ key and phrase in the new tests is generated at test time, and the assertions pr
 
 What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/`, `fixtures/`, `package.json` and `package-lock.json` are byte-identical to `2d37f15`;
 no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no `Date.now()` is called in a flow; no new fixture; the runtime code hash is the one in the table above.
-`tests-anvil/` stays outside `npm run typecheck` with its two older diagnostics. The hermetic count after the pass: 127 files, 3947 passed, 7 skipped.
+`tests-anvil/` stays outside `npm run typecheck` with its two older diagnostics. The hermetic count after the pass, with the two tests of the main loop's read (R5-KEYS-01, R5-PIN-01): 127 files, 3949 passed, 7 skipped.
