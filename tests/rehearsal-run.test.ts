@@ -19,16 +19,16 @@ import { fileURLToPath } from "node:url";
 import { generateHashLock } from "@flop-labs/tclk";
 import { encodeFunctionResult } from "viem";
 import { english, generateMnemonic, generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, EXIT, FLOW_MESSAGE, LATE_REVEAL_SENTENCE, loadRunnerAccount, parseRunRecord, pendingWriteRefusal, refundTimeReached, refundLegAWaiting, revealCameAfterWindow, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
+import { buyerHashLockOnRecord, buyerLockNeverLanded, buyerLockOnRecord, CLAIM_TICK_MS, claimSentLine, claimTickLine, createClaimWatch, EXIT, FLOW_MESSAGE, LATE_REVEAL_SENTENCE, loadRunnerAccount, parseRunRecord, pendingWriteRefusal, refundTimeReached, refundLegAWaiting, revealCameAfterWindow, runRehearsal, sellerSendsOnRecord, untilRefundTime, waitLockFinal, type FinalityWorld, type RecoveredLock, type RehearsalEnv, type RehearsalMode } from "../src/client/rehearsal-run.js";
 import { LockPendingError, RefundNotFinalYetError } from "../src/client/buyer.js";
 import { ClaimPendingError } from "../src/client/seller.js";
 import { encodeFlowRecord, newBuyerRecord, newSellerRecord } from "../src/client/flow-record.js";
 import { FileFlowStore, flowKey } from "../src/client/flow-store.js";
 import { parseRehearsalConfig, type RehearsalConfig } from "../src/client/rehearsal-config.js";
 import { loadOrCreateIdentity } from "../src/client/rehearsal-world.js";
-import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN } from "../src/rails/evm-htlc.js";
+import { ANVIL_LOCAL_PIN, BASE_SEPOLIA_PIN, EvmReceiptTimeoutError } from "../src/rails/evm-htlc.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../src/vendor/evm-hash-rail.js";
 import { decimalKeyScanner, keyScanner, phraseScanner, strippedKeyScanner } from "./helpers/evm-local.js";
@@ -1706,43 +1706,280 @@ describe("P9-4 d10: the runner builds each party's rail with the config's pollMs
 
 // P9-4 decision 7 (the rail part is builder 1's): a lock or claim write whose receipt wait timed out is asked about by its hash before it is sent again, and the flows end
 // with LockPendingError or ClaimPendingError while the node still holds it. The runner refuses (exit 4) with a sentence in its own terms, and never loops or sends on them.
+// P94-FUND-01 (P9-FIXES-R4 decision 1): a CLAIM that is not mined is the case with a deadline, so its sentence (for both shapes: the first run's typed receipt timeout, and a
+// resumed Seller's ClaimPendingError) names the public hash, the minutes left before leg A's refund time and the by-hand step.
 describe("P9-4 d7 (runner part): LockPendingError and ClaimPendingError end the run with a sentence that names --resume", () => {
   const HASH = `0x${"ab".repeat(32)}`;
+  const REFUND_AFTER = 1_790_005_400_000;
+  const REFUND_ISO = new Date(REFUND_AFTER).toISOString();
+  const MIN = 60_000;
+  /** The runner's own view `left` ms before leg A's refund time. */
+  const leftMs = (left: number): { refundAfterMs: number; nowMs: number } => ({ refundAfterMs: REFUND_AFTER, nowMs: REFUND_AFTER - left });
+  const BY_HAND = "speed the claim up by hand with the same nonce and a higher fee from a wallet that holds the key file's key";
+  const README_POINTER = '(README, "A stuck claim is not re-priced")';
+  const timeout = (write: "approve" | "lock" | "claim" | "refund" | undefined, hash = HASH): EvmReceiptTimeoutError => new EvmReceiptTimeoutError(hash as `0x${string}`, 180_000, write);
 
-  it("each typed error becomes a fixed sentence that says nothing new was signed or sent and names --resume; any other error is not one", () => {
+  it("the lock's sentence is fixed text that says nothing new was signed or sent and names --resume; any other error is not a pending write", () => {
     const lock = pendingWriteRefusal(new LockPendingError(HASH));
     expect(lock).toContain("a lock this run sent earlier is not decided yet");
     expect(lock).toContain("nothing new was signed or sent; run --resume again in a few minutes");
-    for (const status of ["pending", "success"] as const) {
-      const claim = pendingWriteRefusal(new ClaimPendingError(HASH, status));
-      expect(claim, status).toContain("a claim this run sent earlier is not decided yet");
-      expect(claim, status).toContain("nothing new was signed or sent; run --resume again in a few minutes");
-      expect(claim, status).toContain("if leg A's refund time comes first, --resume and --refund say what to do");
-    }
-    for (const text of [lock, pendingWriteRefusal(new ClaimPendingError(HASH, "pending"))]) {
-      expect(text).not.toContain(HASH); // fixed text: no hash, no value
-      expect(text).not.toContain("lockLegA()"); // the flows' own API-level wording
-      expect(text).not.toContain("claimLegA()");
-      expect(/^[\x20-\x7e]+$/.test(text ?? "")).toBe(true);
-    }
+    expect(lock).not.toContain(HASH); // the lock's sentence stays fixed text: no hash, no value
+    expect(lock).not.toContain("lockLegA()"); // the flows' own API-level wording
+    expect(/^[\x20-\x7e]+$/.test(lock ?? "")).toBe(true);
+    expect(pendingWriteRefusal(new LockPendingError(HASH), leftMs(10 * MIN))).toBe(lock); // timing changes nothing for a lock
     expect(pendingWriteRefusal(new Error("buyer: the lock for x is not decided on chain yet"))).toBeUndefined();
     expect(pendingWriteRefusal(new RefundNotFinalYetError(HASH, 1_790_005_400_000))).toBeUndefined();
     expect(pendingWriteRefusal("LockPendingError")).toBeUndefined();
     expect(pendingWriteRefusal(undefined)).toBeUndefined();
   });
 
-  it("runRehearsal's catch uses it before the generic refusal and ends with the refusal exit code (code order); the runner has no loop on these errors", async () => {
+  it("P94-FUND-01: a claim the node still holds (a resumed Seller's ClaimPendingError) ends with one sentence: the hash, the minutes left before leg A's refund time, the by-hand step, --resume, nothing new signed", () => {
+    for (const error of [new ClaimPendingError(HASH, "pending", { refundAfterMs: REFUND_AFTER, nowMs: REFUND_AFTER - 12 * MIN - 30_000 }), new ClaimPendingError(HASH, "pending")]) {
+      const sentence = pendingWriteRefusal(error, leftMs(12 * MIN + 30_000)) ?? "";
+      expect(sentence).toContain(`(tx ${HASH})`);
+      expect(sentence).toContain("12 min before leg A's refund time");
+      expect(sentence).toContain(`${BY_HAND}, before leg A's refund time at ${REFUND_ISO} ${README_POINTER}, then run --resume again; nothing new was signed`);
+      expect(sentence).not.toContain("a few minutes"); // today's advice to wait and rerun
+      expect(sentence).not.toContain("claimLegA()"); // the flow's own wording
+      expect(/^[\x20-\x7e]+$/.test(sentence)).toBe(true);
+    }
+    // Without the runner's own timing the error's own fields are used (the Seller's clock at the refusal)...
+    const own = pendingWriteRefusal(new ClaimPendingError(HASH, "pending", { refundAfterMs: REFUND_AFTER, nowMs: REFUND_AFTER - 41 * MIN }));
+    expect(own).toContain("41 min before leg A's refund time");
+    expect(own).toContain(`before leg A's refund time at ${REFUND_ISO}`);
+    // ...and with neither there are no minutes and no time, but the hash and the step stay.
+    const bare = pendingWriteRefusal(new ClaimPendingError(HASH, "pending")) ?? "";
+    expect(bare).toContain(`(tx ${HASH})`);
+    expect(bare).toContain(`${BY_HAND}, before leg A's refund time ${README_POINTER}, then run --resume again; nothing new was signed`);
+    expect(/ min before|under 1 min|20[0-9]{2}-/.test(bare)).toBe(false);
+  });
+
+  it("P94-FUND-01: the first run's claim wait that times out (the typed EvmReceiptTimeoutError, write claim) ends with the same sentence; the runner's clock gives the minutes", () => {
+    const sentence = pendingWriteRefusal(timeout("claim"), leftMs(20 * MIN)) ?? "";
+    expect(sentence).toBe(pendingWriteRefusal(new ClaimPendingError(HASH, "pending"), leftMs(20 * MIN)));
+    expect(sentence).toContain(`(tx ${HASH})`);
+    expect(sentence).toContain("20 min before leg A's refund time");
+    expect(sentence).toContain(BY_HAND);
+    expect(sentence).toContain("then run --resume again; nothing new was signed");
+    // The hash is printed in lower case (the rail lower-cases it; a hash built in another case is still printed as one value).
+    expect(pendingWriteRefusal(timeout("claim", `0x${"AB".repeat(32)}`), leftMs(20 * MIN))).toContain(`(tx ${HASH})`);
+    // A timeout of any other write is not a pending claim (the lock keeps its own handling, the others the generic line).
+    for (const write of ["approve", "lock", "refund", undefined] as const) expect(pendingWriteRefusal(timeout(write), leftMs(20 * MIN)), String(write)).toBeUndefined();
+    // Without the runner's timing a timeout has the hash and the step, no minutes.
+    const bare = pendingWriteRefusal(timeout("claim")) ?? "";
+    expect(bare).toContain(`(tx ${HASH})`);
+    expect(bare).toContain(BY_HAND);
+    expect(/ min before|under 1 min|20[0-9]{2}-/.test(bare)).toBe(false);
+  });
+
+  it("P94-FUND-01: the minutes are whole minutes from the runner's clock (never negative): 1 min, under 1 min; and once leg A's refund time has passed the sentence says so and does not advise a speed-up", () => {
+    expect(pendingWriteRefusal(timeout("claim"), leftMs(1 * MIN))).toContain(", 1 min before leg A's refund time");
+    expect(pendingWriteRefusal(timeout("claim"), leftMs(1 * MIN - 1))).toContain(", under 1 min before leg A's refund time");
+    expect(pendingWriteRefusal(timeout("claim"), leftMs(1))).toContain(", under 1 min before leg A's refund time");
+    for (const left of [0, -1, -45 * MIN]) {
+      const passed = pendingWriteRefusal(timeout("claim"), leftMs(left)) ?? "";
+      expect(passed, String(left)).toContain(`(tx ${HASH})`);
+      expect(passed, String(left)).toContain(`leg A's refund time (${REFUND_ISO}) has passed, so it can no longer land`);
+      expect(passed, String(left)).toContain("a speed-up cannot help now");
+      expect(passed, String(left)).toContain("run --resume first (if the claim landed in time, it finishes the swap), and if --resume stops here again, run --refund; nothing new was signed");
+      expect(passed, String(left)).not.toContain(BY_HAND);
+      expect(passed, String(left)).not.toMatch(/-[0-9]+ min/);
+    }
+  });
+
+  it("P94-FUND-01: a claim that is MINED (the node says success, the endpoint's reads lag) needs no speed-up: the plain sentence, with the hash", () => {
+    const mined = pendingWriteRefusal(new ClaimPendingError(HASH, "success"), leftMs(5 * MIN)) ?? "";
+    expect(mined).toBe(`a claim of leg A this run sent (tx ${HASH}) is mined, but the endpoint's reads do not show it yet: nothing new was signed or sent; run --resume again in a few minutes`);
+    expect(mined).not.toContain(BY_HAND);
+  });
+
+  it("P94-FUND-01: only a hash in the shape of a transaction hash is ever printed (a node's other text stays out of the sentence); the sentences are plain ASCII with a hash, whole minutes and an ISO time as their only values", () => {
+    for (const odd of ["not a hash", "0x12", `0x${"zz".repeat(32)}`, "<script>", ""]) {
+      for (const error of [new ClaimPendingError(odd, "pending"), timeout("claim", odd), new ClaimPendingError(odd, "success")]) {
+        const sentence = pendingWriteRefusal(error, leftMs(9 * MIN)) ?? "";
+        expect(sentence.length > 0, odd).toBe(true);
+        if (odd !== "") expect(sentence.includes(odd), odd).toBe(false);
+        expect(/0x[0-9a-fA-F]/.test(sentence), odd).toBe(false);
+        expect(/^[\x20-\x7e]+$/.test(sentence), odd).toBe(true);
+      }
+    }
+    // A refund time `Date` cannot hold does not make the sentence builder throw (it runs inside the runner's last catch).
+    expect(() => pendingWriteRefusal(timeout("claim"), { refundAfterMs: Number.MAX_SAFE_INTEGER, nowMs: 1 })).not.toThrow();
+    expect(() => pendingWriteRefusal(timeout("claim"), { refundAfterMs: Number.NaN, nowMs: 1 })).not.toThrow();
+  });
+
+  it("runRehearsal's catch uses it before the generic refusal, hands it the run's refund time and the runner's clock, and ends with the refusal exit code (code order); the runner has no loop on these errors", async () => {
     const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
     const at = (needle: string): number => text.indexOf(needle);
-    const order = ["const pending = pendingWriteRefusal(error);", "errLine(`rehearsal: ${pending}`);", "errLine(`rehearsal: refused: ${error instanceof Error"].map(at);
+    const order = ["const pending = pendingWriteRefusal(error, pendingTiming?.());", "errLine(`rehearsal: ${pending}`);", "errLine(`rehearsal: refused: ${error instanceof Error"].map(at);
     expect(order.every((position) => position > 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
-    const block = text.slice(at("const pending = pendingWriteRefusal(error);"), at("errLine(`rehearsal: refused: ${error instanceof Error"));
+    const block = text.slice(at("const pending = pendingWriteRefusal(error, pendingTiming?.());"), at("errLine(`rehearsal: refused: ${error instanceof Error"));
     expect(block).toContain("return EXIT.refused;");
-    // The only places the runner names the two classes are the helper's two tests: nothing catches them to try again.
+    // The timing is leg A's refund time from the run's record against the runner's own clock, set once the run is known.
+    expect(text).toContain("pendingTiming = () => ({ refundAfterMs: run.deadlines.legA.refundAfterMs, nowMs: clock() });");
+    // The only places the runner names the three classes are the helper's three tests: nothing catches them to try again.
     expect(text.match(/instanceof LockPendingError/g)?.length).toBe(1);
     expect(text.match(/instanceof ClaimPendingError/g)?.length).toBe(1);
+    expect(text.match(/instanceof EvmReceiptTimeoutError/g)?.length).toBe(1);
     expect(text.match(/catch \(\w+\) \{\s*if \(\w+ instanceof (Lock|Claim)PendingError/g)).toBeNull();
+    expect(text.match(/catch \(\w+\) \{\s*if \(\w+ instanceof EvmReceiptTimeoutError/g)).toBeNull();
+  });
+});
+
+// P94-FUND-01 (P9-FIXES-R4 decision 1), the runner's part: the claim of leg A is the one write with a deadline a person can still help, so its hash is printed the moment it is
+// broadcast and one line a minute says it is still not mined. (The same watch end to end, against a real Seller on a node that never mines the claim: tests/rehearsal-claim-watch.test.ts.)
+describe("P94-FUND-01 (runner part): the claim of leg A is shown the moment it is broadcast, and a line a minute says it is not mined", () => {
+  const HASH = `0x${"ab".repeat(32)}`;
+  const OTHER = `0x${"cd".repeat(32)}`;
+  const REFUND_AFTER = 1_790_005_400_000;
+  const MIN = 60_000;
+  const FIXED = /^(claim of leg A sent: tx 0x[0-9a-f]{64}|still not mined, [0-9]+ min before leg A's refund time|still not mined, leg A's refund time has passed)$/;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function watchOn(clock: { ms: number }, tickMs?: number): { watch: ReturnType<typeof createClaimWatch>; lines: string[] } {
+    const lines: string[] = [];
+    const watch = createClaimWatch({ log: (line) => void lines.push(line), clock: () => clock.ms, refundAfterMs: REFUND_AFTER, ...(tickMs === undefined ? {} : { tickMs }) });
+    return { watch, lines };
+  }
+
+  it("the broadcast prints exactly 'claim of leg A sent: tx <hash>' at once; then, a minute at a time, 'still not mined, N min before leg A's refund time' with N the whole minutes from the runner's clock; nothing else", () => {
+    vi.useFakeTimers();
+    const clock = { ms: REFUND_AFTER - 90 * MIN };
+    const { watch, lines } = watchOn(clock);
+    expect(CLAIM_TICK_MS).toBe(60_000);
+    watch.onClaimSent(HASH);
+    expect(lines).toEqual([`claim of leg A sent: tx ${HASH}`]);
+    expect(claimSentLine(HASH)).toBe(`claim of leg A sent: tx ${HASH}`);
+    vi.advanceTimersByTime(59_999);
+    expect(lines).toHaveLength(1); // not before the minute
+    clock.ms += 59_999;
+    vi.advanceTimersByTime(1);
+    expect(lines.slice(1)).toEqual(["still not mined, 89 min before leg A's refund time"]); // 90 min minus 59.999 s: whole minutes, rounded down
+    clock.ms = REFUND_AFTER - 30 * MIN;
+    vi.advanceTimersByTime(60_000);
+    clock.ms = REFUND_AFTER - 30_000; // under a minute left: 0
+    vi.advanceTimersByTime(60_000);
+    clock.ms = REFUND_AFTER; // the refund time itself: passed
+    vi.advanceTimersByTime(60_000);
+    clock.ms = REFUND_AFTER + 7 * MIN;
+    vi.advanceTimersByTime(60_000);
+    expect(lines.slice(1)).toEqual([
+      "still not mined, 89 min before leg A's refund time",
+      "still not mined, 30 min before leg A's refund time",
+      "still not mined, 0 min before leg A's refund time",
+      "still not mined, leg A's refund time has passed",
+      "still not mined, leg A's refund time has passed",
+    ]);
+    for (const line of lines) expect(FIXED.test(line), line).toBe(true);
+    watch.stop();
+  });
+
+  it("claimTickLine: whole minutes rounded down, the fixed 'has passed' line at or past the refund time, never a negative number", () => {
+    expect(claimTickLine(90 * MIN)).toBe("still not mined, 90 min before leg A's refund time");
+    expect(claimTickLine(MIN)).toBe("still not mined, 1 min before leg A's refund time");
+    expect(claimTickLine(MIN - 1)).toBe("still not mined, 0 min before leg A's refund time");
+    expect(claimTickLine(1)).toBe("still not mined, 0 min before leg A's refund time");
+    for (const left of [0, -1, -MIN, -10_000 * MIN]) expect(claimTickLine(left), String(left)).toBe("still not mined, leg A's refund time has passed");
+  });
+
+  it("stop() ends the line (a tick after it prints nothing), is safe to repeat, and a second claim's broadcast replaces the first's timer instead of doubling it", () => {
+    vi.useFakeTimers();
+    const clock = { ms: REFUND_AFTER - 50 * MIN };
+    const { watch, lines } = watchOn(clock);
+    watch.onClaimSent(HASH);
+    vi.advanceTimersByTime(60_000);
+    expect(lines).toHaveLength(2);
+    watch.stop();
+    watch.stop();
+    vi.advanceTimersByTime(10 * 60_000);
+    expect(lines).toHaveLength(2);
+    expect(vi.getTimerCount()).toBe(0);
+    // A claim sent again (a re-asked claim of the same call) starts one timer; a third broadcast without a stop replaces it.
+    watch.onClaimSent(HASH);
+    watch.onClaimSent(OTHER);
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(60_000);
+    expect(lines.slice(2).filter((line) => line.startsWith("still not mined"))).toHaveLength(1);
+    expect(lines.filter((line) => line.startsWith("claim of leg A sent")).map((line) => line.slice(-66))).toEqual([HASH, HASH, OTHER]);
+    watch.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a text that is not a transaction hash prints nothing and starts no timer; a tick that cannot print never throws into the timer", () => {
+    vi.useFakeTimers();
+    const clock = { ms: REFUND_AFTER - 50 * MIN };
+    const { watch, lines } = watchOn(clock);
+    for (const odd of ["", "0x12", "not a hash", `0x${"zz".repeat(32)}`, `${HASH} extra`]) watch.onClaimSent(odd);
+    expect(lines).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+    let printed = 0;
+    const broken = createClaimWatch({
+      log: () => {
+        printed += 1;
+        throw new Error("stdout closed");
+      },
+      clock: () => clock.ms,
+      refundAfterMs: REFUND_AFTER,
+    });
+    expect(() => broken.onClaimSent(HASH)).not.toThrow();
+    expect(() => vi.advanceTimersByTime(3 * 60_000)).not.toThrow();
+    expect(printed).toBe(4); // the sent line and three ticks: it kept trying
+    broken.stop();
+  });
+
+  it("the period is injectable (tickMs) and one minute without it; a tickMs that is not a usable number falls back to the minute", () => {
+    vi.useFakeTimers();
+    const clock = { ms: REFUND_AFTER - 50 * MIN };
+    const fast = watchOn(clock, 250);
+    fast.watch.onClaimSent(HASH);
+    vi.advanceTimersByTime(1_000);
+    expect(fast.lines.filter((line) => line.startsWith("still not mined"))).toHaveLength(4);
+    fast.watch.stop();
+    for (const odd of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, 0.5]) {
+      const slow = watchOn(clock, odd);
+      slow.watch.onClaimSent(HASH);
+      vi.advanceTimersByTime(59_999);
+      expect(slow.lines.filter((line) => line.startsWith("still not mined")), String(odd)).toHaveLength(0);
+      vi.advanceTimersByTime(1);
+      expect(slow.lines.filter((line) => line.startsWith("still not mined")), String(odd)).toHaveLength(1);
+      slow.watch.stop();
+    }
+  });
+
+  it("the timer never keeps the process alive (it is unref'd), and stop() clears it: the runner leaves no timer running", () => {
+    const spy = vi.spyOn(globalThis, "setInterval");
+    try {
+      const clock = { ms: REFUND_AFTER - 50 * MIN };
+      const { watch } = watchOn(clock);
+      watch.onClaimSent(HASH);
+      expect(spy).toHaveBeenCalledTimes(1);
+      const handle = spy.mock.results[0]?.value as { hasRef(): boolean };
+      expect(handle.hasRef()).toBe(false);
+      const clear = vi.spyOn(globalThis, "clearInterval");
+      watch.stop();
+      expect(clear).toHaveBeenCalledTimes(1);
+      clear.mockRestore();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("the runner wires it: the Seller of a fresh and of a resumed run gets onClaimSent, the claim loop stops the watch in a finally, and the run's last finally stops it too (code)", async () => {
+    const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
+    expect(text.match(/onClaimSent: w\.claimWatch\.onClaimSent,/g)?.length).toBe(2); // openSeller (resume, refund) and newSeller (a fresh run)
+    const loop = text.slice(text.indexOf("claimed = await seller.claimLegA(lockA.hashLock);"), text.indexOf('step("seller", "claimLegA"'));
+    expect(loop).toContain("} finally {");
+    expect(loop).toContain("w.claimWatch.stop();");
+    expect(loop.indexOf("w.claimWatch.stop();")).toBeGreaterThan(loop.indexOf("} finally {"));
+    expect(text).toContain("claimWatch?.stop(); // the runner leaves no timer running, whatever ended the run");
+    expect(text).toContain("claimWatch = createClaimWatch({ log, clock, refundAfterMs: run.deadlines.legA.refundAfterMs,");
+    // The CLI passes no claimTickMs: production is the one-minute period.
+    const bin = await readFile(join(REPO_ROOT, "bin", "swap-rehearsal-evm.mjs"), "utf8");
+    expect(bin).not.toContain("claimTickMs");
   });
 });
 

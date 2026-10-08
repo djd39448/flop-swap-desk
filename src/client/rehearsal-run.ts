@@ -30,6 +30,9 @@
 //                          after leg A's refund time, which tclk's machine rejects ("refund window is open"): the bundle replays to `revealed`, not `settled`. That is the protocol's own grade
 //                          for a reveal that came late, not a lost swap, so the runner expects `revealed` for that path (decided from the reveal frame's own stamp, never by trying
 //                          `settled` first), writes the bundle, and exits 0 with `LATE_REVEAL_SENTENCE`; the on-chain evidence is the proof.
+//                          P94-FUND-01: the claim of leg A is the one write with a deadline a person can still help (a by-hand same-nonce speed-up, README, "A stuck claim is not
+//                          re-priced"), so its hash is printed the moment it is broadcast ("claim of leg A sent: tx <hash>"), then one line a minute while it is not mined, and a
+//                          claim still pending when the wait ends is a refusal (exit 4) whose one sentence names the hash, the minutes left and the by-hand step.
 //
 // The only network the runner speaks to is `rails.evm.endpoint`. It posts to no HTTP venue and never opens any other socket;
 // the venue and the paper notes are two local files. The one thing it launches is `examples/audit-export.mjs`, offline.
@@ -55,7 +58,7 @@ import { decodeFunctionResult, encodeFunctionData, type Address, type Hex } from
 import type { LocalAccount } from "viem/accounts";
 
 import { swapId as computeSwapId } from "../profile.js";
-import { effectiveMaxLogRange, evmLogScanCoverage, MAX_LOG_SCAN_CHUNKS } from "../rails/evm-htlc.js";
+import { effectiveMaxLogRange, EvmReceiptTimeoutError, evmLogScanCoverage, MAX_LOG_SCAN_CHUNKS } from "../rails/evm-htlc.js";
 import { CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../vendor/evm-hash-rail.js";
 import { writeBundle, type BundleEvidenceSummary } from "./bundle.js";
@@ -88,6 +91,11 @@ export interface RehearsalEnv {
   sleep(ms: number): Promise<void>;
   out(line: string): void;
   err(line: string): void;
+  /**
+   * P94-FUND-01: the period (ms) of the line the runner prints while a broadcast claim of leg A is still not mined (`CLAIM_TICK_MS`, one minute, when absent). Only a test sets it,
+   * to see the line without waiting a minute; the CLI leaves it out.
+   */
+  claimTickMs?: number;
 }
 
 export type RehearsalMode = "dry" | "yes" | "resume" | "refund";
@@ -315,20 +323,146 @@ export function revealCameAfterWindow(reveal: { readonly timestampMs: number } |
 }
 
 /**
- * P9-4 decision 7 (the rail part: a lock or claim write whose receipt wait timed out is asked about by its hash before it is sent again): the two typed refusals that
- * come of it, `LockPendingError` (the Buyer's lock) and `ClaimPendingError` (the Seller's claim), mean the node still holds that transaction or the endpoint's reads do not
- * show it yet, and that nothing new was signed or sent. The runner does not loop on them (a refusal is preferred to any new outward action): it ends with a fixed sentence
- * that says what to do, in the runner's own terms (the flows' own text says "call lockLegA() again later", which a person cannot do). The text carries no hash and no value.
- * `undefined` for any other error. Exported for its own tests.
+ * P94-FUND-01 (P9-FIXES-R4 decision 1): the two times a pending-claim sentence is built from: leg A's refund time and the runner's clock now (both in ms). The runner passes them
+ * from the run's record and its own clock; the sentence says "the minutes left" from them and nothing else.
  */
-export function pendingWriteRefusal(error: unknown): string | undefined {
+export interface PendingTiming {
+  refundAfterMs: number;
+  nowMs: number;
+}
+
+/** A transaction hash as the runner prints it: `0x` and 64 hex digits, lower-cased. Any other text (a node's answer of another shape) is never printed. */
+function printableTxHash(hash: unknown): string | undefined {
+  return typeof hash === "string" && /^0x[0-9a-fA-F]{64}$/.test(hash) ? hash.toLowerCase() : undefined;
+}
+
+/** An ISO time for a time `Date` can hold; `undefined` for any other number (a sentence builder never throws, it runs inside the runner's last `catch`). */
+function safeIso(ms: number): string | undefined {
+  return Number.isSafeInteger(ms) && Math.abs(ms) <= 8.64e15 ? new Date(ms).toISOString() : undefined;
+}
+
+/** The by-hand step of the stuck-claim remedy (P9-4 decision 6), in the runner's words; the README section it points to has the commands. */
+const STUCK_CLAIM_STEP = "speed the claim up by hand with the same nonce and a higher fee from a wallet that holds the key file's key";
+const STUCK_CLAIM_README = "(README, \"A stuck claim is not re-priced\")";
+
+/** What a pending-claim sentence knows of leg A's refund time: the time, and either the exact milliseconds left (the runner's clock) or only whole minutes (a flow's error). */
+interface ClaimClock {
+  refundAfterMs: number;
+  leftMs?: number;
+  minutes?: number;
+}
+
+/**
+ * P94-FUND-01: the ONE sentence a claim of leg A that was sent and is not mined ends the run with: it names the claim's public hash, the whole minutes left before leg A's refund
+ * time (or says the time has passed), and the by-hand step (decision 6) with the README section that has the commands, then says to run `--resume` again; nothing new was signed.
+ * Past leg A's refund time the claim can no longer land (the escrow refuses it), so the sentence says a speed-up cannot help and points to `--resume` and `--refund`. Built from
+ * public values only: a hash, whole minutes, an ISO time. The preimage is in the claim's call data on the chain and is never in a runner line.
+ */
+function stuckClaimSentence(hash: unknown, clock: ClaimClock | undefined): string {
+  const tx = printableTxHash(hash);
+  const sent = tx === undefined ? "a claim of leg A this run sent (its transaction hash could not be read)" : `a claim of leg A this run sent (tx ${tx})`;
+  const at = clock === undefined ? undefined : safeIso(clock.refundAfterMs);
+  const leftMs = clock?.leftMs !== undefined && Number.isFinite(clock.leftMs) ? clock.leftMs : undefined;
+  if (leftMs !== undefined && leftMs <= 0 && at !== undefined) {
+    return `${sent} is not mined yet and leg A's refund time (${at}) has passed, so it can no longer land: a speed-up cannot help now ${STUCK_CLAIM_README}; run --resume first (if the claim landed in time, it finishes the swap), and if --resume stops here again, run --refund; nothing new was signed`;
+  }
+  const minutes = leftMs !== undefined ? Math.floor(leftMs / 60_000) : clock?.minutes;
+  const left = minutes === undefined || at === undefined ? "" : `, ${minutes <= 0 ? "under 1 min" : `${minutes} min`} before leg A's refund time`;
+  const before = at === undefined ? "before leg A's refund time" : `before leg A's refund time at ${at}`;
+  return `${sent} is not mined yet${left}: ${STUCK_CLAIM_STEP}, ${before} ${STUCK_CLAIM_README}, then run --resume again; nothing new was signed`;
+}
+
+/**
+ * P9-4 decision 7 (the rail part: a lock or claim write whose receipt wait timed out is asked about by its hash before it is sent again): the typed refusals that come of it,
+ * `LockPendingError` (the Buyer's lock) and `ClaimPendingError` (the Seller's claim), mean the node still holds that transaction or the endpoint's reads do not show it yet, and
+ * that nothing new was signed or sent. The runner does not loop on them (a refusal is preferred to any new outward action): it ends with a sentence that says what to do, in the
+ * runner's own terms (the flows' own text says "call lockLegA() again later", which a person cannot do).
+ *
+ * P94-FUND-01 (P9-FIXES-R4 decision 1): a CLAIM that is not mined is the one case with a deadline (it must land before leg A's refund time, and only a by-hand same-nonce speed-up
+ * can help it), so its sentence carries the claim's PUBLIC transaction hash, the minutes left before leg A's refund time and the by-hand step (`stuckClaimSentence`). Both shapes
+ * of a pending claim end that way: the typed `EvmReceiptTimeoutError` (write "claim") that a first run's claim wait ends with after the Seller saved the hash, and the
+ * `ClaimPendingError` a resumed Seller throws while the node still holds the saved claim. `timing` is the runner's own view (leg A's refund time and its clock); without it the
+ * error's own fields (a `ClaimPendingError`'s refund time and whole minutes) are used, and a timeout error then has no minutes. A claim that is MINED (the node says success, the
+ * endpoint's reads lag) needs no speed-up: its sentence is the plain "run --resume again in a few minutes", with the hash. The lock's sentence is fixed text, as before. No
+ * sentence carries a value other than a hash, whole minutes and an ISO time; none carries the preimage. `undefined` for any other error. Exported for its own tests.
+ */
+export function pendingWriteRefusal(error: unknown, timing?: PendingTiming): string | undefined {
   if (error instanceof LockPendingError) {
     return "a lock this run sent earlier is not decided yet (the node still holds its transaction, or the endpoint's reads do not show it yet): nothing new was signed or sent; run --resume again in a few minutes";
   }
+  const clock: ClaimClock | undefined = timing === undefined ? undefined : { refundAfterMs: timing.refundAfterMs, leftMs: timing.refundAfterMs - timing.nowMs };
   if (error instanceof ClaimPendingError) {
-    return "a claim this run sent earlier is not decided yet (the node still holds its transaction, or the endpoint's reads do not show it yet): nothing new was signed or sent; run --resume again in a few minutes (if leg A's refund time comes first, --resume and --refund say what to do)";
+    if (error.status === "success") {
+      const tx = printableTxHash(error.txHash);
+      return `a claim of leg A this run sent${tx === undefined ? "" : ` (tx ${tx})`} is mined, but the endpoint's reads do not show it yet: nothing new was signed or sent; run --resume again in a few minutes`;
+    }
+    const own: ClaimClock | undefined = error.refundAfterMs === undefined ? undefined : { refundAfterMs: error.refundAfterMs, ...(error.minutesLeft === undefined ? {} : { minutes: error.minutesLeft }) };
+    return stuckClaimSentence(error.txHash, clock ?? own);
   }
+  if (error instanceof EvmReceiptTimeoutError && error.write === "claim") return stuckClaimSentence(error.hash, clock);
   return undefined;
+}
+
+/** P94-FUND-01: how often the runner says that a claim it has broadcast is still not mined: one line a minute. */
+export const CLAIM_TICK_MS = 60_000;
+
+/** P94-FUND-01: the line printed the moment the claim of leg A is broadcast. The hash is public. */
+export const claimSentLine = (txHash: string): string => `claim of leg A sent: tx ${txHash}`;
+
+/**
+ * P94-FUND-01: the line printed once a minute while the claim's receipt wait lasts: the whole minutes from the runner's clock to leg A's refund time (never negative), or, once that
+ * time has passed, the fixed variant that says so. Nothing but fixed text and one integer.
+ */
+export function claimTickLine(leftMs: number): string {
+  if (leftMs <= 0) return "still not mined, leg A's refund time has passed";
+  return `still not mined, ${Math.floor(leftMs / 60_000)} min before leg A's refund time`;
+}
+
+/** What the runner holds of a claim of leg A while its receipt wait lasts (see `createClaimWatch`). */
+export interface ClaimWatch {
+  /** Handed to the Seller as `SellerFlowOptions.onClaimSent`: prints the hash at once and starts the minute line. */
+  readonly onClaimSent: (txHash: string) => void;
+  /** Ends the minute line. Safe to call at any time, any number of times. */
+  stop(): void;
+}
+
+/**
+ * P94-FUND-01 (P9-FIXES-R4 decision 1, runner part): the claim of leg A carries the swap's preimage into the pool the moment it is broadcast, and if it then sits unmined near leg A's
+ * refund time the only remedy is a by-hand same-nonce speed-up (decision 6), which needs its hash. So the runner does not wait to be told by the end of the receipt wait: the Seller
+ * calls `onClaimSent` as the node accepts the claim, the runner prints `claimSentLine(hash)` through its normal log, and from then on `claimTickLine` once every `tickMs` (a minute)
+ * until `stop()` (the claim loop's `finally`, and the runner's own). The timer is a real one and `unref`'d: it never keeps the process alive, and a tick that fires after `stop()` prints
+ * nothing. A line that cannot be printed never throws into the timer. The hash is shown only in the shape of a transaction hash. `clock` is the runner's clock, `refundAfterMs` leg A's
+ * refund time from the run's record.
+ */
+export function createClaimWatch(params: { log: (line: string) => void; clock: () => number; refundAfterMs: number; tickMs?: number }): ClaimWatch {
+  const period = params.tickMs !== undefined && Number.isFinite(params.tickMs) && params.tickMs >= 1 ? Math.floor(params.tickMs) : CLAIM_TICK_MS;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const stop = (): void => {
+    if (timer !== undefined) clearInterval(timer);
+    timer = undefined;
+  };
+  const onClaimSent = (txHash: string): void => {
+    const tx = printableTxHash(txHash);
+    if (tx === undefined) return;
+    stop();
+    try {
+      params.log(claimSentLine(tx));
+    } catch {
+      // a line that cannot be printed changes nothing about the claim
+    }
+    const handle = setInterval(() => {
+      if (timer !== handle) return; // stopped
+      try {
+        const left = params.refundAfterMs - params.clock();
+        if (Number.isFinite(left)) params.log(claimTickLine(left));
+      } catch {
+        // see above: never into the timer
+      }
+    }, period);
+    handle.unref();
+    timer = handle;
+  };
+  return { onClaimSent, stop };
 }
 
 // --- small helpers --------------------------------------------------------------------------------------------------------------
@@ -585,6 +719,8 @@ interface World {
   /** Removes the endpoint from a text (K3: a failure text is redacted BEFORE it is cut, so every `describeFailure` call gets this one). */
   redact: (text: string) => string;
   pollMs: number;
+  /** P94-FUND-01: the Seller's `onClaimSent` and the minute line of a claim of leg A that is broadcast and not mined yet. */
+  claimWatch: ClaimWatch;
 }
 
 class RunnerRefusal extends Error {
@@ -901,6 +1037,7 @@ async function openSeller(w: World): Promise<{ flow: SellerFlow; next: SellerNex
     rail: w.seller.rail,
     clock: w.clock,
     store: w.seller.store,
+    onClaimSent: w.claimWatch.onClaimSent, // P94-FUND-01
   };
   const keys = (await w.seller.store.list()).filter((key) => key.startsWith("seller:"));
   if (keys.length > 1) throw new RunnerRefusal("the Seller's store holds more than one swap; one state directory is one swap");
@@ -917,6 +1054,7 @@ function newSeller(w: World): SellerFlow {
     rail: w.seller.rail,
     clock: w.clock,
     store: w.seller.store,
+    onClaimSent: w.claimWatch.onClaimSent, // P94-FUND-01
   });
 }
 
@@ -1089,6 +1227,9 @@ async function driveSettle(w: World): Promise<number> {
       if (!FLOW_MESSAGE.lockNotFinal.test(message) || attempt >= CLAIM_REREAD_ATTEMPTS || w.env.now() - claimStartedMs > w.config.waitLimitMs) throw error;
       log(`the lock does not read final to the evidence reader yet (${describeFailure(error, w.redact)}); asking again (${attempt}/${CLAIM_REREAD_ATTEMPTS})`);
       await w.env.sleep(w.pollMs);
+    } finally {
+      // P94-FUND-01: the minute line of an unmined claim lasts exactly as long as the claim call: it ends when claimLegA returns or throws (the pending-claim sentence takes over).
+      w.claimWatch.stop();
     }
   }
   step("seller", "claimLegA", evidenceTx(claimed.evidence));
@@ -1285,6 +1426,9 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
   const stateDir = resolve(options.stateDir);
 
   let release: (() => Promise<void>) | undefined;
+  // P94-FUND-01: set once the run is known; the last `catch` reads them to say how long a pending claim has left (leg A's refund time against the runner's own clock).
+  let pendingTiming: (() => PendingTiming) | undefined;
+  let claimWatch: ClaimWatch | undefined;
   try {
     const rpc = new CapturingRpc({ endpoint: evm.endpoint });
     const clock = await makeClock(config, env, rpc).catch((error) => {
@@ -1456,6 +1600,8 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
 
     const venue = await DurableVenue.open(join(stateDir, "world", "venue.json"), clock);
     const notes = await DurableNoteStore.open(join(stateDir, "world", "notes.json"));
+    pendingTiming = () => ({ refundAfterMs: run.deadlines.legA.refundAfterMs, nowMs: clock() });
+    claimWatch = createClaimWatch({ log, clock, refundAfterMs: run.deadlines.legA.refundAfterMs, ...(env.claimTickMs === undefined ? {} : { tickMs: env.claimTickMs }) });
     const world: World = {
       config,
       env: safeEnv,
@@ -1471,6 +1617,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
       log,
       redact,
       pollMs: config.pollMs,
+      claimWatch,
     };
     log(`${mode === "yes" ? "run" : mode} started: swap ${run.swapId}; buyer ${buyerIdentity.did} account ${accounts.buyer.account.address}; seller ${sellerIdentity.did} account ${sellerAddress}`);
     return mode === "refund" ? await driveRefund(world, options.wait === true) : await driveSettle(world);
@@ -1483,7 +1630,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
       errLine(`rehearsal: ${error.message}`);
       return EXIT.refused;
     }
-    const pending = pendingWriteRefusal(error);
+    const pending = pendingWriteRefusal(error, pendingTiming?.());
     if (pending !== undefined) {
       errLine(`rehearsal: ${pending}`);
       return EXIT.refused;
@@ -1491,6 +1638,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
     errLine(`rehearsal: refused: ${error instanceof Error ? error.name : "Error"}: ${describeFailure(error, redact)}`);
     return EXIT.refused;
   } finally {
+    claimWatch?.stop(); // the runner leaves no timer running, whatever ended the run
     if (release !== undefined) await release().catch(() => undefined);
   }
 }

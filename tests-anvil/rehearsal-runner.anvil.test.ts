@@ -35,7 +35,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 
-import { encodeFunctionData, keccak256, pad, toEventSelector, type Address, type Hex } from "viem";
+import { decodeFunctionData, encodeFunctionData, keccak256, pad, parseTransaction, toEventSelector, type Address, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -117,6 +117,8 @@ interface RigOptions {
   codeHash?: Hex;
   /** The endpoint the config names instead of the node's own (a proxy in front of it). */
   endpoint?: string;
+  /** `rails.evm.receiptTimeoutMs` (anvil takes any value): how long a write's receipt wait lasts before the runner reports it. */
+  receiptTimeoutMs?: number;
 }
 
 /** Two fresh parties: keys generated now into mode-0600 files, funded from anvil's account 0, and a config that names them. */
@@ -150,6 +152,7 @@ async function makeRig(chain: Chain, options: RigOptions = {}): Promise<Rig> {
         contract: chain.contract,
         assets: { USDC: chain.token },
         contractCodeHash: options.codeHash ?? chain.codeHash,
+        ...(options.receiptTimeoutMs === undefined ? {} : { receiptTimeoutMs: options.receiptTimeoutMs }),
       },
     },
     buyerKeyFile: "keys/buyer.key",
@@ -203,6 +206,73 @@ async function startFaultProxy(target: string): Promise<FaultProxy> {
         const upstream = await fetch(target, { method: "POST", headers: { "content-type": "application/json" }, body });
         response.statusCode = upstream.status;
         response.end(await upstream.text());
+      })().catch(() => {
+        response.statusCode = 502;
+        response.end();
+      });
+    });
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  proxy.url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  proxy.close = () => new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  return proxy;
+}
+
+interface ChainProxy {
+  url: string;
+  /** While true, every CLAIM sent through the proxy is swallowed: the proxy answers its hash (as a node that accepted it into its pool does) and never forwards it. */
+  holdClaims: boolean;
+  /** The signed claims swallowed so far (a signed transaction holds no key; its call data is the public preimage a pooled claim shows, so a test never prints one). */
+  held: Array<{ hash: Hex; raw: Hex }>;
+  /** While true, `eth_getTransactionByHash` of a swallowed claim answers a transaction with no block (the node holds it, unmined); otherwise the node's own answer (it has never seen it). */
+  heldArePending: boolean;
+  close: () => Promise<void>;
+}
+
+/**
+ * P94-FUND-01: a JSON-RPC proxy in front of the node for the case a real node cannot be told to show: a CLAIM the endpoint accepts and never mines (swallowed, its hash answered,
+ * `held`). Everything else is passed to the node unchanged.
+ */
+async function startChainProxy(target: string, escrow: Address): Promise<ChainProxy> {
+  const proxy: ChainProxy = { url: "", holdClaims: false, held: [], heldArePending: false, close: async () => undefined };
+  const isEscrowCall = (data: Hex | undefined, name: "claim" | "locks"): boolean => {
+    if (data === undefined) return false;
+    try {
+      return decodeFunctionData({ abi: EVM_HASH_RAIL_ABI, data }).functionName === name;
+    } catch {
+      return false;
+    }
+  };
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      void (async () => {
+        const body = Buffer.concat(chunks).toString("utf8");
+        const call = JSON.parse(body) as { id: number | string; method: string; params?: unknown[] };
+        response.setHeader("content-type", "application/json");
+        const answer = (result: unknown): void => void response.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, result }));
+        if (call.method === "eth_sendRawTransaction" && proxy.holdClaims) {
+          const raw = call.params?.[0] as Hex;
+          const tx = parseTransaction(raw);
+          if (tx.to?.toLowerCase() === escrow.toLowerCase() && isEscrowCall(tx.data, "claim")) {
+            const hash = keccak256(raw);
+            proxy.held.push({ hash, raw });
+            answer(hash);
+            return;
+          }
+        }
+        if (call.method === "eth_getTransactionByHash" && proxy.heldArePending) {
+          const asked = String(call.params?.[0]).toLowerCase();
+          if (proxy.held.some((entry) => entry.hash.toLowerCase() === asked)) {
+            answer({ hash: asked, blockNumber: null });
+            return;
+          }
+        }
+        const upstream = await fetch(target, { method: "POST", headers: { "content-type": "application/json" }, body });
+        const text = await upstream.text();
+        response.statusCode = upstream.status;
+        response.end(text);
       })().catch(() => {
         response.statusCode = 502;
         response.end();
@@ -554,6 +624,15 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       ]) {
         expect(result.stdout).toContain(marker);
       }
+      // P94-FUND-01: the claim's hash is printed the moment it is broadcast, through the runner's log (the endpoint redaction leaves it alone), before the claim's step line, and it is the claim's own.
+      const sentLine = result.stdout.match(/^\[[^\]]+\] claim of leg A sent: tx (0x[0-9a-f]{64})$/m);
+      const stepLine = result.stdout.match(/^\[[^\]]+\] step seller\.claimLegA done: tx (0x[0-9a-f]{64}), block \d+$/m);
+      expect(sentLine, "the runner prints the claim's hash when it is sent").not.toBeNull();
+      expect(stepLine).not.toBeNull();
+      expect(sentLine?.[1]).toBe(stepLine?.[1]);
+      expect(result.stdout.indexOf("claim of leg A sent: tx")).toBeLessThan(result.stdout.indexOf("step seller.claimLegA done"));
+      expect(result.stdout.match(/claim of leg A sent: tx/g)).toHaveLength(1);
+      expect(result.stdout).not.toContain("still not mined"); // the claim was mined within the first minute
       const facts = await chainFacts(main, rig);
       expect(facts).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 }); // approve + lock; claim
       expect(await tokenBalance(main, rig.seller)).toBe(1_000_000n);
@@ -593,6 +672,68 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       expect(await chainFacts(main, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 });
       await expectCleanAndReplays(rig, result, "settled");
     }, 180_000);
+  });
+
+  // P94-FUND-01 (P9-FIXES-R4 decision 1, runner part): the claim of leg A is accepted by the endpoint and never mined (an underpriced claim that sits in the pool: here a proxy swallows it
+  // and answers its hash). The runner prints the hash the moment it is sent, and when the receipt wait gives up it ends with ONE sentence that names the hash, the minutes left before leg A's
+  // refund time and the by-hand step; a --resume while the node still holds the claim ends with the same sentence and signs nothing; once the held transaction is mined (the by-hand
+  // speed-up, here the held transaction itself sent to the node) a --resume finds the claim on the chain and settles the swap. (The per-minute line and the sentences are unit-tested in
+  // tests/rehearsal-run.test.ts and, against a real Seller on a mock node, tests/rehearsal-claim-watch.test.ts.)
+  describe("a claim the endpoint accepts and never mines (P94-FUND-01)", () => {
+    it("prints 'claim of leg A sent: tx <hash>' when it is sent, ends the run with the sentence that names the hash, the minutes left and the by-hand step (also on --resume, which signs nothing), and a --resume after the claim is mined settles the swap", async () => {
+      const proxy = await startChainProxy(main.anvil.endpoint, main.contract);
+      try {
+        const rig = await makeRig(main, { endpoint: proxy.url, receiptTimeoutMs: 10_000 }); // viem polls for a receipt every 4 s: a shorter wait would time out the approve and the lock too
+        proxy.holdClaims = true;
+        const first = await run(rig, ["--yes"]);
+        expect(first.code).toBe(4);
+        expect(proxy.held).toHaveLength(1);
+        const hash = proxy.held[0]!.hash;
+        const lines = first.stdout.split("\n");
+        expect(lines.some((line) => line.endsWith(`] claim of leg A sent: tx ${hash}`))).toBe(true); // while the receipt wait still ran: the exit came 10 s later
+        expect(first.stdout).not.toContain("step seller.claimLegA done");
+        expect(first.stderr).toMatch(new RegExp(`^rehearsal: a claim of leg A this run sent \\(tx ${hash}\\) is not mined yet, (89|90) min before leg A's refund time: speed the claim up by hand with the same nonce and a higher fee from a wallet that holds the key file's key, before leg A's refund time at \\d{4}-\\d\\d-\\d\\dT[0-9:.]+Z \\(README, "A stuck claim is not re-priced"\\), then run --resume again; nothing new was signed$`, "m"));
+        expect(first.stderr).not.toContain("claimLegA()"); // the flow's wording
+        expect(first.stderr).not.toContain("a few minutes");
+        // The Seller's record holds the hash (saved at the broadcast), the chain has no claim, and nothing but the hash is public: no preimage in any output, no key anywhere.
+        const sellerStore = new FileFlowStore(join(rig.stateDir, "seller", "flows"));
+        const sellerKey = (await sellerStore.list()).find((candidate) => candidate.startsWith("seller:"))!;
+        const sellerRecord = decodeFlowRecord((await sellerStore.load(sellerKey))!, sellerKey);
+        expect(sellerRecord.role === "seller" && sellerRecord.claimTxHash === hash).toBe(true);
+        expect(await chainFacts(main, rig)).toEqual({ locked: 1, claimed: 0, refunded: 0, buyerTxs: 2, sellerTxs: 0 });
+        const outputs = { stdout: first.stdout, stderr: first.stderr };
+        expect(await leakingPlaces(rig, [rig.stateDir], outputs)).toEqual([]);
+        const secret = await secretPlaces(rig, await sellerSecret(rig), [rig.stateDir], outputs, (name) => SELLER_FLOWS.test(name));
+        expect(secret.stray).toEqual([]);
+        expect(secret.where.length).toBeGreaterThan(0);
+
+        // --resume while the node holds the claim (it answers the transaction with no block): the same sentence, from the resumed Seller's ClaimPendingError, and nothing is signed.
+        proxy.heldArePending = true;
+        const resumed = await run(rig, ["--resume"]);
+        expect(resumed.code).toBe(4);
+        expect(resumed.stderr).toContain(`a claim of leg A this run sent (tx ${hash}) is not mined yet`);
+        expect(resumed.stderr).toContain("speed the claim up by hand with the same nonce and a higher fee from a wallet that holds the key file's key");
+        expect(resumed.stderr).toContain("then run --resume again; nothing new was signed");
+        expect(resumed.stdout).not.toContain("claim of leg A sent: tx"); // nothing was broadcast by this run
+        expect(proxy.held).toHaveLength(1); // no second claim reached the endpoint
+        expect((await chainFacts(main, rig)).sellerTxs).toBe(0);
+
+        // The by-hand speed-up lands (here the held transaction is sent to the node itself): the claim is on the chain and --resume finishes the swap.
+        await main.anvil.rpcCall<Hex>("eth_sendRawTransaction", [proxy.held[0]!.raw]);
+        await receipt(main.anvil, hash);
+        proxy.heldArePending = false;
+        proxy.holdClaims = false;
+        const finished = await run(rig, ["--resume"]);
+        expect(finished.stderr).toBe("");
+        expect(finished.code).toBe(0);
+        expect(finished.stdout).toContain("audit: the bundle replays offline to settled");
+        expect(proxy.held).toHaveLength(1);
+        expect(await chainFacts(main, rig)).toEqual({ locked: 1, claimed: 1, refunded: 0, buyerTxs: 2, sellerTxs: 1 }); // one lock, one claim: no second claim was signed
+        await expectCleanAndReplays(rig, { ...finished, stdout: first.stdout + resumed.stdout + finished.stdout, stderr: first.stderr + resumed.stderr + finished.stderr }, "settled");
+      } finally {
+        await proxy.close();
+      }
+    }, 240_000);
   });
 
   describe("a kill in the middle, then --resume", () => {
