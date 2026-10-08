@@ -2188,6 +2188,114 @@ describe("P94-FUND-02: the late-claim exit 0 requires the chain: leg A claimed a
   });
 });
 
+// P94-FUND-04 (P9-FIXES-R4 decision 4): R3-FUND-01's late-claim wait of `--refund` released only when the finalized block had passed the HEAD read when the wait began, not when the claim's OWN
+// block was final: with a claim at block 100 and a head of 160 the claim was final after 10 polls, and the runner asked the flow again after 71. It now also ends when leg A reads Claimed at the
+// finalized block (the read that means the flow will route on the claim), so the wait is at most a poll or two longer than the claim's own finality.
+describe("P94-FUND-04: the late-claim wait of --refund ends when the claim's own block is final", () => {
+  const HASH_LOCK = `0x${"5a".repeat(32)}`;
+  const zero: Address = "0x0000000000000000000000000000000000000000";
+  const row = (status: number): string => encodeFunctionResult({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", result: [zero, zero, TOKEN as Address, 1n, 1n, 2n, status] });
+  const POLL = 5_000;
+  const CLAIM_BLOCK = 100n;
+  const HEAD = 160n;
+
+  /**
+   * The review's scripted world: the claim is in block 100, the head is 160, the finalized block starts at 90 and moves one block per poll. `numberedReadsFailAfter`: only that many
+   * `locks` reads at a numbered block answer (the rest fail); `claimNeverFinal`: the finalized block never shows the claim (Locked at every numbered block).
+   */
+  function scripted(options: { numberedReadsFailAfter?: number; claimNeverFinal?: boolean; waitLimitMs?: number } = {}): { world: FinalityWorld; state: { sleeps: number; pollsUntilClaimFinal: number | undefined; finalized: bigint } } {
+    const state = { sleeps: 0, pollsUntilClaimFinal: undefined as number | undefined, finalized: 90n };
+    const clock = { ms: 1_800_000_000_000 };
+    let numberedReads = 0;
+    const config = limitWait(
+      parseRehearsalConfig(
+        { rails: { evm: { pin: ANVIL_LOCAL_PIN, endpoint: "http://mock", contract: CONTRACT, assets: { USDC: TOKEN } } }, buyerKeyFile: "b.key", sellerKeyFile: "s.key", amount: "1000000", out: "bundle", pollMs: POLL },
+        "/base",
+      ),
+      options.waitLimitMs ?? 24 * 3_600_000,
+    );
+    const rpc = {
+      request: async ({ method, params }: { method: string; params?: readonly unknown[] }): Promise<unknown> => {
+        if (method === "eth_blockNumber") return `0x${HEAD.toString(16)}`;
+        if (method === "eth_getBlockByNumber") return { number: `0x${(params?.[0] === "latest" ? HEAD : state.finalized).toString(16)}`, timestamp: "0x1" };
+        if (method === "eth_call") {
+          if (params?.[1] === "latest") return row(2);
+          numberedReads += 1;
+          if (options.numberedReadsFailAfter !== undefined && numberedReads > options.numberedReadsFailAfter) throw new Error("eth_call: transport down");
+          return row(options.claimNeverFinal === true ? 1 : BigInt(params?.[1] as string) >= CLAIM_BLOCK ? 2 : 1);
+        }
+        throw new Error(`unexpected ${method}`);
+      },
+    } as unknown as CapturingRpc;
+    const world: FinalityWorld = {
+      config,
+      env: {
+        now: () => clock.ms,
+        sleep: async (ms) => {
+          state.sleeps += 1;
+          clock.ms += ms;
+          state.finalized += 1n;
+          if (state.pollsUntilClaimFinal === undefined && state.finalized >= CLAIM_BLOCK) state.pollsUntilClaimFinal = state.sleeps;
+        },
+        out: () => undefined,
+        err: () => undefined,
+      },
+      rpc,
+      log: () => undefined,
+      pollMs: POLL,
+    };
+    return { world, state };
+  }
+
+  /** The Buyer as the flow behaves: it routes to learnSecret once ITS read of the finalized block shows the claim, and before that the refund reverts. */
+  function buyerOver(state: { finalized: bigint }): { refundLegA: () => Promise<never>; asks: () => number } {
+    let asks = 0;
+    return {
+      asks: () => asks,
+      refundLegA: async (): Promise<never> => {
+        asks += 1;
+        if (state.finalized >= CLAIM_BLOCK) throw new Error("buyer: refusing to report leg A refunded - the lock was claimed instead; call learnSecret() then claimLegB() instead of refundLegA() (G7)");
+        throw new Error("execution reverted: EvmHashRail: not refundable");
+      },
+    };
+  }
+
+  it("the review's case: the claim (block 100) is final after 10 polls, head 160: the runner asks the flow again within 2 polls of that, not after 71", async () => {
+    const { world, state } = scripted();
+    const buyer = buyerOver(state);
+    const outcome = await refundLegAWaiting(world, buyer, HASH_LOCK).then(() => "returned", (error: unknown) => (error as Error).message);
+    expect(state.pollsUntilClaimFinal).toBe(10); // the script itself: the finalized block reaches the claim's block at the tenth poll
+    expect(state.sleeps).toBeLessThanOrEqual((state.pollsUntilClaimFinal ?? 0) + 2);
+    expect(state.sleeps).toBeGreaterThanOrEqual(state.pollsUntilClaimFinal ?? 0);
+    expect(buyer.asks()).toBe(2); // once at the start, once after the wait
+    expect(outcome).toBe(
+      "leg A's lock was claimed and the claim is final, so leg A is not refunded (the contract has paid the Seller); run --resume, which learns the secret, claims leg B and finishes the swap",
+    );
+  });
+
+  it("a claim read that fails during the wait releases nothing early: the wait falls back to the finalized block passing the head read (70 polls), exactly as before", async () => {
+    const { world, state } = scripted({ numberedReadsFailAfter: 1 }); // the first read (the decision to wait) answers; every later one fails
+    const buyer = buyerOver(state);
+    const outcome = await refundLegAWaiting(world, buyer, HASH_LOCK).then(() => "returned", (error: unknown) => (error as Error).message);
+    expect(state.sleeps).toBeGreaterThanOrEqual(70); // the finalized block went from 90 to the head, 160
+    expect(outcome).toContain("leg A's lock was claimed and the claim is final");
+  });
+
+  it("a claim the finalized block never shows is not released early: the wait is cut by waitLimitMs and says so (nothing was sent), as before", async () => {
+    const { world, state } = scripted({ claimNeverFinal: true, waitLimitMs: 60_000 });
+    const buyer = { refundLegA: async (): Promise<never> => Promise.reject(new Error("execution reverted: EvmHashRail: not refundable")) };
+    await expect(refundLegAWaiting(world, buyer, HASH_LOCK)).rejects.toThrow(/leg A's lock was claimed, but the claim was not final after \d+ s \(waitLimitMs\); nothing was sent; run --refund again to keep waiting/);
+    expect(state.sleeps).toBeGreaterThan(5);
+    expect(state.sleeps).toBeLessThan(40);
+  });
+
+  it("the wait passes alsoDone (code): the call that waits for the claim reads leg A at the finalized block, as waitLockFinal's does", async () => {
+    const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");
+    expect(text).toContain('await waitFinalized(w, await blockNumberNow(w.rpc), "claim of leg A", () => legAClaimedAtFinalized(w, hashLock), LATE_CLAIM_NOT_FINAL);');
+    expect(text).not.toContain('"claim of leg A", undefined, LATE_CLAIM_NOT_FINAL');
+  });
+});
+
 describe("K3: every failure text the runner prints is redacted before it is cut", () => {
   it("no describeFailure call in the runner is given an identity redactor (the claim, re-read and lock read-back messages use the endpoint redactor)", async () => {
     const text = await readFile(join(REPO_ROOT, "src", "client", "rehearsal-run.ts"), "utf8");

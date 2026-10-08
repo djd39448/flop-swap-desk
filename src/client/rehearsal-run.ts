@@ -983,7 +983,9 @@ export async function refundLegAWaiting(w: FinalityWorld, buyer: Pick<BuyerFlow,
         w.log(LATE_CLAIM_LOG);
         announced = true;
       }
-      await waitFinalized(w, await blockNumberNow(w.rpc), "claim of leg A", undefined, LATE_CLAIM_NOT_FINAL);
+      // P94-FUND-04: the wait ends as soon as the CLAIM's own block is final (leg A reads Claimed at the finalized block: the flow then routes on it), not only when the finalized block
+      // has passed the head read now, which can be a whole time-to-final later. Both are reads at the finalized block, so nothing is routed on a read that is not final.
+      await waitFinalized(w, await blockNumberNow(w.rpc), "claim of leg A", () => legAClaimedAtFinalized(w, hashLock), LATE_CLAIM_NOT_FINAL);
       await w.env.sleep(w.pollMs); // the Buyer reads the finalized block by its hash: never ask again in a tight loop if its read and this one disagree
     }
   }

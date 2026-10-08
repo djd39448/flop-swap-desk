@@ -1122,7 +1122,7 @@ describe("the EVM rehearsal runner (bin/swap-rehearsal-evm.mjs) against real anv
       } finally {
         clearInterval(miner);
       }
-      expect(mined).toBeGreaterThanOrEqual(8); // the finalized block (8 below the head) had to pass the head the wait started at
+      expect(mined).toBeGreaterThanOrEqual(7); // the finalized block (8 below the head) had to reach the claim's block, which sits one below the head the wait started at (P94-FUND-04: no longer to pass that head)
       expect(refunded.code).toBe(4);
       expect(refunded.stderr).toMatch(/leg A's lock was claimed and the claim is final, so leg A is not refunded \(the contract has paid the Seller\); run --resume/);
       expect(refunded.stderr).not.toMatch(/reverted|refund refused/);
