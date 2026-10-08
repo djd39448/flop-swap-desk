@@ -543,6 +543,50 @@ describe("parseRehearsalConfig", () => {
     expect(parseRehearsalConfig(anvilConfig({ out: "bundles/\u{1F600}\u{FE0F}-97811a09-a70d-4b56-ad4f-e4c4e7e05f8a" }), BASE).out).toContain("a70d");
   });
 
+  // R5-KEYS-01 (the main loop's read of fix pass 4): KEYS-P94-01 ran the phrase tests on the value with BOTH invisible classes removed, which glues words that a
+  // Hangul filler, U+034F or U+FE0F separated, so a phrase with U+200B inside each word and such a character between the words, refused at 2d37f15, passed. The rule
+  // now also tries the Cf-only reading, and its word-list test also reads the Hangul fillers as word breaks. Every phrase is generated now; labels and booleans only.
+  it("R5-KEYS-01: a phrase with U+200B inside each word joined by U+3164, U+034F or U+FE0F, and one with U+034F inside each word joined by a Hangul filler, are refused by field name and never quoted; ten such words still pass", () => {
+    const words = generateMnemonic(english).split(" ");
+    const inside = (word: string, mark: string): string => `${word.slice(0, 2)}${mark}${word.slice(2)}`;
+    const phrase = (mark: string, join: string, list: readonly string[] = words): string => list.map((word) => inside(word, mark)).join(join);
+    const scan = phraseScanner(words);
+    const invisible = /[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
+    // What a person sees: the phrase with either class removed, or the blank-drawn characters as spaces.
+    const seen = (text: string): boolean =>
+      scan(text) ||
+      scan(text.replace(/\p{Cf}/gu, "")) ||
+      scan(text.replace(invisible, " ")) ||
+      scan(text.replace(/[\u115F\u1160\u3164\uFFA0]/gu, " ").replace(invisible, ""));
+    const refused: Array<[string, string]> = [
+      ["U+200B inside each word, U+3164 (Hangul filler) between", phrase("\u{200B}", "\u{3164}")],
+      ["U+200B inside each word, U+034F (combining grapheme joiner) between", phrase("\u{200B}", "\u{34F}")],
+      ["U+200B inside each word, U+FE0F (variation selector-16) between", phrase("\u{200B}", "\u{FE0F}")],
+      ["U+00AD inside each word, U+FFA0 (halfwidth Hangul filler) between", phrase("\u{AD}", "\u{FFA0}")],
+      ["U+034F inside each word, U+3164 between", phrase("\u{34F}", "\u{3164}")],
+      ["U+FE0F inside each word, U+115F between, as a path segment", `bundles/${phrase("\u{FE0F}", "\u{115F}")}/run`],
+    ];
+    for (const [label, value] of refused) {
+      expect(seen(value), `${label}: the value must hold the phrase, or this test proves nothing`).toBe(true);
+      expect(looksLikeKeyMaterial(value), label).toBe(true);
+      for (const field of ["buyerKeyFile", "sellerKeyFile", "out"] as const) {
+        const message = refusal(anvilConfig({ [field]: value }));
+        expect(message, `${field}: ${label}`).toContain(`${field} looks like key material`);
+        expect(seen(message), `${field}: ${label}: the refusal must not quote any window of it`).toBe(false);
+      }
+    }
+    // Ten words in the same shapes are not a phrase (the rule needs 11), and neither are ten words with a Hangul filler inside each (the word-list test reads the
+    // filler as a break, and the pieces of a word are not words of the list).
+    for (const value of [
+      phrase("\u{200B}", "\u{3164}", words.slice(0, 10)),
+      phrase("\u{34F}", "\u{3164}", words.slice(0, 10)),
+      phrase("\u{3164}", " ", words.slice(0, 10)),
+      phrase("\u{3164}", " "),
+    ]) {
+      expect(looksLikeKeyMaterial(value)).toBe(value.split(" ").length >= 11);
+    }
+  });
+
   it("accepts explicit deadlines and refuses malformed ones", () => {
     const explicit ={ legA: { claimByMin: 40, refundAfterMin: 50, expiresMin: 20 }, legB: { claimByMin: 70, refundAfterMin: 110, expiresMin: 30 } };
     const config = parseRehearsalConfig(anvilConfig({ deadlines: explicit }), BASE);

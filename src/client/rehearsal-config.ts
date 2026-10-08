@@ -201,17 +201,26 @@ function holdsSeedPhrase(value: string): boolean {
  * code points (`\p{Default_Ignorable_Code_Point}`: the variation selectors U+FE00 to U+FE0F, the combining grapheme joiner U+034F, the Hangul fillers U+115F, U+1160, U+3164 and
  * U+FFA0, the Mongolian free variation selectors, the tag characters and the like), which are not all in Cf. The hex reading removes whitespace and both classes, the phrase
  * reading removes both classes (and keeps the whitespace, which separates words). Visible-but-blank separators (U+2800, the braille blank, and the like) are still not seen.
+ *
+ * R5-KEYS-01 (the main loop's read of fix pass 4): removing both classes at once can glue words that one class SEPARATED, so the phrase tests run on three readings and
+ * a value is refused if any reading shows a phrase: the value as it is; with Cf removed only (the reading before KEYS-P94-01: a phrase with U+200B inside each word and a
+ * Hangul filler or U+034F between the words); and with both classes removed (a phrase with U+034F or U+FE0F inside each word). A fourth reading, for the word-list test
+ * only, reads the Hangul fillers (which a terminal draws as a blank) as word breaks and removes every other invisible character (a phrase with U+034F inside each word
+ * and a Hangul filler between them). Every earlier reading is still tried, so an added reading can only add refusals.
  */
 export function looksLikeKeyMaterial(value: string): boolean {
   if (/[0-9a-fA-F]{32}/.test(value)) return true;
   if (/[0-9a-fA-F]{32}/.test(value.replace(/[\s\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, ""))) return true;
-  const withoutFormat = value.replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "");
-  for (const text of withoutFormat === value ? [value] : [value, withoutFormat]) {
+  const invisible = /[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
+  // The value as it is, with Cf removed only, and with both classes removed: both phrase tests.
+  for (const text of new Set<string>([value, value.replace(/\p{Cf}/gu, ""), value.replace(invisible, "")])) {
     const words = text.trim().split(/\s+/);
     if (words.length >= 11 && words.every((word) => /^[a-z]+$/i.test(word))) return true;
     if (holdsSeedPhrase(text)) return true;
   }
-  return false;
+  // The Hangul fillers (drawn as a blank) as word breaks and every other invisible character removed: the word-list test only (the loose test would
+  // count the pieces of words cut by a filler as words).
+  return holdsSeedPhrase(value.replace(/[\u115F\u1160\u3164\uFFA0]/gu, " ").replace(invisible, ""));
 }
 
 const KEY_LIKE_SHAPES = "a run of 32 or more hex digits, or a phrase of 11 or more words";
