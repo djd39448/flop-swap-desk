@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// tests-anvil/rehearsal-runner.anvil.test.ts - P9-6 (handoff/P9-G1-READINESS-SPEC.md, rule 4: "nothing public before Dave"): the EVM
+// tests-anvil/rehearsal-runner.anvil.test.ts - P9-6 (handoff/P9-G1-READINESS-SPEC.md, rule 4: "nothing public before the desk operator says so"): the EVM
 // rehearsal runner, bin/swap-rehearsal-evm.mjs, run as a real child process against real anvil nodes with keys generated at test
 // time. Each party's key is written to a mode-0600 temp file the config names; anvil's unlocked account 0 funds the two accounts
 // and nothing else of anvil's is used. The runner reads the chain, signs in its own process and sends raw transactions.

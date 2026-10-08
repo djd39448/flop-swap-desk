@@ -394,7 +394,7 @@ changed, so `docs/PROFILE.md` is unchanged, and no fixture was added or recaptur
 
 ## First-party EVM signer files (P9-1, handoff/P9-G1-READINESS-SPEC.md) - unaudited, testnet-only
 
-Not vendored: original to this repo, written for the G1 readiness stage (a real key on a public testnet, Dave's own key
+Not vendored: original to this repo, written for the G1 readiness stage (a real key on a public testnet, the desk operator's own key
 files). Unaudited and testnet-only like every file above. No key material is in the repository: the tests generate their
 keys at test time, and the loader reads a key only from a file an operator names at run time.
 
@@ -443,7 +443,7 @@ bytes `eth_getCode` answers); `EvmHtlcRail.connect` and the evidence reader refu
 | runtime code (`deployedBytecode.object`), 3416 bytes, keccak256 | `0x6ab36fa334036370445c22ca9f7999872ae56777d3c969438fb4b2414152da27` |
 | creation code (`bytecode.object`), 3445 bytes, keccak256 (for reference; `forge create` sends this) | `0xb068f157be227cd9fef6611b4e9549aab69f8d8c334cc6375e40914edc754c7f` |
 
-**Dave's deployed contract must report the runtime value through `bin/evm-code-hash.mjs`** (`node bin/evm-code-hash.mjs
+**The desk operator's deployed contract must report the runtime value through `bin/evm-code-hash.mjs`** (`node bin/evm-code-hash.mjs
 <rpc-url> <address>` prints `keccak256 0x...` and `bytes 3416`); that is the string that goes into `contractCodeHash` in
 `rails.json`. Another value means the code at that address is not this source built with this toolchain, and the desk will
 refuse it. **A deploy built with another forge (or another solc, other settings, or a checkout without `lib/forge-std`) must
@@ -590,7 +590,7 @@ signs). Nothing here has talked to a live signet node.
 
 ## First-party rehearsal runner files (P9-6, handoff/P9-G1-READINESS-SPEC.md, rule 4) - unaudited, testnet-only
 
-Not vendored: original to this repo. The runner is dry-run by default and Dave runs it; it posts to no HTTP venue and its only
+Not vendored: original to this repo. The runner is dry-run by default and the desk operator runs it; it posts to no HTTP venue and its only
 network is `rails.evm.endpoint`. No key material in any of them: the two EVM keys are loaded by `loadEvmLocalAccount` from files
 the operator names and are never printed, stored or inspected; the tests generate their keys at test time.
 
@@ -702,7 +702,7 @@ the end of P9-7: 114 files, 3517 passed, 7 skipped).
 
 Not vendored: original to this repo. The second review round of P9 (head `9dcac37`; three lenses and a synthesis) closed all fourteen
 round-1 items, found no leak of a key that the code loads from its file, and found no route by which an honest party loses value in
-G1 (leg B is paper, both keys are Dave's). It found the operator-mistake key-echo class of K1 and K2 still open for five more places
+G1 (leg B is paper, both keys are the desk operator's). It found the operator-mistake key-echo class of K1 and K2 still open for five more places
 a key can be pasted into (KR2-1), three medium items that become value routes once leg B carries value (R2-FUND-01, R2-FUND-02,
 R2-FUND-03), one more in the pre-flight sizing (R2-FUND-04) and lows. The pass changed the files named below; this table names each
 item once, with its test, so that none is missing. Every code fix has a test that was watched to fail with the fix disabled.
@@ -745,7 +745,7 @@ skipped (before it, at `9dcac37`: 116 files, 3629 passed, 7 skipped).
 ## P9 review round 3 fix pass (handoff/P9-FIXES-R3.md) - the item list
 
 Not vendored: original to this repo. The third review round of P9 (head `87a3b96`; three lenses and a synthesis) closed every round-2 item,
-found no route by which an honest party loses value in G1 (leg B is paper, both keys are Dave's) and no leak of a key that the code loads or
+found no route by which an honest party loses value in G1 (leg B is paper, both keys are the desk operator's) and no leak of a key that the code loads or
 of the preimage. It found one medium item against P9-6's promise that `--resume` continues and `--refund` drives the refund path: a claim of
 leg A that landed within one finality lag of leg A's refund time, with its outcome unsaved, stalled the documented refund-then-resume path
 (R3-FUND-01). The rest are lows: two residuals of the never-locked verdict (R3-FUND-02, R3-FUND-03), three more shapes of the key-echo class

@@ -476,7 +476,7 @@ EVM contract, with every verdict re-derivable from the exact captured RPC bytes 
 `anvil-local` (chain id `31337`), an ephemeral node this repo itself starts and stops, never a
 real network, and never with mainnet value at any point in this build (D-09/D-10). The
 Base Sepolia deploy (P2.5), a real testnet with a real key loaded from a key file and never printed (see "Key
-files") and the account lines exchanged for real, is Dave's own G1 step: the commands and the rehearsal runner that drives
+files") and the account lines exchanged for real, is the desk operator's own G1 step: the commands and the rehearsal runner that drives
 the swap are under "Deploying EvmHashRail to Base Sepolia", and none of it has met the real chain yet.
 
 Re-deriving a verdict from the captured bytes (see "Audit replay" above, F3) detects the bytes
@@ -674,8 +674,8 @@ written down instead of hidden.
 
 ## Deploying EvmHashRail to Base Sepolia
 
-This section is for Dave's own G1 steps (P9-6): deploy the escrow to Base Sepolia, pin it by its code, and run the first real
-swap with the rehearsal runner `bin/swap-rehearsal-evm.mjs`. **No deploy and no broadcast ever happens unless Dave runs the
+This section is for the desk operator's own G1 steps (P9-6): deploy the escrow to Base Sepolia, pin it by its code, and run the first real
+swap with the rehearsal runner `bin/swap-rehearsal-evm.mjs`. **No deploy and no broadcast ever happens unless the desk operator runs the
 `forge create` command below himself or passes `--yes` to the runner.** The runner's default is a dry run that only reads; it
 posts nothing to any HTTP venue (the venue and the paper notes are two local files); and the only network it speaks to is
 `rails.evm.endpoint`. Nothing in this repository has been run against the real Base Sepolia: the runner is tested against a real
@@ -688,7 +688,7 @@ accounts funded from faucets. Never the airdrop key, and never a key that holds 
 receive-only: the runner bids with `feeBps` 0 (this branch has no fee contract; `docs/FEES.md`), so there is no fee recipient in play.
 The session that wrote this never sees a key (see "Key files").
 
-### Dave's steps, in order
+### The desk operator's steps, in order
 
 1. Make three throwaway accounts: the Buyer's and the Seller's (two key files, see "Key files": `cast wallet new`, the key pasted
    into a one-line file with a text editor, never typed into a shell command, readable by you alone, outside this repository) and a
@@ -1027,7 +1027,7 @@ the two nonce rows are warnings in `--resume` and `--refund` for the same reason
 ### Known limits of the runner
 
 - **Not run against the real Base Sepolia.** The chain-side behaviour is established on anvil and on a fake read-only chain; the
-  first real run is Dave's. The lag, the log cap, the state read, the fee and the nonces are measured by the dry run on the day, not assumed.
+  first real run is the desk operator's. The lag, the log cap, the state read, the fee and the nonces are measured by the dry run on the day, not assumed.
 - **The finality budget is a bound from one day of readings, not a guarantee.** 80 minutes is the 24-hour sample's largest lag, times 1.5, rounded up (see "The Base
   Sepolia policy"). The dry run's `finality budget` row uses the larger of the lag measured at the moment and the budget, so a quiet moment does not pass a set that
   the budget would not, but a stand-still that begins after the lock and outlasts the budget leaves the Seller unable to read its lock as final before leg A's claim-by:
@@ -1182,7 +1182,7 @@ reject) is refused with the node's own reject-reason and never sent.
 `tests/btc-regtest-fixtures.test.ts`) show a real P2WSH HTLC funded, claimed or refunded on a
 real Bitcoin Core 31.1 node, with every verdict re-derivable from the exact captured RPC bytes —
 but on `regtest`, an ephemeral node this repo itself starts and stops, never a real network, and
-never with mainnet value at any point in this build. The signet run is Dave's own G1 step and has
+never with mainnet value at any point in this build. The signet run is the desk operator's own G1 step and has
 not happened: `BTC_SIGNET_PIN` (`src/rails/btc-htlc.ts`) is named `"btc-signet-UNVERIFIED"`
 because it has never met a live signet node. "Bitcoin signet (P9-5)" below says what is built for
 it (the pin, the node flags, the policy, the fee) and what is still his.
@@ -1212,7 +1212,7 @@ offline from signet's genesis header (version 1, the same coinbase merkle root a
 1598918400, bits `0x1e0377ae`, nonce 52613770: its double sha256, byte-reversed, is exactly this
 hash). That shows the constant is the genesis of that header; it does not show that a node agrees.
 So the pin keeps the name `btc-signet-UNVERIFIED` until it has met a live signet node, which is
-Dave's step at G1 time, and dropping `-UNVERIFIED` needs BOTH of these from that node:
+the desk operator's step at G1 time, and dropping `-UNVERIFIED` needs BOTH of these from that node:
 `bitcoin-cli -signet getblockhash 0` must print exactly the value above, AND `bitcoin-cli -signet
 getblockchaininfo` must report a `signet_challenge` equal to the default signet's,
 `512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae`.
@@ -1287,7 +1287,7 @@ claim and the refund price their fee from the node:
 - Nothing re-prices a transaction that is already out: there is no fee bump (see the known limit
   below).
 
-What is still Dave's at G1 time, and what has not been measured: the live check of the genesis hash
+What is still the desk operator's at G1 time, and what has not been measured: the live check of the genesis hash
 above, a synced signet node with `-txindex=1` and funded wallets for both parties, and what
 `estimatesmartfee` actually answers on that node (a node that has just started answers with no data,
 which prices everything at the floor).
@@ -1458,7 +1458,7 @@ accounts. Every account past that point — including both parties' own swap-sig
 fresh, in-memory, zero-value ed25519 keypair this process itself generates
 (`InMemoryNearSigner.generate`), never written to disk, never printed, never in a fixture. This
 is a deliberately narrower exception than the Bitcoin/EVM legs' own fully keyless design (NEAR
-has no node-side signer the way a bitcoind wallet or anvil's own accounts do), approved by Dave
+has no node-side signer the way a bitcoind wallet or anvil's own accounts do), approved by the desk operator
 specifically for the sandboxed build (`handoff/P5-NEAR-SPEC.md` §1: "yes, in-memory throwaway
 keys are fine").
 

@@ -3,7 +3,7 @@
 // tests-regtest/helpers/bitcoind.ts — P4-BTC-SPEC.md §0/§1/§2: finds and spawns a throwaway,
 // single-node `bitcoind -regtest` for the regtest-only suite (`npm run test:regtest`), never
 // used by the hermetic `npm test`. Resolution order: `BITCOIND_BIN` env, then
-// `C:\Users\trustcore-rdp\tools\bitcoin-core-31.1\bitcoin-31.1\bin\bitcoind(.exe)` (Dave's
+// `C:\Users\trustcore-rdp\tools\bitcoin-core-31.1\bitcoin-31.1\bin\bitcoind(.exe)` (the desk operator's
 // machine), then bare `bitcoind` on PATH. A missing/unspawnable binary throws a clear error —
 // `startBitcoind` is normally called from a `beforeAll`, so that failure fails the whole regtest
 // file with an obvious cause (spec: "a missing bitcoind FAILS it") rather than a mysterious

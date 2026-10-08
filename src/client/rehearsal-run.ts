@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// P9-6 (handoff/P9-G1-READINESS-SPEC.md rule 4, "nothing public before Dave"): the EVM rehearsal runner's modes. bin/swap-rehearsal-evm.mjs
+// P9-6 (handoff/P9-G1-READINESS-SPEC.md rule 4, "nothing public before the desk operator says so"): the EVM rehearsal runner's modes. bin/swap-rehearsal-evm.mjs
 // is a thin CLI over `runRehearsal`; everything that decides anything is here, typed and testable.
 //
 //   dry run (the default)  loads both key files (to print the two ADDRESSES), reads the chain, prints the pre-flight table
@@ -1583,7 +1583,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
     }
     if (mode === "dry") {
       for (const line of describeSwapPlan(config, absolute, t0Ms, lockTimeMs)) out(line);
-      out("This was a dry run: no transaction was sent, no file was written. Dave runs --yes (or --resume, --refund) himself.");
+      out("This was a dry run: no transaction was sent, no file was written. The desk operator runs --yes (or --resume, --refund) by hand.");
       return EXIT.ok;
     }
 

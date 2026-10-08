@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// P9-6 (handoff/P9-G1-READINESS-SPEC.md, rule 4: "nothing public before Dave"): the config file of the EVM rehearsal runner
+// P9-6 (handoff/P9-G1-READINESS-SPEC.md, rule 4: "nothing public before the desk operator says so"): the config file of the EVM rehearsal runner
 // (bin/swap-rehearsal-evm.mjs). One JSON object names everything a rehearsal needs and nothing else:
 //
 //   {

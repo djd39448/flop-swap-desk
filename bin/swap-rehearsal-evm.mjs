@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: MIT
 //
-// P9-6: the EVM rehearsal runner (handoff/P9-G1-READINESS-SPEC.md, rule 4: "nothing public before Dave"). One process plays
+// P9-6: the EVM rehearsal runner (handoff/P9-G1-READINESS-SPEC.md, rule 4: "nothing public before the desk operator says so"). One process plays
 // both the Buyer and the Seller of one swap (leg A on an EVM chain, leg B on the FLOP paper rail) over a local venue and a
 // local note file, signs with two local key files, and ends by writing the evidence bundle and replaying it offline with
 // examples/audit-export.mjs. The default is a DRY RUN: it reads the chain, prints the pre-flight table with the two addresses
-// and sends nothing. `--yes` broadcasts; Dave runs it. Everything it does is in src/client/rehearsal-run.ts (this file only
+// and sends nothing. `--yes` broadcasts; the desk operator runs it. Everything it does is in src/client/rehearsal-run.ts (this file only
 // reads the command line); it imports from ../dist/, so `npm run build` must run first.
 //
 // The only network it speaks to is rails.evm.endpoint in the config. It posts to no HTTP venue. It never prints a key, nor

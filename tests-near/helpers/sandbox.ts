@@ -86,7 +86,7 @@ const ONE_NEAR = 1_000_000_000_000_000_000_000_000n; // 1 NEAR, in yoctoNEAR
 function resolveNearSandboxBin(): string {
   const fromEnv = process.env.NEAR_SANDBOX_BIN;
   if (fromEnv !== undefined && fromEnv !== "") return fromEnv;
-  return "/home/trustcore-rdp/.near-sandbox/2.13.4/Linux-x86_64/near-sandbox"; // Dave's machine, per P5-NEAR-SPEC.md §0
+  return "/home/trustcore-rdp/.near-sandbox/2.13.4/Linux-x86_64/near-sandbox"; // the desk operator's machine, per P5-NEAR-SPEC.md §0
 }
 
 /** The worktree's own path, as WSL sees it under `/mnt/c` — used only for the one-time

@@ -3,7 +3,7 @@
 // tests-anvil/helpers/anvil.ts — P22-P24-EVM-SPEC.md §2.3: finds and spawns a local anvil
 // node for the anvil-only test suite (`npm run test:anvil`), never used by the hermetic `npm
 // test`. Resolution order: `ANVIL_BIN` env, then `%USERPROFILE%\.foundry\bin\anvil(.exe)`
-// (Dave's machine), then bare `anvil` on PATH. A missing/unspawnable binary, or a node that
+// (the desk operator's machine), then bare `anvil` on PATH. A missing/unspawnable binary, or a node that
 // never answers `eth_chainId`, throws a clear error — `startAnvil` is normally called from a
 // `beforeAll`, so that failure fails the whole anvil test file with an obvious cause rather
 // than a mysterious timeout deep in some other call.

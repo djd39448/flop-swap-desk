@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// tests/rehearsal-run.test.ts: P9-6 (rule 4, "nothing public before Dave"), the runner's front door without a chain that moves value:
+// tests/rehearsal-run.test.ts: P9-6 (rule 4, "nothing public before the desk operator says so"), the runner's front door without a chain that moves value:
 // `runRehearsal` and bin/swap-rehearsal-evm.mjs against a fake READ-ONLY chain served over a throwaway local HTTP server (the fake
 // refuses every write method and records it), with key files generated now. What is pinned here: the dry run (the default) reads, prints
 // a table with the two addresses and never a key or the endpoint, writes nothing and exits 0; every refusal path (a failed pre-flight,

@@ -198,7 +198,7 @@ describe("checkBtcRailConfig / validateBtcRailConfig", () => {
 
 // The real signet genesis block hash (64 lowercase hex), as published by signet's own parameters and read from a
 // public block explorer on 2026-10-05 (handoff/G1-PREP-2026-10-05.md section 4). It has NOT met a live node of this
-// build yet: that check is Dave's at G1 time, and the pin keeps its `-UNVERIFIED` name until it has.
+// build yet: that check is the desk operator's at G1 time, and the pin keeps its `-UNVERIFIED` name until it has.
 const SIGNET_GENESIS = "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6";
 // The 63-character value this constant held before P9-5 (one character short, with a different tail).
 const OLD_SIGNET_GENESIS = "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3628bea634";

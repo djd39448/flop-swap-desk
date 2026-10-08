@@ -100,7 +100,7 @@ export const BTC_REGTEST_PIN: BtcChainPin = {
 
 /** UNVERIFIED (P4-BTC-SPEC.md §4): this genesis hash is signet's well-known default value from
  *  public references (a public block explorer's signet API, 2026-10-05, G1-PREP section 4), never
- *  confirmed by this build against a live signet node — that confirmation is Dave's own G1 step
+ *  confirmed by this build against a live signet node — that confirmation is the desk operator's own G1 step
  *  (`bitcoin-cli -signet getblockhash 0` must print exactly `genesisHash` below), and the
  *  `-UNVERIFIED` suffix stays on `name` until it has been. Do not use this pin for a real
  *  deployment until it has; `connect()`'s own genesis check will simply refuse a live signet node

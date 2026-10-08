@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: MIT
 //
-// The dedicated G0 rehearsal poster (Dave, 2026-09-18: "dedicated poster", "parametric").
+// The dedicated G0 rehearsal poster (the desk operator, 2026-09-18: "dedicated poster", "parametric").
 // Regenerates the approved plan at the real t0 (same nonce seed, same preimage: only the
 // timestamp fields change), then plays both sides of ONE two-leg PaperRail swap on the venue,
 // posting only the plan's byte-identical lines through the signed lane, verifying each write by

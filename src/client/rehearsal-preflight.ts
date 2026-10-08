@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// P9-6 (rule 4, "nothing public before Dave"): the pre-flight of the EVM rehearsal runner. It reads the chain a swap would run
+// P9-6 (rule 4, "nothing public before the desk operator says so"): the pre-flight of the EVM rehearsal runner. It reads the chain a swap would run
 // on and answers, row by row, whether the swap can go: the dry run (the runner's default) prints this table and sends nothing,
 // and `--yes` runs the same checks first and refuses to broadcast unless every row that is needed holds. Every call here is a
 // READ (`eth_chainId`, `eth_getCode`, `eth_getBlockByNumber`, `eth_call`, `eth_getLogs`, `eth_getBalance`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_getTransactionCount`); no

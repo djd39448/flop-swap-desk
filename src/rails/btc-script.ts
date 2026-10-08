@@ -46,7 +46,7 @@ export const BTC_REGTEST_NETWORK: BTC_NETWORK = { bech32: "bcrt", pubKeyHash: 11
 /** Signet reuses testnet's base58/bech32 version bytes, including the `tb` HRP (signet and
  *  testnet3 addresses are not distinguishable by HRP alone). Present so the type exists for
  *  P4-BTC-SPEC.md §4's `BTC_SIGNET_PIN`; not verified against a live signet node by this build
- *  (Dave's own G1 step) — see the "UNVERIFIED" pin in src/rails/btc-htlc.ts. */
+ *  (the desk operator's own G1 step) — see the "UNVERIFIED" pin in src/rails/btc-htlc.ts. */
 export const BTC_SIGNET_NETWORK: BTC_NETWORK = { bech32: "tb", pubKeyHash: 111, scriptHash: 196, wif: 239 };
 
 const COMPRESSED_PUBKEY_LENGTH = 33;
