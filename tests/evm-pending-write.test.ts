@@ -637,6 +637,26 @@ describe("P94-FUND-01: the claim's hash is shown the moment it is broadcast, and
       }
     });
 
+    // R5-PIN-01 (the main loop's read of fix pass 4): the cap is Base Sepolia's only. Every other claim wait in the suites is at or under 180 s, so without this case the
+    // chain-id condition could be dropped and every test would still pass.
+    it("R5-PIN-01: on anvil (31337) the claim keeps its receiptTimeoutMs: a 400 s wait is not cut to 180 s", async () => {
+      const r = await pairedSwap({ chainId: 31337, receiptTimeoutMs: 400_000 });
+      const lockA = await r.buyer.lockLegA();
+      r.node.holdNextSend("claim");
+      vi.useFakeTimers();
+      try {
+        const claim = await settleWithin(caught(r.seller.claimLegA(lockA.hashLock)), 500_000);
+        expect(claim.elapsedMs, "the claim's wait ended").toBeDefined();
+        expect(claim.elapsedMs!).toBeGreaterThan(EVM_CLAIM_RECEIPT_WAIT_MS_BASE_SEPOLIA + 60_000);
+        expect(claim.elapsedMs!).toBeLessThanOrEqual(402_000);
+        expect(claim.value).toBeInstanceOf(EvmReceiptTimeoutError);
+        expect((claim.value as EvmReceiptTimeoutError).write).toBe("claim");
+        expect((claim.value as EvmReceiptTimeoutError).timeoutMs).toBe(400_000);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("a receiptTimeoutMs below 180 s is kept for the claim (the cap only lowers)", async () => {
       const r = await pairedSwap({ chainId: 84532, receiptTimeoutMs: 20_000 });
       const lockA = await r.buyer.lockLegA();
