@@ -1465,19 +1465,38 @@ export class BtcHtlcRail {
   }
 
   /**
-   * P10 B7, READ-ONLY (it never sends): what became of the one claim whose txid the Seller recorded. The node is asked about the txid (`recoverFunding`: the
-   * mempool and, with the `-txindex=1` this rail already needs, the chain); known is `mined` once it has a confirmation, else `in-mempool`. Unknown: when
-   * the funding output is spent by another transaction (`gettxout` with the mempool answers nothing) the claim can no longer land: `spent-by-other`; otherwise
-   * `unknown`, and `resendClaim` decides. The txid is looked up once more before the `spent-by-other` verdict, so a claim that reached the node between the two
-   * reads is never called superseded.
+   * P10-FUND-02: what the node says of a claim txid, as `resendRefundIfDropped` reads a refund: `mined` ONLY with a confirmation on the best chain (`getrawtransaction` through the
+   * `-txindex=1` this rail needs), `in-mempool` ONLY when `getmempoolentry` knows the txid, otherwise `null`. `getrawtransaction` alone is not enough for the second: with a txindex it
+   * also answers for a transaction that sits in a block of a stale branch (confirmations 0 and a blockhash) while the node holds it nowhere, and a claim read as "in the mempool" in
+   * that state would never be sent again. Only Core's own "not found" answer (code -5) reads as absent; any other failure propagates (the R2-2 discipline). READ-ONLY.
+   */
+  private async claimTxPresence(claimTxid: string): Promise<"mined" | "in-mempool" | null> {
+    const known = await this.recoverFunding(claimTxid);
+    if (!known.broadcast) return null;
+    if (known.confirmations !== null && known.confirmations >= 1) return "mined";
+    try {
+      await this.request("getmempoolentry", [claimTxid]);
+      return "in-mempool";
+    } catch (error) {
+      if (!isRpcNotFound(error)) throw error;
+      return null;
+    }
+  }
+
+  /**
+   * P10 B7, READ-ONLY (it never sends): what became of the one claim whose txid the Seller recorded. The node is asked about the txid (`claimTxPresence`, P10-FUND-02): `mined` with
+   * a confirmation, `in-mempool` only while its mempool holds the transaction. Otherwise (never sent, dropped, or only in a block of a stale branch): when the funding output is
+   * spent by another transaction (`gettxout` with the mempool answers nothing) the claim can no longer land: `spent-by-other`; else `unknown`, and `resendClaim` (with the Seller's
+   * own bound, P10-FUND-01/03) decides. The txid is looked up once more before the `spent-by-other` verdict, so a claim that reached the node between the two reads is never called
+   * superseded.
    */
   async claimStatus(ref: string, claimTxid: string): Promise<BtcClaimStatus> {
     parseOutpointRef(ref);
-    const known = await this.recoverFunding(claimTxid);
-    if (known.broadcast) return known.confirmations !== null && known.confirmations >= 1 ? "mined" : "in-mempool";
+    const known = await this.claimTxPresence(claimTxid);
+    if (known !== null) return known;
     if (await this.fundingOutputUnspent(ref)) return "unknown";
-    const again = await this.recoverFunding(claimTxid);
-    if (again.broadcast) return again.confirmations !== null && again.confirmations >= 1 ? "mined" : "in-mempool";
+    const again = await this.claimTxPresence(claimTxid);
+    if (again !== null) return again;
     return "spent-by-other";
   }
 
@@ -1485,9 +1504,10 @@ export class BtcHtlcRail {
    * P10 B7: re-send the IDENTICAL recorded claim bytes, once, when the node no longer holds them. NEVER rebuilds or re-signs (identical bytes have one txid and
    * one fee, so this cannot create a second spend), and reveals nothing the first send did not: the preimage is in the bytes. First the bytes are checked
    * locally: they must decode, hash to `claimTxid` and spend exactly the outpoint `ref` (a record that was edited into some other transaction is refused before
-   * any call). Then, in order: the node already holds the txid (`mined` or `in-mempool`, nothing sent); the funding output is spent by another transaction
-   * (`spent-by-other`, nothing sent); otherwise `options.notAfterMs`, when given, is checked against fresh chain time as the last read (a claim that may never
-   * have been sent is a first claim and keeps its deadline; a claim known to have been sent passes none, the secret being public already), and
+   * any call). Then, in order: the node already holds the txid (`mined` with a confirmation, `in-mempool` only when `getmempoolentry` knows it: a transaction that only a
+   * stale branch's block holds is neither, P10-FUND-02; nothing sent); the funding output is spent by another transaction
+   * (`spent-by-other`, nothing sent); otherwise `options.notAfterMs`, when given, is checked against fresh chain time as the last read (the Seller passes it unless leg B's note
+   * already reads claimed with the secret, P10-FUND-01/03), and
    * `testmempoolaccept` then `sendrawtransaction` run with Core's "already known" answer counting as success. A refusal by `testmempoolaccept` (the inputs gone, a
    * policy rejection such as a mempool minimum fee that has risen) is a `BtcBroadcastRefusedError`: a person decides, the claim is never re-priced.
    */
@@ -1515,12 +1535,13 @@ export class BtcHtlcRail {
     const before = this.rpc.exchanges().length;
     const done = (outcome: BtcClaimResend) => ({ outcome, txid: claimTxid, raw: this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256) });
 
-    const known = await this.recoverFunding(claimTxid);
-    if (known.broadcast) return done(known.confirmations !== null && known.confirmations >= 1 ? "mined" : "in-mempool");
+    // P10-FUND-02: "held" means the mempool has it or a block of the best chain does; a transaction only in a stale branch's block is neither, and is sent below (funding unspent)
+    const known = await this.claimTxPresence(claimTxid);
+    if (known !== null) return done(known);
     const txout = await this.request<Record<string, unknown> | null>("gettxout", [fundTxid, fundVout, true]);
     if (txout === null) {
-      const again = await this.recoverFunding(claimTxid);
-      if (again.broadcast) return done(again.confirmations !== null && again.confirmations >= 1 ? "mined" : "in-mempool");
+      const again = await this.claimTxPresence(claimTxid);
+      if (again !== null) return done(again);
       return done("spent-by-other");
     }
     if (options.notAfterMs !== undefined) await this.assertChainTimeBeforeOrThrow(options.notAfterMs);

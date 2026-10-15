@@ -5,7 +5,8 @@
 //
 //   BtcHtlcRail.claim        record before send: `onSigned` hears of the claim's txid and exact bytes after signing, before the deadline read (which stays the last
 //                            read) and before anything is sent; `onNotBroadcast` hears of a claim that provably never reached the network
-//   BtcHtlcRail.claimStatus  READ-ONLY: mined, in the mempool, unknown (dropped or never sent, funding unspent) or spent by another transaction
+//   BtcHtlcRail.claimStatus  READ-ONLY: mined (a confirmation), in the mempool (`getmempoolentry` knows it, P10-FUND-02), unknown (dropped or never sent, or only in a block of a
+//                            stale branch, funding unspent) or spent by another transaction
 //   BtcHtlcRail.resendClaim  the IDENTICAL bytes, never a rebuild: checked against the txid and the outpoint first, then "already held", "spent by another", the optional
 //                            last-moment deadline, `testmempoolaccept`, send
 //   BtcHtlcRail.claimMined   a MINED spend by the hash branch (the block scan without the mempool step)
@@ -82,12 +83,19 @@ interface NodeState {
   blocks: Array<Array<{ vin: Array<{ txid: string; vout: number; txinwitness?: string[] }> }>>;
   mempoolSpend: { txid: string; witness: string[] } | null;
   tipTimeSeconds: number;
+  /**
+   * P10-FUND-02: `getrawtransaction` answers the claim's txid with `confirmations: 0` and a `blockhash` (with `-txindex=1` Core does that for a transaction that sits in a block of a stale
+   * branch) while `getmempoolentry` does not know it: the node holds the transaction nowhere. Needs `claimConfirmations: 0`.
+   */
+  staleBlock: boolean;
+  /** Core's code for a failed `getmempoolentry` of a txid the mempool does not hold: -5 ("not in mempool") by default; any other code is a failure that must propagate. */
+  mempoolEntryCode: number;
   /** Called when the node answers `gettxout` (a test uses it to let the claim reach the node between two of the rail's reads). */
   onGetTxOut?: () => void;
 }
 
 function freshState(): NodeState {
-  return { claimConfirmations: null, fundingUnspent: true, accept: { allowed: true }, notFoundCode: -5, blocks: [], mempoolSpend: null, tipTimeSeconds: CHAIN_TIME_S };
+  return { claimConfirmations: null, fundingUnspent: true, accept: { allowed: true }, notFoundCode: -5, blocks: [], mempoolSpend: null, tipTimeSeconds: CHAIN_TIME_S, staleBlock: false, mempoolEntryCode: -5 };
 }
 
 function mockNode(state: NodeState, claimHex: string, claimId: string): { fetch: typeof fetch; calls: Call[] } {
@@ -103,7 +111,11 @@ function mockNode(state: NodeState, claimHex: string, claimId: string): { fetch:
         if (params[0] !== claimId) throw Object.assign(new Error("No such mempool or blockchain transaction"), { code: -5 });
         if (state.claimConfirmations === null) throw Object.assign(new Error(state.notFoundCode === -5 ? "No such mempool or blockchain transaction" : "node trouble"), { code: state.notFoundCode });
         const vin = state.mempoolSpend === null ? {} : { vin: [{ txid: FUND_TXID, vout: FUND_VOUT, txinwitness: state.mempoolSpend.witness }] };
-        return state.claimConfirmations >= 1 ? { txid: claimId, confirmations: state.claimConfirmations, blockhash: "cc".repeat(32), ...vin } : { txid: claimId, ...vin };
+        return state.claimConfirmations >= 1 || state.staleBlock ? { txid: claimId, confirmations: state.claimConfirmations, blockhash: "cc".repeat(32), ...vin } : { txid: claimId, ...vin };
+      }
+      case "getmempoolentry": {
+        if (params[0] === claimId && state.claimConfirmations === 0 && !state.staleBlock) return { vsize: 150, weight: 600, fees: { base: 0.00001 } };
+        throw Object.assign(new Error(state.mempoolEntryCode === -5 ? "Transaction not in mempool" : "node trouble (mempool)"), { code: state.mempoolEntryCode });
       }
       case "gettxout":
         state.onGetTxOut?.();
@@ -219,11 +231,31 @@ describe("P10 B7: BtcHtlcRail.claimStatus (READ-ONLY)", () => {
     ["mined (many)", { claimConfirmations: 9 }, "mined"],
     ["unknown to the node, funding unspent", { claimConfirmations: null, fundingUnspent: true }, "unknown"],
     ["unknown to the node, funding spent by another transaction", { claimConfirmations: null, fundingUnspent: false }, "spent-by-other"],
+    // P10-FUND-02: `getrawtransaction` alone said "in the mempool" for a transaction that only a block of a stale branch holds
+    ["in a block of a stale branch (confirmations 0 and a blockhash), not in the mempool, funding unspent", { claimConfirmations: 0, staleBlock: true, fundingUnspent: true }, "unknown"],
+    ["in a block of a stale branch, funding spent by another transaction", { claimConfirmations: 0, staleBlock: true, fundingUnspent: false }, "spent-by-other"],
   ] as const)("%s", async (_label, patch, expected) => {
     const state = { ...freshState(), ...patch };
     const { rail, calls } = await connect(state);
     expect(await rail.claimStatus(REF, CLAIM.id)).toBe(expected);
     for (const sending of ["sendrawtransaction", "testmempoolaccept", "walletprocesspsbt", "walletcreatefundedpsbt"]) expect(methods(calls), sending).not.toContain(sending);
+  });
+
+  it("P10-FUND-02: the mempool is asked only about a transaction the node knows without a confirmation; a mined claim never reaches that read", async () => {
+    const mined = await connect({ ...freshState(), claimConfirmations: 3 });
+    expect(await mined.rail.claimStatus(REF, CLAIM.id)).toBe("mined");
+    expect(methods(mined.calls)).not.toContain("getmempoolentry");
+    const held = await connect({ ...freshState(), claimConfirmations: 0 });
+    expect(await held.rail.claimStatus(REF, CLAIM.id)).toBe("in-mempool");
+    expect(sentTo(held.calls, "getmempoolentry")).toEqual([[CLAIM.id]]);
+    const unknown = await connect(freshState());
+    expect(await unknown.rail.claimStatus(REF, CLAIM.id)).toBe("unknown");
+    expect(methods(unknown.calls)).not.toContain("getmempoolentry"); // getrawtransaction said not found: there is nothing to ask the mempool
+  });
+
+  it("P10-FUND-02: a getmempoolentry failure that is not Core's own 'not in mempool' answer propagates: it is never read as 'unknown' (nor as 'in the mempool')", async () => {
+    const { rail } = await connect({ ...freshState(), claimConfirmations: 0, staleBlock: true, mempoolEntryCode: -32603 });
+    await expect(rail.claimStatus(REF, CLAIM.id)).rejects.toThrow(/node trouble \(mempool\)/);
   });
 
   it("a claim that reaches the node between the two reads is never called superseded", async () => {
@@ -273,6 +305,19 @@ describe("P10 B7: BtcHtlcRail.resendClaim sends the IDENTICAL recorded bytes, an
       expect(methods(calls)).not.toContain("sendrawtransaction");
       expect(methods(calls)).not.toContain("testmempoolaccept");
     }
+  });
+
+  it("P10-FUND-02: a claim that only a block of a stale branch holds (confirmations 0 and a blockhash, not in the mempool) is sent again while the funding output is unspent: the recorded bytes, nothing signed", async () => {
+    const { rail, calls } = await connect({ ...freshState(), claimConfirmations: 0, staleBlock: true });
+    const resent = await rail.resendClaim(REF, CLAIM.id, CLAIM.hex);
+    expect(resent.outcome).toBe("in-mempool");
+    expect(sentTo(calls, "testmempoolaccept")).toEqual([[[CLAIM.hex]]]);
+    expect(sentTo(calls, "sendrawtransaction")).toEqual([[CLAIM.hex]]);
+    for (const wallet of ["walletprocesspsbt", "walletcreatefundedpsbt", "estimatesmartfee"]) expect(methods(calls), wallet).not.toContain(wallet);
+    // and with the funding output spent by another transaction it is still not sent
+    const spent = await connect({ ...freshState(), claimConfirmations: 0, staleBlock: true, fundingUnspent: false });
+    expect((await spent.rail.resendClaim(REF, CLAIM.id, CLAIM.hex)).outcome).toBe("spent-by-other");
+    expect(methods(spent.calls)).not.toContain("sendrawtransaction");
   });
 
   it("a funding output spent by another transaction is NOT re-sent: spent-by-other, nothing tested, nothing sent", async () => {
@@ -426,6 +471,13 @@ describe("P10 B7: the same through the wrapper (ConnectedBtcCounterRail)", () =>
     expect((error as RailRecoveryRefusedError).code).toBe("rebroadcast-refused");
     expect((error as RailRecoveryRefusedError).message).toContain(CLAIM.id);
     expect((error as RailRecoveryRefusedError).message).toContain("not re-signed and not re-priced");
+  });
+
+  it("P10-FUND-02: the wrapper reads a claim that only a stale branch's block holds as unknown, and its re-send sends the recorded bytes", async () => {
+    const { connected, calls } = await wrapped({ ...freshState(), claimConfirmations: 0, staleBlock: true });
+    expect(await connected.claimTxStatus?.(REF, handle())).toBe("unknown");
+    expect(await connected.resendClaimTx?.(REF, handle())).toBe("in-mempool");
+    expect(sentTo(calls, "sendrawtransaction")).toEqual([[CLAIM.hex]]);
   });
 
   it("claimIsMined reads the block scan from the marker (a number), 0 when there is none", async () => {

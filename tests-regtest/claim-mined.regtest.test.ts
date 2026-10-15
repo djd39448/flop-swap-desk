@@ -13,6 +13,8 @@
 //      process makes no wallet signing call, one `testmempoolaccept` and one `sendrawtransaction` carrying exactly the recorded bytes, the mempool holds the same txid again,
 //      and a block settles the swap (the Buyer takes leg B with the secret)
 //   4  a funding output spent by another transaction (the Buyer's refund, after the claim dropped) is NOT re-sent: `ClaimSupersededError`, nothing sent, no claim in the mempool
+//   5  (P10-FUND-02) a claim mined, then reorged out (`invalidateblock`) and dropped from the mempool is read as unknown, not "in the mempool" (with a txindex Core still answers
+//      `getrawtransaction` for it with no confirmation and a blockhash): the restarted process sends the SAME bytes, again with no signing call
 // `npm run test:regtest` only; `npm test` never spawns bitcoind.
 
 import { mkdtemp, rm } from "node:fs/promises";
@@ -313,5 +315,42 @@ describe("P10 B7 on bitcoind regtest: a claim the node dropped is sent again as 
     expect(await mempoolOf(node)).not.toContain(txid);
     expect((await w.sellerRecord(acceptA.contract)).claimOutcome).toBe("none"); // never counted as landed
     expect(await w.frames(acceptA.contract, "receipt")).toBe(0);
+  }, 180_000);
+
+  it("5: P10-FUND-02: a claim mined and then reorged out (invalidateblock) and dropped from the mempool is read as unknown, not as 'in the mempool': the restarted process sends the SAME bytes", async () => {
+    const w = await buildSwap(node, config);
+    const { sellerFlow, acceptA, statement, swapId } = await w.pairAndLock();
+    const pending = await claimBroadcast(sellerFlow, statement);
+    const txid = pending.txid as string;
+    const recorded = (await w.sellerRecord(acceptA.contract)).claimTx;
+    expect(recorded?.txid).toBe(txid);
+
+    const [minedHash] = await node.mine(1); // the claim is in a block
+    expect(await mempoolOf(node)).not.toContain(txid);
+    await node.rpcCall("invalidateblock", [minedHash as string]); // that block leaves the best chain: its transactions go back to the mempool...
+    await expireMempool(); // ...and the node's one-hour expiry then drops them
+    expect(await mempoolOf(node)).not.toContain(txid); // the premise: the node holds the claim nowhere
+    // with a txindex Core still answers for a transaction that sits in a block of a stale branch: no confirmation, but a blockhash
+    const stale = await node.rpcCall<{ confirmations?: number; blockhash?: string }>("getrawtransaction", [txid, true]);
+    expect(stale.blockhash, "getrawtransaction names the stale block").toBe(minedHash);
+    expect(stale.confirmations ?? 0, "and reports no confirmation").toBe(0);
+    const [fundTxid, fundVout] = (await w.sellerRecord(acceptA.contract)).frozenLegARailRef!.split(":");
+    expect(await node.rpcCall("gettxout", [fundTxid, Number(fundVout), true])).not.toBeNull(); // the funding output is unspent in the best chain
+
+    const restarted = await w.restartSeller(swapId, acceptA.contract);
+    expect(restarted.next).toBe("claimLegA");
+    const outcome = await restarted.flow.claimLegA(statement).then(() => undefined, (error: unknown) => error);
+    expect(outcome, "back in the mempool, not mined").toBeInstanceOf(ClaimNotMinedError);
+    expect(signingCalls(restarted.calls), "no new claim was signed or built").toBe(0);
+    expect(restarted.calls.count("testmempoolaccept")).toBe(1);
+    expect(restarted.calls.count("sendrawtransaction")).toBe(1);
+    const send = restarted.calls.requests.find((call) => call.method === "sendrawtransaction");
+    expect((send?.params as string[])[0]).toBe(recorded?.rawTx); // the identical recorded bytes
+    expect(await mempoolOf(node)).toContain(txid);
+
+    await node.mine(1);
+    const claimed = await restarted.flow.claimLegA(statement);
+    expect(claimed.receipt).toBeDefined();
+    expect((await w.sellerRecord(acceptA.contract)).claimOutcome).toBe("landed");
   }, 180_000);
 });
