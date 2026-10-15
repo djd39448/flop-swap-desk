@@ -8,7 +8,8 @@
 //   1  a claim that is broadcast and NOT mined leaves the Seller at its claim step (`ClaimNotMinedError`, `next` is `claimLegA`, the reveal is posted, no receipt, the claim's
 //      txid and exact bytes are in the stored record from before the send), and the claim sits in the node's mempool; one block settles it as before
 //   2  a restarted Seller whose claim is still in the mempool signs, tests and sends NOTHING (the node holds it); a block later it settles
-//   3  a claim that left the mempool unmined (a real eviction, `-mempoolexpiry=1`) is sent again as the SAME bytes by a restarted process, also after the claim-by: the new
+//   3  a claim that left the mempool unmined (a real eviction, `-mempoolexpiry=1`) is sent again as the SAME bytes by a restarted process, also after the claim-by (and before
+//      leg A's refund time minus the claim-inclusion margin: past that the re-send needs leg B claimed with the secret, P10-FUND-03, hermetic in flow-claim-mined-btc): the new
 //      process makes no wallet signing call, one `testmempoolaccept` and one `sendrawtransaction` carrying exactly the recorded bytes, the mempool holds the same txid again,
 //      and a block settles the swap (the Buyer takes leg B with the secret)
 //   4  a funding output spent by another transaction (the Buyer's refund, after the claim dropped) is NOT re-sent: `ClaimSupersededError`, nothing sent, no claim in the mempool
@@ -256,7 +257,7 @@ describe("P10 B7 on bitcoind regtest: a claim the node dropped is sent again as 
     const [fundTxid, fundVout] = (await w.sellerRecord(acceptA.contract)).frozenLegARailRef!.split(":");
     expect(await node.rpcCall("gettxout", [fundTxid, Number(fundVout), true])).not.toBeNull(); // and the funding output is unspent
 
-    w.clockRef.ms = offerA.claimByMs + 60 * 60_000; // past the claim-by: the first-claim guard would refuse a NEW claim now
+    w.clockRef.ms = offerA.claimByMs + 30 * 60_000; // past the claim-by (the first-claim guard would refuse a NEW claim now) and before leg A's refund time minus the 60 minute margin (P10-FUND-03's bound for an accepted claim)
     const restarted = await w.restartSeller(swapId, acceptA.contract);
     expect(restarted.next).toBe("claimLegA");
     const outcome = await restarted.flow.claimLegA(statement).then(() => undefined, (error: unknown) => error);

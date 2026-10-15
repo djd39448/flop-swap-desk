@@ -10,8 +10,10 @@
 //      (the secret is public and tclk takes a reveal only before refundAfterMs) and the claim's txid and exact bytes saved BEFORE it was sent;
 //   2  mined, it settles as before (receipt, `claimOutcome` landed, `done`); with a chain that mines at once, one call settles;
 //   3  a claim the node still holds is never sent again, in this process or after a restart; the Buyer still learns the secret from the mempool;
-//   4  a claim that left the mempool unmined is sent again as the SAME bytes while leg A's funding output is unspent, also after the claim-by
-//      and after leg A's refund time (the secret is public already), and never as a new spend with another fee (claims built stays 1);
+//   4  a claim that left the mempool unmined is sent again as the SAME bytes while leg A's funding output is unspent, also after the claim-by, never as a new
+//      spend with another fee (claims built stays 1), and under the bound of P10-FUND-01/03 (P10-FIXES-R1.md decision 1): at any time once leg B's note reads
+//      claimed with this swap's secret (the Buyer holds leg B), else for a claim the node had accepted only before leg A's refund time minus the claim-inclusion
+//      margin (past it the typed ClaimResendTooLateError, nothing sent);
 //   5  a claim that may never have been sent (signed and saved, the process died before the send) is a FIRST claim: its re-send keeps every guard;
 //   6  a funding output spent by another transaction is not re-sent;
 //   7  a node that refuses the saved bytes is a typed error for a person, nothing new is built.
@@ -22,7 +24,8 @@ import { describe, expect, it } from "vitest";
 import { RailRecoveryRefusedError } from "../src/client/counter-rail.js";
 import { decodeFlowRecord, encodeFlowRecord, redactFlowRecord, type SellerFlowRecord } from "../src/client/flow-record.js";
 import { flowDigest } from "../src/client/flow-store.js";
-import { ClaimNotMinedError, ClaimSupersededError, SellerFlow } from "../src/client/seller.js";
+import { BTC_LOCAL_POLICY } from "../src/client/policy.js";
+import { ClaimNotMinedError, ClaimResendTooLateError, ClaimSupersededError, SellerFlow } from "../src/client/seller.js";
 import { Controller, PREFIX, STEPS, frameCounts, readSwap, type Ctx, type Mode, type World } from "./helpers/crash-matrix.js";
 import { BuyerFlow } from "../src/client/buyer.js";
 import { sellerKeyOf } from "./helpers/seller-key.js";
@@ -45,6 +48,14 @@ async function lockedWorld(options: { autoMine?: boolean; steps?: Parameters<typ
 }
 
 const dealRoomA = async (w: World): Promise<string> => dealRoom((await contractsOf(w)).contractA);
+
+/** The Buyer learns the secret (the reveal frame, or the mempool) and takes leg B: leg B's paper note then reads claimed with this swap's secret. */
+const buyerTakesLegB = async (s: Started): Promise<void> => {
+  await s.c.buyer.claimLegB(await s.c.buyer.learnSecret());
+};
+
+/** The last moment a saved claim may be sent again without leg B claimed: leg A's refund time minus the policy's claim-inclusion margin (the rail's last-moment guard). */
+const notAfterMsOf = (w: World): number => w.refundAt.legA - BTC_LOCAL_POLICY.claimInclusionMarginMs;
 
 async function legAFrames(w: World): Promise<{ reveal: number; receipt: number }> {
   const counts = await frameCounts(w, await dealRoomA(w));
@@ -213,8 +224,9 @@ describe("P10 B7: a claim that left the mempool unmined is sent again as the SAM
     expect(chain.knownTxs.has(txid)).toBe(true);
   });
 
-  it("after leg A's refund time, while the funding output is still unspent: re-sent in a restarted process, the same bytes", async () => {
+  it("after leg A's refund time, while the funding output is still unspent and the Buyer holds leg B: re-sent in a restarted process, the same bytes", async () => {
     const { s, chain, statement, txid, rawTx } = await evicted();
+    await buyerTakesLegB(s); // P10-FUND-03: past refundAfterMs minus the margin the re-send needs leg B claimed with the secret (the reveal frame is in the room)
     s.w.setTime(s.w.refundAt.legA + 60 * 60_000);
     const back = await resumedSeller(s);
     expect(back.next).toBe("claimLegA");
@@ -360,6 +372,131 @@ describe("P10 B7: a claim that may never have been sent is a FIRST claim and kee
     expect(chain.counts).toMatchObject({ claimBuilt: 0, claimSent: 0 });
     expect((await sellerRecordOf(s.w)).claimTx).toBeUndefined();
     expect((await sellerRecordOf(s.w)).claimAttempted).toBe(false);
+  });
+});
+
+// P10-FUND-01 and P10-FUND-03 (P10-FIXES-R1.md decision 1). The earlier reasoning ("the secret is already public, so a re-send reveals nothing new") fails when the first broadcast
+// was evicted before the Buyer saw it: the re-send is then the Buyer's first chance to learn the secret, and one sent after leg B's claim-by could take leg A from a Buyer who can no longer
+// claim leg B. The rule, for a recorded claim the node no longer knows while leg A's funding output is unspent: (a) leg B's note reads claimed with this swap's secret: re-send at any time,
+// `sent` or not; (b) else for a claim marked `sent`: only before leg A's refund time minus the claim-inclusion margin, else ClaimResendTooLateError; (c) else every first-claim guard.
+describe("P10-FUND-01: the Buyer already holds leg B: the saved claim is sent again at any time, also when it was never marked sent", () => {
+  it.each([
+    ["past the claim-by", (_s: Started, claimByMs: number): number => claimByMs + 10 * 60_000],
+    ["past leg A's refund time", (s: Started, _claimByMs: number): number => s.w.refundAt.legA + 60 * 60_000],
+  ] as const)(
+    "the node accepted the claim, the mark was lost with the process, the Buyer took leg B from the mempool, the claim was evicted: %s, the identical bytes go out once",
+    async (_label, when) => {
+      const { s, chain, statement } = await diedBeforeClaimSend("after-store-fail");
+      const { txid, rawTx, sent } = await claimTxOf(s.w);
+      expect(sent).toBeUndefined(); // the premise: the record never learned that the node accepted the claim
+      expect(chain.knownTxs.has(txid)).toBe(true); // ...which it did
+      await buyerTakesLegB(s); // no reveal frame was ever posted: the Buyer reads the mempool
+      expect(await legAFrames(s.w)).toEqual({ reveal: 0, receipt: 0 });
+      chain.evictClaim(txid);
+      s.w.setTime(when(s, (await readSwap(s.w)).offerA!.claimByMs));
+
+      const back = await resumedSeller(s);
+      expect(back.next).toBe("claimLegA");
+      expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError); // back in the mempool, not mined
+      expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 2, rebroadcasts: 1 });
+      expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
+      expect(chain.knownTxs.has(txid)).toBe(true);
+      expect(await claimTxOf(s.w)).toEqual({ txid, rawTx, sent: true });
+      chain.mine();
+      await back.flow.claimLegA(statement);
+      expect(await legAFrames(s.w)).toEqual({ reveal: 1, receipt: 1 });
+    },
+  );
+
+  it("control: the same premise with leg B NOT claimed keeps every first-claim guard: past the claim-by nothing is sent", async () => {
+    const { s, chain, statement } = await diedBeforeClaimSend("after-store-fail");
+    const { txid } = await claimTxOf(s.w);
+    chain.evictClaim(txid);
+    s.w.setTime((await readSwap(s.w)).offerA!.claimByMs + 10 * 60_000);
+    const back = await resumedSeller(s);
+    const error = await rejection(back.flow.claimLegA(statement));
+    expect((error as Error).message).toMatch(/at\/after its claimByMs/);
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 1, rebroadcasts: 0 });
+    expect((await claimTxOf(s.w)).sent).toBeUndefined();
+  });
+});
+
+describe("P10-FUND-03: a claim the node accepted and dropped is sent again only while it can still land before leg A's refund time, unless the Buyer holds leg B", () => {
+  async function acceptedThenEvicted(): Promise<{ s: Started; chain: LedgerChain; statement: string; txid: string; rawTx: string }> {
+    const { s, chain, statement } = await lockedWorld();
+    await rejection(s.c.seller.claimLegA(statement));
+    const { txid, rawTx, sent } = await claimTxOf(s.w);
+    expect(sent).toBe(true);
+    chain.evictClaim(txid);
+    return { s, chain, statement, txid, rawTx };
+  }
+
+  it.each([
+    ["exactly at the bound (refundAfterMs minus the margin)", (s: Started) => notAfterMsOf(s.w)],
+    ["inside the margin, before leg A's refund time", (s: Started) => s.w.refundAt.legA - 30 * 60_000],
+    ["past leg A's refund time", (s: Started) => s.w.refundAt.legA + 60 * 60_000],
+  ] as const)("leg B unclaimed, %s: ClaimResendTooLateError, nothing is sent, in this process and in a restarted one", async (_label, when) => {
+    const { s, chain, statement, txid, rawTx } = await acceptedThenEvicted();
+    s.w.setTime(when(s));
+    const before = { ...chain.counts };
+    const error = await rejection(s.c.seller.claimLegA(statement));
+    expect(error).toBeInstanceOf(ClaimResendTooLateError);
+    const tooLate = error as ClaimResendTooLateError;
+    expect(tooLate.txid).toBe(txid);
+    expect(tooLate.notAfterMs).toBe(notAfterMsOf(s.w));
+    expect(tooLate.message).toContain("Nothing was sent");
+    expect(tooLate.message).toContain("may be refunding leg A");
+    expect(tooLate.message).toContain("without the time to claim leg B");
+    expect(tooLate.message).toContain("call claimLegA() again");
+    expect(chain.counts).toEqual(before);
+    expect(chain.knownTxs.has(txid)).toBe(false);
+    expect(await claimTxOf(s.w)).toEqual({ txid, rawTx, sent: true }); // the record is untouched
+    const back = await resumedSeller(s);
+    expect(back.next).toBe("claimLegA");
+    expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimResendTooLateError);
+    expect(chain.counts).toEqual(before);
+    expect((await sellerRecordOf(s.w)).receiptPosted).toBe(false);
+  });
+
+  it("the refusal is not for ever: once the Buyer has claimed leg B with the secret, the next claimLegA sends the saved bytes once", async () => {
+    const { s, chain, statement, txid, rawTx } = await acceptedThenEvicted();
+    s.w.setTime(s.w.refundAt.legA + 60 * 60_000);
+    expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimResendTooLateError);
+    await buyerTakesLegB(s); // the reveal frame has been in the room since the first broadcast
+    expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 2, rebroadcasts: 1 });
+    expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
+    expect(chain.knownTxs.has(txid)).toBe(true);
+  });
+
+  it("leg B claimed with the secret, past the bound: one identical re-send, whatever the clock says", async () => {
+    const { s, chain, statement, txid, rawTx } = await acceptedThenEvicted();
+    await buyerTakesLegB(s);
+    s.w.setTime(s.w.refundAt.legA + 60 * 60_000);
+    expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 2, rebroadcasts: 1 });
+    expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
+    chain.mine();
+    await s.c.seller.claimLegA(statement);
+    expect(await legAFrames(s.w)).toEqual({ reveal: 1, receipt: 1 });
+  });
+
+  it("leg B unclaimed, one millisecond before the bound: one identical re-send (as before this fix)", async () => {
+    const { s, chain, statement, txid, rawTx } = await acceptedThenEvicted();
+    s.w.setTime(notAfterMsOf(s.w) - 1);
+    expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 2, rebroadcasts: 1 });
+    expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
+    expect(chain.knownTxs.has(txid)).toBe(true);
+  });
+
+  it("a funding output spent by the Buyer's refund is still ClaimSupersededError, not the too-late refusal (nothing is sent)", async () => {
+    const { s, chain, statement } = await acceptedThenEvicted();
+    s.w.setTime(s.w.refundAt.legA);
+    await s.c.buyer.refundLegA();
+    const before = { ...chain.counts };
+    expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimSupersededError);
+    expect(chain.counts).toEqual(before);
   });
 });
 

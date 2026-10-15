@@ -127,10 +127,12 @@
 // (`claimTx`); once the node accepts it the reveal frame is posted (the secret is public, and tclk's machine takes a reveal only before refundAfterMs, so it
 // cannot wait for a block) but NOT the receipt, `claimOutcome` stays `none`, `next` stays `claimLegA`, and `claimLegA` throws `ClaimNotMinedError` ("broadcast,
 // not mined"); a later `claimLegA` reads the chain: mined settles (the receipt is posted, `claimOutcome` is `landed`); still in the mempool it is the same
-// error and sends nothing; dropped while leg A's funding output is unspent it sends the IDENTICAL saved bytes again (never a new spend with another fee), past
-// the claim-by too once the node has accepted the claim before (the secret is public already, so the re-send reveals nothing new); a funding output spent by
-// another transaction is not re-sent (`ClaimSupersededError`). A claim that is only recorded and may never have been sent is a FIRST claim: its re-send keeps
-// every guard of one. Every other rail is unchanged.
+// error and sends nothing; dropped while leg A's funding output is unspent it sends the IDENTICAL saved bytes again (never a new spend with another fee), under the
+// bound of P10-FUND-01/03 (`resendUnknownClaim`): at any time once leg B's note reads claimed with this swap's secret (the Buyer holds leg B, so the secret is public);
+// else, for a claim the node had accepted (`sent`), only before leg A's refund time minus the claim-inclusion margin (past it: `ClaimResendTooLateError`, nothing sent:
+// the first broadcast may have been evicted before the Buyer saw the secret, and a late claim could leave the Buyer without time to claim leg B); a funding output spent
+// by another transaction is not re-sent (`ClaimSupersededError`). A claim that is only recorded and may never have been sent is a FIRST claim: its re-send keeps every
+// guard of one. Every other rail is unchanged.
 //
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
 // B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a;
@@ -380,6 +382,32 @@ export class ClaimSupersededError extends Error {
     this.name = "ClaimSupersededError";
     this.txid = txid;
     this.sent = sent;
+  }
+}
+
+/**
+ * P10 B7 (P10-FUND-03, Bitcoin only): the node accepted this flow's claim earlier, no longer holds it, and leg A's funding output is still unspent, but leg B's note does not show the Buyer
+ * taking leg B with this swap's secret, and it is too late to send the saved claim again: the last moment (`notAfterMs`, leg A's refund time minus the claim-inclusion margin) has passed.
+ * A claim that lands late could leave the Buyer, who may be refunding leg A, without the time to claim leg B. Nothing was sent. If the Buyer does take leg B, a later `claimLegA()` sends the
+ * saved claim at once (the secret is then demonstrably public). Nothing here is secret: a txid and two times.
+ */
+export class ClaimResendTooLateError extends Error {
+  readonly txid: string;
+  readonly refundAfterMs: number;
+  readonly notAfterMs: number;
+  constructor(txid: string, refundAfterMs: number, notAfterMs: number) {
+    const iso = (ms: number): string => (Number.isSafeInteger(ms) && Math.abs(ms) <= 8.64e15 ? new Date(ms).toISOString() : String(ms));
+    super(
+      `seller: the claim of leg A (transaction ${txid}) was accepted by the node earlier but the node no longer holds it, and leg A's funding output is still unspent. ` +
+        `It is NOT sent again now: the last safe moment to send it was ${iso(notAfterMs)} (leg A's refund time ${iso(refundAfterMs)} minus the claim-inclusion margin), and a claim that lands later could ` +
+        "leave the Buyer, who may be refunding leg A, without the time to claim leg B. Nothing was sent. " +
+        "A person can read leg B's note and leg A's funding output by hand: once the Buyer has claimed leg B with this swap's secret, call claimLegA() again and the saved claim is sent at once; " +
+        "otherwise the desk operator decides whether to broadcast the saved claim by hand, knowing the Buyer may already hold leg A's refund (P10 B7, P10-FUND-03)",
+    );
+    this.name = "ClaimResendTooLateError";
+    this.txid = txid;
+    this.refundAfterMs = refundAfterMs;
+    this.notAfterMs = notAfterMs;
   }
 }
 
@@ -1911,7 +1939,7 @@ export class SellerFlow {
 
   /**
    * P10 B7: the node holds or has mined this flow's claim, so it was ACCEPTED and the secret is public from then on: the record says so (`claimTx.sent`), and a re-send of
-   * this claim keeps no first-claim guard from now on. A no-op without a recorded claim or when it is already marked.
+   * this claim keeps no first-claim guard from now on, only the bound of `resendUnknownClaim` (P10-FUND-03). A no-op without a recorded claim or when it is already marked.
    */
   private async noteClaimAccepted(): Promise<void> {
     if (this.claimTx === undefined || this.claimTx.sent === true) return;
@@ -1924,8 +1952,9 @@ export class SellerFlow {
    *  1. The scan (mempool, then the blocks from the marker saved with the attempt) shows this flow's own preimage: the node holds or has mined a claim, so it was accepted.
    *     `settleBtcClaim` posts the reveal and settles if a block holds it, else throws `ClaimNotMinedError`. Recognising a claim that is there is never gated by a clock.
    *  2. The scan shows nothing and a claim is recorded: the node is asked about its txid. `unknown` (never sent, or dropped, with the funding output unspent): the IDENTICAL
-   *     bytes are sent again, past the claim-by too when the node had accepted them before (`sent`: the secret is public already), and after every first-claim guard plus the rail's
-   *     last-moment deadline read when they may never have been sent. `spent-by-other` is `ClaimSupersededError`, nothing sent. Mined or in the mempool (the scan missed it): as step 1.
+   *     bytes are sent again under the bound of `resendUnknownClaim` (P10-FUND-01/03: at any time once leg B is claimed with this swap's secret; else, for a claim marked `sent`, before
+   *     leg A's refund time minus the claim-inclusion margin, and `ClaimResendTooLateError` past it; else behind every first-claim guard plus the rail's last-moment deadline read).
+   *     `spent-by-other` is `ClaimSupersededError`, nothing sent. Mined or in the mempool (the scan missed it): as step 1.
    *  3. Nothing is recorded and nothing is seen: `undefined`, nothing of this flow's own ever reached the network, and the caller goes on to the guarded first claim.
    */
   private async resumeBtcClaim(
@@ -1955,16 +1984,60 @@ export class SellerFlow {
     const handle = this.claimTxHandle();
     let status = await claimStatus.call(connected, railRef, handle);
     if (status === "unknown") {
-      const maybeNeverSent = this.claimTx.sent !== true;
-      if (maybeNeverSent) await this.assertFirstClaimGuards(connected, termsA, railRef, accounts, offerA);
-      const notAfterMs = offerA.refundAfterMs - this.rail.policy.claimInclusionMarginMs;
-      status = await resendClaim.call(connected, railRef, handle, maybeNeverSent ? { notAfterMs } : {});
+      // P10-FUND-01/03: the identical re-send is bounded; see `resendUnknownClaim`.
+      status = await this.resendUnknownClaim(connected, termsA, railRef, accounts, offerA, handle, resendClaim);
     }
     if (status === "spent-by-other") throw new ClaimSupersededError(this.claimTx.txid, this.claimTx.sent === true);
     // "mined" or "in-mempool" (an answer that is "unknown" cannot reach here: it was re-sent above)
     await this.freezeLegA(accounts, railRef);
     await this.noteClaimAccepted();
     return await this.settleBtcClaim(connected, railRef, acceptA, offerA, options, evidence(), status === "mined");
+  }
+
+  /**
+   * P10-FUND-01 / P10-FUND-03 (Bitcoin): the one place that decides whether the recorded claim, which the node no longer knows while leg A's funding output is unspent, is sent again as the
+   * IDENTICAL bytes. Never a new spend. In this order:
+   *  (a) leg B's note reads claimed with this swap's secret (`legBTakenWithOurSecret`): the Buyer holds leg B and the secret is demonstrably public, so the saved bytes go out again at any
+   *      time, whether or not the claim is marked `sent` (this also closes the window of a claim the node accepted, whose mark was lost, and which was then evicted);
+   *  (b) otherwise, a claim marked `sent` (the node accepted it, so the first broadcast may have been evicted before the Buyer saw the secret): sent again only while it can still land before
+   *      leg A's refund time, that is before `notAfterMs` = leg A's `refundAfterMs` minus the claim-inclusion margin, judged against `max(chain time, clock)` here and by the rail as the last
+   *      read before the send. At or past it: `ClaimResendTooLateError`, nothing sent (the Buyer may be refunding leg A, and a late claim could leave it without time to claim leg B);
+   *  (c) otherwise (the claim may never have been sent: a FIRST claim, a new reveal): every first-claim guard, then the rail's last-moment read, exactly as before.
+   * A failed read of leg B's note ends the call with that error and sends nothing (a refusal is preferred to any new outward action). Returns what the rail settled.
+   */
+  private async resendUnknownClaim(
+    connected: ConnectedCounterAssetRail,
+    termsA: ReturnType<typeof offerAcceptLockTerms>,
+    railRef: string,
+    accounts: RailAccounts,
+    offerA: OfferFrame,
+    handle: LockRecovery,
+    resendClaim: NonNullable<ConnectedCounterAssetRail["resendClaimTx"]>,
+  ): Promise<"mined" | "in-mempool" | "spent-by-other"> {
+    const claimTx = this.claimTx;
+    if (claimTx === undefined) throw new Error("seller: no Bitcoin claim is recorded");
+    if (await this.legBTakenWithOurSecret()) return await resendClaim.call(connected, railRef, handle, {});
+    const notAfterMs = offerA.refundAfterMs - this.rail.policy.claimInclusionMarginMs;
+    if (claimTx.sent === true) {
+      const chainNow = Math.max(await connected.chainTimeMs(), this.clock());
+      if (chainNow >= notAfterMs) throw new ClaimResendTooLateError(claimTx.txid, offerA.refundAfterMs, notAfterMs);
+      return await resendClaim.call(connected, railRef, handle, { notAfterMs });
+    }
+    await this.assertFirstClaimGuards(connected, termsA, railRef, accounts, offerA);
+    return await resendClaim.call(connected, railRef, handle, { notAfterMs });
+  }
+
+  /**
+   * P10-FUND-01: whether leg B's paper note reads claimed with THIS swap's secret (`noteOpensOurStatement`, the same test `refundLegB` makes): the Buyer then holds leg B, and the secret is
+   * public. `legBClaimSeen` (saved by an earlier `refundLegB` that saw it) counts as the same fact. Leg B's contract is the one this flow locked or attempted to lock; with none there is no note
+   * to read. A read that throws propagates.
+   */
+  private async legBTakenWithOurSecret(): Promise<boolean> {
+    if (this.legBClaimSeen) return true;
+    const contractB = this.lockedLegBContract ?? this.attemptedAcceptB?.contract;
+    if (contractB === undefined) return false;
+    const note = await this.paperRail.read(contractB);
+    return note !== null && note.status === "claimed" && this.noteOpensOurStatement(note);
   }
 
   /**
