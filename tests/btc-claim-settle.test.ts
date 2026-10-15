@@ -10,6 +10,7 @@
 //   BtcHtlcRail.resendClaim  the IDENTICAL bytes, never a rebuild: checked against the txid and the outpoint first, then "already held", "spent by another", the optional
 //                            last-moment deadline, `testmempoolaccept`, send
 //   BtcHtlcRail.claimMined   a MINED spend by the hash branch (the block scan without the mempool step)
+//   BtcHtlcRail.walletKnowsTransaction  READ-ONLY (P10R2-FUND-02): does the Seller's own node wallet know the claim (`gettransaction`)? Evidence that the node accepted it, never mined/mempool
 //   the wrapper              the same through ConnectedBtcCounterRail (the recovery-handle checks, the typed refusal)
 //
 // The flow-level behaviour (next stays at the claim step, the reveal, the receipt only when mined, the re-send after the claim-by) is in
@@ -90,12 +91,16 @@ interface NodeState {
   staleBlock: boolean;
   /** Core's code for a failed `getmempoolentry` of a txid the mempool does not hold: -5 ("not in mempool") by default; any other code is a failure that must propagate. */
   mempoolEntryCode: number;
+  /** P10R2-FUND-02: the Seller's node wallet knows the claim's txid (`gettransaction` answers), whether or not the node holds the transaction now. */
+  walletKnows: boolean;
+  /** Core's code for `gettransaction` of a txid the wallet does not know: -5 ("Invalid or non-wallet transaction id") by default; any other code is a failure that must propagate. */
+  walletErrorCode: number;
   /** Called when the node answers `gettxout` (a test uses it to let the claim reach the node between two of the rail's reads). */
   onGetTxOut?: () => void;
 }
 
 function freshState(): NodeState {
-  return { claimConfirmations: null, fundingUnspent: true, accept: { allowed: true }, notFoundCode: -5, blocks: [], mempoolSpend: null, tipTimeSeconds: CHAIN_TIME_S, staleBlock: false, mempoolEntryCode: -5 };
+  return { claimConfirmations: null, fundingUnspent: true, accept: { allowed: true }, notFoundCode: -5, blocks: [], mempoolSpend: null, tipTimeSeconds: CHAIN_TIME_S, staleBlock: false, mempoolEntryCode: -5, walletKnows: false, walletErrorCode: -5 };
 }
 
 function mockNode(state: NodeState, claimHex: string, claimId: string): { fetch: typeof fetch; calls: Call[] } {
@@ -112,6 +117,10 @@ function mockNode(state: NodeState, claimHex: string, claimId: string): { fetch:
         if (state.claimConfirmations === null) throw Object.assign(new Error(state.notFoundCode === -5 ? "No such mempool or blockchain transaction" : "node trouble"), { code: state.notFoundCode });
         const vin = state.mempoolSpend === null ? {} : { vin: [{ txid: FUND_TXID, vout: FUND_VOUT, txinwitness: state.mempoolSpend.witness }] };
         return state.claimConfirmations >= 1 || state.staleBlock ? { txid: claimId, confirmations: state.claimConfirmations, blockhash: "cc".repeat(32), ...vin } : { txid: claimId, ...vin };
+      }
+      case "gettransaction": {
+        if (params[0] === claimId && state.walletKnows) return { amount: 0.99999, fee: 0, confirmations: 0, txid: claimId, walletconflicts: [], details: [], hex: claimHex };
+        throw Object.assign(new Error(state.walletErrorCode === -5 ? "Invalid or non-wallet transaction id" : "node trouble (wallet)"), { code: state.walletErrorCode });
       }
       case "getmempoolentry": {
         if (params[0] === claimId && state.claimConfirmations === 0 && !state.staleBlock) return { vsize: 150, weight: 600, fees: { base: 0.00001 } };
@@ -414,6 +423,40 @@ describe("P10 B7: BtcHtlcRail.claimMined is a MINED spend by the hash branch, ne
   });
 });
 
+describe("P10R2-FUND-02: BtcHtlcRail.walletKnowsTransaction asks the Seller's own wallet, READ-ONLY, and its answer is only 'the node accepted it at some point'", () => {
+  const SELLER_HANDLE: BtcWalletHandle = SELLER;
+
+  it("a wallet that knows the txid: true. One gettransaction (after the pin check); nothing is signed, tested or sent; the mempool and the chain are not asked", async () => {
+    const { rail, calls } = await connect({ ...freshState(), walletKnows: true });
+    expect(await rail.walletKnowsTransaction(SELLER_HANDLE, CLAIM.id)).toBe(true);
+    expect(sentTo(calls, "gettransaction")).toEqual([[CLAIM.id]]);
+    for (const other of ["sendrawtransaction", "testmempoolaccept", "walletprocesspsbt", "walletcreatefundedpsbt", "getmempoolentry", "getrawtransaction", "gettxout"]) expect(methods(calls), other).not.toContain(other);
+  });
+
+  it("Core's own 'Invalid or non-wallet transaction id' (code -5) is false; any other failure propagates (never read as false, so never as true either)", async () => {
+    const unknown = await connect(freshState());
+    expect(await unknown.rail.walletKnowsTransaction(SELLER_HANDLE, CLAIM.id)).toBe(false);
+    const trouble = await connect({ ...freshState(), walletErrorCode: -32603 });
+    await expect(trouble.rail.walletKnowsTransaction(SELLER_HANDLE, CLAIM.id)).rejects.toThrow(/node trouble \(wallet\)/);
+  });
+
+  it("refuses a txid that is not 64 lower-case hex before any call", async () => {
+    const { rail, calls } = await connect({ ...freshState(), walletKnows: true });
+    for (const bad of ["", "NOT-HEX", CLAIM.id.toUpperCase(), CLAIM.id.slice(2)]) await expect(rail.walletKnowsTransaction(SELLER_HANDLE, bad)).rejects.toThrow(/txid must be 64 lowercase hex/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("a wallet answer is never read as mined or in the mempool: with the wallet knowing the txid and the node not, claimStatus is still 'unknown' and resendClaim still sends the recorded bytes", async () => {
+    const status = await connect({ ...freshState(), walletKnows: true });
+    expect(await status.rail.claimStatus(REF, CLAIM.id)).toBe("unknown");
+    expect(methods(status.calls)).not.toContain("gettransaction"); // the status reads do not consult the wallet at all
+    const resend = await connect({ ...freshState(), walletKnows: true });
+    expect((await resend.rail.resendClaim(REF, CLAIM.id, CLAIM.hex)).outcome).toBe("in-mempool");
+    expect(sentTo(resend.calls, "sendrawtransaction")).toEqual([[CLAIM.hex]]);
+    expect(methods(resend.calls)).not.toContain("gettransaction");
+  });
+});
+
 describe("P10 B7: the same through the wrapper (ConnectedBtcCounterRail)", () => {
   const key = { pubkey: PAYEE_PUBKEY, fingerprint: 0xb222e7bb, path: [0x80000054, 0x80000001, 0x80000000, 0, 0] };
   const terms = { lock: "hash", statement: HASH_LOCK, amount: "100000000", refundAfterMs: REFUND_AFTER_MS, claimByMs: REFUND_AFTER_MS - 3_600_000, payer: "did:key:payer", payee: "did:key:payee", asset: "BTC", contract: `0x${"cc".repeat(32)}` };
@@ -478,6 +521,19 @@ describe("P10 B7: the same through the wrapper (ConnectedBtcCounterRail)", () =>
     expect(await connected.claimTxStatus?.(REF, handle())).toBe("unknown");
     expect(await connected.resendClaimTx?.(REF, handle())).toBe("in-mempool");
     expect(sentTo(calls, "sendrawtransaction")).toEqual([[CLAIM.hex]]);
+  });
+
+  it("P10R2-FUND-02: claimTxKnownToWallet asks the party's own wallet about the recorded txid, and refuses a handle that is not this claim's before any call", async () => {
+    const { connected, calls } = await wrapped({ ...freshState(), walletKnows: true });
+    expect(await connected.claimTxKnownToWallet?.(REF, handle())).toBe(true);
+    expect(sentTo(calls, "gettransaction")).toEqual([[CLAIM.id]]);
+    const unknown = await wrapped(freshState());
+    expect(await unknown.connected.claimTxKnownToWallet?.(REF, handle())).toBe(false);
+    for (const bad of [{ chain: "near", txHash: "x", signedTxBase64: "AA==" } as LockRecovery, handle({ txid: "NOT-HEX" }), handle({ rawTx: "zz" }), handle({ txid: "ee".repeat(32) })]) {
+      const error = await Promise.resolve(unknown.connected.claimTxKnownToWallet?.(REF, bad)).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(RailRecoveryRefusedError);
+    }
+    expect(sentTo(unknown.calls, "gettransaction")).toHaveLength(1); // only the one good call went out
   });
 
   it("claimIsMined reads the block scan from the marker (a number), 0 when there is none", async () => {

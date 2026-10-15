@@ -296,6 +296,15 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
   }
 
   /**
+   * P10R2-FUND-02, READ-ONLY: whether this party's own node wallet knows the recorded claim (`BtcHtlcRail.walletKnowsTransaction`: `gettransaction`). True is evidence that the node accepted
+   * the claim at some point; false is no evidence. The handle is checked for shape and internal consistency first.
+   */
+  async claimTxKnownToWallet(ref: string, recovery: LockRecovery): Promise<boolean> {
+    const handle = requireBtcHandle(ref, recovery, false);
+    return this.btcRail.walletKnowsTransaction(this.ownWallet(), handle.txid);
+  }
+
+  /**
    * P10 B7: re-sends the IDENTICAL recorded claim bytes (`BtcHtlcRail.resendClaim`: nothing is built or signed; the bytes must hash to the txid and spend exactly `ref`).
    * A node that refuses them (the inputs gone, a policy rejection) is a `RailRecoveryRefusedError("rebroadcast-refused")`: a person decides; the claim is never re-priced.
    */

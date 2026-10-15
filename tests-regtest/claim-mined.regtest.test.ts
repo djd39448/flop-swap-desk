@@ -26,12 +26,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { BuyerFlow } from "../src/client/buyer.js";
 import { createBtcCounterRail } from "../src/client/btc-rail.js";
-import { decodeFlowRecord, type SellerFlowRecord } from "../src/client/flow-record.js";
-import { FileFlowStore, type FlowStore } from "../src/client/flow-store.js";
+import { decodeFlowRecord, encodeFlowRecord, type SellerFlowRecord } from "../src/client/flow-record.js";
+import { FileFlowStore, flowDigest, type FlowStore } from "../src/client/flow-store.js";
 import { ClaimNotMinedError, ClaimSupersededError, SellerFlow, type SellerFlowOptions } from "../src/client/seller.js";
 import { MemoryVenue } from "../src/client/venue.js";
 import { swapId as computeSwapId } from "../src/profile.js";
-import { BTC_REGTEST_PIN, keyFromAddressInfo, type BtcRailConfig, type BtcSignerKey } from "../src/rails/btc-htlc.js";
+import { BTC_REGTEST_PIN, BtcHtlcRail, keyFromAddressInfo, type BtcRailConfig, type BtcSignerKey } from "../src/rails/btc-htlc.js";
 import { identity, type Identity } from "../tests/helpers/identity.js";
 import { countingFetch, RecordingStore, type CountingFetch } from "../tests/helpers/live-resume.js";
 import { startBitcoind, type BitcoindHandle, type RegtestWallet } from "./helpers/bitcoind.js";
@@ -119,9 +119,21 @@ async function buildSwap(node: BitcoindHandle, config: BtcRailConfig) {
     return record;
   }
 
+  /** The lost-reply window: the node accepted the claim and the process died before the `sent` mark was saved, so the stored record is rewritten without it. */
+  async function dropSentMark(contractA: string): Promise<void> {
+    const key = `seller:${contractA}`;
+    const bytes = await sellerStore.load(key);
+    if (bytes === null) throw new Error("test: no Seller record");
+    const record = decodeFlowRecord(bytes, key);
+    if (record.role !== "seller" || record.claimTx === undefined) throw new Error("test: no recorded claim to unmark");
+    const { sent: _mark, ...unmarked } = record.claimTx;
+    void _mark;
+    await sellerStore.save(key, encodeFlowRecord({ ...record, claimTx: unmarked }), flowDigest(bytes));
+  }
+
   const frames = async (contractA: string, type: string): Promise<number> => (await venue.read(dealRoom(contractA))).filter((record) => tryDecodeFrame(record.line)?.type === type && record.sender === seller.did).length;
 
-  return { t0, clockRef, venue, buyerFlow, sellerLock, sellerStore, pairAndLock, restartSeller, sellerRecord, frames, seller };
+  return { t0, clockRef, venue, buyerFlow, sellerLock, sellerStore, pairAndLock, restartSeller, sellerRecord, dropSentMark, frames, seller };
 }
 
 const mempoolOf = (node: BitcoindHandle): Promise<string[]> => node.rpcCall<string[]>("getrawmempool", []);
@@ -347,6 +359,52 @@ describe("P10 B7 on bitcoind regtest: a claim the node dropped is sent again as 
     const send = restarted.calls.requests.find((call) => call.method === "sendrawtransaction");
     expect((send?.params as string[])[0]).toBe(recorded?.rawTx); // the identical recorded bytes
     expect(await mempoolOf(node)).toContain(txid);
+
+    await node.mine(1);
+    const claimed = await restarted.flow.claimLegA(statement);
+    expect(claimed.receipt).toBeDefined();
+    expect((await w.sellerRecord(acceptA.contract)).claimOutcome).toBe("landed");
+  }, 180_000);
+
+  it("6: P10R2-FUND-02: the Seller's own wallet still knows a claim the node accepted and then evicted, so a lost 'sent' mark does not turn its re-send into a first claim: past the claim-by and inside the bound the SAME bytes go out", async () => {
+    const w = await buildSwap(node, config);
+    const { sellerFlow, offerA, acceptA, statement, swapId } = await w.pairAndLock();
+    const pending = await claimBroadcast(sellerFlow, statement);
+    const txid = pending.txid as string;
+    const recorded = (await w.sellerRecord(acceptA.contract)).claimTx;
+    expect(recorded?.txid).toBe(txid);
+    await w.dropSentMark(acceptA.contract); // the node accepted the claim; the mark never reached the record
+    expect((await w.sellerRecord(acceptA.contract)).claimTx?.sent).toBeUndefined();
+
+    await expireMempool();
+    expect(await mempoolOf(node)).not.toContain(txid); // the premise: the node dropped the claim
+    // Core 31.1, observed: after the eviction the Seller's wallet still answers gettransaction for the claim, with no confirmation (and no blockhash); it never reports it as mined
+    const wallet = `/wallet/${node.seller.wallet}`;
+    const afterEviction = await node.rpcCall<Record<string, unknown>>("gettransaction", [txid], wallet);
+    expect(afterEviction.confirmations, "a wallet that knows the claim says nothing about it being mined").toBe(0);
+    expect(afterEviction.blockhash).toBeUndefined();
+    expect(afterEviction.txid, "the wallet still answers for it").toBe(txid);
+
+    // the rail's own read: true for the claim, false for a transaction the Seller's wallet has no part in (the Buyer's funding)
+    const [fundTxid] = (await w.sellerRecord(acceptA.contract)).frozenLegARailRef!.split(":");
+    const probe = await BtcHtlcRail.connect({ config, rpc: node.createCapturingRpc() });
+    const sellerHandle = { wallet: node.seller.wallet, key: keyFor(node.seller) };
+    expect(await probe.walletKnowsTransaction(sellerHandle, txid)).toBe(true);
+    expect(await probe.walletKnowsTransaction(sellerHandle, fundTxid as string)).toBe(false);
+
+    w.clockRef.ms = offerA.claimByMs + 30 * 60_000; // past the claim-by, inside the bound (leg A's refund time minus the 60 minute margin)
+    const restarted = await w.restartSeller(swapId, acceptA.contract);
+    expect(restarted.next).toBe("claimLegA");
+    const outcome = await restarted.flow.claimLegA(statement).then(() => undefined, (error: unknown) => error);
+    expect(outcome, "back in the mempool, not mined").toBeInstanceOf(ClaimNotMinedError);
+    expect(signingCalls(restarted.calls), "no new claim was signed or built").toBe(0);
+    expect(restarted.calls.count("gettransaction"), "the wallet was asked once").toBe(1);
+    expect(restarted.calls.count("testmempoolaccept")).toBe(1);
+    expect(restarted.calls.count("sendrawtransaction")).toBe(1);
+    const send = restarted.calls.requests.find((call) => call.method === "sendrawtransaction");
+    expect((send?.params as string[])[0]).toBe(recorded?.rawTx); // the identical recorded bytes
+    expect(await mempoolOf(node)).toContain(txid);
+    expect((await w.sellerRecord(acceptA.contract)).claimTx?.sent, "the wallet's knowledge is saved as the mark").toBe(true);
 
     await node.mine(1);
     const claimed = await restarted.flow.claimLegA(statement);

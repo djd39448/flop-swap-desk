@@ -125,6 +125,14 @@ export class LedgerChain {
   autoMineClaims = true;
   /** P10 B7 (Bitcoin): the node refuses a recorded claim it is asked to send again (its inputs are gone, or its fee is below the minimum). */
   refuseClaimResend = false;
+  /**
+   * P10R2-FUND-02 (Bitcoin): the txids the Seller's own node wallet knows. A claim the node ACCEPTS is added (the wallet is told of a transaction that pays to it), and it stays after the
+   * claim is evicted from the mempool. A test that models "the claim's destination is not the wallet's address" (or a wallet that never saw it) clears the set.
+   */
+  readonly walletKnownTxs = new Set<string>();
+  /** P10R2-FUND-02: how many times the Seller's wallet was asked about a claim, and a knob that makes the read fail. */
+  walletReads = 0;
+  walletReadFails = false;
   /** P10-PIN-01 (Bitcoin): the node's `testmempoolaccept` refuses the claim: the recorder hears that the signed bytes never reached the network (`onNotBroadcastTx`) and nothing is sent. */
   refuseClaimAcceptance = false;
   /** P10-KEY-01 (Bitcoin): a signed claim's bytes embed the preimage (lower-case hex inside the transaction hex), as a real claim's witness does. By default the bytes are a label only. */
@@ -262,6 +270,8 @@ class LedgerConnected implements ConnectedCounterAssetRail {
   readonly claimIsMined?: (ref: string, fromMarker?: RailBlockMarker) => Promise<boolean>;
   readonly claimTxStatus?: (ref: string, recovery: LockRecovery) => Promise<ClaimTxStatus>;
   readonly resendClaimTx?: (ref: string, recovery: LockRecovery, options?: { notAfterMs?: number }) => Promise<ClaimTxResend>;
+  /** P10R2-FUND-02, Bitcoin only: does the Seller's own node wallet know the recorded claim (`gettransaction`)? */
+  readonly claimTxKnownToWallet?: (ref: string, recovery: LockRecovery) => Promise<boolean>;
 
   constructor(
     private readonly options: LedgerRailOptions,
@@ -275,6 +285,13 @@ class LedgerConnected implements ConnectedCounterAssetRail {
       this.claimIsMined = (ref, fromMarker) => this.btcClaimIsMined(ref, fromMarker);
       this.claimTxStatus = (ref, recovery) => this.btcClaimTxStatus(ref, recovery);
       this.resendClaimTx = (ref, recovery, options) => this.btcResendClaimTx(ref, recovery, options);
+      this.claimTxKnownToWallet = async (ref, recovery) => {
+        this.options.hooks.alive();
+        if (recovery.chain !== "btc") throw new RailRecoveryRefusedError("handle-mismatch", ref, `a ${recovery.chain} handle for the btc rail`);
+        this.chain.walletReads += 1;
+        if (this.chain.walletReadFails) throw new Error("ledger rail: the wallet read failed");
+        return this.chain.walletKnownTxs.has(recovery.txid);
+      };
       this.resendRefundIfDropped = async (ref, prior) => {
         this.options.hooks.alive();
         const output = this.options.chain.outputs.get(ref);
@@ -397,6 +414,7 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     if (this.chain.knownTxs.has(txid)) return;
     this.chain.counts.claimSent += 1;
     this.chain.knownTxs.add(txid);
+    this.chain.walletKnownTxs.add(txid); // P10R2-FUND-02: the wallet is told, and keeps it after an eviction
     if (this.chain.autoMineClaims) {
       output.status = "claimed";
       output.preimage = secret;

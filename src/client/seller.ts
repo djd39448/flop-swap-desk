@@ -367,8 +367,9 @@ export class ClaimNotMinedError extends Error {
 
 /**
  * P10 B7 (Bitcoin only): leg A's funding output is spent by a transaction that is not this flow's recorded claim (the node does not know the claim's txid), most
- * likely the Buyer's refund after leg A's refund time. The recorded claim can no longer land and is NOT sent again. Nothing was sent. `sent` says whether the node
- * had accepted the claim before: if it had, the secret is public and leg B stays exposed until its own refund time.
+ * likely the Buyer's refund after leg A's refund time. The recorded claim can no longer land and is NOT sent again. Nothing was sent. `sent` says whether this flow knows the node
+ * had accepted the claim (its record says so, or since P10R2-FUND-02 the Seller's own wallet knows the transaction): if it does, the secret is public and leg B stays exposed until its
+ * own refund time. `sent` false is "no record", not "the node never saw it".
  */
 export class ClaimSupersededError extends Error {
   readonly txid: string;
@@ -378,7 +379,7 @@ export class ClaimSupersededError extends Error {
       `seller: leg A's funding output is spent by a transaction that is not this flow's claim ${txid} (the node does not know it), so that claim can no longer land and is not sent again; ` +
         (sent
           ? "the claim had been accepted by the node, so the secret is public: leg B is exposed until its refund time (P10 B7)"
-          : "the claim had never been seen by the node, so the secret was not made public by it (P10 B7)"),
+          : "this flow has no record that the node accepted the claim, so it is not known whether the secret was made public: if the Buyer has learned it, leg B is exposed until its refund time (P10 B7)"),
     );
     this.name = "ClaimSupersededError";
     this.txid = txid;
@@ -1995,7 +1996,11 @@ export class SellerFlow {
       // P10-FUND-01/03: the identical re-send is bounded; see `resendUnknownClaim`.
       status = await this.resendUnknownClaim(connected, termsA, railRef, accounts, offerA, handle, resendClaim);
     }
-    if (status === "spent-by-other") throw new ClaimSupersededError(this.#claimTx.txid, this.#claimTx.sent === true);
+    if (status === "spent-by-other") {
+      // P10R2-FUND-02: before the verdict is worded, the Seller's own wallet is asked whether the node ever accepted the claim (best effort; it changes nothing else)
+      await this.noteClaimKnownToWallet(connected, railRef, handle);
+      throw new ClaimSupersededError(this.#claimTx.txid, this.#claimTx.sent === true);
+    }
     // "mined" or "in-mempool" (an answer that is "unknown" cannot reach here: it was re-sent above)
     await this.freezeLegA(accounts, railRef);
     await this.noteClaimAccepted();
@@ -2011,6 +2016,8 @@ export class SellerFlow {
    *      leg A's refund time, that is before `notAfterMs` = leg A's `refundAfterMs` minus the claim-inclusion margin, judged against `max(chain time, clock)` here and by the rail as the last
    *      read before the send. At or past it: `ClaimResendTooLateError`, nothing sent (the Buyer may be refunding leg A, and a late claim could leave it without time to claim leg B);
    *  (c) otherwise (the claim may never have been sent: a FIRST claim, a new reveal): every first-claim guard, then the rail's last-moment read, exactly as before.
+   * P10R2-FUND-02: between (a) and (b), a claim with no `sent` mark is looked up in the Seller's own node wallet (`noteClaimKnownToWallet`): a wallet that knows the transaction proves the
+   * node accepted it at some point, so the mark is set (and saved) and rule (b) applies; a wallet that does not know it, or cannot be read, changes nothing, and the claim is (c).
    * A failed read of leg B's note counts as "not shown claimed" and falls through to (b) or (c) (P10R2-FUND-01). Returns what the rail settled.
    */
   private async resendUnknownClaim(
@@ -2026,13 +2033,35 @@ export class SellerFlow {
     if (claimTx === undefined) throw new Error("seller: no Bitcoin claim is recorded");
     if (await this.legBTakenWithOurSecret()) return await resendClaim.call(connected, railRef, handle, {});
     const notAfterMs = offerA.refundAfterMs - this.rail.policy.claimInclusionMarginMs;
-    if (claimTx.sent === true) {
+    // P10R2-FUND-02: a claim with no `sent` mark may still have been accepted by the node (the reply and the mark lost with the process); the Seller's own wallet knows
+    await this.noteClaimKnownToWallet(connected, railRef, handle);
+    if (this.#claimTx?.sent === true) {
       const chainNow = Math.max(await connected.chainTimeMs(), this.clock());
       if (chainNow >= notAfterMs) throw new ClaimResendTooLateError(claimTx.txid, offerA.refundAfterMs, notAfterMs);
       return await resendClaim.call(connected, railRef, handle, { notAfterMs });
     }
     await this.assertFirstClaimGuards(connected, termsA, railRef, accounts, offerA);
     return await resendClaim.call(connected, railRef, handle, { notAfterMs });
+  }
+
+  /**
+   * P10R2-FUND-02 (Bitcoin): a claim not marked `sent` may still have been accepted by the node (the reply and the mark lost with the process, the claim then evicted). The Seller's own node
+   * wallet is told of every transaction that pays to it when the node accepts it, and keeps it after an eviction; the claim's only input is the HTLC output, so the wallet knows the claim
+   * only when its destination is the wallet's own address and the node accepted it at some point (`claimTxKnownToWallet`). A wallet that knows it: the claim counts as sent (saved) from
+   * here on, so the identical re-send follows rule (b), that is before the Buyer can refund, instead of the claim-by guard of a first claim, which closes the window in which a Buyer who
+   * refunds leg A first and then claims leg B leaves the Seller without leg A. A wallet that does not know it, a rail without the read, and a failed read change nothing (the claim stays
+   * unmarked). The answer is never read as "mined" or "in the mempool". A refused save of the mark propagates, before anything is sent.
+   */
+  private async noteClaimKnownToWallet(connected: ConnectedCounterAssetRail, railRef: string, handle: LockRecovery): Promise<void> {
+    const knownToWallet = connected.claimTxKnownToWallet;
+    if (knownToWallet === undefined || this.#claimTx === undefined || this.#claimTx.sent === true) return;
+    let seen: boolean;
+    try {
+      seen = await knownToWallet.call(connected, railRef, handle);
+    } catch {
+      return;
+    }
+    if (seen) await this.noteClaimAccepted();
   }
 
   /**

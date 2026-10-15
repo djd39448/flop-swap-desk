@@ -407,6 +407,14 @@ export interface ConnectedCounterAssetRail {
    * sent, which is then a first claim and keeps its deadline). A node that refuses the bytes is a thrown `RailRecoveryRefusedError("rebroadcast-refused")`.
    */
   resendClaimTx?(ref: string, recovery: LockRecovery, options?: { notAfterMs?: number }): Promise<ClaimTxResend>;
+  /**
+   * P10R2-FUND-02 (Bitcoin only), optional: does the Seller's OWN wallet know the claim transaction `recovery` names? READ-ONLY (`gettransaction` on the wallet RPC the rail already uses to
+   * sign). A node wallet records a transaction only when it pays to, or spends from, the wallet, and is told of it when the node accepts it into its mempool; the claim's only input is
+   * the HTLC output, so the wallet knows the claim only when the claim's destination is the wallet's own address AND the node accepted the claim at some point. It keeps knowing it after
+   * the node evicts it. So `true` is evidence that the node accepted the claim (the secret was public then); `false` is no evidence either way (a destination that is not this wallet, a
+   * wallet that never saw the claim, a lost mempool). It is never evidence that the claim is mined or in the mempool now. A failed read is a thrown error.
+   */
+  claimTxKnownToWallet?(ref: string, recovery: LockRecovery): Promise<boolean>;
   /** P4-BTC-FIXES-R2.md R2-1: on a refund retry (this connected handle's own `refund()` already
    *  broadcast once), re-check the chain and re-send `priorEvidence`'s own EXACT bytes
    *  (`priorEvidence.rawTx`) if they have genuinely dropped (not in the mempool, not confirmed)

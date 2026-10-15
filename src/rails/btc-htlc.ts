@@ -1467,6 +1467,24 @@ export class BtcHtlcRail {
   }
 
   /**
+   * P10R2-FUND-02, READ-ONLY: does `wallet` (the Seller's own node wallet, the RPC wallet the rail already signs with) know the transaction `txid`? `gettransaction` answers for a
+   * transaction the wallet recorded (one that pays to or spends from it, when the node accepted it into its mempool or a block holds it) and keeps answering after the mempool drops it;
+   * Core's own "Invalid or non-wallet transaction id" (code -5) is "no". Any other failure propagates. The answer says only that the node accepted the transaction at some point: it is
+   * never read as confirmations or as "in the mempool" (`claimStatus` decides those).
+   */
+  async walletKnowsTransaction(wallet: BtcWalletHandle, txid: string): Promise<boolean> {
+    if (!/^[0-9a-f]{64}$/.test(txid)) throw new Error("btc-htlc: txid must be 64 lowercase hex");
+    await this.assertPinnedChain();
+    try {
+      await this.walletRequest(wallet.wallet, "gettransaction", [txid]);
+      return true;
+    } catch (error) {
+      if (isRpcNotFound(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
    * P10-FUND-02: what the node says of a claim txid, as `resendRefundIfDropped` reads a refund: `mined` ONLY with a confirmation on the best chain (`getrawtransaction` through the
    * `-txindex=1` this rail needs), `in-mempool` ONLY when `getmempoolentry` knows the txid, otherwise `null`. `getrawtransaction` alone is not enough for the second: with a txindex it
    * also answers for a transaction that sits in a block of a stale branch (confirmations 0 and a blockhash) while the node holds it nowhere, and a claim read as "in the mempool" in

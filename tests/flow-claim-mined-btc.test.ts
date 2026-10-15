@@ -355,7 +355,7 @@ describe("P10 B7: a claim that may never have been sent is a FIRST claim and kee
     expect(chain.counts.claimSent).toBe(0);
   });
 
-  it("the output is spent by the Buyer's refund before the restart: ClaimSupersededError (sent=false: the node never saw the claim), nothing is sent", async () => {
+  it("the output is spent by the Buyer's refund before the restart: ClaimSupersededError (sent=false: no record that the node accepted the claim), nothing is sent", async () => {
     const { s, chain, statement } = await diedBeforeClaimSend();
     s.w.setTime(s.w.refundAt.legA);
     await s.c.buyer.refundLegA(); // the Buyer's own refund takes the output
@@ -363,7 +363,8 @@ describe("P10 B7: a claim that may never have been sent is a FIRST claim and kee
     const error = await rejection(back.flow.claimLegA(statement));
     expect(error).toBeInstanceOf(ClaimSupersededError);
     expect((error as ClaimSupersededError).sent).toBe(false);
-    expect((error as ClaimSupersededError).message).toContain("never been seen by the node");
+    expect((error as ClaimSupersededError).message).toContain("no record that the node accepted the claim"); // P10R2-FUND-02: not "the node never saw it", which nobody knows
+    expect((error as ClaimSupersededError).message).not.toContain("never been seen by the node");
     expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 0, rebroadcasts: 0 });
     expect((await legAFrames(s.w)).reveal).toBe(0); // the secret was never made public by this flow
   });
@@ -413,10 +414,11 @@ describe("P10-FUND-01: the Buyer already holds leg B: the saved claim is sent ag
     },
   );
 
-  it("control: the same premise with leg B NOT claimed keeps every first-claim guard: past the claim-by nothing is sent", async () => {
+  it("control: the same premise with leg B NOT claimed and a wallet that does not know the claim keeps every first-claim guard: past the claim-by nothing is sent", async () => {
     const { s, chain, statement } = await diedBeforeClaimSend("after-store-fail");
     const { txid } = await claimTxOf(s.w);
     chain.evictClaim(txid);
+    chain.walletKnownTxs.clear(); // P10R2-FUND-02: a Seller whose wallet knows the claim marks it sent and re-sends inside the bound (below); this is the one that cannot tell
     s.w.setTime((await readSwap(s.w)).offerA!.claimByMs + 10 * 60_000);
     const back = await resumedSeller(s);
     const error = await rejection(back.flow.claimLegA(statement));
@@ -654,6 +656,112 @@ describe("P10R2-FUND-01: a failed read of leg B's note is 'not shown claimed': r
     expect(await rejection(earlyBack.flow.claimLegA(early.statement))).toBeInstanceOf(ClaimNotMinedError);
     expect(early.chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 1 });
     expect(early.chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
+  });
+});
+
+// P10R2-FUND-02 (P10-FIXES-R2): rule (a) misses a dishonest Buyer who refunds leg A first and claims leg B afterwards, in the lost-reply window: the node accepted the claim, the reply and the
+// `sent` mark were lost with the process, the claim was evicted, and the claim-by has passed. The claim then looks like one that may never have been sent (a first claim), the claim-by guard
+// refuses the re-send, and the Seller ends in ClaimSupersededError without leg A. The Seller's OWN node wallet knows the claim whenever the node accepted it (it pays to the wallet), and keeps
+// it after the eviction: that is the signal. A wallet that knows it makes the claim count as sent (saved), so rule (b) applies: the identical re-send before refundAfterMs minus the margin,
+// which is before the Buyer can refund. A wallet that does not know it, or cannot be read, changes nothing.
+describe("P10R2-FUND-02: the Seller's own wallet knows a claim the node accepted, so a lost 'sent' mark no longer turns the re-send into a first claim", () => {
+  /** Accepted by the node, the mark lost with the process (the next save refused), evicted, past the claim-by and inside the bound. */
+  async function lostMarkEvicted() {
+    const w = await diedBeforeClaimSend("after-store-fail");
+    const { txid, rawTx, sent } = await claimTxOf(w.s.w);
+    expect(sent, "the premise: the record never learned that the node accepted the claim").toBeUndefined();
+    expect(w.chain.knownTxs.has(txid)).toBe(true);
+    expect(w.chain.walletKnownTxs.has(txid), "the Seller's wallet was told of the transaction").toBe(true);
+    w.chain.evictClaim(txid);
+    expect(w.chain.walletKnownTxs.has(txid), "and keeps it after the eviction").toBe(true);
+    w.s.w.setTime((await readSwap(w.s.w)).offerA!.claimByMs + 10 * 60_000);
+    return { ...w, txid, rawTx };
+  }
+
+  it("the wallet knows the evicted claim: it is marked sent (saved), and the identical bytes go out once, past the claim-by and inside the bound", async () => {
+    const { s, chain, statement, txid, rawTx } = await lostMarkEvicted();
+    const back = await resumedSeller(s);
+    expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError); // back in the mempool, not mined
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 2, rebroadcasts: 1 });
+    expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
+    expect(chain.knownTxs.has(txid)).toBe(true);
+    expect(chain.walletReads).toBe(1);
+    expect(await claimTxOf(s.w), "the mark is saved").toEqual({ txid, rawTx, sent: true });
+    chain.mine();
+    await back.flow.claimLegA(statement);
+    expect(await legAFrames(s.w)).toEqual({ reveal: 1, receipt: 1 });
+  });
+
+  it("the wallet knows the claim, but the bound has passed and leg B is unclaimed: the mark is saved and the answer is ClaimResendTooLateError, nothing sent", async () => {
+    const { s, chain, statement, txid, rawTx } = await lostMarkEvicted();
+    s.w.setTime(notAfterMsOf(s.w));
+    const back = await resumedSeller(s);
+    const before = { ...chain.counts };
+    expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimResendTooLateError);
+    expect(chain.counts).toEqual(before);
+    expect(await claimTxOf(s.w)).toEqual({ txid, rawTx, sent: true });
+  });
+
+  it("the wallet does not know it (a destination that is not the wallet's address, or a wallet that never saw it): nothing changes, the claim-by guard of a first claim refuses and nothing is sent", async () => {
+    const { s, chain, statement, txid } = await lostMarkEvicted();
+    chain.walletKnownTxs.clear();
+    const back = await resumedSeller(s);
+    const before = { ...chain.counts };
+    expect(((await rejection(back.flow.claimLegA(statement))) as Error).message).toMatch(/at\/after its claimByMs/);
+    expect(chain.counts).toEqual(before);
+    expect(chain.walletReads).toBe(1);
+    expect((await claimTxOf(s.w)).sent, "the claim stays unmarked").toBeUndefined();
+
+    // and the ending the wallet signal exists to prevent: the Buyer refunds leg A, and the Seller's flow ends without leg A. Its sentence no longer says the node never saw the claim.
+    s.w.setTime(s.w.refundAt.legA);
+    await s.c.buyer.refundLegA();
+    const error = await rejection(back.flow.claimLegA(statement));
+    expect(error).toBeInstanceOf(ClaimSupersededError);
+    expect((error as ClaimSupersededError).sent).toBe(false);
+    expect((error as ClaimSupersededError).message).toContain("no record that the node accepted the claim");
+    expect((error as ClaimSupersededError).message).not.toContain("never been seen by the node");
+    expect(chain.knownTxs.has(txid)).toBe(false);
+  });
+
+  it("a wallet read that fails changes nothing either: past the claim-by the first-claim guard refuses; inside the claim-by window the guards pass and the identical bytes go out", async () => {
+    const late = await lostMarkEvicted();
+    late.chain.walletReadFails = true;
+    const lateBack = await resumedSeller(late.s);
+    const before = { ...late.chain.counts };
+    expect(((await rejection(lateBack.flow.claimLegA(late.statement))) as Error).message).toMatch(/at\/after its claimByMs/);
+    expect(late.chain.counts).toEqual(before);
+    expect((await claimTxOf(late.s.w)).sent).toBeUndefined();
+
+    const early = await diedBeforeClaimSend("after-store-fail");
+    early.chain.evictClaim((await claimTxOf(early.s.w)).txid);
+    early.chain.walletReadFails = true; // the clock is still before the claim-by: rule (c) passes every guard
+    const earlyBack = await resumedSeller(early.s);
+    expect(await rejection(earlyBack.flow.claimLegA(early.statement))).toBeInstanceOf(ClaimNotMinedError);
+    expect(early.chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 2, rebroadcasts: 1 });
+  });
+
+  it("the wallet knows the claim and the funding output was spent by the Buyer's refund: ClaimSupersededError says the node accepted the claim (leg B is exposed), and the mark is saved", async () => {
+    const { s, chain, statement } = await lostMarkEvicted();
+    s.w.setTime(s.w.refundAt.legA);
+    await s.c.buyer.refundLegA();
+    const back = await resumedSeller(s);
+    const before = { ...chain.counts };
+    const error = await rejection(back.flow.claimLegA(statement));
+    expect(error).toBeInstanceOf(ClaimSupersededError);
+    expect((error as ClaimSupersededError).sent).toBe(true);
+    expect((error as ClaimSupersededError).message).toContain("leg B is exposed");
+    expect(chain.counts).toEqual(before);
+    expect((await claimTxOf(s.w)).sent).toBe(true);
+  });
+
+  it("a claim the node still holds, or has mined, never asks the wallet (the txid read decides; a wallet answer is never read as mined or in the mempool)", async () => {
+    const { s, chain, statement } = await diedBeforeClaimSend("after-store-fail");
+    const back = await resumedSeller(s);
+    expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError); // in the mempool: found by the scan
+    chain.mine();
+    await back.flow.claimLegA(statement); // mined: settles
+    expect(chain.walletReads).toBe(0);
+    expect(await legAFrames(s.w)).toEqual({ reveal: 1, receipt: 1 });
   });
 });
 
