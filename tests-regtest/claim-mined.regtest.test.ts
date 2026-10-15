@@ -15,6 +15,10 @@
 //   4  a funding output spent by another transaction (the Buyer's refund, after the claim dropped) is NOT re-sent: `ClaimSupersededError`, nothing sent, no claim in the mempool
 //   5  (P10-FUND-02) a claim mined, then reorged out (`invalidateblock`) and dropped from the mempool is read as unknown, not "in the mempool" (with a txindex Core still answers
 //      `getrawtransaction` for it with no confirmation and a blockhash): the restarted process sends the SAME bytes, again with no signing call
+//   6  (P10R2-FUND-02) the Seller's own wallet still knows a claim the node accepted and then evicted, so a lost `sent` mark does not turn its re-send into a first claim
+//   7  (P10R3-PIN-01) the negative that case 6 rests on: a claim that was signed and passed `testmempoolaccept` but was never sent (the `sendrawtransaction` call dropped before the
+//      node), and a claim signed and then refused by the rail's own last deadline read, are unknown to the Seller's wallet (`gettransaction` answers code -5), so a restarted Seller keeps
+//      the first-claim guard and sends nothing
 // `npm run test:regtest` only; `npm test` never spawns bitcoind.
 
 import { mkdtemp, rm } from "node:fs/promises";
@@ -32,8 +36,9 @@ import { ClaimNotMinedError, ClaimSupersededError, SellerFlow, type SellerFlowOp
 import { MemoryVenue } from "../src/client/venue.js";
 import { swapId as computeSwapId } from "../src/profile.js";
 import { BTC_REGTEST_PIN, BtcHtlcRail, keyFromAddressInfo, type BtcRailConfig, type BtcSignerKey } from "../src/rails/btc-htlc.js";
+import { RpcCaptureError } from "../src/rails/rpc-capture.js";
 import { identity, type Identity } from "../tests/helpers/identity.js";
-import { countingFetch, RecordingStore, type CountingFetch } from "../tests/helpers/live-resume.js";
+import { countingFetch, droppingFetch, RecordingStore, type CountingFetch } from "../tests/helpers/live-resume.js";
 import { startBitcoind, type BitcoindHandle, type RegtestWallet } from "./helpers/bitcoind.js";
 import { claimBroadcast } from "./helpers/claim.js";
 
@@ -74,8 +79,7 @@ async function buildSwap(node: BitcoindHandle, config: BtcRailConfig) {
   const buyerFlow = new BuyerFlow({ identity: buyer, venue, paperRail: new PaperRail(noteStore, clock), rail: buyerRail, clock });
 
   /** A Seller process: its own transport (`calls` counts what it sent) and rail, over the shared venue, notes, clock and store directory. */
-  function sellerProc(): { calls: CountingFetch; options: SellerFlowOptions & { store: FlowStore } } {
-    const calls = countingFetch();
+  function sellerProc(calls: CountingFetch = countingFetch()): { calls: CountingFetch; options: SellerFlowOptions & { store: FlowStore } } {
     const rail = createBtcCounterRail({
       config,
       rpc: node.createCapturingRpc({ fetch: calls.fetch }),
@@ -87,8 +91,8 @@ async function buildSwap(node: BitcoindHandle, config: BtcRailConfig) {
     return { calls, options: { identity: seller, venue, paperRail: new PaperRail(noteStore, clock), rail, clock, store: sellerStore, mintHashLock: () => sellerLock } };
   }
 
-  async function pairAndLock() {
-    const first = sellerProc();
+  async function pairAndLock(firstTransport?: CountingFetch) {
+    const first = sellerProc(firstTransport);
     const sellerFlow = new SellerFlow(first.options);
     const swapId = computeSwapId(buyer.did, `0000a${scenarioCount.toString(16).padStart(3, "0")}`);
     const offerA = await buyerFlow.bid({ swapId, wantAsset: "FLOP", wantAmount: "52070000", wantRail: "flop-htlc", amount: "1000000", asset: "BTC", ...legADeadlines(t0) });
@@ -228,6 +232,97 @@ describe("P10 B7 on bitcoind regtest: a claim is landed only once it is mined", 
     expect(first.calls.count("sendrawtransaction")).toBe(0);
     expect((await w.sellerRecord(acceptA.contract)).claimTx).toBeUndefined();
     expect(await mempoolOf(node)).toEqual([]);
+  }, 120_000);
+  it("7a: P10R3-PIN-01: a claim signed, passed through testmempoolaccept and NEVER sent (the sendrawtransaction call dropped before the node) is unknown to the Seller's wallet (gettransaction answers -5), so a restarted Seller keeps the first-claim guard", async () => {
+    const w = await buildSwap(node, config);
+    const dropping = droppingFetch("sendrawtransaction");
+    const { sellerFlow, offerA, acceptA, statement, swapId } = await w.pairAndLock(dropping);
+    dropping.arm(); // the next sendrawtransaction of this process is the claim's: it never leaves the process
+    const failure = await sellerFlow.claimLegA(statement).then(() => undefined, (error: unknown) => error);
+    expect(failure, "the claim's send failed").toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(ClaimNotMinedError);
+    expect(dropping.dropped(), "one request was dropped").toBe(1);
+    expect(dropping.count("testmempoolaccept"), "the claim passed the node's acceptance test").toBe(1);
+    expect(dropping.count("sendrawtransaction"), "nothing reached the node's sendrawtransaction").toBe(0);
+
+    // (1) the record holds the claim, without the mark
+    const recorded = (await w.sellerRecord(acceptA.contract)).claimTx;
+    expect(recorded, "the claim was recorded before the send").toBeDefined();
+    expect(recorded?.sent, "and never marked").toBeUndefined();
+    const txid = recorded?.txid as string;
+    expect(await mempoolOf(node)).not.toContain(txid);
+    await expect(node.rpcCall("getrawtransaction", [txid, true])).rejects.toThrow(/No such mempool or blockchain transaction/);
+
+    // (2) the Seller's wallet does not know it: Core answers code -5, and the rail's read says false
+    const wallet = `/wallet/${node.seller.wallet}`;
+    const answer = await node.createCapturingRpc().request({ method: "gettransaction", params: [txid], path: wallet }).then(() => undefined, (error: unknown) => error);
+    expect(answer, "Core refuses the wallet read").toBeInstanceOf(RpcCaptureError);
+    expect((answer as RpcCaptureError).code, "with code -5, Invalid or non-wallet transaction id").toBe(-5);
+    await expect(node.rpcCall("gettransaction", [txid], wallet)).rejects.toThrow(/Invalid or non-wallet transaction id/);
+    const probe = await BtcHtlcRail.connect({ config, rpc: node.createCapturingRpc() });
+    expect(await probe.walletKnowsTransaction({ wallet: node.seller.wallet, key: keyFor(node.seller) }, txid)).toBe(false);
+
+    // (3) past the claim-by (and inside the bound) a restarted Seller asks the wallet once, is told no, and keeps the first-claim guard: nothing is tested or sent
+    w.clockRef.ms = offerA.claimByMs + 30 * 60_000;
+    const restarted = await w.restartSeller(swapId, acceptA.contract);
+    expect(restarted.next).toBe("claimLegA");
+    const refusal = await restarted.flow.claimLegA(statement).then(() => undefined, (error: unknown) => error);
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toMatch(/at\/after its claimByMs/);
+    expect(restarted.calls.count("gettransaction"), "the wallet was asked once").toBe(1);
+    expect(restarted.calls.count("testmempoolaccept")).toBe(0);
+    expect(restarted.calls.count("sendrawtransaction")).toBe(0);
+    expect(signingCalls(restarted.calls)).toBe(0);
+    expect((await w.sellerRecord(acceptA.contract)).claimTx?.sent, "the claim stays unmarked").toBeUndefined();
+    expect(await mempoolOf(node)).not.toContain(txid);
+  }, 120_000);
+
+  it("7b: P10R3-PIN-01: a claim recorded and then refused by the rail's own last deadline read (before any send) is unknown to the Seller's wallet too (-5), and is forgotten in the record", async () => {
+    const w = await buildSwap(node, config);
+    let jumpTo: number | undefined;
+    // the clock moves right after the claim is signed (the wallet's walletprocesspsbt answered), so the rail's last read before testmempoolaccept finds it inside the claim-inclusion margin
+    const movingClock: typeof fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      if (jumpTo !== undefined && typeof init?.body === "string" && init.body.includes('"walletprocesspsbt"')) {
+        w.clockRef.ms = jumpTo;
+        jumpTo = undefined;
+      }
+      return response;
+    };
+    const calls = countingFetch(movingClock);
+    const { sellerFlow, offerA, acceptA, statement, swapId } = await w.pairAndLock(calls);
+    const signedBefore = calls.count("walletprocesspsbt");
+    jumpTo = offerA.refundAfterMs - 30 * 60_000;
+    const failure = await sellerFlow.claimLegA(statement).then(() => undefined, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message, "refused by the rail's last deadline read").toMatch(/at\/after the given deadline/);
+    expect(calls.count("walletprocesspsbt") - signedBefore, "the claim was signed once").toBe(1);
+    expect(calls.count("testmempoolaccept"), "refused before the acceptance test").toBe(0);
+    expect(calls.count("sendrawtransaction"), "and before any send").toBe(0);
+
+    // the txid of the claim that was signed: the saves of the Seller's record held it before the refusal dropped it
+    const key = `seller:${acceptA.contract}`;
+    const signed = w.sellerStore.saved
+      .map((text) => decodeFlowRecord(new TextEncoder().encode(text), key))
+      .flatMap((record) => (record.role === "seller" && record.claimTx !== undefined ? [record.claimTx.txid] : []));
+    expect(signed.length, "the claim was saved before the deadline read").toBeGreaterThan(0);
+    const txid = signed[0] as string;
+    expect((await w.sellerRecord(acceptA.contract)).claimTx, "provably never sent, so the record forgot it").toBeUndefined();
+    expect(await mempoolOf(node)).not.toContain(txid);
+
+    // the wallet still answers -5
+    const answer = await node.createCapturingRpc().request({ method: "gettransaction", params: [txid], path: `/wallet/${node.seller.wallet}` }).then(() => undefined, (error: unknown) => error);
+    expect((answer as RpcCaptureError).code).toBe(-5);
+    const probe = await BtcHtlcRail.connect({ config, rpc: node.createCapturingRpc() });
+    expect(await probe.walletKnowsTransaction({ wallet: node.seller.wallet, key: keyFor(node.seller) }, txid)).toBe(false);
+
+    // and a restarted Seller, the clock still past the claim-by, refuses as a first claim and signs and sends nothing
+    const restarted = await w.restartSeller(swapId, acceptA.contract);
+    const refusal = await restarted.flow.claimLegA(statement).then(() => undefined, (error: unknown) => error);
+    expect((refusal as Error).message).toMatch(/at\/after its claimByMs/);
+    expect(signingCalls(restarted.calls)).toBe(0);
+    expect(restarted.calls.count("testmempoolaccept")).toBe(0);
+    expect(restarted.calls.count("sendrawtransaction")).toBe(0);
   }, 120_000);
 });
 

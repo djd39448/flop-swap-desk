@@ -992,6 +992,11 @@ mempool dropped the claim): `gettransaction <claim txid>` on the Seller's wallet
 `abandoned` or `in_mempool` key; for a transaction the wallet has no part in (the Buyer's funding) it answers code -5. A wallet that was restored from a backup without a rescan, or a claim whose destination
 is another wallet's address, would not know the transaction: that is the residual, written in the README's limit (1).
 
+P10R3-PIN-01 (test only, `tests-regtest/claim-mined.regtest.test.ts`, cases 7a and 7b): the negative the wallet signal rests on, on a real node. A claim signed and passed through
+`testmempoolaccept` whose `sendrawtransaction` call was dropped before the node (record: `claimTx` without `sent`), and a claim signed and then refused by the rail's own last deadline read,
+are unknown to the Seller's wallet (`gettransaction` answers code -5, `walletKnowsTransaction` is false), and a restarted Seller past the claim-by keeps the first-claim guard ("at/after its
+claimByMs") and makes no `testmempoolaccept` and no `sendrawtransaction` call.
+
 Not built, on purpose: the backlog's two other items wait for the desk operator's word. B8, an automatic same-nonce re-pricing of a stuck EVM claim, is recommended after the first
 real Base Sepolia rehearsal, with its numbers (the README still says to speed a stuck claim up by hand). B9, the Solana program-side compute fix (store the vault bump in the escrow:
 a program build, a fixture refresh and a review round), is recommended with Solana devnet. Neither has code, a test or a fixture in this package.
