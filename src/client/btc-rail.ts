@@ -45,6 +45,8 @@ import { verifiedExchangeBytes, type CapturingRpc, type Exchange } from "../rail
 import {
   RailRecoveryRefusedError,
   type ConnectedCounterAssetRail,
+  type ClaimTxResend,
+  type ClaimTxStatus,
   type CounterAssetRail,
   type LockRecovery,
   type LockRecoveryOutcome,
@@ -52,6 +54,7 @@ import {
   type PreparedLock,
   type RailAccounts,
   type RailBlockMarker,
+  type RailClaimOptions,
   type RailEvidenceResult,
   type RailRefundOptions,
   type RailWriteEvidence,
@@ -269,11 +272,48 @@ class ConnectedBtcCounterRail implements ConnectedCounterAssetRail {
 
   /** The Seller's claim — `src/rails/btc-htlc.ts`'s own `claim()` re-checks `notAfterMs` against
    *  fresh chain time as the very last read, and runs `testmempoolaccept` before ever
-   *  broadcasting (P4-BTC-SPEC.md §4/§7a); this wrapper adds no behaviour of its own. */
-  async claim(ref: string, secret: string, notAfterMs: number): Promise<RailWriteEvidence> {
+   *  broadcasting (P4-BTC-SPEC.md sections 4 and 7a). P10 B7: the claim's txid and exact bytes go to `options.onSignedTx` after signing and before anything is sent
+   *  (and `onNotBroadcastTx` hears of a claim that provably never was). The return says the node ACCEPTED the claim, not that it is mined: `claimIsMined` says that. */
+  async claim(ref: string, secret: string, notAfterMs: number, options?: RailClaimOptions): Promise<RailWriteEvidence> {
     const btcTerms = toBtcHtlcTerms(this.terms, this.accounts);
-    const evidence = await this.btcRail.claim(ref, btcTerms, secret, this.ownWallet(), this.options.destinationAddress, notAfterMs);
+    const evidence = await this.btcRail.claim(ref, btcTerms, secret, this.ownWallet(), this.options.destinationAddress, notAfterMs, {
+      ...(options?.onSignedTx === undefined ? {} : { onSigned: (signed: { txid: string; rawTx: string }) => options.onSignedTx?.({ chain: "btc", ...signed }) }),
+      ...(options?.onNotBroadcastTx === undefined ? {} : { onNotBroadcast: (signed: { txid: string; rawTx: string }) => options.onNotBroadcastTx?.({ chain: "btc", ...signed }) }),
+    });
     return toWriteEvidence(evidence);
+  }
+
+  /** P10 B7: a MINED spend of the funding output by its hash branch (one confirmation on the pinned chain), by the block scan from `fromMarker`. READ-ONLY. */
+  async claimIsMined(ref: string, fromMarker?: RailBlockMarker): Promise<boolean> {
+    const fromHeight = typeof fromMarker === "number" ? fromMarker : 0;
+    return this.btcRail.claimMined(ref, this.terms.statement, fromHeight);
+  }
+
+  /** P10 B7, READ-ONLY: what became of the one claim recorded through `claim`'s `onSignedTx` (`BtcHtlcRail.claimStatus`); the handle is checked for shape and internal consistency first. */
+  async claimTxStatus(ref: string, recovery: LockRecovery): Promise<ClaimTxStatus> {
+    const handle = requireBtcHandle(ref, recovery, false);
+    return this.btcRail.claimStatus(ref, handle.txid);
+  }
+
+  /**
+   * P10 B7: re-sends the IDENTICAL recorded claim bytes (`BtcHtlcRail.resendClaim`: nothing is built or signed; the bytes must hash to the txid and spend exactly `ref`).
+   * A node that refuses them (the inputs gone, a policy rejection) is a `RailRecoveryRefusedError("rebroadcast-refused")`: a person decides; the claim is never re-priced.
+   */
+  async resendClaimTx(ref: string, recovery: LockRecovery, options?: { notAfterMs?: number }): Promise<ClaimTxResend> {
+    const handle = requireBtcHandle(ref, recovery, false);
+    try {
+      const sent = await this.btcRail.resendClaim(ref, handle.txid, handle.rawTx, options?.notAfterMs === undefined ? {} : { notAfterMs: options.notAfterMs });
+      return sent.outcome;
+    } catch (error) {
+      if (error instanceof BtcBroadcastRefusedError) {
+        throw new RailRecoveryRefusedError(
+          "rebroadcast-refused",
+          ref,
+          `the node refuses the recorded claim transaction ${handle.txid} (${error.reason}); it was not re-signed and not re-priced`,
+        );
+      }
+      throw error;
+    }
   }
 
   async refund(ref: string, options?: RailRefundOptions): Promise<RailWriteEvidence> {

@@ -22,6 +22,7 @@ import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { swapId as computeSwapId } from "../src/profile.js";
 import { identity, type Identity } from "../tests/helpers/identity.js";
 import { startBitcoind, type BitcoindHandle, type RegtestWallet } from "./helpers/bitcoind.js";
+import { claimBroadcast } from "./helpers/claim.js";
 
 function keyFor(wallet: RegtestWallet): BtcSignerKey {
   return keyFromAddressInfo({ pubkey: wallet.pubkey, hdmasterfingerprint: wallet.hdMasterFingerprint, hdkeypath: wallet.hdKeyPath });
@@ -144,7 +145,8 @@ describe("K1/K2 — a pending (unmined) claim, on a real bitcoind mempool", () =
     // The Seller claims, but posts NO reveal frame (options.skipReveal), and deliberately no
     // block is mined afterward — the claim sits in the mempool alone. Before K1, the Buyer's own
     // learnSecret (via findClaimedPreimage's bounded BLOCK scan) would find nothing here at all.
-    await h.sellerFlow.claimLegA(lockA.hashLock, { skipReveal: true });
+    // (P10 B7: a claim that is only in the mempool is not landed, so the call ends in ClaimNotMinedError, with the claim in the mempool.)
+    await claimBroadcast(h.sellerFlow, lockA.hashLock, { skipReveal: true });
 
     const mempool = await node.rpcCall<string[]>("getrawmempool", []);
     expect(mempool).toHaveLength(1); // the claim really is only in the mempool
@@ -169,7 +171,7 @@ describe("K1/K2 — a pending (unmined) claim, on a real bitcoind mempool", () =
 
     // The Seller claims (no reveal frame, no block mined) — exactly the race K1/K2 describe: a
     // claim the Buyer would otherwise not know about until (and unless) a block confirms it.
-    await h.sellerFlow.claimLegA(lockA.hashLock, { skipReveal: true });
+    await claimBroadcast(h.sellerFlow, lockA.hashLock, { skipReveal: true });
 
     // Past refundAfterMs now, so a Buyer that never learned about the claim would normally reach
     // for refundLegA — K2 requires it to check the outpoint's own state FIRST and refuse with a
@@ -252,17 +254,21 @@ describe("K2 — a lost claim reply still lets the Seller post its reveal and re
     const mempool = await node.rpcCall<string[]>("getrawmempool", []);
     expect(mempool).toHaveLength(1); // the claim really did land, just unseen by this flow
 
-    // K2: retrying `claimLegA` rebuilds the IDENTICAL, deterministic claim transaction; Core's own
-    // "txn-already-known" answer is now recognized as success (rather than a fresh failure), so
-    // this reports the SAME txid and — for the first time — posts the reveal and receipt frames.
-    const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
-    expect(claimed.evidence.txid).toMatch(/^[0-9a-f]{64}$/);
-    expect(claimed.reveal).toBeDefined();
-    expect(claimed.receipt).toBeDefined();
+    // K2 (P10 B7): retrying `claimLegA` finds the claim the flow recorded before it sent it, sees it in the node's mempool (the secret is public), posts the REVEAL for
+    // the first time and then ends in ClaimNotMinedError: a claim that is only in the mempool is not landed, and the receipt waits for a block. It rebuilds nothing and
+    // sends nothing (the node already holds the recorded claim).
+    await claimBroadcast(h.sellerFlow, lockA.hashLock);
 
     // Never a second, separately-broadcast claim transaction.
     const mempoolAfter = await node.rpcCall<string[]>("getrawmempool", []);
     expect(mempoolAfter).toEqual(mempool);
+
+    // A block mines the claim: the next call posts the receipt and reports the SAME txid.
+    await h.mineBlocks(1);
+    const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
+    expect(claimed.evidence.txid).toBe(mempool[0]);
+    expect(claimed.reveal).toBeDefined();
+    expect(claimed.receipt).toBeDefined();
 
     // The evidence reader itself confirms the claim once mined — the money side of this, not
     // merely the two frames.

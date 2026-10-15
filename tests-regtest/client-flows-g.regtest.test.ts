@@ -26,6 +26,7 @@ import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import { swapId as computeSwapId } from "../src/profile.js";
 import { identity, type Identity } from "../tests/helpers/identity.js";
 import { startBitcoind, type BitcoindHandle, type RegtestWallet } from "./helpers/bitcoind.js";
+import { claimAndMine, claimBroadcast } from "./helpers/claim.js";
 
 function keyFor(wallet: RegtestWallet): BtcSignerKey {
   return keyFromAddressInfo({ pubkey: wallet.pubkey, hdmasterfingerprint: wallet.hdMasterFingerprint, hdkeypath: wallet.hdKeyPath });
@@ -175,7 +176,7 @@ describe("Group G — Bitcoin client-flow fixes that need a real bitcoind wallet
       const otherPayerPubkey = `02${"cc".repeat(32)}`;
       await h.venue.post(dealRoom(acceptA.contract), h.buyerRail.formatAccountLine(otherPayerPubkey), buyer);
 
-      const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
+      const { claimed } = await claimAndMine(h.sellerFlow, lockA.hashLock, () => h.mineBlocks(1)); // P10 B7: landed only once mined
       expect(claimed.evidence.ref).toBe(lockA.writeEvidence.ref);
     }, 120_000);
   });
@@ -268,8 +269,9 @@ describe("Group G — Bitcoin client-flow fixes that need a real bitcoind wallet
 
       // Posts the real reveal frame (ref: the outpoint, per SellerFlow.claimLegA); deliberately
       // NO blocks are mined afterward, so `findClaimedPreimage`'s own bounded scan would find
-      // nothing yet — the reveal frame is the ONLY way `learnSecret` can succeed here.
-      await h.sellerFlow.claimLegA(lockA.hashLock);
+      // nothing yet - the reveal frame is the ONLY way `learnSecret` can succeed here. (P10 B7: the
+      // claim is broadcast and not mined, so the call ends in ClaimNotMinedError after the reveal.)
+      await claimBroadcast(h.sellerFlow, lockA.hashLock);
 
       const secret = await h.buyerFlow.learnSecret();
       expect(secret).toBe(h.sellerLock.preimage);
@@ -314,7 +316,7 @@ describe("Group G — Bitcoin client-flow fixes that need a real bitcoind wallet
       expect(firstLockFrame?.frame && (firstLockFrame.frame as { ref: string }).ref).toBe(bogusRef);
 
       // G8: the Seller's own claim must still work, using the REAL outpoint.
-      const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
+      const { claimed } = await claimAndMine(h.sellerFlow, lockA.hashLock, () => h.mineBlocks(1)); // P10 B7: landed only once mined
       expect(claimed.evidence.ref).toBe(lockA.writeEvidence.ref);
       expect(claimed.evidence.ref).not.toBe(bogusRef);
     }, 120_000);

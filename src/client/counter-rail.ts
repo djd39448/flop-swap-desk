@@ -123,6 +123,14 @@ export interface RailClaimOptions {
   onSigned?: (record: RailClaimRecord) => void | Promise<void>;
   /** Solana only (S2-2): called when a recorded claim was provably never handed to the network (nothing to resolve). */
   onNotBroadcast?: (record: RailClaimRecord) => void | Promise<void>;
+  /**
+   * Bitcoin only (P10 B7, record before send): called, and awaited, with the claim's recovery handle (`{ chain: "btc", txid, rawTx }`) once the claim is signed and
+   * BEFORE the last deadline read and anything is sent, so the Seller can persist the exact bytes and, if the claim later drops out of the mempool, send them again
+   * with `resendClaimTx`. The bytes carry the preimage in their witness: for the Seller's own record only.
+   */
+  onSignedTx?: (recovery: LockRecovery) => void | Promise<void>;
+  /** Bitcoin only (P10 B7): called with the same handle when the claim provably never reached the network (the deadline refused it, or `testmempoolaccept` did), so the record may be dropped. */
+  onNotBroadcastTx?: (recovery: LockRecovery) => void | Promise<void>;
 }
 
 /** Solana only (S2-2): what a Seller records about one claim it signed, enough to resolve it later by signature. */
@@ -215,6 +223,19 @@ export type LockRecovery =
  *     `resendLock` / `resendRefund` once its own guards allow a new outward action; that call is what settles it.
  */
 export type LockRecoveryOutcome = "landed" | "never-landed" | "pending" | "unknown";
+
+/**
+ * P10 B7 (Bitcoin only): what the node says of ONE claim the Seller signed and recorded, from its txid and the funding output (`claimTxStatus`, READ-ONLY).
+ *   - `mined`: the claim has a confirmation on the pinned chain: the Seller is paid.
+ *   - `in-mempool`: the node holds it, unmined. The preimage is public (it is in the bytes); nothing new may be signed or sent.
+ *   - `unknown`: the node does not know the txid and the funding output is still unspent by anyone (mempool included): the claim was never sent, or it was dropped.
+ *     The IDENTICAL recorded bytes may be sent again with `resendClaimTx`; a new claim with another fee is never built.
+ *   - `spent-by-other`: the node does not know the txid and the funding output is spent by another transaction (the Buyer's refund, say): this claim can no longer land.
+ */
+export type ClaimTxStatus = "mined" | "in-mempool" | "unknown" | "spent-by-other";
+
+/** P10 B7 (Bitcoin only): what `resendClaimTx` settled: the node already held the claim (`mined`, `in-mempool`), the funding output is spent by another transaction (`spent-by-other`, nothing sent), or it sent the identical bytes (`in-mempool`). */
+export type ClaimTxResend = "mined" | "in-mempool" | "spent-by-other";
 
 /**
  * R1-01 (part 2): what `resendLock` / `resendRefund` answer after sending the identical persisted bytes once (or after
@@ -371,6 +392,21 @@ export interface ConnectedCounterAssetRail {
   /** Solana only (S2-2): resolve one recorded claim by its signature (never by a scan or a resend). Optional: a rail
    *  with no such concept omits it. */
   recoverClaim?(ref: string, record: RailClaimRecord): Promise<RailClaimRecovery>;
+  /**
+   * P10 B7 (Bitcoin only), optional: a rail that has it SETTLES a claim on chain, not at the broadcast: the Seller counts a claim as landed only once it is mined,
+   * keeps its `next` at the claim step until then, and keeps the claim alive by re-sending the identical recorded bytes. The three methods go together
+   * (`claimIsMined`, `claimTxStatus`, `resendClaimTx`); a rail without them (EVM, NEAR, Solana, the scripted fakes) behaves as before.
+   * `claimIsMined`: has the hash branch of the funding output been spent by a MINED transaction (the block scan from `fromMarker`, no mempool step)? READ-ONLY.
+   */
+  claimIsMined?(ref: string, fromMarker?: RailBlockMarker): Promise<boolean>;
+  /** P10 B7 (Bitcoin only): what became of the one claim recorded through `claim`'s `onSignedTx`, from its txid and the funding output. READ-ONLY: it never sends. */
+  claimTxStatus?(ref: string, recovery: LockRecovery): Promise<ClaimTxStatus>;
+  /**
+   * P10 B7 (Bitcoin only): send the IDENTICAL recorded claim bytes once, after `claimTxStatus` answered `unknown`. Never signs or builds anything, so it can never be a
+   * second spend; an `options.notAfterMs` is checked against fresh chain time as the last read before the send (the Seller passes it for a claim it cannot show was ever
+   * sent, which is then a first claim and keeps its deadline). A node that refuses the bytes is a thrown `RailRecoveryRefusedError("rebroadcast-refused")`.
+   */
+  resendClaimTx?(ref: string, recovery: LockRecovery, options?: { notAfterMs?: number }): Promise<ClaimTxResend>;
   /** P4-BTC-FIXES-R2.md R2-1: on a refund retry (this connected handle's own `refund()` already
    *  broadcast once), re-check the chain and re-send `priorEvidence`'s own EXACT bytes
    *  (`priorEvidence.rawTx`) if they have genuinely dropped (not in the mempool, not confirmed)

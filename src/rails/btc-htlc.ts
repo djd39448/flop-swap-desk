@@ -671,6 +671,29 @@ export interface BtcRefundOptions {
   onNotBroadcast?: (signed: { txid: string; rawTx: string }) => void | Promise<void>;
 }
 
+/**
+ * P10 B7: the recorder `BtcHtlcRail.claim` accepts, the claim's twin of `BtcRefundOptions` (record before send). `onSigned` is awaited with the claim's txid
+ * and exact signed bytes once they are final and BEFORE the last deadline read and anything is sent, so a caller can persist them: a claim that is later
+ * dropped from the mempool is re-sent as these very bytes (`resendClaim`), never rebuilt with another fee. `onNotBroadcast` is called with the same pair when
+ * the claim provably never reached the network: the deadline guard refused it, or `testmempoolaccept` did. The bytes carry the preimage in their witness: they
+ * are for the Seller's own record, never a log. Omitted: no behaviour change.
+ */
+export interface BtcClaimOptions {
+  onSigned?: (signed: { txid: string; rawTx: string }) => void | Promise<void>;
+  onNotBroadcast?: (signed: { txid: string; rawTx: string }) => void | Promise<void>;
+}
+
+/**
+ * P10 B7: what the node says of ONE claim transaction a Seller signed, from its txid and the state of the funding output (`BtcHtlcRail.claimStatus`).
+ * `mined`: it has a confirmation. `in-mempool`: the node holds it, unmined. `unknown`: the node does not know the txid and the funding output is still unspent
+ * by anyone (mempool included): the claim was never sent or was dropped, and the identical bytes may be sent again. `spent-by-other`: the node does not know
+ * the txid and the funding output is spent by another transaction (the Buyer's refund, most likely), so this claim can no longer land.
+ */
+export type BtcClaimStatus = "mined" | "in-mempool" | "unknown" | "spent-by-other";
+
+/** P10 B7: what `BtcHtlcRail.resendClaim` settled: the node already had the claim (`mined`, `in-mempool`), the funding output is spent by another transaction (`spent-by-other`, nothing sent), or it sent the identical bytes (`in-mempool`). */
+export type BtcClaimResend = "mined" | "in-mempool" | "spent-by-other";
+
 export interface BtcHtlcRailOptions {
   config: BtcRailConfig;
   rpc: CapturingRpc;
@@ -1143,6 +1166,10 @@ export class BtcHtlcRail {
    * key + the BIP174 sha256 preimage field), has `seller`'s own wallet sign AND finalize it in
    * one `walletprocesspsbt` call, re-checks `notAfterMs` against fresh chain time as the very
    * last read, runs `testmempoolaccept`, and only then broadcasts.
+   *
+   * P10 B7 (record before send): `options.onSigned` is awaited with the claim's txid and exact bytes after signing and before that last read, so a caller
+   * can persist them; the deadline read is still the last RPC before `testmempoolaccept`. If the deadline refuses the claim, or `testmempoolaccept` does,
+   * `options.onNotBroadcast` hears of it (the bytes never reached the network). The return says the claim was ACCEPTED by this node, not that it is mined.
    */
   async claim(
     ref: string,
@@ -1151,6 +1178,7 @@ export class BtcHtlcRail {
     seller: BtcWalletHandle,
     destinationAddress: string,
     notAfterMs: number,
+    options: BtcClaimOptions = {},
   ): Promise<WriteEvidence> {
     const { txid: fundTxid, vout: fundVout } = parseOutpointRef(ref);
     validateTerms(terms);
@@ -1205,10 +1233,6 @@ export class BtcHtlcRail {
         throw new Error("btc-htlc: walletprocesspsbt did not produce a complete, finalized claim transaction");
       }
 
-      // The deadline guard is the LAST read before broadcast - nothing but testmempoolaccept and
-      // the broadcast itself follow.
-      await this.assertChainTimeBeforeOrThrow(notAfterMs);
-
       // P4-BTC-FIXES-R3.md K2: "sign-and-record, then broadcast" - this transaction's own txid is
       // already fully determined by its own signed bytes (a hash of them), knowable before ever
       // broadcasting. Recording it here (a local decode, no RPC of its own) means a caller retrying
@@ -1216,8 +1240,30 @@ export class BtcHtlcRail {
       // same txid, so `broadcastOrThrow` recognizes Core's own "already known" answer as success.
       const claimTxid = Transaction.fromRaw(hexToBytes(processed.hex), { allowUnknownInputs: true, allowUnknownOutputs: true }).id;
 
-      mayHaveReachedTheNode = true;
-      const txid = await this.broadcastOrThrow(processed.hex, claimTxid);
+      // P10 B7 (record before send): the signed bytes are handed to the caller (awaited) BEFORE anything is sent, so a restart can find this one claim again
+      // (and send it again, byte for byte, if it drops out of the mempool) instead of signing a second. It comes before the deadline read below, which stays
+      // the last read before `testmempoolaccept`: a claim the deadline then refuses is reported through `onNotBroadcast`.
+      const signed = { txid: claimTxid, rawTx: processed.hex };
+      if (options.onSigned !== undefined) await options.onSigned(signed);
+
+      // The deadline guard is the LAST read before broadcast - nothing but testmempoolaccept and
+      // the broadcast itself follow.
+      try {
+        await this.assertChainTimeBeforeOrThrow(notAfterMs);
+      } catch (error) {
+        if (options.onNotBroadcast !== undefined) await options.onNotBroadcast(signed);
+        throw error;
+      }
+
+      let txid: string;
+      try {
+        mayHaveReachedTheNode = true;
+        txid = await this.broadcastOrThrow(processed.hex, claimTxid);
+      } catch (error) {
+        // `testmempoolaccept` refused it: `sendrawtransaction` was never called, so these bytes never reached the network.
+        if (error instanceof BtcBroadcastRefusedError && options.onNotBroadcast !== undefined) await options.onNotBroadcast(signed);
+        throw error;
+      }
       return this.finishWriteEvidence(ref, txid, before);
     } catch (error) {
       // A `testmempoolaccept` refusal means the bytes provably never reached the network: the fee is forgotten.
@@ -1382,6 +1428,11 @@ export class BtcHtlcRail {
       // DIFFERENT, already-mined spend exists (e.g. this mempool entry is about to be replaced).
     }
 
+    return this.scanMinedSpend(fundTxid, fundVout, hashLockBytes, fromHeight);
+  }
+
+  /** The bounded block scan of `findClaimPreimage` (mined spends only, never the mempool): the preimage of the first mined spend of the outpoint that opens `hashLockBytes`, else `null`. */
+  private async scanMinedSpend(fundTxid: string, fundVout: number, hashLockBytes: Uint8Array, fromHeight: number): Promise<string | null> {
     const info = await this.request<{ blocks: number }>("getblockchaininfo", []);
     for (let height = fromHeight; height <= info.blocks; height += 1) {
       const blockHash = await this.request<string>("getblockhash", [height]);
@@ -1396,6 +1447,88 @@ export class BtcHtlcRail {
         }
       }
     }
-    return null; // never spent within the scanned window (mempool or mined)
+    return null; // never spent within the scanned window
+  }
+
+  /**
+   * P10 B7: has the hash branch of this funding output been spent by a MINED transaction (one confirmation on the pinned chain)? The block scan of
+   * `findClaimPreimage` without its mempool step: a claim that is only in the mempool is not mined. Only a spend whose witness opens `hashLockHex` counts
+   * (the Buyer's timelock-branch refund never does). The chain is re-checked first, so the answer is always about the pinned chain.
+   */
+  async claimMined(ref: string, hashLockHex: string, fromHeight: number): Promise<boolean> {
+    const { txid: fundTxid, vout: fundVout } = parseOutpointRef(ref);
+    if (!HASH_LOCK_SHAPE.test(hashLockHex)) {
+      throw new Error("btc-htlc: hashLock must be 0x + 64 lowercase hex");
+    }
+    await this.assertPinnedChain();
+    return (await this.scanMinedSpend(fundTxid, fundVout, hexToBytes(hashLockHex.slice(2)), fromHeight)) !== null;
+  }
+
+  /**
+   * P10 B7, READ-ONLY (it never sends): what became of the one claim whose txid the Seller recorded. The node is asked about the txid (`recoverFunding`: the
+   * mempool and, with the `-txindex=1` this rail already needs, the chain); known is `mined` once it has a confirmation, else `in-mempool`. Unknown: when
+   * the funding output is spent by another transaction (`gettxout` with the mempool answers nothing) the claim can no longer land: `spent-by-other`; otherwise
+   * `unknown`, and `resendClaim` decides. The txid is looked up once more before the `spent-by-other` verdict, so a claim that reached the node between the two
+   * reads is never called superseded.
+   */
+  async claimStatus(ref: string, claimTxid: string): Promise<BtcClaimStatus> {
+    parseOutpointRef(ref);
+    const known = await this.recoverFunding(claimTxid);
+    if (known.broadcast) return known.confirmations !== null && known.confirmations >= 1 ? "mined" : "in-mempool";
+    if (await this.fundingOutputUnspent(ref)) return "unknown";
+    const again = await this.recoverFunding(claimTxid);
+    if (again.broadcast) return again.confirmations !== null && again.confirmations >= 1 ? "mined" : "in-mempool";
+    return "spent-by-other";
+  }
+
+  /**
+   * P10 B7: re-send the IDENTICAL recorded claim bytes, once, when the node no longer holds them. NEVER rebuilds or re-signs (identical bytes have one txid and
+   * one fee, so this cannot create a second spend), and reveals nothing the first send did not: the preimage is in the bytes. First the bytes are checked
+   * locally: they must decode, hash to `claimTxid` and spend exactly the outpoint `ref` (a record that was edited into some other transaction is refused before
+   * any call). Then, in order: the node already holds the txid (`mined` or `in-mempool`, nothing sent); the funding output is spent by another transaction
+   * (`spent-by-other`, nothing sent); otherwise `options.notAfterMs`, when given, is checked against fresh chain time as the last read (a claim that may never
+   * have been sent is a first claim and keeps its deadline; a claim known to have been sent passes none, the secret being public already), and
+   * `testmempoolaccept` then `sendrawtransaction` run with Core's "already known" answer counting as success. A refusal by `testmempoolaccept` (the inputs gone, a
+   * policy rejection such as a mempool minimum fee that has risen) is a `BtcBroadcastRefusedError`: a person decides, the claim is never re-priced.
+   */
+  async resendClaim(
+    ref: string,
+    claimTxid: string,
+    claimRawTx: string,
+    options: { notAfterMs?: number } = {},
+  ): Promise<{ outcome: BtcClaimResend; txid: string; raw: string[] }> {
+    const { txid: fundTxid, vout: fundVout } = parseOutpointRef(ref);
+    let decoded: Transaction;
+    try {
+      decoded = Transaction.fromRaw(hexToBytes(claimRawTx), { allowUnknownInputs: true, allowUnknownOutputs: true });
+    } catch {
+      throw new Error("btc-htlc: the recorded claim rawTx does not decode as a transaction");
+    }
+    if (decoded.id !== claimTxid) {
+      throw new Error("btc-htlc: the recorded claim rawTx does not hash to the recorded txid, refusing to broadcast it");
+    }
+    const input = decoded.inputsLength === 1 ? decoded.getInput(0) : undefined;
+    if (input === undefined || input.txid === undefined || bytesToHex(input.txid) !== fundTxid || input.index !== fundVout) {
+      throw new Error("btc-htlc: the recorded claim rawTx does not spend exactly the funding output it is recorded for, refusing to broadcast it");
+    }
+    await this.assertPinnedChain();
+    const before = this.rpc.exchanges().length;
+    const done = (outcome: BtcClaimResend) => ({ outcome, txid: claimTxid, raw: this.rpc.exchanges().slice(before).map((exchange) => exchange.responseSha256) });
+
+    const known = await this.recoverFunding(claimTxid);
+    if (known.broadcast) return done(known.confirmations !== null && known.confirmations >= 1 ? "mined" : "in-mempool");
+    const txout = await this.request<Record<string, unknown> | null>("gettxout", [fundTxid, fundVout, true]);
+    if (txout === null) {
+      const again = await this.recoverFunding(claimTxid);
+      if (again.broadcast) return done(again.confirmations !== null && again.confirmations >= 1 ? "mined" : "in-mempool");
+      return done("spent-by-other");
+    }
+    if (options.notAfterMs !== undefined) await this.assertChainTimeBeforeOrThrow(options.notAfterMs);
+    const sentTxid = await this.broadcastOrThrow(claimRawTx, claimTxid);
+    if (sentTxid !== claimTxid) {
+      // Unreachable given identical bytes hash deterministically to the identical txid - kept as a loud sanity check.
+      throw new Error("btc-htlc: resending the recorded claim produced a different txid than recorded (unexpected)");
+    }
+    return done("in-mempool");
   }
 }

@@ -11,7 +11,12 @@
 //                  never-landed), and `resendLock` sends the IDENTICAL bytes; a refund is recorded with `onSigned` before it is
 //                  sent, `recoverRefund` reads (`landed`, `unknown` while the output is unspent, `never-landed` once another
 //                  transaction spent it) and `resendRefund` re-sends the identical bytes while the output is unspent;
-//                  `checkPendingClaim` and `resendRefundIfDropped` exist.
+//                  `checkPendingClaim` and `resendRefundIfDropped` exist. P10 B7: a claim is SIGNED (its txid and bytes go to `onSignedTx` before
+//                  anything is sent), then SENT; with `chain.autoMineClaims` (the default: the chain is instant) it is mined at once, otherwise it
+//                  sits in the "mempool" (the preimage is visible to `findClaimedPreimage` and `checkPendingClaim`, the output still reads `locked`
+//                  to the evidence reader) until `chain.mine()`, and `chain.evictClaim(txid)` drops it. The three Bitcoin settlement methods exist:
+//                  `claimIsMined` (a mined spend, by height), `claimTxStatus` (read the txid: mined, in the mempool, unknown, spent by another
+//                  transaction) and `resendClaimTx` (the identical bytes, never a new claim).
 //   flavour "near" (rail id near-htlc): the ref is `0x<hash lock>:<payer>`; the handle is `{txHash, signedTxBase64}`; a lock the
 //                  node has no row for is `never-landed` (the nonce proof; `nonceProof: false` makes it `pending`, the real
 //                  adapter's stall); `lockRecorded` and `checkPendingClaim` exist.
@@ -28,6 +33,8 @@ import { verifySecret, verifyTranscriptRecord, type LockTerms, type TranscriptRe
 
 import {
   RailRecoveryRefusedError,
+  type ClaimTxResend,
+  type ClaimTxStatus,
   type ConnectedCounterAssetRail,
   type CounterAssetRail,
   type LockRecovery,
@@ -36,6 +43,7 @@ import {
   type PreparedLock,
   type RailAccounts,
   type RailBlockMarker,
+  type RailClaimOptions,
   type RailEvidenceResult,
   type RailRefundOptions,
   type RailWriteEvidence,
@@ -67,12 +75,18 @@ interface Output {
   fundingTxid: string;
   /** The chain height the claim was mined at (set by `claim`); a test moves it to model a reorg that mines the claim lower (R2-13). */
   claimHeight?: number;
+  /** P10 B7: a claim the node holds but no block does (the output still reads `locked` to the evidence reader). */
+  mempoolSpend?: { txid: string; preimage: string };
+  /** P10 B7: the txid of the claim that was mined. */
+  minedClaimTxid?: string;
 }
 
 export interface LedgerCounts {
   /** Fundings (locks) built / actually sent. */
   fundBuilt: number;
   fundSent: number;
+  /** P10 B7 (Bitcoin): claims built (signed). A claim is built once per swap, however many times it is sent. */
+  claimBuilt: number;
   claimSent: number;
   /** Refunds built (signed) / actually sent. A refund built but never sent never reached the network. */
   refundBuilt: number;
@@ -98,7 +112,32 @@ export class LedgerChain {
   readonly knownTxs = new Set<string>();
   /** What each built funding's bytes mean, by txid (the "wallet": a persisted funding can be sent again from its bytes alone). */
   readonly builtFundings = new Map<string, PreparedFunding>();
-  readonly counts: LedgerCounts = { fundBuilt: 0, fundSent: 0, claimSent: 0, refundBuilt: 0, refundSent: 0, rebroadcasts: 0 };
+  readonly counts: LedgerCounts = { fundBuilt: 0, fundSent: 0, claimBuilt: 0, claimSent: 0, refundBuilt: 0, refundSent: 0, rebroadcasts: 0 };
+  /** P10 B7 (Bitcoin): what the "wallet" signed, by claim txid: the identical bytes can be sent again from the txid alone. */
+  readonly claimBytes = new Map<string, { ref: string; secret: string; rawTx: string }>();
+  /** P10 B7 (Bitcoin): true (the default, "the chain is instant"): a sent claim is mined at once. False: it sits in the mempool until `mine()`. */
+  autoMineClaims = true;
+  /** P10 B7 (Bitcoin): the node refuses a recorded claim it is asked to send again (its inputs are gone, or its fee is below the minimum). */
+  refuseClaimResend = false;
+  /** P10 B7 (Bitcoin): a block is mined: every claim in the mempool is in it. */
+  mine(): void {
+    this.height += 1;
+    for (const output of this.outputs.values()) {
+      if (output.mempoolSpend === undefined) continue;
+      output.status = "claimed";
+      output.preimage = output.mempoolSpend.preimage;
+      output.minedClaimTxid = output.mempoolSpend.txid;
+      output.claimHeight = this.height;
+      delete output.mempoolSpend;
+    }
+  }
+  /** P10 B7 (Bitcoin): the node drops a claim from its mempool (an expiry, a restart without the mempool): the output is unspent again, the txid unknown. */
+  evictClaim(txid: string): void {
+    for (const output of this.outputs.values()) {
+      if (output.mempoolSpend?.txid === txid) delete output.mempoolSpend;
+    }
+    this.knownTxs.delete(txid);
+  }
   /** Bitcoin: the node refuses to take a persisted funding again (its inputs are gone). */
   refuseRebroadcast = false;
   /** NEAR: a transaction that was never sent is provably dead (the access key's nonce moved past it). */
@@ -209,6 +248,10 @@ class LedgerConnected implements ConnectedCounterAssetRail {
   /** Bitcoin only (R1-01 part 2): the identical-bytes re-sends; the near flavour never answers `unknown` and has none. */
   readonly resendLock?: (prepared: PreparedLock) => Promise<LockResendOutcome>;
   readonly resendRefund?: (ref: string, recovery: LockRecovery) => Promise<LockResendOutcome>;
+  /** P10 B7, Bitcoin only: the three settlement methods of a claim (a mined spend, the status of the recorded txid, the identical bytes again). */
+  readonly claimIsMined?: (ref: string, fromMarker?: RailBlockMarker) => Promise<boolean>;
+  readonly claimTxStatus?: (ref: string, recovery: LockRecovery) => Promise<ClaimTxStatus>;
+  readonly resendClaimTx?: (ref: string, recovery: LockRecovery, options?: { notAfterMs?: number }) => Promise<ClaimTxResend>;
 
   constructor(
     private readonly options: LedgerRailOptions,
@@ -219,6 +262,9 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     if (options.flavour === "btc") {
       this.resendLock = (prepared) => this.btcResendLock(prepared);
       this.resendRefund = (ref, recovery) => this.btcResendRefund(ref, recovery);
+      this.claimIsMined = (ref, fromMarker) => this.btcClaimIsMined(ref, fromMarker);
+      this.claimTxStatus = (ref, recovery) => this.btcClaimTxStatus(ref, recovery);
+      this.resendClaimTx = (ref, recovery, options) => this.btcResendClaimTx(ref, recovery, options);
       this.resendRefundIfDropped = async (ref, prior) => {
         this.options.hooks.alive();
         const output = this.options.chain.outputs.get(ref);
@@ -336,22 +382,98 @@ class LedgerConnected implements ConnectedCounterAssetRail {
 
   // --- claim ------------------------------------------------------------------------------------------------------------
 
-  async claim(ref: string, secret: string): Promise<RailWriteEvidence> {
+  /** The claim lands on the chain: in a block at once (the default) or in the mempool. The identical bytes again are "already known" and change nothing. */
+  private applyClaim(output: Output, txid: string, secret: string): void {
+    if (this.chain.knownTxs.has(txid)) return;
+    this.chain.counts.claimSent += 1;
+    this.chain.knownTxs.add(txid);
+    if (this.chain.autoMineClaims) {
+      output.status = "claimed";
+      output.preimage = secret;
+      output.minedClaimTxid = txid;
+      output.claimHeight = this.chain.height;
+    } else {
+      output.mempoolSpend = { txid, preimage: secret };
+    }
+  }
+
+  async claim(ref: string, secret: string, notAfterMs: number, options: RailClaimOptions = {}): Promise<RailWriteEvidence> {
     this.options.hooks.alive();
     const output = this.chain.outputs.get(ref);
     if (output === undefined) throw new Error("ledger rail: no such output");
+    const btc = this.options.flavour === "btc";
+    const txid = hex(`claim|${ref}`);
     if (output.status !== "locked") throw new Error(`ledger rail: claim refused, the output is ${output.status}`);
+    if (btc && output.mempoolSpend !== undefined && output.mempoolSpend.txid !== txid) throw new Error("ledger rail: claim refused, the output is spent in the mempool by another transaction");
     if (!verifySecret("hash", output.hashLock, secret)) throw new Error("ledger rail: claim refused, the secret does not open the statement");
     // NEAR's contract refuses a claim at or after refundAfterMs; Bitcoin has no on-chain claim deadline (a claim and a refund race).
     if (this.options.flavour === "near" && this.chain.nowMs() >= output.refundAfterMs) throw new Error("ledger rail: claim refused, too late");
+    if (btc) {
+      // P10 B7 (record before send): the claim is signed (its bytes are the same whenever it is built), the recorder hears of it, then the last deadline read, then the send.
+      const rawTx = hex(`raw-claim|${txid}`);
+      if (!this.chain.claimBytes.has(txid)) {
+        this.chain.counts.claimBuilt += 1;
+        this.chain.claimBytes.set(txid, { ref, secret, rawTx });
+      }
+      const handle: LockRecovery = { chain: "btc", txid, rawTx };
+      if (options.onSignedTx !== undefined) await options.onSignedTx(handle);
+      if (this.chain.nowMs() >= notAfterMs) {
+        if (options.onNotBroadcastTx !== undefined) await options.onNotBroadcastTx(handle);
+        throw new Error("ledger rail: claim refused, at or after notAfterMs");
+      }
+    }
     await this.options.hooks.act("claim.send", async () => {
+      if (btc) {
+        this.applyClaim(output, txid, secret);
+        return;
+      }
       this.chain.counts.claimSent += 1;
       output.status = "claimed";
       output.preimage = secret;
       output.claimHeight = this.chain.height;
       this.chain.knownTxs.add(hex(`claim|${ref}`));
     });
-    return { ref, raw: [], ...(this.options.flavour === "btc" ? { txid: hex(`claim|${ref}`) } : {}) };
+    return { ref, raw: [], ...(btc ? { txid } : {}) };
+  }
+
+  // --- P10 B7: Bitcoin's claim settlement ------------------------------------------------------------------------------------
+
+  /** A mined spend of the output by its hash branch, found by a scan that starts at the marker (a claim a reorg mined below it is not seen). */
+  private async btcClaimIsMined(ref: string, fromMarker?: RailBlockMarker): Promise<boolean> {
+    this.options.hooks.alive();
+    const output = this.chain.outputs.get(ref);
+    if (output?.status !== "claimed" || output.claimHeight === undefined) return false;
+    return !(typeof fromMarker === "number" && output.claimHeight < fromMarker);
+  }
+
+  /** What the node says of the recorded claim's txid (READ-ONLY, like the real adapter's). */
+  private async btcClaimTxStatus(ref: string, recovery: LockRecovery): Promise<ClaimTxStatus> {
+    this.options.hooks.alive();
+    if (recovery.chain !== "btc") throw new RailRecoveryRefusedError("handle-mismatch", ref, `a ${recovery.chain} handle for the btc rail`);
+    const output = this.chain.outputs.get(ref);
+    if (this.chain.knownTxs.has(recovery.txid)) return output?.minedClaimTxid === recovery.txid && output.status === "claimed" ? "mined" : "in-mempool";
+    return output?.status === "locked" && output.mempoolSpend === undefined ? "unknown" : "spent-by-other";
+  }
+
+  /** The identical recorded claim bytes go out again, once: never a new claim. */
+  private async btcResendClaimTx(ref: string, recovery: LockRecovery, options?: { notAfterMs?: number }): Promise<ClaimTxResend> {
+    this.options.hooks.alive();
+    if (recovery.chain !== "btc") throw new RailRecoveryRefusedError("handle-mismatch", ref, `a ${recovery.chain} handle for the btc rail`);
+    const output = this.chain.outputs.get(ref);
+    const bytes = this.chain.claimBytes.get(recovery.txid);
+    if (output === undefined || bytes === undefined || bytes.ref !== ref || bytes.rawTx !== recovery.rawTx) {
+      throw new RailRecoveryRefusedError("handle-mismatch", ref, "this chain never signed that claim");
+    }
+    if (this.chain.knownTxs.has(recovery.txid)) return output.minedClaimTxid === recovery.txid && output.status === "claimed" ? "mined" : "in-mempool";
+    if (output.status !== "locked" || output.mempoolSpend !== undefined) return "spent-by-other";
+    if (this.chain.refuseClaimResend) throw new RailRecoveryRefusedError("rebroadcast-refused", ref, "the node refuses the recorded claim");
+    if (options?.notAfterMs !== undefined && this.chain.nowMs() >= options.notAfterMs) throw new Error("ledger rail: the claim re-send refused, at or after notAfterMs");
+    await this.options.hooks.act("claim.rebroadcast", async () => {
+      this.chain.counts.rebroadcasts += 1;
+      this.applyClaim(output, recovery.txid, bytes.secret);
+    });
+    // (the send mined it at once, or left it in the mempool)
+    return (output as Output).status === "claimed" ? "mined" : "in-mempool";
   }
 
   // --- refund -----------------------------------------------------------------------------------------------------------
@@ -424,6 +546,7 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     this.options.hooks.alive();
     if (this.chain.hideSpends) return null;
     const output = this.chain.outputs.get(ref);
+    if (output?.mempoolSpend !== undefined) return output.mempoolSpend.preimage;
     return output?.status === "claimed" && output.preimage !== undefined ? output.preimage : null;
   }
 
@@ -451,6 +574,7 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     this.options.hooks.alive();
     this.chain.scanFrom.push(fromMarker);
     const output = this.chain.outputs.get(ref);
+    if (output?.mempoolSpend !== undefined) return output.mempoolSpend.preimage; // the mempool step of the real scan (K1)
     // a bounded block scan starts at the marker: a claim mined below it is not seen (R2-13)
     if (typeof fromMarker === "number" && output?.claimHeight !== undefined && output.claimHeight < fromMarker) return null;
     return output?.status === "claimed" && output.preimage !== undefined ? output.preimage : null;

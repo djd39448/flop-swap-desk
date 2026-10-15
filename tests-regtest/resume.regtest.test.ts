@@ -46,6 +46,7 @@ import { identity, type Identity } from "../tests/helpers/identity.js";
 import { assertSavesClean, countingFetch, droppingFetch, lossyFetch, RecordingStore, swapProblems, type CountingFetch, type Outcome } from "../tests/helpers/live-resume.js";
 import { crashRail } from "../tests/helpers/resume-flows.js";
 import { startBitcoind, type BitcoindHandle, type RegtestWallet } from "./helpers/bitcoind.js";
+import { claimAndMine } from "./helpers/claim.js";
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL("../", import.meta.url)));
@@ -265,9 +266,9 @@ installSuite("Resume on bitcoind regtest: the Buyer's funding and refund exist o
   /** After the Buyer's lock frame is posted: finality, the Seller's claim, the Buyer learns the secret and claims leg B. */
   async function settle(w: World, p: Paired, buyerFlow: BuyerFlow, sellerFlow: SellerFlow): Promise<void> {
     await w.mineBlocks(2);
-    const claimed = await sellerFlow.claimLegA(p.statement);
+    const { claimed } = await claimAndMine(sellerFlow, p.statement, () => w.mineBlocks(1)); // P10 B7: a Bitcoin claim is landed only once mined
     expect(claimed.reveal).toBeDefined();
-    await w.mineBlocks(2);
+    await w.mineBlocks(1);
     const secret = await buyerFlow.learnSecret();
     expect(verifyHashPreimage(p.statement, secret)).toBe(true);
     expect(secret).toBe(w.sellerLock.preimage);

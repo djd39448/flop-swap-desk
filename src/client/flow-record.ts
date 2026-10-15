@@ -241,6 +241,13 @@ export interface FlowRecordBase {
   ledger: LedgerEntry[];
 }
 
+/** P10 B7: the Seller's recorded Bitcoin claim, see `SellerFlowState.claimTx`. `txid` is lower-case 64 hex; `rawTx` is the complete signed transaction, lower-case hex; `sent` is `true` or absent. */
+export interface ClaimTxRecord {
+  txid: string;
+  rawTx: string;
+  sent?: true;
+}
+
 export interface SellerFlowState {
   /** Leg A's tclk contract id (`0x` + 64 hex): the record's key (`seller:<contractA>`), set from the record's birth. */
   contractA: string;
@@ -267,6 +274,15 @@ export interface SellerFlowState {
    *  chain asks the node about it (`eth_getTransactionByHash`) before it sends a second claim: a transaction the node still holds is `pending`. Needs
    *  `claimAttempted`; absent for a claim that did not time out and for every other rail. */
   claimTxHash?: string;
+  /**
+   * P10 B7 (Bitcoin only): the one claim transaction the Seller signed, recorded BEFORE it was sent (record before send): its txid and its exact signed bytes. A
+   * claim counts as landed only once it is mined; until then a resumed `claimLegA` asks the node about this txid and, if the node dropped it while the funding output
+   * is unspent, sends these very bytes again (never a new spend with another fee). `sent` is true once the node ACCEPTED the claim (the secret is public from then on):
+   * a claim that is only recorded may never have been sent, and a re-send of it keeps every guard of a first claim; a claim that was sent is re-sent whenever the funding
+   * output is unspent, past the claim-by too. The bytes carry the preimage in their witness: this is the Seller's own record, the one place that holds it. Needs
+   * `claimAttempted`; absent for a claim that was not recorded and for every other rail.
+   */
+  claimTx?: ClaimTxRecord;
   /** Solana: every claim signature signed and not yet resolved (recorded before simulate/send). */
   claimRecords: RailClaimRecord[];
   publicClaimSignature?: string;
@@ -518,6 +534,9 @@ export function redactFlowRecord(record: FlowRecord): Record<string, unknown> {
       if (secretHex !== "" && entry.text.includes(secretHex)) entry.text = "[redacted]";
       if (secretHex !== "" && entry.landed?.record !== undefined && entry.landed.record.line.includes(secretHex)) entry.landed.record.line = "[redacted]";
     }
+    // P10 B7: a recorded Bitcoin claim carries the preimage in the witness of its signed bytes: masked too.
+    const claimTx = (copy as { claimTx?: { rawTx: string } }).claimTx;
+    if (claimTx !== undefined && secretHex !== "" && claimTx.rawTx.includes(secretHex)) claimTx.rawTx = "[redacted]";
     copy.preimage = "[redacted]";
   }
   return copy;
@@ -857,6 +876,25 @@ class Reader {
     return this.fail(`${path}.chain`, evmAllowed ? 'must be "btc", "near", "sol" or "evm"' : 'must be "btc", "near" or "sol"');
   }
 
+  /** P10 B7: the Seller's recorded Bitcoin claim: a txid, the signed bytes, and `sent` (`true` or absent). Shape only; the rail checks that the bytes hash to the txid and spend the funding output before it uses them. */
+  claimTx(value: unknown, path: string): ClaimTxRecord {
+    const o = this.object(value, path, ["txid", "rawTx"], ["sent"]);
+    const sent = this.optional(
+      o,
+      "sent",
+      (v, p) => {
+        if (this.bool(v, p) !== true) this.fail(p, "must be true when present");
+        return true as const;
+      },
+      path,
+    );
+    return {
+      txid: this.string(o.txid, `${path}.txid`, { pattern: /^[0-9a-f]{64}$/ }),
+      rawTx: this.string(o.rawTx, `${path}.rawTx`, { pattern: HEX_EVEN, max: MAX_FLOW_RECORD_BYTES }),
+      ...(sent === undefined ? {} : { sent }),
+    };
+  }
+
   claimRecord(value: unknown, path: string): RailClaimRecord {
     const o = this.object(value, path, ["signature", "blockhash", "lastValidBlockHeight"], ["signedSlot"]);
     const signedSlot = this.optional(o, "signedSlot", (v, p) => this.int(v, p), path);
@@ -873,7 +911,7 @@ const COMMON_REQUIRED = ["v", "role", "swapId", "did", "railId", "caip2", "deplo
 const COMMON_OPTIONAL = ["contractB", "lockTimeMs", "legB"] as const;
 // A Seller record is keyed by contract A (R1-14), so it has one from birth; a Buyer learns it with accept A.
 const SELLER_REQUIRED = ["contractA", "preimage", "statement", "claimAttempted", "claimRecords", "neverLandedClaims", "claimOutcome", "revealPosted", "receiptPosted", "legBRefund"] as const;
-const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature", "claimFromBlock", "claimTxHash", "legBClaimSeen"] as const;
+const SELLER_OPTIONAL = ["attemptedAcceptB", "lockedLegBContract", "frozenLegAAccounts", "frozenLegARailRef", "ownAccountLine", "publicClaimSignature", "claimFromBlock", "claimTxHash", "claimTx", "legBClaimSeen"] as const;
 const BUYER_REQUIRED = ["legBVerified", "lock", "legBClaimAttempted", "legBClaimed", "refund", "refundNotes"] as const;
 const BUYER_OPTIONAL = ["contractA", "ownAccountLine", "legBClaimAdopted"] as const;
 
@@ -1003,6 +1041,10 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
   if (claimFromBlock !== undefined && !claimAttempted) r.fail(`${path}.claimFromBlock`, "is saved with claimAttempted and needs it");
   const claimTxHash = r.optional(o, "claimTxHash", (v, p) => r.string(v, p, { pattern: /^0x[0-9a-f]{64}$/ }), path);
   if (claimTxHash !== undefined && !claimAttempted) r.fail(`${path}.claimTxHash`, "is saved after a claim attempt and needs claimAttempted");
+  const claimTx = r.optional(o, "claimTx", (v, p) => r.claimTx(v, p), path);
+  if (claimTx !== undefined && !claimAttempted) r.fail(`${path}.claimTx`, "is recorded after the claim attempt was saved and needs claimAttempted");
+  if (claimTx !== undefined && claimTxHash !== undefined) r.fail(`${path}.claimTx`, "a Bitcoin claim record never comes with an EVM claim hash");
+  if (claimTx !== undefined && claimRecords.length > 0) r.fail(`${path}.claimTx`, "a Bitcoin claim record never comes with Solana claim records");
   if (claimOutcome === "failed-public" && publicClaimSignature === undefined) r.fail(`${path}.publicClaimSignature`, "is required for a failed-public claim: it is the proof the secret is public");
   const refundObject = r.object(o.legBRefund, `${path}.legBRefund`, ["attempted", "done", "framesPosted"]);
   const legBClaimSeen = r.optional(
@@ -1041,6 +1083,7 @@ function parseSeller(r: Reader, o: Record<string, unknown>, path: string, common
     claimAttempted,
     ...(claimFromBlock === undefined ? {} : { claimFromBlock }),
     ...(claimTxHash === undefined ? {} : { claimTxHash }),
+    ...(claimTx === undefined ? {} : { claimTx }),
     claimRecords,
     ...(publicClaimSignature === undefined ? {} : { publicClaimSignature }),
     neverLandedClaims: r.int(o.neverLandedClaims, `${path}.neverLandedClaims`),

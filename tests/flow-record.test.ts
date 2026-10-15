@@ -983,3 +983,103 @@ describe("P9-4 decision 7 (record part): the EVM handle of a timed-out lock writ
     assertNoForbiddenFields(envelope(sellerWith(GOOD)), "seller with a claimTxHash");
   });
 });
+
+// P10 B7 (record part): the Seller's recorded Bitcoin claim, one strictly decoded optional field added in place (the record version stays 1). `claimTx` is the claim's
+// txid (lower-case 64 hex), its exact signed bytes (lower-case hex of even length) and `sent` (`true` or absent), saved BEFORE the claim is sent; it needs `claimAttempted`
+// and is a Bitcoin field: it never comes with an EVM claim hash or Solana claim records. A record without it (every record written before this change) decodes as before.
+describe("P10 B7 (record part): the Seller's claimTx", () => {
+  const TXID = "ab".repeat(32);
+  const RAW = "02000000000101deadbeef00";
+  /** The Solana-flavoured sample, turned into a Bitcoin Seller's record (no Solana claim records), with `claimTx` set to `claimTx`. */
+  const btcSeller = (claimTx: unknown): Record<string, unknown> => {
+    const r = plain(sampleSellerRecord());
+    r.railId = "btc-htlc";
+    r.claimRecords = [];
+    r.claimOutcome = "none";
+    delete r.publicClaimSignature;
+    r.neverLandedClaims = 0;
+    r.claimFromBlock = { kind: "number", value: "694" };
+    if (claimTx !== undefined) r.claimTx = claimTx;
+    return r;
+  };
+
+  it("a record with the claim decodes, keeps it, and encodes to the same bytes again, with and without 'sent'", () => {
+    for (const claimTx of [{ txid: TXID, rawTx: RAW }, { txid: TXID, rawTx: RAW, sent: true }]) {
+      const record = btcSeller(claimTx);
+      const decoded = decodeFlowRecord(envelope(record));
+      if (decoded.role !== "seller") throw new Error("expected a Seller record");
+      expect(decoded.claimTx).toEqual(claimTx);
+      expect(text(encodeFlowRecord(decoded))).toBe(text(envelope(record)));
+    }
+    expect(FLOW_RECORD_VERSION).toBe(1); // extended in place
+  });
+
+  it("a record without it (every record written before this change) decodes as before, and no sample carries it", () => {
+    const decoded = decodeFlowRecord(envelope(btcSeller(undefined)));
+    if (decoded.role !== "seller") throw new Error("expected a Seller record");
+    expect(decoded.claimTx).toBeUndefined();
+    expect("claimTx" in decoded).toBe(false);
+    for (const sample of sampleRecords()) expect(JSON.stringify(sample)).not.toContain('"claimTx"');
+  });
+
+  const refused: Array<[label: string, record: () => Record<string, unknown>]> = [
+    ["a txid that is short", () => btcSeller({ txid: "ab", rawTx: RAW })],
+    ["a txid in upper case", () => btcSeller({ txid: TXID.toUpperCase(), rawTx: RAW })],
+    ["a txid that is not a string", () => btcSeller({ txid: 42, rawTx: RAW })],
+    ["a txid that is missing", () => btcSeller({ rawTx: RAW })],
+    ["bytes of odd length", () => btcSeller({ txid: TXID, rawTx: "020" })],
+    ["bytes in upper case", () => btcSeller({ txid: TXID, rawTx: "02000000DEADBEEF" })],
+    ["bytes that are not hex", () => btcSeller({ txid: TXID, rawTx: "zz" })],
+    ["bytes that are empty", () => btcSeller({ txid: TXID, rawTx: "" })],
+    ["bytes that are missing", () => btcSeller({ txid: TXID })],
+    ["bytes that are not a string", () => btcSeller({ txid: TXID, rawTx: 12 })],
+    ["'sent' that is false", () => btcSeller({ txid: TXID, rawTx: RAW, sent: false })],
+    ["'sent' that is not a boolean", () => btcSeller({ txid: TXID, rawTx: RAW, sent: "yes" })],
+    ["an extra field in the claim", () => btcSeller({ txid: TXID, rawTx: RAW, feeSats: 1000 })],
+    ["a claim that is a string", () => btcSeller("claim")],
+    ["a claim that is null", () => btcSeller(null)],
+    ["a claim that is an array", () => btcSeller([TXID, RAW])],
+    ["a claim without a claim attempt (it is saved after one)", () => {
+      const r = btcSeller({ txid: TXID, rawTx: RAW });
+      r.claimAttempted = false;
+      delete r.claimFromBlock;
+      return r;
+    }],
+    ["a claim together with an EVM claim hash", () => {
+      const r = btcSeller({ txid: TXID, rawTx: RAW });
+      r.claimTxHash = `0x${"1d".repeat(32)}`;
+      return r;
+    }],
+    ["a claim together with Solana claim records", () => {
+      const r = btcSeller({ txid: TXID, rawTx: RAW });
+      r.claimRecords = [{ signature: "sig-one", blockhash: "hash-one", lastValidBlockHeight: 5_082 }];
+      return r;
+    }],
+  ];
+  it.each(refused)("seller: %s is refused", (_label, record) => {
+    expect(() => decodeFlowRecord(envelope(record()))).toThrow(FlowStoreCorruptError);
+  });
+
+  it("a Buyer record never carries claimTx (closed schema)", () => {
+    const buyer = plain(sampleBuyerRecord());
+    buyer.claimTx = { txid: TXID, rawTx: RAW };
+    expect(() => decodeFlowRecord(envelope(buyer))).toThrow(FlowStoreCorruptError);
+  });
+
+  it("the claim's txid and bytes are not key material: neither the field name nor a value trips the forbidden-field scan", () => {
+    assertNoForbiddenFields(envelope(btcSeller({ txid: TXID, rawTx: RAW, sent: true })), "seller with a claimTx");
+  });
+
+  it("redactFlowRecord masks claim bytes that carry the preimage (the Seller's own record is the only place it may be)", () => {
+    const withSecret = btcSeller({ txid: TXID, rawTx: `0200${SAMPLE_PREIMAGE.slice(2)}00`, sent: true });
+    const decoded = decodeFlowRecord(envelope(withSecret));
+    const redacted = redactFlowRecord(decoded) as { claimTx: { rawTx: string; txid: string; sent: boolean }; preimage: string };
+    expect(redacted.claimTx.rawTx).toBe("[redacted]");
+    expect(redacted.claimTx.txid).toBe(TXID);
+    expect(redacted.preimage).toBe("[redacted]");
+    expect(JSON.stringify(redacted)).not.toContain(SAMPLE_PREIMAGE.slice(2));
+    // bytes that do not carry it are left alone
+    const plainRaw = redactFlowRecord(decodeFlowRecord(envelope(btcSeller({ txid: TXID, rawTx: RAW })))) as { claimTx: { rawTx: string } };
+    expect(plainRaw.claimTx.rawTx).toBe(RAW);
+  });
+});

@@ -120,6 +120,18 @@
 //    most 100 calls: R1-FUND-03), so neither the margin nor the delay of a resume is bounded by it any more; and the resumed claim reads the lock's
 //    own row first (`claimPaidOut`), so a scan that cannot finish never stalls a Seller that is already paid.
 //
+// P10 B7 (P8 checkpoint decision 7; Bitcoin only): a Bitcoin claim counts as LANDED only once it is mined (one confirmation on the pinned chain), not when the
+// node accepts the broadcast. A claim seen only in the mempool has already shown the preimage: if the Seller then stopped and the claim were dropped, the Buyer
+// could learn the secret, claim leg B and refund leg A after its refund time, and the Seller would lose leg A. So, on a rail whose connected handle has
+// `claimTxStatus` / `resendClaimTx` / `claimIsMined` (only the Bitcoin adapter): the claim's txid and exact signed bytes are saved BEFORE it is sent
+// (`claimTx`); once the node accepts it the reveal frame is posted (the secret is public, and tclk's machine takes a reveal only before refundAfterMs, so it
+// cannot wait for a block) but NOT the receipt, `claimOutcome` stays `none`, `next` stays `claimLegA`, and `claimLegA` throws `ClaimNotMinedError` ("broadcast,
+// not mined"); a later `claimLegA` reads the chain: mined settles (the receipt is posted, `claimOutcome` is `landed`); still in the mempool it is the same
+// error and sends nothing; dropped while leg A's funding output is unspent it sends the IDENTICAL saved bytes again (never a new spend with another fee), past
+// the claim-by too once the node has accepted the claim before (the secret is public already, so the re-send reveals nothing new); a funding output spent by
+// another transaction is not re-sent (`ClaimSupersededError`). A claim that is only recorded and may never have been sent is a FIRST claim: its re-send keeps
+// every guard of one. Every other rail is unchanged.
+//
 // Design source: flop-contrib/handoff/P22-P24-EVM-SPEC.md §6; P22-P24-EVM-FIXES.md B1, B2, B3,
 // B5; P22-P24-EVM-FIXES-R2.md C1, C3; P22-P24-EVM-FIXES-R3.md E2, E4; P4-BTC-SPEC.md §7a;
 // P6-SOL-SPEC.md sections 3-5; P8-RESUME-SPEC.md.
@@ -158,7 +170,7 @@ import { SOL_CLAIM_LANDING_MARGIN_MS, SolClaimFailedError, SolNotLandedError, So
 import type { Exchange } from "../rails/rpc-capture.js";
 import { findAuthenticatedLock, foldAcceptedLock } from "../replay.js";
 import { offerAcceptLockTerms } from "../swap.js";
-import { belowMinLockable, type ConnectedCounterAssetRail, type CounterAssetRail, type RailAccounts, type RailBlockMarker, type RailClaimRecord, type RailWriteBroadcast, type RailWriteEvidence } from "./counter-rail.js";
+import { belowMinLockable, type ConnectedCounterAssetRail, type CounterAssetRail, type LockRecovery, type RailAccounts, type RailBlockMarker, type RailClaimOptions, type RailClaimRecord, type RailWriteBroadcast, type RailWriteEvidence } from "./counter-rail.js";
 import {
   FlowRecordConflictError,
   FlowRecordMismatchError,
@@ -168,6 +180,7 @@ import {
   newSellerRecord,
   railDeploymentId,
   withLedgerIntent,
+  type ClaimTxRecord,
   type SellerFlowRecord,
 } from "./flow-record.js";
 import {
@@ -325,6 +338,51 @@ export class ClaimPendingError extends Error {
   }
 }
 
+/**
+ * P10 B7 (Bitcoin only): the Seller's claim of leg A is BROADCAST but not MINED. The node accepted it (so the secret is public and the reveal frame is posted), but a
+ * claim counts as landed only once a block holds it, so no receipt is posted, `next` stays `claimLegA` and nothing is settled. Nothing new was signed and nothing is
+ * sent by this error's call: call `claimLegA()` again after the next block. A claim that drops out of the mempool is sent again as the same saved bytes, whenever
+ * leg A's funding output is still unspent. `txid` is the claim's public transaction id, `undefined` for a record that kept no claim bytes (written before they were
+ * recorded): such a claim cannot be sent again by this flow.
+ */
+export class ClaimNotMinedError extends Error {
+  readonly txid: string | undefined;
+  readonly evidence: RailWriteEvidence;
+  constructor(txid: string | undefined, evidence: RailWriteEvidence) {
+    super(
+      txid === undefined
+        ? "seller: a claim of leg A with this swap's secret is broadcast but not mined yet, and this record kept no claim bytes (it was written before they were recorded), so the flow cannot send it again: " +
+            "call claimLegA() again after the next block; if the claim drops out of the mempool a person must act (P10 B7)"
+        : `seller: the claim of leg A (transaction ${txid}) is broadcast but not mined yet; it counts as landed only once a block holds it. Nothing new was signed or sent: ` +
+            "call claimLegA() again after the next block. A claim that drops out of the mempool is sent again as the same bytes while leg A's funding output is unspent (P10 B7)",
+    );
+    this.name = "ClaimNotMinedError";
+    this.txid = txid;
+    this.evidence = evidence;
+  }
+}
+
+/**
+ * P10 B7 (Bitcoin only): leg A's funding output is spent by a transaction that is not this flow's recorded claim (the node does not know the claim's txid), most
+ * likely the Buyer's refund after leg A's refund time. The recorded claim can no longer land and is NOT sent again. Nothing was sent. `sent` says whether the node
+ * had accepted the claim before: if it had, the secret is public and leg B stays exposed until its own refund time.
+ */
+export class ClaimSupersededError extends Error {
+  readonly txid: string;
+  readonly sent: boolean;
+  constructor(txid: string, sent: boolean) {
+    super(
+      `seller: leg A's funding output is spent by a transaction that is not this flow's claim ${txid} (the node does not know it), so that claim can no longer land and is not sent again; ` +
+        (sent
+          ? "the claim had been accepted by the node, so the secret is public: leg B is exposed until its refund time (P10 B7)"
+          : "the claim had never been seen by the node, so the secret was not made public by it (P10 B7)"),
+    );
+    this.name = "ClaimSupersededError";
+    this.txid = txid;
+    this.sent = sent;
+  }
+}
+
 /** R3-2: a Solana claim whose signed bytes were handed to the network but never landed (starved: the blockhash
  *  expired with no status). The secret was BROADCAST, so it may have been seen, and the claim did not pay the
  *  Seller. Thrown to the runner when the Seller cannot finish the claim (the landing bound passed, the attempts
@@ -455,6 +513,8 @@ export class SellerFlow {
   private claimFromBlock?: RailBlockMarker;
   /** P9-4 decision 7: the hash of a claim write whose receipt wait timed out (EVM only), saved after the timeout; see `ClaimPendingError`. */
   private claimTxHash?: string;
+  /** P10 B7 (Bitcoin only): the claim transaction this flow signed, recorded before it was sent; see `SellerFlowState.claimTx`. */
+  private claimTx?: ClaimTxRecord;
   private claimOutcome: "none" | "landed" | "failed-public" = "none";
   private legBRefundAttempted = false;
   private legBRefundDone = false;
@@ -726,6 +786,7 @@ export class SellerFlow {
     this.claimAttempted = record.claimAttempted;
     if (record.claimFromBlock !== undefined) this.claimFromBlock = markerFromJson(record.claimFromBlock);
     if (record.claimTxHash !== undefined) this.claimTxHash = record.claimTxHash;
+    if (record.claimTx !== undefined) this.claimTx = { ...record.claimTx };
     this.claimRecords = record.claimRecords.map((entry) => ({ ...entry }));
     if (record.publicClaimSignature !== undefined) this.publicClaimSignature = record.publicClaimSignature;
     this.neverLandedClaims = record.neverLandedClaims;
@@ -747,6 +808,7 @@ export class SellerFlow {
       claimAttempted: this.claimAttempted,
       ...(this.claimFromBlock === undefined ? {} : { claimFromBlock: markerToJson(this.claimFromBlock) }),
       ...(this.claimTxHash === undefined ? {} : { claimTxHash: this.claimTxHash }),
+      ...(this.claimTx === undefined ? {} : { claimTx: { ...this.claimTx } }),
       claimRecords: this.claimRecords.map((entry) => ({ ...entry })),
       ...(this.publicClaimSignature === undefined ? {} : { publicClaimSignature: this.publicClaimSignature }),
       neverLandedClaims: this.neverLandedClaims,
@@ -1500,6 +1562,9 @@ export class SellerFlow {
 
     const connected = await this.rail.connect(termsA, accounts);
 
+    // P10 B7: a rail that settles a claim on chain (only the Bitcoin adapter has all three methods) is driven by `resumeBtcClaim` / `settleBtcClaim` below.
+    const settlesOnChain = connected.claimTxStatus !== undefined && connected.resendClaimTx !== undefined && connected.claimIsMined !== undefined;
+
     // P5-NEAR-FIXES.md G2/G3: check chain state for THIS flow's own secret before ever touching
     // a deadline guard or risking a write. A retry after a lost reply from an already-successful
     // claim (G2) must recognise success from the chain rather than treat "unverified/expired" as
@@ -1532,12 +1597,19 @@ export class SellerFlow {
         return { evidence: landed, ...(reveal === undefined ? {} : { reveal }), receipt, ...this.neverLandedField() };
       }
     }
+    // P10 B7 (Bitcoin): a claim that was attempted is looked for on chain, and the answer is "mined", "in the mempool", "dropped" or "superseded", never just "seen":
+    // see `resumeBtcClaim`. With a store or without one (the same-process retry of a flow that has no store reads it too).
+    if (settlesOnChain && this.claimAttempted) {
+      const settled = await this.resumeBtcClaim(connected, termsA, railRef, accounts, offerA, acceptA, options);
+      if (settled !== undefined) return settled;
+      // nothing of this flow's own was ever sent (no claim was recorded, or the one that was provably never reached the network): the guarded first claim follows
+    }
     // P8 (rule 2, "decides by reading the chain"): with a store, a claim that was attempted on ANY rail (the flag is
     // saved before the first send) is looked for on chain before another is built: a Bitcoin claim whose reply was
     // lost and which mined before the retry, or an EVM claim that landed before a crash, posts its frames now. These
     // rails post the frames right after their write returns, so a claim the chain shows is treated as landed; NEAR and
-    // Solana keep their finality rule below.
-    const lookedUpOnChain = this.#journal !== undefined && this.claimAttempted && this.rail.railId !== NEAR_RAIL_ID && !isSol;
+    // Solana keep their finality rule below. (A rail that settles on chain, P10 B7, does it above, not here.)
+    const lookedUpOnChain = this.#journal !== undefined && this.claimAttempted && this.rail.railId !== NEAR_RAIL_ID && !isSol && !settlesOnChain;
     if (this.rail.railId === NEAR_RAIL_ID || isSol || lookedUpOnChain) {
       const priorPreimage = isSol && this.publicClaimSignature !== undefined ? this.#hashLock.preimage : await this.findPriorPreimage(connected, railRef, this.#hashLock.preimage);
       const revealedIsOwn = priorPreimage !== null && priorPreimage === this.#hashLock.preimage;
@@ -1584,57 +1656,7 @@ export class SellerFlow {
       await this.freezeLegA(accounts, railRef);
     }
     if (!skipDeadlineGuards && !possiblySeen) {
-      // B2/C3: read before verifyLockFinal (whose own capture drains this rail's exchange log
-      // when it finishes). Neither the chain's own last block nor wall-clock alone is safe to
-      // judge this against: an idle chain's `latest` block can lag real time indefinitely
-      // (nothing forces a new block just because time passes), so trusting it alone risks a stale
-      // "still safe" reading for a claim that will actually land well after `refundAfterMs` once
-      // it is finally mined; trusting wall-clock alone was the pre-B2 bug (this process's own
-      // clock lagging a chain that has already moved past the deadline). `chainNow` takes
-      // whichever of the two already reports the more dangerous (later) time — it is never
-      // earlier than either one alone, so it can only make this guard more conservative, never
-      // less.
-      const chainTimeMs = await connected.chainTimeMs();
-      const chainNow = Math.max(chainTimeMs, this.clock());
-      if (chainNow >= offerA.claimByMs) {
-        throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time) (B2/C3)");
-      }
-      if (offerA.refundAfterMs - chainNow < this.rail.policy.claimInclusionMarginMs) {
-        throw new Error(
-          `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
-            `(${this.rail.policy.claimInclusionMarginMs} ms) remains before refundAfterMs (chain time) (B2/C3)`,
-        );
-      }
-
-      const evidence = await connected.verifyLockFinal(termsA, railRef, accounts);
-      if (evidence.lock.railVerified !== true) {
-        throw new Error(
-          `seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): ${evidence.lock.reason ?? "unverified"}`,
-        );
-      }
-
-      // P4-BTC-FIXES.md G1: freeze the accounts/railRef this call resolved, now that the lock has
-      // verified for the first time — a later call (from a runner retrying after some other
-      // failure below) must never re-resolve them.
-      await this.freezeLegA(accounts, railRef);
-
-      // P22-P24-EVM-FIXES-R3.md E4: `verifyLockFinal` can itself take a long time (a slow or
-      // rate-limited RPC — the reviewer's own probe was a 29-minute `locks()` read); the margin
-      // checked above, before it ran, is not evidence that any margin still remains now that it
-      // has returned. Re-read chain time and re-apply the identical claimByMs/margin guards
-      // immediately before ever calling `claim()` — never trusting the earlier reading alone.
-      const chainTimeAfterVerifyMs = await connected.chainTimeMs();
-      const chainNowAfterVerify = Math.max(chainTimeAfterVerifyMs, this.clock());
-      if (chainNowAfterVerify >= offerA.claimByMs) {
-        throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time, re-checked after verifyLockFinal) (E4)");
-      }
-      if (offerA.refundAfterMs - chainNowAfterVerify < this.rail.policy.claimInclusionMarginMs) {
-        throw new Error(
-          `seller: refusing to claim leg A — less than the claim-inclusion margin ` +
-            `(${this.rail.policy.claimInclusionMarginMs} ms) remains before refundAfterMs ` +
-            `(chain time, re-checked after verifyLockFinal) (E4)`,
-        );
-      }
+      await this.assertFirstClaimGuards(connected, termsA, railRef, accounts, offerA);
     }
 
     // E4: the leg-A rail's own `claim` re-checks this same bound once more, against its own
@@ -1654,7 +1676,7 @@ export class SellerFlow {
       // R1-13: the block marker is taken BEFORE the first send and saved in the same save as the attempt, so a claim that lands after it is
       // found by a scan that starts there. Only the rails whose scan walks blocks need one (EVM, Bitcoin); a flow without a store is not resumed.
       // R2-13: what is saved is the tip minus a reorg margin, so a claim that a reorg mines below the tip is still inside the scan.
-      if (this.#journal !== undefined && this.rail.railId !== NEAR_RAIL_ID && !isSol) this.claimFromBlock = claimMarkerWithReorgMargin(await connected.currentBlockMarker());
+      if ((this.#journal !== undefined || settlesOnChain) && this.rail.railId !== NEAR_RAIL_ID && !isSol) this.claimFromBlock = claimMarkerWithReorgMargin(await connected.currentBlockMarker());
       this.claimAttempted = true;
       await this.persist();
     }
@@ -1671,6 +1693,22 @@ export class SellerFlow {
         // a runner's printer never changes the claim
       }
     });
+    // P10 B7 (record before send): the Bitcoin claim's txid and exact signed bytes are saved (awaited) before anything is sent, so a restart finds this one claim
+    // again instead of signing a second; a claim that provably never reached the network is forgotten again. A refused save throws out of the rail's `claim`, before the send.
+    const btcRecording: RailClaimOptions = settlesOnChain
+      ? {
+          onSignedTx: async (handle: LockRecovery): Promise<void> => {
+            if (handle.chain !== "btc") throw new Error("seller: a Bitcoin claim handle was expected");
+            this.claimTx = { txid: handle.txid, rawTx: handle.rawTx };
+            await this.persist();
+          },
+          onNotBroadcastTx: async (handle: LockRecovery): Promise<void> => {
+            if (handle.chain !== "btc" || this.claimTx?.txid !== handle.txid || this.claimTx.sent === true) return;
+            delete this.claimTx;
+            await this.persist();
+          },
+        }
+      : {};
     for (let retries = 0; ; retries += 1) {
       const before = connected.exchanges.length;
       try {
@@ -1698,11 +1736,16 @@ export class SellerFlow {
             })
           : isSol
             ? await connected.claim(railRef, this.#hashLock.preimage, notAfterMs, solRecording)
-            : await connected.claim(railRef, this.#hashLock.preimage, notAfterMs);
+            : settlesOnChain
+              ? await connected.claim(railRef, this.#hashLock.preimage, notAfterMs, btcRecording)
+              : await connected.claim(railRef, this.#hashLock.preimage, notAfterMs);
         this.#writeExchanges.push(...connected.exchanges.slice(before)); // B5
         if (writeEvidence.txHash !== undefined) this.dropClaimRecord(writeEvidence.txHash); // resolved: it landed
-        this.claimOutcome = "landed";
-        await this.persist();
+        // P10 B7: on a rail that settles on chain the node's acceptance is not "landed": `settleBtcClaim` below decides, once the claim is mined.
+        if (!settlesOnChain) {
+          this.claimOutcome = "landed";
+          await this.persist();
+        }
         break;
       } catch (error) {
         this.#heldClaimExchanges.push(...connected.exchanges.slice(before)); // B5, held until the reveal (R1-22)
@@ -1773,6 +1816,12 @@ export class SellerFlow {
       }
     }
 
+    // P10 B7: the node ACCEPTED the claim (the secret is public from now on): the reveal is posted, the receipt only once the claim is mined.
+    if (settlesOnChain) {
+      await this.noteClaimAccepted();
+      return await this.settleBtcClaim(connected, railRef, acceptA, offerA, options, writeEvidence, false);
+    }
+
     // vendor/tclk/src/machine.ts's own "reveal" transition requires the frame's `ref`, when
     // present, to equal the contract's own accepted `railRef` (identical rule to refund/receipt
     // above) — `railRef`, never `hashLockHex` (only ever the same value by coincidence for
@@ -1787,6 +1836,161 @@ export class SellerFlow {
     const receipt = await this.postReceiptLatched(acceptA.contract, railRef);
 
     return { evidence: writeEvidence, ...(reveal === undefined ? {} : { reveal }), receipt, ...this.neverLandedField() };
+  }
+
+  /**
+   * The first-claim guards, moved here verbatim from `claimLegAUnlatched` (P10 B7): they run before a FIRST claim and before the re-send of a claim that may never
+   * have been sent. `claimByMs` and the claim-inclusion margin against `max(chain time, clock)`, leg A's lock verified final, the accounts frozen, and the same two
+   * guards again after the (possibly slow) verification.
+   */
+  private async assertFirstClaimGuards(
+    connected: ConnectedCounterAssetRail,
+    termsA: ReturnType<typeof offerAcceptLockTerms>,
+    railRef: string,
+    accounts: RailAccounts,
+    offerA: OfferFrame,
+  ): Promise<void> {
+    // B2/C3: read before verifyLockFinal (whose own capture drains this rail's exchange log
+    // when it finishes). Neither the chain's own last block nor wall-clock alone is safe to
+    // judge this against: an idle chain's `latest` block can lag real time indefinitely
+    // (nothing forces a new block just because time passes), so trusting it alone risks a stale
+    // "still safe" reading for a claim that will actually land well after `refundAfterMs` once
+    // it is finally mined; trusting wall-clock alone was the pre-B2 bug (this process's own
+    // clock lagging a chain that has already moved past the deadline). `chainNow` takes
+    // whichever of the two already reports the more dangerous (later) time - it is never
+    // earlier than either one alone, so it can only make this guard more conservative, never
+    // less.
+    const chainTimeMs = await connected.chainTimeMs();
+    const chainNow = Math.max(chainTimeMs, this.clock());
+    if (chainNow >= offerA.claimByMs) {
+      throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time) (B2/C3)");
+    }
+    if (offerA.refundAfterMs - chainNow < this.rail.policy.claimInclusionMarginMs) {
+      throw new Error(
+        `seller: refusing to claim leg A - less than the claim-inclusion margin ` +
+          `(${this.rail.policy.claimInclusionMarginMs} ms) remains before refundAfterMs (chain time) (B2/C3)`,
+      );
+    }
+
+    const evidence = await connected.verifyLockFinal(termsA, railRef, accounts);
+    if (evidence.lock.railVerified !== true) {
+      throw new Error(
+        `seller: refusing to claim leg A before verifyLockFinal(A) is true (D-11): ${evidence.lock.reason ?? "unverified"}`,
+      );
+    }
+
+    // P4-BTC-FIXES.md G1: freeze the accounts/railRef this call resolved, now that the lock has
+    // verified for the first time - a later call (from a runner retrying after some other
+    // failure below) must never re-resolve them.
+    await this.freezeLegA(accounts, railRef);
+
+    // P22-P24-EVM-FIXES-R3.md E4: `verifyLockFinal` can itself take a long time (a slow or
+    // rate-limited RPC - the reviewer's own probe was a 29-minute `locks()` read); the margin
+    // checked above, before it ran, is not evidence that any margin still remains now that it
+    // has returned. Re-read chain time and re-apply the identical claimByMs/margin guards
+    // immediately before ever calling `claim()` - never trusting the earlier reading alone.
+    const chainTimeAfterVerifyMs = await connected.chainTimeMs();
+    const chainNowAfterVerify = Math.max(chainTimeAfterVerifyMs, this.clock());
+    if (chainNowAfterVerify >= offerA.claimByMs) {
+      throw new Error("seller: refusing to claim leg A at/after its claimByMs (chain time, re-checked after verifyLockFinal) (E4)");
+    }
+    if (offerA.refundAfterMs - chainNowAfterVerify < this.rail.policy.claimInclusionMarginMs) {
+      throw new Error(
+        `seller: refusing to claim leg A - less than the claim-inclusion margin ` +
+          `(${this.rail.policy.claimInclusionMarginMs} ms) remains before refundAfterMs ` +
+          `(chain time, re-checked after verifyLockFinal) (E4)`,
+      );
+    }
+  }
+
+  /** The recorded Bitcoin claim as the rail's recovery handle. Only called with a claim recorded. */
+  private claimTxHandle(): LockRecovery {
+    if (this.claimTx === undefined) throw new Error("seller: no Bitcoin claim is recorded");
+    return { chain: "btc", txid: this.claimTx.txid, rawTx: this.claimTx.rawTx };
+  }
+
+  /**
+   * P10 B7: the node holds or has mined this flow's claim, so it was ACCEPTED and the secret is public from then on: the record says so (`claimTx.sent`), and a re-send of
+   * this claim keeps no first-claim guard from now on. A no-op without a recorded claim or when it is already marked.
+   */
+  private async noteClaimAccepted(): Promise<void> {
+    if (this.claimTx === undefined || this.claimTx.sent === true) return;
+    this.claimTx = { ...this.claimTx, sent: true };
+    await this.persist();
+  }
+
+  /**
+   * P10 B7 (Bitcoin): the rest of a claim that was attempted. Decides by READING the chain, in this order; nothing is sent except the one identical re-send in step 2.
+   *  1. The scan (mempool, then the blocks from the marker saved with the attempt) shows this flow's own preimage: the node holds or has mined a claim, so it was accepted.
+   *     `settleBtcClaim` posts the reveal and settles if a block holds it, else throws `ClaimNotMinedError`. Recognising a claim that is there is never gated by a clock.
+   *  2. The scan shows nothing and a claim is recorded: the node is asked about its txid. `unknown` (never sent, or dropped, with the funding output unspent): the IDENTICAL
+   *     bytes are sent again, past the claim-by too when the node had accepted them before (`sent`: the secret is public already), and after every first-claim guard plus the rail's
+   *     last-moment deadline read when they may never have been sent. `spent-by-other` is `ClaimSupersededError`, nothing sent. Mined or in the mempool (the scan missed it): as step 1.
+   *  3. Nothing is recorded and nothing is seen: `undefined`, nothing of this flow's own ever reached the network, and the caller goes on to the guarded first claim.
+   */
+  private async resumeBtcClaim(
+    connected: ConnectedCounterAssetRail,
+    termsA: ReturnType<typeof offerAcceptLockTerms>,
+    railRef: string,
+    accounts: RailAccounts,
+    offerA: OfferFrame,
+    acceptA: AcceptFrame,
+    options: { skipReveal?: boolean } | undefined,
+  ): Promise<{ evidence: RailWriteEvidence; reveal?: TranscriptRecord; receipt: TranscriptRecord } | undefined> {
+    const hashLock = this.#hashLock;
+    if (hashLock === undefined) throw new Error("seller: no secret minted for this flow");
+    const claimStatus = connected.claimTxStatus;
+    const resendClaim = connected.resendClaimTx;
+    if (claimStatus === undefined || resendClaim === undefined) throw new Error("seller: resumeBtcClaim needs a rail that settles claims on chain");
+    const evidence = (): RailWriteEvidence => ({ ref: railRef, raw: [], ...(this.claimTx === undefined ? {} : { txid: this.claimTx.txid }) });
+
+    const prior = await this.findPriorPreimage(connected, railRef, hashLock.preimage);
+    if (prior !== null && prior === hashLock.preimage) {
+      await this.freezeLegA(accounts, railRef);
+      await this.noteClaimAccepted();
+      return await this.settleBtcClaim(connected, railRef, acceptA, offerA, options, evidence(), false);
+    }
+    if (this.claimTx === undefined) return undefined;
+
+    const handle = this.claimTxHandle();
+    let status = await claimStatus.call(connected, railRef, handle);
+    if (status === "unknown") {
+      const maybeNeverSent = this.claimTx.sent !== true;
+      if (maybeNeverSent) await this.assertFirstClaimGuards(connected, termsA, railRef, accounts, offerA);
+      const notAfterMs = offerA.refundAfterMs - this.rail.policy.claimInclusionMarginMs;
+      status = await resendClaim.call(connected, railRef, handle, maybeNeverSent ? { notAfterMs } : {});
+    }
+    if (status === "spent-by-other") throw new ClaimSupersededError(this.claimTx.txid, this.claimTx.sent === true);
+    // "mined" or "in-mempool" (an answer that is "unknown" cannot reach here: it was re-sent above)
+    await this.freezeLegA(accounts, railRef);
+    await this.noteClaimAccepted();
+    return await this.settleBtcClaim(connected, railRef, acceptA, offerA, options, evidence(), status === "mined");
+  }
+
+  /**
+   * P10 B7 (Bitcoin): the node holds or has mined this flow's claim. The reveal frame is posted now (the secret is public in the claim's witness, and tclk's machine takes a
+   * reveal only before refundAfterMs, so it cannot wait for a block); the receipt, `claimOutcome` "landed" and a return only once a block holds the claim, else
+   * `ClaimNotMinedError` (nothing new signed or sent). `knownMined` is the txid-based answer of the rail (the node reports a confirmation for the recorded txid), taken
+   * as final; otherwise the block scan from the saved marker decides.
+   */
+  private async settleBtcClaim(
+    connected: ConnectedCounterAssetRail,
+    railRef: string,
+    acceptA: AcceptFrame,
+    offerA: OfferFrame,
+    options: { skipReveal?: boolean } | undefined,
+    evidence: RailWriteEvidence,
+    knownMined: boolean,
+  ): Promise<{ evidence: RailWriteEvidence; reveal?: TranscriptRecord; receipt: TranscriptRecord }> {
+    const claimIsMined = connected.claimIsMined;
+    if (claimIsMined === undefined) throw new Error("seller: settleBtcClaim needs a rail that settles claims on chain");
+    const reveal = options?.skipReveal === true ? undefined : await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, "claim accepted by the node (not mined yet)");
+    const mined = knownMined || (await claimIsMined.call(connected, railRef, this.claimFromBlock));
+    if (!mined) throw new ClaimNotMinedError(this.claimTx?.txid, evidence);
+    this.claimOutcome = "landed";
+    await this.persist();
+    const receipt = await this.postReceiptLatched(acceptA.contract, railRef);
+    return { evidence, ...(reveal === undefined ? {} : { reveal }), receipt };
   }
 
   /** G1: freeze this leg's resolved accounts and rail ref the first time they are relied on. P8: and save them. */

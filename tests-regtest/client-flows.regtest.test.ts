@@ -55,6 +55,7 @@ import { offerAcceptLockTerms } from "../src/swap.js";
 import { swapId as computeSwapId } from "../src/profile.js";
 import { identity, type Identity } from "../tests/helpers/identity.js";
 import { startBitcoind, type BitcoindHandle, type RegtestWallet } from "./helpers/bitcoind.js";
+import { claimAndMine } from "./helpers/claim.js";
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL("../", import.meta.url)));
@@ -315,9 +316,11 @@ describe("Seller/Buyer client flows against a real bitcoind -regtest node", () =
     const lockA = await h.buyerFlow.lockLegA();
     await h.mineBlocks(2);
 
-    const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
+    // P10 B7: a Bitcoin claim counts as landed only once it is mined: the first call broadcasts it and posts the reveal, one block settles it, and a second
+    // block (this file's N is 2) lets the evidence reader call it final.
+    const { broadcast, claimed } = await claimAndMine(h.sellerFlow, lockA.hashLock, () => h.mineBlocks(1));
     expect(claimed.reveal).toBeDefined();
-    await h.mineBlocks(2);
+    await h.mineBlocks(1);
 
     const secret = await h.buyerFlow.learnSecret();
     expect(verifyHashPreimage(lockA.hashLock, secret)).toBe(true);
@@ -339,7 +342,7 @@ describe("Seller/Buyer client flows against a real bitcoind -regtest node", () =
       nowMs: h.clock(),
       writes: [
         { leg: "a", step: "lock", rail: "btc-htlc", evidence: lockA.writeEvidence },
-        { leg: "a", step: "claim", rail: "btc-htlc", evidence: claimed.evidence },
+        { leg: "a", step: "claim", rail: "btc-htlc", evidence: broadcast },
       ],
       writeExchanges: [...h.buyerFlow.exchanges, ...h.sellerFlow.exchanges],
     });
@@ -437,7 +440,8 @@ describe("Seller/Buyer client flows against a real bitcoind -regtest node", () =
     await expect(h.sellerFlow.claimLegA(lockA.hashLock)).rejects.toThrow(/verifyLockFinal\(A\) is true/);
 
     await h.mineBlocks(1); // now 2
-    const claimed = await h.sellerFlow.claimLegA(lockA.hashLock);
+    const { broadcast, claimed } = await claimAndMine(h.sellerFlow, lockA.hashLock, () => h.mineBlocks(1));
+    expect(broadcast.ref).toBe(lockA.writeEvidence.ref);
     expect(claimed.evidence.ref).toBe(lockA.writeEvidence.ref);
   }, 120_000);
 
@@ -451,9 +455,8 @@ describe("Seller/Buyer client flows against a real bitcoind -regtest node", () =
     const lockA = await h.buyerFlow.lockLegA();
     await h.mineBlocks(2);
 
-    const claimed = await h.sellerFlow.claimLegA(lockA.hashLock, { skipReveal: true });
+    const { claimed } = await claimAndMine(h.sellerFlow, lockA.hashLock, () => h.mineBlocks(1), { skipReveal: true });
     expect(claimed.reveal).toBeUndefined();
-    await h.mineBlocks(1);
 
     const secret = await h.buyerFlow.learnSecret();
     expect(verifyHashPreimage(lockA.hashLock, secret)).toBe(true);
