@@ -119,6 +119,8 @@ export class LedgerChain {
   autoMineClaims = true;
   /** P10 B7 (Bitcoin): the node refuses a recorded claim it is asked to send again (its inputs are gone, or its fee is below the minimum). */
   refuseClaimResend = false;
+  /** P10-KEY-01 (Bitcoin): a signed claim's bytes embed the preimage (lower-case hex inside the transaction hex), as a real claim's witness does. By default the bytes are a label only. */
+  claimBytesCarrySecret = false;
   /** P10 B7 (Bitcoin): a block is mined: every claim in the mempool is in it. */
   mine(): void {
     this.height += 1;
@@ -410,7 +412,7 @@ class LedgerConnected implements ConnectedCounterAssetRail {
     if (this.options.flavour === "near" && this.chain.nowMs() >= output.refundAfterMs) throw new Error("ledger rail: claim refused, too late");
     if (btc) {
       // P10 B7 (record before send): the claim is signed (its bytes are the same whenever it is built), the recorder hears of it, then the last deadline read, then the send.
-      const rawTx = hex(`raw-claim|${txid}`);
+      const rawTx = this.chain.claimBytesCarrySecret ? `0200${secret.slice(2).toLowerCase()}${hex(`raw-claim|${txid}`).slice(0, 8)}` : hex(`raw-claim|${txid}`);
       if (!this.chain.claimBytes.has(txid)) {
         this.chain.counts.claimBuilt += 1;
         this.chain.claimBytes.set(txid, { ref, secret, rawTx });

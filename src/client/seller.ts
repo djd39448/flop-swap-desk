@@ -541,8 +541,10 @@ export class SellerFlow {
   private claimFromBlock?: RailBlockMarker;
   /** P9-4 decision 7: the hash of a claim write whose receipt wait timed out (EVM only), saved after the timeout; see `ClaimPendingError`. */
   private claimTxHash?: string;
-  /** P10 B7 (Bitcoin only): the claim transaction this flow signed, recorded before it was sent; see `SellerFlowState.claimTx`. */
-  private claimTx?: ClaimTxRecord;
+  /** P10 B7 (Bitcoin only): the claim transaction this flow signed, recorded before it was sent; see `SellerFlowState.claimTx`. P10-KEY-01 (R2-11): an ES `#private` field, like every
+   *  other field that holds preimage-bearing data: the signed bytes carry the preimage in their witness, and a claim the node has not yet been sent is not public, so
+   *  `Object.entries(flow)`, `util.inspect(flow, { customInspect: false })`, `JSON.stringify` and structured clone must not reach them. */
+  #claimTx: ClaimTxRecord | undefined;
   private claimOutcome: "none" | "landed" | "failed-public" = "none";
   private legBRefundAttempted = false;
   private legBRefundDone = false;
@@ -814,7 +816,7 @@ export class SellerFlow {
     this.claimAttempted = record.claimAttempted;
     if (record.claimFromBlock !== undefined) this.claimFromBlock = markerFromJson(record.claimFromBlock);
     if (record.claimTxHash !== undefined) this.claimTxHash = record.claimTxHash;
-    if (record.claimTx !== undefined) this.claimTx = { ...record.claimTx };
+    if (record.claimTx !== undefined) this.#claimTx = { ...record.claimTx };
     this.claimRecords = record.claimRecords.map((entry) => ({ ...entry }));
     if (record.publicClaimSignature !== undefined) this.publicClaimSignature = record.publicClaimSignature;
     this.neverLandedClaims = record.neverLandedClaims;
@@ -836,7 +838,7 @@ export class SellerFlow {
       claimAttempted: this.claimAttempted,
       ...(this.claimFromBlock === undefined ? {} : { claimFromBlock: markerToJson(this.claimFromBlock) }),
       ...(this.claimTxHash === undefined ? {} : { claimTxHash: this.claimTxHash }),
-      ...(this.claimTx === undefined ? {} : { claimTx: { ...this.claimTx } }),
+      ...(this.#claimTx === undefined ? {} : { claimTx: { ...this.#claimTx } }),
       claimRecords: this.claimRecords.map((entry) => ({ ...entry })),
       ...(this.publicClaimSignature === undefined ? {} : { publicClaimSignature: this.publicClaimSignature }),
       neverLandedClaims: this.neverLandedClaims,
@@ -1727,12 +1729,12 @@ export class SellerFlow {
       ? {
           onSignedTx: async (handle: LockRecovery): Promise<void> => {
             if (handle.chain !== "btc") throw new Error("seller: a Bitcoin claim handle was expected");
-            this.claimTx = { txid: handle.txid, rawTx: handle.rawTx };
+            this.#claimTx = { txid: handle.txid, rawTx: handle.rawTx };
             await this.persist();
           },
           onNotBroadcastTx: async (handle: LockRecovery): Promise<void> => {
-            if (handle.chain !== "btc" || this.claimTx?.txid !== handle.txid || this.claimTx.sent === true) return;
-            delete this.claimTx;
+            if (handle.chain !== "btc" || this.#claimTx?.txid !== handle.txid || this.#claimTx.sent === true) return;
+            this.#claimTx = undefined;
             await this.persist();
           },
         }
@@ -1933,8 +1935,8 @@ export class SellerFlow {
 
   /** The recorded Bitcoin claim as the rail's recovery handle. Only called with a claim recorded. */
   private claimTxHandle(): LockRecovery {
-    if (this.claimTx === undefined) throw new Error("seller: no Bitcoin claim is recorded");
-    return { chain: "btc", txid: this.claimTx.txid, rawTx: this.claimTx.rawTx };
+    if (this.#claimTx === undefined) throw new Error("seller: no Bitcoin claim is recorded");
+    return { chain: "btc", txid: this.#claimTx.txid, rawTx: this.#claimTx.rawTx };
   }
 
   /**
@@ -1942,8 +1944,8 @@ export class SellerFlow {
    * this claim keeps no first-claim guard from now on, only the bound of `resendUnknownClaim` (P10-FUND-03). A no-op without a recorded claim or when it is already marked.
    */
   private async noteClaimAccepted(): Promise<void> {
-    if (this.claimTx === undefined || this.claimTx.sent === true) return;
-    this.claimTx = { ...this.claimTx, sent: true };
+    if (this.#claimTx === undefined || this.#claimTx.sent === true) return;
+    this.#claimTx = { ...this.#claimTx, sent: true };
     await this.persist();
   }
 
@@ -1971,7 +1973,7 @@ export class SellerFlow {
     const claimStatus = connected.claimTxStatus;
     const resendClaim = connected.resendClaimTx;
     if (claimStatus === undefined || resendClaim === undefined) throw new Error("seller: resumeBtcClaim needs a rail that settles claims on chain");
-    const evidence = (): RailWriteEvidence => ({ ref: railRef, raw: [], ...(this.claimTx === undefined ? {} : { txid: this.claimTx.txid }) });
+    const evidence = (): RailWriteEvidence => ({ ref: railRef, raw: [], ...(this.#claimTx === undefined ? {} : { txid: this.#claimTx.txid }) });
 
     const prior = await this.findPriorPreimage(connected, railRef, hashLock.preimage);
     if (prior !== null && prior === hashLock.preimage) {
@@ -1979,7 +1981,7 @@ export class SellerFlow {
       await this.noteClaimAccepted();
       return await this.settleBtcClaim(connected, railRef, acceptA, offerA, options, evidence(), false);
     }
-    if (this.claimTx === undefined) return undefined;
+    if (this.#claimTx === undefined) return undefined;
 
     const handle = this.claimTxHandle();
     let status = await claimStatus.call(connected, railRef, handle);
@@ -1987,7 +1989,7 @@ export class SellerFlow {
       // P10-FUND-01/03: the identical re-send is bounded; see `resendUnknownClaim`.
       status = await this.resendUnknownClaim(connected, termsA, railRef, accounts, offerA, handle, resendClaim);
     }
-    if (status === "spent-by-other") throw new ClaimSupersededError(this.claimTx.txid, this.claimTx.sent === true);
+    if (status === "spent-by-other") throw new ClaimSupersededError(this.#claimTx.txid, this.#claimTx.sent === true);
     // "mined" or "in-mempool" (an answer that is "unknown" cannot reach here: it was re-sent above)
     await this.freezeLegA(accounts, railRef);
     await this.noteClaimAccepted();
@@ -2014,7 +2016,7 @@ export class SellerFlow {
     handle: LockRecovery,
     resendClaim: NonNullable<ConnectedCounterAssetRail["resendClaimTx"]>,
   ): Promise<"mined" | "in-mempool" | "spent-by-other"> {
-    const claimTx = this.claimTx;
+    const claimTx = this.#claimTx;
     if (claimTx === undefined) throw new Error("seller: no Bitcoin claim is recorded");
     if (await this.legBTakenWithOurSecret()) return await resendClaim.call(connected, railRef, handle, {});
     const notAfterMs = offerA.refundAfterMs - this.rail.policy.claimInclusionMarginMs;
@@ -2059,7 +2061,7 @@ export class SellerFlow {
     if (claimIsMined === undefined) throw new Error("seller: settleBtcClaim needs a rail that settles claims on chain");
     const reveal = options?.skipReveal === true ? undefined : await this.postRevealLatched(acceptA.contract, railRef, offerA.refundAfterMs, "claim accepted by the node (not mined yet)");
     const mined = knownMined || (await claimIsMined.call(connected, railRef, this.claimFromBlock));
-    if (!mined) throw new ClaimNotMinedError(this.claimTx?.txid, evidence);
+    if (!mined) throw new ClaimNotMinedError(this.#claimTx?.txid, evidence);
     this.claimOutcome = "landed";
     await this.persist();
     const receipt = await this.postReceiptLatched(acceptA.contract, railRef);
