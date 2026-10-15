@@ -9,8 +9,10 @@
 //
 // Keys here are generated now, only ever scanned for (a boolean), and never printed.
 
+import { readFile } from "node:fs/promises";
+
 import { MemoryNoteStore, PaperRail } from "@flop-labs/tclk";
-import { getAddress } from "viem";
+import { getAddress, keccak256 } from "viem";
 import { describe, expect, it } from "vitest";
 
 import { BuyerFlow, type BidParams } from "../src/client/buyer.js";
@@ -67,6 +69,8 @@ async function rig(receiptTimeoutMs: number) {
   const buyerWire = localSigningRpc(node);
   const sellerWire = localSigningRpc(node);
   const lines: string[] = [];
+  /** P10 B6: what both rails reported through `onWarning` (the runner passes its error stream there). */
+  const warnings: string[] = [];
   const watch = createClaimWatch({ log: (line) => void lines.push(line), clock, refundAfterMs: dead.legA.refundAfterMs, tickMs: 250 });
   const buyerId = identity("61".repeat(32));
   const sellerId = identity("62".repeat(32));
@@ -77,7 +81,7 @@ async function rig(receiptTimeoutMs: number) {
     identity: sellerId,
     venue,
     paperRail: new PaperRail(noteStore, clock),
-    rail: createEvmCounterRail({ config: node.config(), rpc: sellerWire.rpc, account: sellerKey.account, clock }),
+    rail: createEvmCounterRail({ config: node.config(), rpc: sellerWire.rpc, account: sellerKey.account, clock, onWarning: (text) => void warnings.push(text) }),
     clock,
     store: stores.seller,
     onClaimSent: watch.onClaimSent,
@@ -86,7 +90,7 @@ async function rig(receiptTimeoutMs: number) {
     identity: buyerId,
     venue,
     paperRail: new PaperRail(noteStore, clock),
-    rail: createEvmCounterRail({ config: node.config(), rpc: buyerWire.rpc, account: buyerKey.account, clock }),
+    rail: createEvmCounterRail({ config: node.config(), rpc: buyerWire.rpc, account: buyerKey.account, clock, onWarning: (text) => void warnings.push(text) }),
     clock,
     store: stores.buyer,
   });
@@ -105,7 +109,7 @@ async function rig(receiptTimeoutMs: number) {
     const key = flowKey("seller", acceptA.contract);
     return decodeFlowRecord((await stores.seller.load(key))!, key) as SellerFlowRecord;
   };
-  return { node, seller, sellerWire, stores, swapId, sellerOptions, acceptA, lockA, lines, watch, clockRef, clock, record, refundAfterMs: dead.legA.refundAfterMs, leaks: (text: string) => buyerKey.leaks(text) || sellerKey.leaks(text) };
+  return { node, seller, sellerWire, stores, swapId, sellerOptions, acceptA, lockA, lines, warnings, watch, clockRef, clock, record, refundAfterMs: dead.legA.refundAfterMs, leaks: (text: string) => buyerKey.leaks(text) || sellerKey.leaks(text) };
 }
 
 describe("P94-FUND-01 (runner part, end to end): a claim the node accepts and never mines is shown while its receipt wait runs", () => {
@@ -204,5 +208,45 @@ describe("P94-FUND-01 (runner part, end to end): a claim the node accepts and ne
     expect(sentence).not.toContain("speed the claim up by hand");
     expect(sentence).toContain("run --resume first");
     expect(sentence).toContain("run --refund");
+  });
+
+  // P10 B6 (runner part): the line the runner prints the moment a claim is broadcast, and the sentence that ends a run with a claim still pending, name the claim by the keccak256 of the
+  // bytes the Seller signed, not by what the endpoint answered. The endpoint here answers another well-formed hash for the claim (the node still holds it under its true hash); the
+  // wrong hash appears only in the warning the rail reports (the runner prints that on its error stream), once.
+  it("P10 B6: an endpoint that answers the wrong hash for the claim: 'claim of leg A sent: tx <hash>', the saved hash and the ending sentence carry keccak256 of the raw claim; the wrong hash is only in the one warning", async () => {
+    const r = await rig(2_500);
+    r.node.holdNextSend("claim");
+    r.node.answerWrongHashForNextSend("claim");
+    const claiming = caught(r.seller.claimLegA(r.lockA.hashLock)).then((error) => {
+      r.watch.stop();
+      return error;
+    });
+    await pause(900);
+    const computed = keccak256(r.sellerWire.rawSends[0]!.raw);
+    expect(r.node.held[0]!.txHash, "the node holds the claim under its true hash").toBe(computed);
+    expect(r.lines[0]).toBe(`claim of leg A sent: tx ${computed}`); // today: the endpoint's wrong hash
+    expect((await r.record()).claimTxHash).toBe(computed);
+    expect(r.warnings).toHaveLength(1);
+    const [wrong, ...rest] = r.warnings[0]!.match(/0x[0-9a-f]{64}/g)!;
+    expect(rest).toEqual([computed]);
+    expect(wrong).not.toBe(computed);
+
+    const error = await claiming;
+    expect(error).toBeInstanceOf(EvmReceiptTimeoutError);
+    expect((error as EvmReceiptTimeoutError).hash).toBe(computed);
+    const sentence = pendingWriteRefusal(error, { refundAfterMs: r.refundAfterMs, nowMs: r.clock() }) ?? "";
+    expect(sentence).toContain(`(tx ${computed})`);
+    // the wrong answer is in no runner line and in no sentence: only in the rail's warning
+    expect([...r.lines, sentence].some((text) => text.includes(wrong!))).toBe(false);
+    expect(r.warnings).toHaveLength(1);
+    expect(r.warnings[0]!.includes(computed) && r.warnings[0]!.includes(wrong!)).toBe(true);
+    const preimage = (await r.record()).preimage;
+    expect([...r.lines, sentence, ...r.warnings].some((text) => text.includes(preimage) || text.includes(preimage.replace(/^0x/, "")) || r.leaks(text))).toBe(false);
+  });
+
+  it("P10 B6: the runner hands its error stream to the rails as onWarning (source pin: the warning reaches the operator, redacted like every runner line)", async () => {
+    const text = await readFile(new URL("../src/client/rehearsal-run.ts", import.meta.url), "utf8");
+    expect(text).toContain("account, clock, pollMs: config.pollMs, onWarning: errLine }),");
+    expect(text).toContain("const errLine = (line: string): void => env.err(redact(line));");
   });
 });

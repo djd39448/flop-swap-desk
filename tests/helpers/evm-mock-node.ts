@@ -12,6 +12,10 @@
 // answered its hash, nothing else changed); `answerTxByHash` makes the node answer `eth_getTransactionByHash` (a pooled transaction has no block; a mined one
 // has its block); `releaseHeld()` mines the pool, `failHeld()` mines it as reverted (a receipt with status 0, no effect), `dropHeld()` forgets it.
 //
+// P10 B6 (the claim's printed and saved hash): a node's answer to a RAW send (`eth_sendRawTransaction`) is keccak256 of the raw bytes, as a real node's is: the local-signing wire
+// (tests/helpers/evm-local.ts) hands the node that hash (`rawHash`) and the node keys the transaction under it. `answerWrongHashForNextSend(fn)` makes the next send of that kind answer
+// a DIFFERENT, well-formed hash (the node still keys the transaction under the true one): an endpoint whose answer cannot be trusted.
+//
 // Fault knobs, each firing once: `rejectNextSend(fn)` answers the send with a JSON-RPC error WITHOUT applying it (the transaction
 // never happened); `loseNextSendReply(fn)` applies the effect and then answers with an error (the transaction landed, the reply was
 // lost). `sends` records every send that was applied, so a test can count approvals and locks exactly.
@@ -144,6 +148,7 @@ export class EvmMockNode {
   private txCounter = 0;
   private readonly rejectNext = new Set<SendKind>();
   private readonly loseNext = new Set<SendKind>();
+  private readonly wrongHashNext = new Set<SendKind>();
 
   constructor(
     /** The chain's time (block timestamps and the contract's `block.timestamp`), in ms. */
@@ -188,6 +193,10 @@ export class EvmMockNode {
   }
   loseNextSendReply(fn: SendKind): void {
     this.loseNext.add(fn);
+  }
+  /** P10 B6: the next send of this kind is applied (or pooled) as usual under its true hash, but the node ANSWERS another, well-formed lower-case hash (never the true one). */
+  answerWrongHashForNextSend(fn: SendKind): void {
+    this.wrongHashNext.add(fn);
   }
 
   /** R2-13: a reorg mined the transaction that emitted `event` for `hashLock` into another block, `blockNumber`, than the one it was first
@@ -324,7 +333,7 @@ export class EvmMockNode {
         return { result: null };
       }
       case "eth_sendTransaction":
-        return this.send(params[0] as { from: Address; to: Address; data: Hex });
+        return this.send(params[0] as { from: Address; to: Address; data: Hex; rawHash?: Hex });
       default:
         return { error: { code: -32601, message: `mock evm node: unexpected method ${method}` } };
     }
@@ -393,7 +402,7 @@ export class EvmMockNode {
     });
   }
 
-  private send(tx: { from: Address; to: Address; data: Hex }, presetHash?: Hex, released = false): Envelope {
+  private send(tx: { from: Address; to: Address; data: Hex; rawHash?: Hex }, presetHash?: Hex, released = false): Envelope {
     const from = getAddress(tx.from);
     const isToken = tx.to.toLowerCase() === this.token.toLowerCase();
     let fn: SendKind;
@@ -407,13 +416,13 @@ export class EvmMockNode {
     }
     if (!released && this.rejectNext.delete(fn)) return { error: { code: -32000, message: `mock evm node: ${fn} not accepted (test)` } };
     if (!released && this.holdNext.delete(fn)) {
-      const pooledHash = this.nextTxHash();
+      const pooledHash = tx.rawHash ?? this.nextTxHash();
       this.held.push({ fn, txHash: pooledHash, tx: { from, to: tx.to, data: tx.data } });
-      return { result: pooledHash };
+      return { result: this.wrongHashNext.delete(fn) ? this.nextTxHash() : pooledHash };
     }
     const hookToken = this.hook?.begin(fn, from);
 
-    const txHash = presetHash ?? this.nextTxHash();
+    const txHash = presetHash ?? tx.rawHash ?? this.nextTxHash();
     const blockNumber = this.mine();
     const now = BigInt(this.nowMs());
     let hashLock: Hex | undefined;
@@ -442,6 +451,6 @@ export class EvmMockNode {
     this.sends.push({ fn, from, ...(hashLock === undefined ? {} : { hashLock }) });
     this.hook?.end(hookToken);
     if (this.loseNext.delete(fn)) return { error: { code: -32000, message: `mock evm node: connection reset after ${fn} (test)` } };
-    return { result: txHash };
+    return { result: this.wrongHashNext.delete(fn) ? this.nextTxHash() : txHash };
   }
 }

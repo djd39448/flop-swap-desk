@@ -15,7 +15,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { getAddress, parseTransaction, recoverTransactionAddress, type Address, type Hex } from "viem";
+import { getAddress, keccak256, parseTransaction, recoverTransactionAddress, type Address, type Hex } from "viem";
 import { generatePrivateKey, type LocalAccount } from "viem/accounts";
 
 import { loadEvmLocalAccount } from "../../src/client/evm-key-file.js";
@@ -99,6 +99,8 @@ export interface RawSend {
   chainId: number | undefined;
   to: Address | null | undefined;
   data: Hex | undefined;
+  /** P10 B6: the signed transaction as sent (public bytes: a signature, never a key); its keccak256 is the transaction's hash. */
+  raw: Hex;
 }
 
 export interface LocalSigningRpc {
@@ -192,7 +194,7 @@ export function localSigningRpc(node: EvmMockNode, expectedChainId = 31337): Loc
         const parsed = parseTransaction(raw);
         const from = getAddress(await recoverTransactionAddress({ serializedTransaction: raw as never }));
         const expected = counts.get(from.toLowerCase()) ?? 0;
-        const send: RawSend = { from, nonce: parsed.nonce ?? -1, chainId: parsed.chainId, to: parsed.to, data: parsed.data };
+        const send: RawSend = { from, nonce: parsed.nonce ?? -1, chainId: parsed.chainId, to: parsed.to, data: parsed.data, raw };
         state.rawSends.push(send);
         if (parsed.chainId !== expectedChainId) return { error: { code: -32000, message: "invalid chain id for signer" } };
         if (parsed.nonce !== expected) return { error: { code: -32000, message: `nonce too ${(parsed.nonce ?? 0) < expected ? "low" : "high"}: next nonce ${expected}, tx nonce ${parsed.nonce}` } };
@@ -200,7 +202,8 @@ export function localSigningRpc(node: EvmMockNode, expectedChainId = 31337): Loc
         // applied (the nonce moves) although the caller sees an error.
         const sendsBefore = node.sends.length;
         const heldBefore = node.held.length;
-        const applied = await delegate("eth_sendTransaction", [{ from, to: parsed.to, data: parsed.data }]);
+        // P10 B6: a node's hash for a raw send is keccak256 of the raw bytes; the stateful node keys the transaction under it.
+        const applied = await delegate("eth_sendTransaction", [{ from, to: parsed.to, data: parsed.data, rawHash: keccak256(raw) }]);
         // a pooled send (P9-4 decision 7) counts too: the node holds it, so the account's pending nonce has moved
         if (node.sends.length > sendsBefore || node.held.length > heldBefore) counts.set(from.toLowerCase(), expected + 1);
         if (state.upperCaseHashes && typeof applied.result === "string" && /^0x[0-9a-f]{64}$/.test(applied.result)) return { result: `0x${applied.result.slice(2).toUpperCase()}` };

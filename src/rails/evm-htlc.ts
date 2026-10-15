@@ -53,6 +53,7 @@ import {
   guardEstimateFeesPerGas,
   guardLocalAccount,
   refuseFillTransaction,
+  verifySentTransactionHash,
   type EvmSignerRefusedError,
   type EvmSignerWatch,
 } from "./evm-signer.js";
@@ -865,6 +866,13 @@ export interface EvmHtlcRailOptions {
   lookupPauseMs?: number;
   /** The pause itself: a timer by default; a test injects one that records the pauses (and, for a mock, lets a block pass). */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * P10 B6: told, once per write, when the endpoint's answer to `eth_sendRawTransaction` is not the keccak256 of the signed transaction this process sent. The rail names every write by
+   * that computed hash whatever the endpoint says (see `verifySentTransactionHash` in src/rails/evm-signer.ts), so this is only a report: its one fixed sentence carries no value but the
+   * two public hashes (the computed one and, when the answer is shaped like a hash, the answered one). Local accounts only (a JSON-RPC account's node signs, and there are no bytes to
+   * hash). The listener cannot change what the write does: an error it throws is swallowed. Omitted: the mismatch is corrected and not reported.
+   */
+  onWarning?: (text: string) => void;
 }
 
 /**
@@ -994,7 +1002,8 @@ export class EvmHtlcRail {
         : createWalletClient({
             account: guardLocalAccount(local, { chainId: options.config.pin.chainId, maxGas: EVM_MAX_GAS_PER_WRITE, maxFeePerGas }, signerWatch),
             chain: { ...chain, fees: { estimateFeesPerGas: guardEstimateFeesPerGas(maxFeePerGas, signerWatch) } },
-            transport: custom(refuseFillTransaction(options.rpc), { retryCount: 0 }),
+            // P10 B6: the hash of a write is the keccak256 of the bytes this process signed, never the endpoint's say-so (`verifySentTransactionHash`, outside the fill refusal).
+            transport: custom(verifySentTransactionHash(refuseFillTransaction(options.rpc), options.onWarning), { retryCount: 0 }),
           });
 
     const liveChainIdHex = (await options.rpc.request({ method: "eth_chainId", params: [] })) as Hex;

@@ -17,7 +17,7 @@
 // Keys are generated at test time; none is printed.
 
 import { MemoryNoteStore, PaperRail, generateHashLock, verifyHashPreimage, type HashLock } from "@flop-labs/tclk";
-import { encodeFunctionResult, getAddress, type Address, type Hex } from "viem";
+import { encodeFunctionResult, getAddress, keccak256, type Address, type Hex } from "viem";
 import { describe, expect, it, vi } from "vitest";
 
 import { BuyerFlow, LockPendingError, type BidParams } from "../src/client/buyer.js";
@@ -75,6 +75,8 @@ async function pairedSwap(
     onClaimSent?: (txHash: string) => void;
     mintHashLock?: () => HashLock;
     wrapRail?: (rail: CounterAssetRail) => CounterAssetRail;
+    /** P10 B6: both parties' rails report an endpoint answer that is not the hash of the signed transaction here (see `EvmCounterRailOptions.onWarning`). */
+    onWarning?: (text: string) => void;
   } = {},
 ) {
   const chainId = options.chainId ?? 31337;
@@ -100,7 +102,7 @@ async function pairedSwap(
     identity: buyerId,
     venue,
     paperRail: new PaperRail(noteStore, clock),
-    rail: wrapRail(createEvmCounterRail({ config: node.config(), rpc: buyerWire.rpc, account: buyerAccount, clock })),
+    rail: wrapRail(createEvmCounterRail({ config: node.config(), rpc: buyerWire.rpc, account: buyerAccount, clock, ...(options.onWarning === undefined ? {} : { onWarning: options.onWarning }) })),
     clock,
     store: stores.buyer,
   });
@@ -108,7 +110,7 @@ async function pairedSwap(
     identity: sellerId,
     venue,
     paperRail: new PaperRail(noteStore, clock),
-    rail: wrapRail(createEvmCounterRail({ config: node.config(), rpc: sellerWire.rpc, account: sellerAccount, clock })),
+    rail: wrapRail(createEvmCounterRail({ config: node.config(), rpc: sellerWire.rpc, account: sellerAccount, clock, ...(options.onWarning === undefined ? {} : { onWarning: options.onWarning }) })),
     clock,
     store: stores.seller,
     ...(options.onClaimSent === undefined ? {} : { onClaimSent: options.onClaimSent }),
@@ -670,6 +672,147 @@ describe("P94-FUND-01: the claim's hash is shown the moment it is broadcast, and
         vi.useRealTimers();
       }
     });
+  });
+});
+
+// P10 B6 (P10-BACKLOG-SPEC.md decision 6; R5-KEY-INFO): the rail names every write by the keccak256 of the raw transaction it signed, not by the answer of the endpoint (which was only
+// checked for shape). The mock node's `answerWrongHashForNextSend` makes the node answer ANOTHER, well-formed hash for the next send of a kind while it keeps the transaction under its true
+// hash, as an endpoint whose answer cannot be trusted does. Everything downstream of the send must carry the true hash: the broadcast event, the Seller's saved claimTxHash, the Buyer's
+// saved recovery handle, the callback the runner prints from, the receipt wait (a wait on the wrong hash never sees the receipt) and EvmReceiptTimeoutError.hash; the mismatch is reported once
+// per write as one fixed warning. (The runner's printed line: tests/rehearsal-claim-watch.test.ts; the transport alone: tests/evm-sent-hash.test.ts.)
+describe("P10 B6: a write is named by the keccak256 of the bytes this process signed, whatever the endpoint answers", () => {
+  const HASHES = /0x[0-9a-f]{64}/g;
+  const WARNING = /^evm-htlc: warning: the endpoint answered the transaction hash 0x[0-9a-f]{64} for a transaction this process sent, but that transaction's hash is 0x[0-9a-f]{64}; the computed hash is used for this write$/;
+
+  it("the Seller's claim: the saved claimTxHash, the runner's callback, the broadcast event and the timeout error all carry keccak256 of the raw claim, the wrong answer is nowhere but the warning, which appears once", async () => {
+    const sent: string[] = [];
+    const warnings: string[] = [];
+    const broadcast: Array<{ write: RailWriteBroadcast["write"]; hash: string }> = [];
+    const wrap = (rail: CounterAssetRail): CounterAssetRail =>
+      Object.create(rail, {
+        connect: {
+          value: async (...args: Parameters<CounterAssetRail["connect"]>) => {
+            const connected = await rail.connect(...args);
+            connected.onWriteBroadcast?.((event) => void broadcast.push({ write: event.write, hash: event.hash }));
+            return connected;
+          },
+        },
+      }) as CounterAssetRail;
+    const r = await pairedSwap({ receiptTimeoutMs: 2_500, onClaimSent: (hash) => void sent.push(hash), onWarning: (text) => void warnings.push(text), wrapRail: wrap });
+    const lockA = await r.buyer.lockLegA();
+    r.node.holdNextSend("claim");
+    r.node.answerWrongHashForNextSend("claim");
+    const claiming = caught(r.seller.claimLegA(lockA.hashLock));
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    const computed = keccak256(r.sellerWire.rawSends[0]!.raw);
+    expect(r.node.held[0]!.txHash, "the node holds the transaction under its true hash").toBe(computed);
+    expect(warnings).toHaveLength(1);
+    const [wrong, ...rest] = warnings[0]!.match(HASHES)!;
+    expect(rest).toEqual([computed]); // the warning carries the two public hashes and nothing else
+    expect(wrong).not.toBe(computed);
+    expect(warnings[0]).toMatch(WARNING);
+
+    expect((await sellerRecord(r.stores, r.acceptA.contract)).claimTxHash).toBe(computed); // today: the wrong hash
+    expect(sent).toEqual([computed]);
+    expect(r.seller.claimSentHash).toBe(computed);
+    expect(broadcast.filter((event) => event.write === "claim")).toEqual([{ write: "claim", hash: computed }]);
+
+    const ended = await claiming;
+    expect(ended).toBeInstanceOf(EvmReceiptTimeoutError);
+    expect((ended as EvmReceiptTimeoutError).hash).toBe(computed);
+    expect((ended as EvmReceiptTimeoutError).message).not.toContain(wrong!);
+    expect(warnings, "once per write, not again at the timeout").toHaveLength(1);
+    // The wrong answer is nowhere in the record either.
+    expect(Buffer.from((await r.stores.seller.load(flowKey("seller", r.acceptA.contract)))!).toString("utf8")).not.toContain(wrong!);
+  });
+
+  it("the Seller's claim, resumed: the saved hash is one the node knows, so the resumed claim is ClaimPendingError and no second claim is signed (with the wrong hash saved, the node would not know it)", async () => {
+    const r = await pairedSwap({ receiptTimeoutMs: 400 });
+    const lockA = await r.buyer.lockLegA();
+    r.node.holdNextSend("claim");
+    r.node.answerWrongHashForNextSend("claim");
+    expect(await caught(r.seller.claimLegA(lockA.hashLock))).toBeInstanceOf(EvmReceiptTimeoutError);
+    r.exposeTxLookups();
+    const sentBefore = r.sellerWire.rawSends.length;
+    const resumed = await SellerFlow.resume({ ...r.sellerOptions(), swapId: r.swapId, contractA: r.acceptA.contract });
+    const refused = await caught(resumed.flow.claimLegA(lockA.hashLock));
+    expect(refused).toBeInstanceOf(ClaimPendingError);
+    expect((refused as ClaimPendingError).txHash).toBe(keccak256(r.sellerWire.rawSends[0]!.raw));
+    expect(r.sellerWire.rawSends.length, "no second claim was signed").toBe(sentBefore);
+    expect(r.node.count("claim")).toBe(0);
+  });
+
+  it("the Buyer's lock: the saved recovery handle is keccak256 of the raw lock, and the resumed Buyer ends with LockPendingError, not a new approve and lock", async () => {
+    const warnings: string[] = [];
+    const r = await pairedSwap({ onWarning: (text) => void warnings.push(text) });
+    r.node.holdNextSend("lock");
+    r.node.answerWrongHashForNextSend("lock");
+    const timeout = await caught(r.buyer.lockLegA());
+    expect(timeout).toBeInstanceOf(EvmReceiptTimeoutError);
+    expect((timeout as EvmReceiptTimeoutError).write).toBe("lock");
+    const computed = keccak256(r.buyerWire.rawSends[1]!.raw); // the approve is the first raw send, the lock the second
+    expect((timeout as EvmReceiptTimeoutError).hash).toBe(computed);
+    expect(r.node.held[0]!.txHash).toBe(computed);
+    expect((await buyerRecord(r.stores, r.swapId)).lock.prepared?.recovery).toEqual({ chain: "evm", txHash: computed }); // today: the wrong hash
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(WARNING);
+    expect(warnings[0]!.endsWith(`${computed}; the computed hash is used for this write`)).toBe(true);
+
+    r.exposeTxLookups();
+    const sentBefore = r.buyerWire.rawSends.length;
+    const resumed = await BuyerFlow.resume({ ...r.buyerOptions(), swapId: r.swapId });
+    expect(await caught(resumed.flow.lockLegA())).toBeInstanceOf(LockPendingError); // today: the node does not know the wrong hash, so a second approve and lock go out
+    expect(r.buyerWire.rawSends.length, "no second approve, no second lock").toBe(sentBefore);
+    expect(r.node.count("approve")).toBe(1);
+    expect(r.node.count("lock")).toBe(0);
+  });
+
+  it("the approve: a wrong answer cannot send the receipt wait to a hash the chain never mined (today the approve times out on it); the swap goes on, the warning appears once and the broadcast event carries the true hash", async () => {
+    const warnings: string[] = [];
+    const broadcast: Array<{ write: RailWriteBroadcast["write"]; hash: string }> = [];
+    const wrap = (rail: CounterAssetRail): CounterAssetRail =>
+      Object.create(rail, {
+        connect: {
+          value: async (...args: Parameters<CounterAssetRail["connect"]>) => {
+            const connected = await rail.connect(...args);
+            connected.onWriteBroadcast?.((event) => void broadcast.push({ write: event.write, hash: event.hash }));
+            return connected;
+          },
+        },
+      }) as CounterAssetRail;
+    const r = await pairedSwap({ onWarning: (text) => void warnings.push(text), wrapRail: wrap });
+    r.node.answerWrongHashForNextSend("approve");
+    const lockA = await r.buyer.lockLegA(); // the approve is mined and answered with a hash that is not its own
+    expect(lockA.writeEvidence.event).toBe("Locked");
+    expect(r.node.count("approve")).toBe(1);
+    expect(r.node.count("lock")).toBe(1);
+    const approveHash = keccak256(r.buyerWire.rawSends[0]!.raw);
+    const lockHash = keccak256(r.buyerWire.rawSends[1]!.raw);
+    expect(broadcast).toEqual([
+      { write: "approve", hash: approveHash },
+      { write: "lock", hash: lockHash },
+    ]);
+    expect(warnings).toHaveLength(1); // the lock's answer was right: one warning, for the approve
+    expect(warnings[0]!.endsWith(`${approveHash}; the computed hash is used for this write`)).toBe(true);
+  });
+
+  it("an answer that is the right hash in another case is not a mismatch: no warning, and the hash is in lower case from the broadcast on", async () => {
+    const warnings: string[] = [];
+    const r = await pairedSwap({ upperCaseHashes: true, onWarning: (text) => void warnings.push(text) });
+    const lockA = await r.buyer.lockLegA();
+    const claimed = await r.seller.claimLegA(lockA.hashLock);
+    expect(claimed.evidence.event).toBe("Claimed");
+    expect(warnings).toEqual([]);
+    expect((await sellerRecord(r.stores, r.acceptA.contract)).claimTxHash).toBe(keccak256(r.sellerWire.rawSends[0]!.raw));
+  });
+
+  it("an honest endpoint changes nothing: a whole lock and claim report no warning, and the saved hash is keccak256 of the raw claim", async () => {
+    const warnings: string[] = [];
+    const r = await pairedSwap({ onWarning: (text) => void warnings.push(text) });
+    const lockA = await r.buyer.lockLegA();
+    await r.seller.claimLegA(lockA.hashLock);
+    expect(warnings).toEqual([]);
+    expect((await sellerRecord(r.stores, r.acceptA.contract)).claimTxHash).toBe(keccak256(r.sellerWire.rawSends[0]!.raw));
   });
 });
 

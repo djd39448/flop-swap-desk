@@ -55,6 +55,8 @@ export interface EvmCounterRailOptions {
   pollMs?: number;
   /** P9-4 decision 10: the pause itself (a timer by default); a test injects one that records the pauses. */
   sleep?: (ms: number) => Promise<void>;
+  /** P10 B6: see `EvmHtlcRailOptions.onWarning`: told once per write when the endpoint's answer was not the hash of the signed transaction (the rail uses the computed hash either way). */
+  onWarning?: (text: string) => void;
 }
 
 /** The address of either kind of account. */
@@ -374,6 +376,7 @@ class EvmCounterRail implements CounterAssetRail {
       clock: this.options.clock,
       lookupPauseMs: this.lookupPauseMs(),
       ...(this.options.sleep === undefined ? {} : { sleep: this.options.sleep }),
+      ...(this.options.onWarning === undefined ? {} : { onWarning: this.options.onWarning }),
     });
     return new ConnectedEvmCounterRail(rail, this.options.rpc, this.options.account, this.caip2);
   }
