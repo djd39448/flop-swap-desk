@@ -351,7 +351,7 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
       acceptAContract: acceptA.contract,
       acceptBContract: acceptB.contract,
       noteStore,
-      evm: { hashLock: lockA.hashLock },
+      evm: { hashLock: lockA.hashLock as Hex },
       nowMs: clock(),
       writes: [
         { leg: "a", step: "lock", rail: "evm-htlc", evidence: lockA.writeEvidence },
@@ -411,7 +411,7 @@ describe("Seller/Buyer client flows against a real anvil node", () => {
       acceptAContract: acceptA.contract,
       acceptBContract: acceptB.contract,
       noteStore,
-      evm: { hashLock: lockA.hashLock },
+      evm: { hashLock: lockA.hashLock as Hex },
       nowMs: clock(),
       writes: [
         { leg: "a", step: "lock", rail: "evm-htlc", evidence: lockA.writeEvidence },

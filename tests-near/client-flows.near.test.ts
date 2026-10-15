@@ -632,7 +632,7 @@ describe("Seller/Buyer client flows against a real near-sandbox node", () => {
     // `evidence.ref` verbatim — never the raw txHash (A9: an evidence reader keys and re-binds
     // captures by ref, so returning anything else would silently mislabel a recovered write).
     // Here the caller's own ref is `0x<hash lock>:<payer>` (squatting fix: near-htlc's own write ref).
-    const recovered = await recoveryRail.recoverByTxHash(lockA.writeEvidence.txHash, sandbox.buyer.accountId, lockA.writeEvidence.ref);
+    const recovered = await recoveryRail.recoverByTxHash(lockA.writeEvidence.txHash!, sandbox.buyer.accountId, lockA.writeEvidence.ref);
     expect(recovered).not.toBeNull();
     expect(recovered?.blockHash).toBe(lockA.writeEvidence.blockHash);
     expect(recovered?.ref).toBe(lockA.writeEvidence.ref);
@@ -643,9 +643,9 @@ describe("Seller/Buyer client flows against a real near-sandbox node", () => {
     // `TIMEOUT_ERROR` cause, which `recoverByTxHash` reports as `NearTimeoutError`, never
     // collapsing it to `null` (H4: "returns null only for unknown", and a genuine "ask again" is
     // not the same as "never broadcast"). Intentionally slow — waits out the node's own timeout.
-    const flippedLastChar = lockA.writeEvidence.txHash.endsWith("z") ? "y" : "z";
+    const flippedLastChar = lockA.writeEvidence.txHash!.endsWith("z") ? "y" : "z";
     await expect(
-      recoveryRail.recoverByTxHash(`${lockA.writeEvidence.txHash.slice(0, -1)}${flippedLastChar}`, sandbox.buyer.accountId, lockA.writeEvidence.ref),
+      recoveryRail.recoverByTxHash(`${lockA.writeEvidence.txHash!.slice(0, -1)}${flippedLastChar}`, sandbox.buyer.accountId, lockA.writeEvidence.ref),
     ).rejects.toBeInstanceOf(NearTimeoutError);
   }, 120_000);
 
