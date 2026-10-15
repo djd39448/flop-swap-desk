@@ -14,22 +14,36 @@ import { fileURLToPath } from "node:url";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { Transaction } from "@scure/btc-signer";
+import { bech32m } from "@scure/base";
+import { MemoryNoteStore, OFFER_ROOM, PaperRail } from "@flop-labs/tclk";
 import { describe, expect, it } from "vitest";
 
+import { BuyerFlow } from "../src/client/buyer.js";
 import { createBtcCounterRail } from "../src/client/btc-rail.js";
+import { belowMinLockable } from "../src/client/counter-rail.js";
 import { BTC_LOCAL_POLICY, BTC_SIGNET_POLICY, btcLocalPolicyFor } from "../src/client/policy.js";
+import { SellerFlow } from "../src/client/seller.js";
+import { MemoryVenue } from "../src/client/venue.js";
+import { swapId } from "../src/profile.js";
 import { DEFAULT_POLICY_EXAMPLE } from "../src/deadlines.js";
 import {
+  BTC_HTLC_WITNESS_SCRIPT_BYTES,
+  BTC_MAX_DESTINATION_SCRIPT_BYTES,
   BTC_MIN_LOCKABLE_SATS,
   BTC_REGTEST_PIN,
   BTC_SIGNET_FEE_CAP_SAT_PER_VB,
   BTC_SIGNET_FEE_FLOOR_SAT_PER_VB,
   BTC_SIGNET_FEE_RULE,
   BTC_SIGNET_FEE_TARGET_BLOCKS,
+  BTC_SIGNET_MAX_SPEND_FEE_SATS,
+  BTC_SIGNET_MIN_LOCKABLE_SATS,
   BTC_SIGNET_PIN,
+  BtcSpendUnaffordableError,
   DEFAULT_FEE_SATS,
   DUST_LIMIT_SATS,
+  MIN_LOCKABLE_MARGIN_SATS,
   btcFeeRuleFor,
+  btcMinLockableSatsFor,
   feeRateFromEstimate,
   spendFeeSatsFor,
   type BtcFeeRule,
@@ -43,6 +57,7 @@ import {
   scriptPubKeyForAddress,
 } from "../src/rails/btc-script.js";
 import { CapturingRpc } from "../src/rails/rpc-capture.js";
+import { identity } from "./helpers/identity.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..");
@@ -282,7 +297,7 @@ describe("P9-5: feeRateFromEstimate (sat per 1000 vB, clamped to [8000, 50000])"
 
 // -- the whole fee of a spend -----------------------------------------------------------------
 
-describe("P9-5: spendFeeSatsFor (rate times size, 1,000 satoshi floor, dust ceiling)", () => {
+describe("P9-5: spendFeeSatsFor (rate times size, 1,000 satoshi floor; P10 B2: refused, never cut, when the leg cannot pay it)", () => {
   it("is ceil(rate * size / 1000) between the floor and the ceiling", () => {
     expect(spendFeeSatsFor(RULE, 12_000, 140, 100_000_000n)).toBe(1680n);
     expect(spendFeeSatsFor(RULE, 8000, 132, 100_000_000n)).toBe(1056n);
@@ -302,12 +317,65 @@ describe("P9-5: spendFeeSatsFor (rate times size, 1,000 satoshi floor, dust ceil
     expect(spendFeeSatsFor(lowRule, 1, 140, 100_000_000n)).toBe(1000n); // below the rule's rate floor: clamped up, then floored
   });
 
-  it("never leaves an output under the dust limit, except that the floor wins on a leg too small to leave one", () => {
-    expect(spendFeeSatsFor(RULE, 50_000, 140, 3000n)).toBe(3000n - DUST_LIMIT_SATS);
-    expect(spendFeeSatsFor(RULE, 50_000, 140, BTC_MIN_LOCKABLE_SATS)).toBe(BTC_MIN_LOCKABLE_SATS - DUST_LIMIT_SATS); // 1,500, above the floor
-    expect(spendFeeSatsFor(RULE, 8000, 132, BTC_MIN_LOCKABLE_SATS)).toBe(1056n); // under the ceiling, untouched
-    expect(spendFeeSatsFor(RULE, 50_000, 140, 1200n)).toBe(1000n); // 1200 - 546 = 654 < the floor: the floor
-    expect(spendFeeSatsFor(RULE, 8000, 132, 1001n)).toBe(1000n);
+  it("P10 B2: a fee that would leave the output under the dust limit is refused with the numbers, never cut to fit", () => {
+    // The reviewer's case: a 2,046 satoshi leg at 30 sat/vB over 137 virtual bytes. The rule asks 4,110; the old code returned 1,500 (the amount less the dust limit).
+    const refusal = (): unknown => spendFeeSatsFor(RULE, 30_000, 137, 2046n);
+    expect(refusal).toThrow(BtcSpendUnaffordableError);
+    let caught: unknown;
+    try {
+      spendFeeSatsFor(RULE, 30_000, 137, 2046n);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(BtcSpendUnaffordableError);
+    const error = caught as BtcSpendUnaffordableError;
+    expect([error.amountSats, error.feeSats, error.dustLimitSats, error.vsize, error.rateSatPerKvB]).toEqual([2046n, 4110n, 546n, 137, 30_000]);
+    // the message names the numbers: amount, fee, rate, size, what would be left, the dust limit
+    for (const part of ["2046", "4110", "30000", "137", "1500", "546"]) expect(error.message, part).toContain(part);
+    // the other old cases, now refusals too: 3,000 at the cap, and the floor on a leg that cannot leave dust (it used to win)
+    expect(() => spendFeeSatsFor(RULE, 50_000, 140, 3000n)).toThrow(BtcSpendUnaffordableError);
+    expect(() => spendFeeSatsFor(RULE, 50_000, 140, 1200n)).toThrow(BtcSpendUnaffordableError); // 1200 - 546 = 654 < the 1,000 floor
+    expect(() => spendFeeSatsFor(RULE, 8000, 132, 1001n)).toThrow(BtcSpendUnaffordableError);
+  });
+
+  it("P10 B2: the boundary is exact: a fee that leaves exactly the dust limit is paid in full, one satoshi less room is refused", () => {
+    expect(spendFeeSatsFor(RULE, 50_000, 140, 7000n + DUST_LIMIT_SATS)).toBe(7000n); // leaves 546
+    expect(() => spendFeeSatsFor(RULE, 50_000, 140, 7000n + DUST_LIMIT_SATS - 1n)).toThrow(BtcSpendUnaffordableError);
+    expect(() => spendFeeSatsFor(RULE, 8000, 132, 1000n + DUST_LIMIT_SATS)).toThrow(BtcSpendUnaffordableError); // the rate asks 1,056, more than the 1,000 floor: it is not cut to the floor either
+    expect(spendFeeSatsFor(RULE, 8000, 132, 1056n + DUST_LIMIT_SATS)).toBe(1056n);
+    expect(() => spendFeeSatsFor(RULE, 8000, 132, 1056n + DUST_LIMIT_SATS - 1n)).toThrow(BtcSpendUnaffordableError);
+    const floorRule: BtcFeeRule = { ...RULE, floorSatPerKvB: 1000 };
+    expect(spendFeeSatsFor(floorRule, 1000, 140, 1000n + DUST_LIMIT_SATS)).toBe(1000n); // the floor, exactly affordable
+    expect(() => spendFeeSatsFor(floorRule, 1000, 140, 1000n + DUST_LIMIT_SATS - 1n)).toThrow(BtcSpendUnaffordableError);
+  });
+
+  it("P10 B2: whatever it returns is the rule's own fee (never below the estimate, never above it), over a grid of rates, sizes and amounts", () => {
+    let returned = 0;
+    let refused = 0;
+    for (let rate = 8000; rate <= 50_000; rate += 971) {
+      for (const vsize of [132, 140, 144, 152, 160]) {
+        for (const amount of [600n, 1546n, 2046n, 3000n, 4110n + DUST_LIMIT_SATS, 8000n, BTC_SIGNET_MIN_LOCKABLE_SATS, 100_000n, 100_000_000n]) {
+          const estimate = BigInt(Math.ceil((rate * vsize) / 1000));
+          const expected = estimate < 1000n ? 1000n : estimate;
+          let fee: bigint | null = null;
+          try {
+            fee = spendFeeSatsFor(RULE, rate, vsize, amount);
+          } catch (error) {
+            expect(error).toBeInstanceOf(BtcSpendUnaffordableError);
+          }
+          if (fee === null) {
+            refused += 1;
+            expect(amount - DUST_LIMIT_SATS < expected, `refused only when the estimate cannot be paid: ${rate}/${vsize}/${amount}`).toBe(true);
+          } else {
+            returned += 1;
+            expect(fee, `${rate}/${vsize}/${amount}`).toBe(expected); // exactly the estimate (or the floor), never cut
+            expect(amount - fee >= DUST_LIMIT_SATS, `${rate}/${vsize}/${amount}`).toBe(true);
+          }
+        }
+      }
+    }
+    expect(returned).toBeGreaterThan(100);
+    expect(refused).toBeGreaterThan(100);
   });
 
   it("refuses a rate or size that is not a positive safe integer", () => {
@@ -379,8 +447,149 @@ describe("P9-5: BTC_SIGNET_POLICY is chosen by the pin's network name, and regte
     expect(() => createBtcCounterRail({ config, rpc, wallet: "buyer", key, destinationAddress: SCRIPT.address, clock: () => 0 })).toThrow(/no policy for network "main"/);
   });
 
-  it("the minimum lockable amount is the same on both networks (a leg that clears regtest clears signet)", () => {
+  it("P10 B2: the minimum lockable amount is regtest's 2,046 on regtest and signet's 8,646 on signet (the rail chooses by the pin's network name)", () => {
     expect(rail("regtest").minLockableAmount).toBe(BTC_MIN_LOCKABLE_SATS.toString());
-    expect(rail("signet").minLockableAmount).toBe(BTC_MIN_LOCKABLE_SATS.toString());
+    expect(rail("regtest").minLockableAmount).toBe("2046");
+    expect(rail("signet").minLockableAmount).toBe(BTC_SIGNET_MIN_LOCKABLE_SATS.toString());
+    expect(rail("signet").minLockableAmount).toBe("8646");
+    expect(btcMinLockableSatsFor("regtest")).toBe(BTC_MIN_LOCKABLE_SATS);
+    expect(btcMinLockableSatsFor("signet")).toBe(BTC_SIGNET_MIN_LOCKABLE_SATS);
+    for (const other of ["main", "test", "testnet4", "", "Signet"]) expect(() => btcMinLockableSatsFor(other), other).toThrow(/no minimum lockable amount for network/);
+  });
+});
+
+// -- P10 B2 (R1-FUND-05): the lock guard and the fee rule agree ---------------------------------
+//
+// A signet leg whose amount cannot pay a claim or a refund at the fee rule's cap rate plus the dust limit is refused BEFORE anything is locked (the
+// signet `minLockableAmount`), and a leg the guard accepts always pays the rule's own fee. The reviewer's case, a 2,046 satoshi signet leg at 30 sat/vB,
+// used to pay 1,500 where the rule asked 4,110: an underpriced claim in the mempool with the preimage visible. Regtest and the other rails are unchanged.
+
+describe("P10 B2: the signet minimum lockable amount covers the cap-rate fee of the largest claim, the dust limit and a stated margin", () => {
+  it("is ceil(50,000 x claim size / 1000) + 546 + 500 = 8,646 for the longest destination, and the pieces are pinned to what the build really produces", () => {
+    // the claim bound for the 118-byte script and the longest destination (34 bytes) is 152 virtual bytes: 7,600 at the cap
+    expect(htlcSpendVsizeBound("claim", BTC_HTLC_WITNESS_SCRIPT_BYTES, BTC_MAX_DESTINATION_SCRIPT_BYTES)).toBe(152);
+    expect(BTC_SIGNET_MAX_SPEND_FEE_SATS).toBe(7600n);
+    expect(MIN_LOCKABLE_MARGIN_SATS).toBe(500n);
+    expect(BTC_SIGNET_MIN_LOCKABLE_SATS).toBe(BTC_SIGNET_MAX_SPEND_FEE_SATS + DUST_LIMIT_SATS + MIN_LOCKABLE_MARGIN_SATS);
+    expect(BTC_SIGNET_MIN_LOCKABLE_SATS).toBe(8646n);
+    expect(BTC_MIN_LOCKABLE_SATS).toBe(2046n); // regtest is unchanged
+    // the script and destination lengths are what buildHtlcScript and scriptPubKeyForAddress produce (a change to either would move the floor)
+    expect(SCRIPT.witnessScript.length).toBe(BTC_HTLC_WITNESS_SCRIPT_BYTES);
+    const tallest = buildHtlcScript({ hashLock: H, payeePubkey: hexToBytes(PAYEE_HEX), payerPubkey: hexToBytes(PAYER_HEX), locktime: 0x7fffffff }, BTC_REGTEST_NETWORK);
+    expect(tallest.witnessScript.length).toBe(BTC_HTLC_WITNESS_SCRIPT_BYTES); // the largest locktime a leg can have is still 118 bytes
+    expect(P2WSH_DESTINATION.length).toBe(BTC_MAX_DESTINATION_SCRIPT_BYTES);
+    const taproot = bech32m.encode("bcrt", [1, ...bech32m.toWords(new Uint8Array(32).fill(7))]);
+    expect(scriptPubKeyForAddress(taproot, BTC_REGTEST_NETWORK).length).toBe(BTC_MAX_DESTINATION_SCRIPT_BYTES);
+    // a witness program of another version or length has no destination script at all
+    const unknownWitness = bech32m.encode("bcrt", [2, ...bech32m.toWords(new Uint8Array(40).fill(7))]);
+    expect(() => scriptPubKeyForAddress(unknownWitness, BTC_REGTEST_NETWORK)).toThrow();
+  });
+
+  it("a refund is never larger than a claim, so the claim bound is the one the floor covers (every destination length an address can have)", () => {
+    for (const destinationLength of [22, 23, 25, 34]) {
+      const claim = htlcSpendVsizeBound("claim", BTC_HTLC_WITNESS_SCRIPT_BYTES, destinationLength);
+      const refund = htlcSpendVsizeBound("refund", BTC_HTLC_WITNESS_SCRIPT_BYTES, destinationLength);
+      expect(refund, String(destinationLength)).toBeLessThan(claim);
+      expect(BigInt(Math.ceil((50_000 * claim) / 1000)), String(destinationLength)).toBeLessThanOrEqual(BTC_SIGNET_MAX_SPEND_FEE_SATS);
+    }
+  });
+
+  it("every leg at or above the floor can pay the rule's own fee at any rate the rule allows, for a claim and a refund to any destination: spendFeeSatsFor never has to refuse an accepted leg", () => {
+    for (let rate = 8000; rate <= 50_000; rate += 250) {
+      for (const destinationLength of [22, 23, 25, 34]) {
+        for (const branch of ["claim", "refund"] as const) {
+          const vsize = htlcSpendVsizeBound(branch, BTC_HTLC_WITNESS_SCRIPT_BYTES, destinationLength);
+          for (const amount of [BTC_SIGNET_MIN_LOCKABLE_SATS, BTC_SIGNET_MIN_LOCKABLE_SATS + 1n, 100_000n, 100_000_000n]) {
+            const estimate = BigInt(Math.ceil((rate * vsize) / 1000));
+            expect(spendFeeSatsFor(RULE, rate, vsize, amount), `${branch}/${destinationLength}/${rate}/${amount}`).toBe(estimate < 1000n ? 1000n : estimate);
+          }
+        }
+      }
+    }
+  });
+
+  it("and the floor is not slack beyond its stated margin: a leg 501 satoshis below it is refused at the cap rate by the largest claim", () => {
+    const vsize = htlcSpendVsizeBound("claim", BTC_HTLC_WITNESS_SCRIPT_BYTES, BTC_MAX_DESTINATION_SCRIPT_BYTES);
+    expect(() => spendFeeSatsFor(RULE, 50_000, vsize, BTC_SIGNET_MIN_LOCKABLE_SATS - MIN_LOCKABLE_MARGIN_SATS - 1n)).toThrow(BtcSpendUnaffordableError);
+    expect(spendFeeSatsFor(RULE, 50_000, vsize, BTC_SIGNET_MIN_LOCKABLE_SATS - MIN_LOCKABLE_MARGIN_SATS)).toBe(7600n);
+  });
+});
+
+describe("P10 B2: the lock guard refuses a small signet leg before anything is locked (BuyerFlow.bid, SellerFlow.acceptLegA), and regtest still takes it", () => {
+  const T0 = 1_700_000_000_000;
+  const lockTimeMs = T0 + 30 * 60_000;
+  const deadlines = { claimByMs: lockTimeMs + 5 * 60_000, refundAfterMs: lockTimeMs + 6 * 60 * 60_000, expiresMs: T0 + 10 * 60_000 };
+
+  function railFor(network: "regtest" | "signet") {
+    const pin = network === "regtest" ? BTC_REGTEST_PIN : BTC_SIGNET_PIN;
+    const rpc = new CapturingRpc({
+      endpoint: "http://127.0.0.1:1",
+      fetch: (() => {
+        throw new Error("the lock guard must refuse before any node call");
+      }) as typeof fetch,
+    });
+    return createBtcCounterRail({
+      config: { pin, endpoint: "http://127.0.0.1:1" },
+      rpc,
+      wallet: "buyer",
+      key: { pubkey: PAYER_HEX, fingerprint: 0x2cd95c68, path: DERIVATION.path },
+      destinationAddress: SCRIPT.address,
+      clock: () => T0,
+    });
+  }
+
+  function buyerOn(network: "regtest" | "signet") {
+    const buyer = identity("c1".repeat(32));
+    const venue = new MemoryVenue(() => T0);
+    const flow = new BuyerFlow({ identity: buyer, venue, paperRail: new PaperRail(new MemoryNoteStore(), () => T0), rail: railFor(network), clock: () => T0 });
+    return { buyer, venue, flow };
+  }
+
+  function bidOf(buyer: { did: string }, amount: string) {
+    return {
+      swapId: swapId(buyer.did, "00000001"),
+      wantAsset: "FLOP",
+      wantAmount: "52070000",
+      wantRail: "flop-htlc",
+      amount,
+      asset: "BTC",
+      ...deadlines,
+    };
+  }
+
+  it("BuyerFlow.bid on a signet rail refuses 2,046 and 8,645 and takes 8,646; the same rail on regtest takes 2,046", async () => {
+    for (const amount of ["2046", "8645"]) {
+      const { buyer, flow } = buyerOn("signet");
+      await expect(flow.bid(bidOf(buyer, amount)), amount).rejects.toThrow(/below this rail's minimum lockable amount 8646/);
+    }
+    const atFloor = buyerOn("signet");
+    await expect(atFloor.flow.bid(bidOf(atFloor.buyer, "8646"))).resolves.toBeDefined();
+    const regtest = buyerOn("regtest");
+    await expect(regtest.flow.bid(bidOf(regtest.buyer, "2046"))).resolves.toBeDefined();
+    const regtestBelow = buyerOn("regtest");
+    await expect(regtestBelow.flow.bid(bidOf(regtestBelow.buyer, "2045"))).rejects.toThrow(/below this rail's minimum lockable amount 2046/);
+  });
+
+  it("SellerFlow.acceptLegA on a signet rail refuses an offer of 2,046 (posted by a regtest buyer) before it mints or posts anything; belowMinLockable agrees at the edge", async () => {
+    const offerer = buyerOn("regtest");
+    const offerA = await offerer.flow.bid(bidOf(offerer.buyer, "2046"));
+    const seller = identity("c2".repeat(32));
+    const sellerFlow = new SellerFlow({
+      identity: seller,
+      venue: offerer.venue,
+      paperRail: new PaperRail(new MemoryNoteStore(), () => T0),
+      rail: railFor("signet"),
+      clock: () => T0,
+    });
+    const before = (await offerer.venue.read(OFFER_ROOM)).length;
+    await expect(
+      sellerFlow.acceptLegA(offerA, { claimByMs: T0 + 12 * 60 * 60_000, refundAfterMs: T0 + 24 * 60 * 60_000, expiresMs: T0 + 60 * 60_000 }, lockTimeMs),
+    ).rejects.toThrow(/below this rail's minimum lockable amount 8646/);
+    expect((await offerer.venue.read(OFFER_ROOM)).length).toBe(before); // nothing was posted
+    const signet = railFor("signet");
+    expect(belowMinLockable(signet, "8645")).toBe(true);
+    expect(belowMinLockable(signet, "8646")).toBe(false);
+    expect(belowMinLockable(railFor("regtest"), "2045")).toBe(true);
+    expect(belowMinLockable(railFor("regtest"), "2046")).toBe(false);
   });
 });

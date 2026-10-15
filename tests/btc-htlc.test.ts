@@ -23,9 +23,11 @@ import { CapturingRpc } from "../src/rails/rpc-capture.js";
 import {
   BTC_MIN_LOCKABLE_SATS,
   BTC_REGTEST_PIN,
+  BTC_SIGNET_MIN_LOCKABLE_SATS,
   BTC_SIGNET_PIN,
   BtcHtlcRail,
   BtcPinMismatchError,
+  BtcSpendUnaffordableError,
   checkBtcRailConfig,
   DEFAULT_FEE_SATS,
   DUST_LIMIT_SATS,
@@ -619,15 +621,53 @@ describe("P9-5: a signet claim and refund pay the node's fee for their own size"
     expect(methodsOf(calls)).toEqual(["getblockchaininfo", "getblockhash", "getrawtransaction", "estimatesmartfee", "walletprocesspsbt", "testmempoolaccept", "sendrawtransaction"]);
   });
 
-  it("a fee that would leave less than the dust limit is cut to what leaves it (a 2,046 satoshi leg pays at most 1,500)", async () => {
+  // P10 B2 (R1-FUND-05): the fee was cut to the amount less the dust limit, so a 2,046 satoshi leg's claim paid 1,500 where the rule asked for more
+  // (4,110 at 30 sat/vB for a 137 virtual byte spend), an underpriced claim in the mempool with the preimage visible. The fee is the rule's own or the
+  // spend is refused: before the wallet is asked for anything, before any test of acceptance, before any send.
+  it("a leg too small to pay the fee the rule asks is refused before anything is signed or sent: a 2,046 satoshi leg at 30 sat/vB", async () => {
     const small = BTC_MIN_LOCKABLE_SATS;
+    expect(small).toBe(2046n);
     const smallFunding = (params: unknown[]) => (params[1] === true ? { vout: [{ n: 1, scriptPubKey: { hex: bytesToHex(SCRIPT.scriptPubKey) } }] } : fakeRawFundingTxHex(SCRIPT.scriptPubKey, small));
+    for (const [branch, vbytes] of [
+      ["claim", CLAIM_VBYTES],
+      ["refund", REFUND_VBYTES],
+    ] as const) {
+      const spendFees = new Map<string, bigint>();
+      const node = await signetRail(feeHandlers(() => ({ feerate: 0.0003 }), { getrawtransaction: smallFunding }), spendFees);
+      const terms = { ...TERMS, amountSats: small.toString() };
+      const error = await (branch === "claim"
+        ? node.rail.claim(REF, terms, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS)
+        : node.rail.refund(REF, terms, BUYER, SIGNET_DESTINATION)
+      ).then(
+        () => null,
+        (caught: unknown) => caught,
+      );
+      expect(error, branch).toBeInstanceOf(BtcSpendUnaffordableError);
+      const unaffordable = error as BtcSpendUnaffordableError;
+      expect(unaffordable.amountSats, branch).toBe(small);
+      expect(unaffordable.feeSats, branch).toBe(BigInt(30 * vbytes)); // 4,560 / 4,320: the rule's own fee, not 1,500
+      expect(unaffordable.dustLimitSats, branch).toBe(DUST_LIMIT_SATS);
+      expect(unaffordable.message, branch).toContain(`${small}`);
+      expect(unaffordable.message, branch).toContain(`${30 * vbytes}`);
+      expect(unaffordable.message, branch).toContain(`${DUST_LIMIT_SATS}`);
+      // nothing was signed, tested or sent, and no fee was remembered (a retry prices afresh)
+      expect(methodsOf(node.calls), branch).toEqual(["getblockchaininfo", "getblockhash", "getrawtransaction", "estimatesmartfee"]);
+      expect(spendFees.size, branch).toBe(0);
+    }
+  });
+
+  it("the smallest signet leg the lock guard accepts (8,646) pays the cap fee at the cap rate and its output stays above the dust limit, on a claim and on a refund", async () => {
+    const smallest = BTC_SIGNET_MIN_LOCKABLE_SATS;
+    expect(smallest).toBe(8646n);
+    const smallFunding = (params: unknown[]) => (params[1] === true ? { vout: [{ n: 1, scriptPubKey: { hex: bytesToHex(SCRIPT.scriptPubKey) } }] } : fakeRawFundingTxHex(SCRIPT.scriptPubKey, smallest));
     const claimNode = await signetRail(feeHandlers(() => ({ feerate: 0.5 }), { getrawtransaction: smallFunding }));
-    await claimNode.rail.claim(REF, { ...TERMS, amountSats: small.toString() }, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS);
-    expect(psbtOutputSats(claimNode.calls)).toBe(DUST_LIMIT_SATS);
+    await claimNode.rail.claim(REF, { ...TERMS, amountSats: smallest.toString() }, SECRET, SELLER, SIGNET_DESTINATION, SIGNET_NOT_AFTER_MS);
+    expect(psbtOutputSats(claimNode.calls)).toBe(smallest - BigInt((50_000 * CLAIM_VBYTES) / 1000)); // the estimate in full: 7,600
+    expect(psbtOutputSats(claimNode.calls) >= DUST_LIMIT_SATS).toBe(true);
     const refundNode = await signetRail(feeHandlers(() => ({ feerate: 0.5 }), { getrawtransaction: smallFunding }));
-    await refundNode.rail.refund(REF, { ...TERMS, amountSats: small.toString() }, BUYER, SIGNET_DESTINATION);
-    expect(psbtOutputSats(refundNode.calls)).toBe(DUST_LIMIT_SATS);
+    await refundNode.rail.refund(REF, { ...TERMS, amountSats: smallest.toString() }, BUYER, SIGNET_DESTINATION);
+    expect(psbtOutputSats(refundNode.calls)).toBe(smallest - BigInt((50_000 * REFUND_VBYTES) / 1000)); // 7,200
+    expect(psbtOutputSats(refundNode.calls) >= DUST_LIMIT_SATS).toBe(true);
   });
 
   it("a failing estimate never stops a claim or a refund: both go out at the floor", async () => {

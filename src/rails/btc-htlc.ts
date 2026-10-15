@@ -449,9 +449,9 @@ export const BTC_MIN_LOCKABLE_SATS: bigint = DEFAULT_FEE_SATS + DUST_LIMIT_SATS 
  *
  * What a build pays: the node's `estimatesmartfee` rate for `confTarget` blocks, clamped to
  * [`floorSatPerKvB`, `capSatPerKvB`]. A claim or refund pays that rate times an upper bound for its own size
- * (`htlcSpendVsizeBound`), never less than `floorFeeSats` in total and never so much that its output falls under the
- * dust limit. The funding transaction asks the wallet for that rate (`fee_rate`), since only the wallet knows how many
- * inputs it will spend.
+ * (`htlcSpendVsizeBound`), never less than `floorFeeSats` in total, and never cut: P10 B2, a leg too small to pay that fee and keep its
+ * output at the dust limit is refused (`BTC_SIGNET_MIN_LOCKABLE_SATS` at the lock guard, `BtcSpendUnaffordableError` in `spendFeeSatsFor`).
+ * The funding transaction asks the wallet for that rate (`fee_rate`), since only the wallet knows how many inputs it will spend.
  */
 export interface BtcFeeRule {
   /** `estimatesmartfee`'s `conf_target`, in blocks. */
@@ -480,8 +480,12 @@ export const BTC_SIGNET_FEE_FLOOR_SAT_PER_VB = 8;
 /** THE CAP on a signet fee RATE: 50 sat/vB, about six times the floor. It bounds an estimator that has gone wrong (a
  *  node with sparse data, a mis-set mempool, a lying endpoint), not any real fee market: whatever the node answers, a
  *  claim or refund pays at most 50 sat/vB over its own size (7,000 satoshis for a claim to a P2WPKH address, 7,600 to a
- *  P2WSH one) and never more than its funding amount less the dust limit (the 1,000 satoshi floor aside). The cap is a
- *  rate: a funding transaction that the wallet builds from very many inputs pays that rate on a larger transaction. */
+ *  P2WSH one). P10 B2: that fee is never cut to fit a small leg (it used to be capped at the funding amount less the
+ *  dust limit, which paid a 2,046 satoshi leg 1,500 where the rule asked for 4,110, an underpriced claim sitting in the
+ *  mempool with its preimage visible): a leg that cannot pay it is refused before anything is locked
+ *  (`BTC_SIGNET_MIN_LOCKABLE_SATS`), and `spendFeeSatsFor` throws `BtcSpendUnaffordableError` for one that reaches it
+ *  anyway. The cap is a rate: a funding transaction that the wallet builds from very many inputs pays that rate on a
+ *  larger transaction. */
 export const BTC_SIGNET_FEE_CAP_SAT_PER_VB = 50;
 
 /** The signet fee rule (`BTC_SIGNET_POLICY.fee` is this same object). `conservative` because a claim that waits
@@ -520,21 +524,85 @@ export function feeRateFromEstimate(rule: BtcFeeRule, answer: unknown): number {
 }
 
 /**
+ * P10 B2: a claim or refund of this funding cannot pay the fee the rule asks for and still leave an output at or above the dust limit. Thrown by
+ * `spendFeeSatsFor` BEFORE anything is built or signed (nothing was sent, no fee was remembered), naming the numbers. The old rule cut such a fee to
+ * the amount less the dust limit (a 2,046 satoshi leg paid 1,500 where the rule asked for 4,110), which left an underpriced claim in the mempool with
+ * the preimage visible; now the leg is refused instead. The lock guard keeps a real leg out of this case (`BTC_SIGNET_MIN_LOCKABLE_SATS`), so a leg
+ * the flows accepted never reaches it.
+ */
+export class BtcSpendUnaffordableError extends Error {
+  readonly amountSats: bigint;
+  readonly feeSats: bigint;
+  readonly dustLimitSats: bigint;
+  readonly vsize: number;
+  readonly rateSatPerKvB: number;
+  constructor(amountSats: bigint, feeSats: bigint, dustLimitSats: bigint, vsize: number, rateSatPerKvB: number) {
+    super(
+      `btc-htlc: refusing a spend of a ${amountSats} satoshi leg: the fee rule asks ${feeSats} satoshis (${rateSatPerKvB} sat per 1000 vB over ${vsize} vB), ` +
+        `but the leg can pay at most ${amountSats > dustLimitSats ? amountSats - dustLimitSats : 0n} and keep its output at the ${dustLimitSats} satoshi dust limit; ` +
+        "the fee is never cut to fit, so the leg is too small",
+    );
+    this.name = "BtcSpendUnaffordableError";
+    this.amountSats = amountSats;
+    this.feeSats = feeSats;
+    this.dustLimitSats = dustLimitSats;
+    this.vsize = vsize;
+    this.rateSatPerKvB = rateSatPerKvB;
+  }
+}
+
+/**
  * The whole fee, in satoshis, of one claim or refund of `fundingAmountSats` that is `vsize` virtual bytes at
- * `rateSatPerKvB` (clamped into the rule's range again here, so a caller cannot pass a rate outside it). Pure. At
- * least `floorFeeSats`; at most the funding amount less the dust limit, except that the floor wins when the amount is
- * too small to leave dust (the regtest rule: `BTC_MIN_LOCKABLE_SATS` keeps a real leg out of that case).
+ * `rateSatPerKvB` (clamped into the rule's range again here, so a caller cannot pass a rate outside it). Pure. Exactly
+ * `ceil(rate * vsize / 1000)`, never less than `floorFeeSats`: the rule's own estimate, never cut. P10 B2: when that fee
+ * would leave the single output under the dust limit, it throws `BtcSpendUnaffordableError` (the leg is too small for the
+ * rule) instead of returning a smaller fee, so no leg that is accepted pays below the estimate.
  */
 export function spendFeeSatsFor(rule: BtcFeeRule, rateSatPerKvB: number, vsize: number, fundingAmountSats: bigint): bigint {
   if (!Number.isSafeInteger(rateSatPerKvB) || rateSatPerKvB <= 0) throw new Error("btc-htlc: fee rate must be a positive integer (sat per 1000 vB)");
   if (!Number.isSafeInteger(vsize) || vsize <= 0) throw new Error("btc-htlc: vsize must be a positive integer");
-  const rate = BigInt(Math.min(Math.max(rateSatPerKvB, rule.floorSatPerKvB), rule.capSatPerKvB));
+  const clamped = Math.min(Math.max(rateSatPerKvB, rule.floorSatPerKvB), rule.capSatPerKvB);
+  const rate = BigInt(clamped);
   let fee = (rate * BigInt(vsize) + 999n) / 1000n; // ceil(rate * vsize / 1000)
   const floor = BigInt(rule.floorFeeSats);
   if (fee < floor) fee = floor;
-  const roomAboveDust = fundingAmountSats - DUST_LIMIT_SATS;
-  const ceiling = roomAboveDust > floor ? roomAboveDust : floor;
-  return fee > ceiling ? ceiling : fee;
+  if (fee > fundingAmountSats - DUST_LIMIT_SATS) throw new BtcSpendUnaffordableError(fundingAmountSats, fee, DUST_LIMIT_SATS, vsize, clamped);
+  return fee;
+}
+
+/**
+ * P10 B2: the witness script of this build's HTLC is 118 bytes (two 33-byte keys, a 4-byte locktime, a 32-byte hash and 16 bytes of opcodes and length bytes);
+ * a locktime is at most `MAX_LOCKTIME` (0x7fffffff), which is also a 4-byte script number, so no valid terms make it longer. tests/btc-signet-fee.test.ts
+ * pins this against `buildHtlcScript`.
+ */
+export const BTC_HTLC_WITNESS_SCRIPT_BYTES = 118;
+
+/**
+ * P10 B2: the longest scriptPubKey `scriptPubKeyForAddress` can return, which is the longest destination a claim or refund pays: 34 bytes (P2WSH and
+ * P2TR; P2WPKH is 22, P2PKH 25, P2SH 23, and a witness program of another version or length is refused by the address decoder).
+ */
+export const BTC_MAX_DESTINATION_SCRIPT_BYTES = 34;
+
+/**
+ * P10 B2: the most a signet claim or refund can cost: the cap rate over the claim bound for the longest destination and the 118-byte script
+ * (`ceil(50,000 x 152 / 1000)` = 7,600 satoshis). A refund is smaller (144 virtual bytes), and a leg is spent by one or the other, never both.
+ */
+export const BTC_SIGNET_MAX_SPEND_FEE_SATS: bigint =
+  (BigInt(BTC_SIGNET_FEE_RULE.capSatPerKvB) * BigInt(htlcSpendVsizeBound("claim", BTC_HTLC_WITNESS_SCRIPT_BYTES, BTC_MAX_DESTINATION_SCRIPT_BYTES)) + 999n) / 1000n;
+
+/**
+ * P10 B2 (R1-FUND-05): the smallest `amountSats` a signet leg may lock: the most a claim or refund can cost (`BTC_SIGNET_MAX_SPEND_FEE_SATS`, 7,600) plus
+ * the dust limit (546) plus the same 500 satoshi margin the regtest floor carries (`MIN_LOCKABLE_MARGIN_SATS`): 8,646. A leg below it is refused by
+ * `BuyerFlow.bid` / `lockLegA` and `SellerFlow.acceptLegA` (the lock guard), before anything is locked; at or above it, the fee rule's own fee at any rate
+ * the rule allows leaves the output above the dust limit, so `spendFeeSatsFor` never has to refuse an accepted leg. Regtest keeps `BTC_MIN_LOCKABLE_SATS`.
+ */
+export const BTC_SIGNET_MIN_LOCKABLE_SATS: bigint = BTC_SIGNET_MAX_SPEND_FEE_SATS + DUST_LIMIT_SATS + MIN_LOCKABLE_MARGIN_SATS;
+
+/** The smallest lockable amount of a pinned network by its name: `BTC_MIN_LOCKABLE_SATS` on regtest, `BTC_SIGNET_MIN_LOCKABLE_SATS` on signet; throws for any name off the allow list. */
+export function btcMinLockableSatsFor(network: string): bigint {
+  if (network === "regtest") return BTC_MIN_LOCKABLE_SATS;
+  if (network === "signet") return BTC_SIGNET_MIN_LOCKABLE_SATS;
+  throw new Error(`btc-htlc: no minimum lockable amount for network ${quotedPinTextOrPlaceholder(network)} (regtest, signet only)`);
 }
 
 /** P4-BTC-FIXES.md H2: a funding transaction built and signed, but never yet broadcast — every

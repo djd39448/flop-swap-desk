@@ -31,7 +31,7 @@ import { bip322ProofPsbt, bip322Verifier, bip322WitnessFromSignedTx } from "../r
 import { btcEvidence, captureBtcLeg, BTC_RAIL_ID, type BtcAccounts, type BtcCapture } from "../rails/btc-evidence.js";
 import {
   assetIdFor,
-  BTC_MIN_LOCKABLE_SATS,
+  btcMinLockableSatsFor,
   BtcBroadcastRefusedError,
   BtcHtlcRail,
   checkBtcRailConfig,
@@ -400,8 +400,9 @@ class BtcCounterRail implements CounterAssetRail {
    *  connects anew), so a retry rebuilds the identical transaction. Empty and unused on regtest. */
   private readonly spendFees = new Map<string, bigint>();
   /** G6: the fixed fee plus the worst-case dust limit, with margin — see
-   *  `BTC_MIN_LOCKABLE_SATS`'s own doc. */
-  readonly minLockableAmount: string = BTC_MIN_LOCKABLE_SATS.toString();
+   *  `BTC_MIN_LOCKABLE_SATS`'s own doc. P10 B2: on signet the cap-rate fee of the largest claim plus the dust limit plus the same margin
+   *  (`BTC_SIGNET_MIN_LOCKABLE_SATS`), chosen by the pin's network name; regtest keeps 2,046. */
+  readonly minLockableAmount: string;
   /** K3: the asset id this configured rail settles (`config.asset`, defaulted to `BTC_ASSET_ID`). */
   readonly assetId: string;
   /** R1-05: the network name and the genesis hash prefix (the first 32 hex characters, the same prefix `caip2` carries). A
@@ -413,6 +414,7 @@ class BtcCounterRail implements CounterAssetRail {
     this.options = options;
     this.caip2 = options.config.pin.caip2;
     this.policy = btcLocalPolicyFor(options.config.pin.network);
+    this.minLockableAmount = btcMinLockableSatsFor(options.config.pin.network).toString();
     this.assetId = assetIdFor(options.config);
     // P10 B4: the genesis prefix is named only for a pin this build knows (a public constant); a config that is not one (a hand-written value, a key
     // pasted into the wrong field) can never connect, and its deployment id must not carry a window of what it holds. The network is on the
