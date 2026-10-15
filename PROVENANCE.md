@@ -958,6 +958,25 @@ restored byte for byte.
 | B2: a signet leg that cannot pay the fee is refused; a spend never pays below the rule's estimate | `ece90c1` | `src/rails/btc-htlc.ts` (`spendFeeSatsFor` returns the estimate or throws `BtcSpendUnaffordableError`; `BTC_HTLC_WITNESS_SCRIPT_BYTES` 118, `BTC_MAX_DESTINATION_SCRIPT_BYTES` 34, `BTC_SIGNET_MAX_SPEND_FEE_SATS` 7,600, `BTC_SIGNET_MIN_LOCKABLE_SATS` 8,646, `btcMinLockableSatsFor`), `src/client/btc-rail.ts` (the rail's `minLockableAmount` is chosen by the pin's network name) | `tests/btc-signet-fee.test.ts` (the old "dust ceiling, the floor wins" case became the refusal; an exact boundary, a grid over rates, sizes and amounts, 118 and 34 pinned against `buildHtlcScript` and `scriptPubKeyForAddress`, the real `BuyerFlow.bid` and `SellerFlow.acceptLegA` refusing 2,046 and 8,645 on signet and taking 8,646, regtest unchanged at 2,046), `tests/btc-htlc.test.ts` (a claim and a refund of a 2,046 satoshi leg throw before any wallet, acceptance or send call; an 8,646 leg pays the full cap fee) |
 | B7: a Bitcoin Seller claim counts as landed only once mined | `bb1c80f` | `src/rails/btc-htlc.ts` (`BtcClaimOptions`, the recorder in `claim`, `claimStatus`, `resendClaim`, `claimMined`, `scanMinedSpend`), `src/client/counter-rail.ts` (`RailClaimOptions.onSignedTx` and `onNotBroadcastTx`, `ClaimTxStatus`, `ClaimTxResend`, the three optional methods `claimIsMined`, `claimTxStatus`, `resendClaimTx`), `src/client/btc-rail.ts`, `src/client/flow-record.ts` (the optional Seller field `claimTx { txid, rawTx, sent? }`, record version unchanged, redaction), `src/client/seller.ts` (`ClaimNotMinedError`, `ClaimSupersededError`, `assertFirstClaimGuards` moved verbatim, `resumeBtcClaim`, `settleBtcClaim`) | `tests/flow-claim-mined-btc.test.ts` (new, 25 cases over the stateful Bitcoin ledger fake on a chain that mines only when told), `tests/btc-claim-settle.test.ts` (new, 27 cases against a mocked bitcoind), `tests/flow-record.test.ts` (24 cases for `claimTx`), `tests/helpers/ledger-rail.ts` (the Bitcoin flavour signs, records, sends, mines, evicts and has the three methods), and live `tests-regtest/claim-mined.regtest.test.ts` (new, 6 cases on a real bitcoind: a real eviction with `-mempoolexpiry=1`, an identical re-send counted from the wire, also past the claim-by, a spent funding output not re-sent); helper `tests-regtest/helpers/claim.ts` (new) and four existing regtest files adjusted (a scenario that called `claimLegA` once now broadcasts, mines and calls again) |
 
+### The first review's fix pass (handoff/P10-FIXES-R1.md)
+
+One read-only review of `a59f6b2..c037aaa` (fund safety with the Bitcoin claim state machine first, key handling, pins and bounds) found no route by which an honest party loses funds that
+could not before, no key or preimage leak and no weakened assertion; its findings were all low, and one of them showed the main loop's own revision of decision 7 was too generous. Six commits fix
+them. Each code fix has a failing-without test, recorded in its commit message: the fix (or the old logic) put back, the focused tests seen to fail, the file restored byte for byte.
+
+| finding | commit | files | pinned by |
+|---|---|---|---|
+| P10-FUND-03 + P10-FUND-01: the identical re-send of a Bitcoin claim gets a bound, and the narrow window closes | `ff3a7da` | `src/client/seller.ts` (`ClaimResendTooLateError`, `resendUnknownClaim`, `legBTakenWithOurSecret`; the headers and docblocks) | `tests/flow-claim-mined-btc.test.ts` (10 new cases: leg B claimed with the secret re-sends at any time, with or without the `sent` mark; an accepted claim that was dropped is refused at and past `refundAfterMs` minus the claim-inclusion margin and re-sent one millisecond before it; the refusal ends once the Buyer claims leg B; a refund still ends in `ClaimSupersededError`), `tests-regtest/claim-mined.regtest.test.ts` (the re-send case moved inside the bound) |
+| P10-KEY-01: the recorded claim is an ES `#private` field | `cd1486c` | `src/client/seller.ts` (`#claimTx`), `tests/helpers/ledger-rail.ts` (`claimBytesCarrySecret`) | `tests/flow-resume-held.test.ts` (2 new cases: a Bitcoin world whose claim bytes embed the preimage, the Seller dead before the send; the signing flow and the resumed one show nothing in `Object.entries`, `util.inspect` with hidden properties at any depth, JSON or structured clone) |
+| P10-FUND-02: a claim is "in the mempool" only when `getmempoolentry` knows it | `d15cc5b` | `src/rails/btc-htlc.ts` (`claimTxPresence`, `claimStatus`, `resendClaim`) | `tests/btc-claim-settle.test.ts` (6 new cases, the mock gained `getmempoolentry` and a stale-branch knob), `tests-regtest/claim-mined.regtest.test.ts` (a real node: mined, `invalidateblock`, expired from the mempool, sent again with the recorded bytes) |
+| P10-KEY-02: `rails.btc.asset` is a short plain name, quoted only through the helper | `8c2416f` | `src/rails/pin-text.ts` (`ASSET_NAME_SHAPE` moved from the EVM rail, `UNPLAIN_ASSET_NAME`, `quotedAssetNameOrPlaceholder`), `src/rails/btc-htlc.ts` (the config check), `src/rails/btc-evidence.ts`, `src/rails/evm-htlc.ts` (re-export), `src/client/seller.ts`, `src/client/buyer.ts` | `tests/btc-asset-text.test.ts` (new, 8 cases: a generated key in five spellings and a phrase in three; the config check, `btcEvidence`, the Seller's accept, the Buyer's bid and lock, the sweep, `watch.mjs` and `audit-export`) |
+| P10-PIN-01: the B7 test gaps, and a defect the last of them found | `53ae3c8` | `src/client/seller.ts` (`project` no longer keeps a forgotten `claimTx` from the last saved record), `tests/helpers/ledger-rail.ts` (`claimCalls`, `refuseClaimAcceptance`) | `tests/flow-claim-mined-btc.test.ts` (5 new cases: `noteClaimAccepted` on the scan path and on the txid path, the dropped record of a refused claim at the flow level, a counter that sees a re-send through `claim()`, tclk's fold) |
+| P10-DOCS-01: the documentation | the commit that carries this part | `README.md`, `PROVENANCE.md`, a comment of `src/client/near-rail.ts` | none (documentation) |
+
+What the fix pass found beyond the list: the drop of a claim the node refused (`onNotBroadcastTx`) was never saved, because `project` laid the live state over the last saved record and an
+undefined `#claimTx` left the stale one in place (a restarted process re-sent the old bytes, or ended in a `RailRecoveryRefusedError`, instead of making a fresh guarded first claim; no fund was
+at risk, the bytes had never reached the network). Fixed in the P10-PIN-01 commit.
+
 Not built, on purpose: the backlog's two other items wait for the desk operator's word. B8, an automatic same-nonce re-pricing of a stuck EVM claim, is recommended after the first
 real Base Sepolia rehearsal, with its numbers (the README still says to speed a stuck claim up by hand). B9, the Solana program-side compute fix (store the vault bump in the escrow:
 a program build, a fixture refresh and a review round), is recommended with Solana devnet. Neither has code, a test or a fixture in this package.
@@ -976,9 +995,13 @@ build; that check, with the genesis hash, is the desk operator's G1 step before 
 
 Open residuals the packages leave, each written in the README as a known limit:
 
-- B7: in one narrow window the first-claim guards refuse a re-send (the node accepted the claim, the reply was lost, the lookup then failed, the claim was evicted and the claim-by has
-  passed: a never-sent claim re-sent late would be a new reveal after the claim-by); the claim status reads need `-txindex=1`; a claim that a reorg removes after its one confirmation is
-  not sent again; a record written before this change holds no claim bytes, so its flow cannot re-send a claim it never recorded.
+- B7: in one narrow window the first-claim guards refuse a re-send (the node accepted the claim, the reply was lost, the lookup then failed, the claim was evicted, the claim-by has
+  passed and leg B's note does not read claimed with the swap's secret: a never-sent claim re-sent late would be a new reveal after the claim-by); an accepted claim that was dropped is
+  not re-sent past leg A's refund time minus the claim-inclusion margin unless the Buyer has claimed leg B (`ClaimResendTooLateError`, a person acts); the claim status reads need
+  `-txindex=1`; a claim that a reorg removes after its one confirmation is not sent again; a record written before this change holds no claim bytes, so its flow cannot re-send a claim it
+  never recorded.
+- B4 (NEAR): a NEAR contract or token account that is a 64-hex implicit account has a new deployment id (a digest of it, not the digits), so a flow record written before P10 for such a
+  deployment is refused on resume (`FlowRecordMismatchError` on `deploymentId`; fail closed; a person reads the lock and leg B's note on chain and settles or refunds by hand). A deployment with named accounts keeps its id byte for byte.
 - B3: the offline replay and the evidence reader do not compare the signet challenge; the live `connect()` and every write do.
 - B4: a plain pin text of at most 40 characters is quoted by design, so a key cut to 40 characters or fewer and pasted into a pin name would still be echoed; `src/rails/account-line.ts`
   still quotes the caip2 it is given (a rail built in code, not a rails file).
@@ -990,7 +1013,11 @@ Documentation (the commit(s) that carry this section):
   second check and the new exit 6 sentence; the regtest suite list; the signet pin paragraph; the fee bullet, with the two minimums; the Bitcoin lost-reply paragraph and the new "counts as
   landed only once it is mined" bullet; the NEAR evidence reason; the Solana pin paragraph; the deployment id sentence; and the Bitcoin bullets of "What a resumed step does", "What still
   needs a person" and "Limits of resume".
-- `PROVENANCE.md`: the P9-5 signet paragraph, the P9-1 signer note, the P9-7 gate lines and the "stays outside the gate" notes now point here, and this section is new.
+- `PROVENANCE.md`: the P9-5 signet paragraph, the P9-1 signer note, the P9-7 gate lines and the "stays outside the gate" notes now point here, and this section is new; the fix pass
+  after the first review adds the table above ("The first review's fix pass") and updates the B7 and B4 residuals.
+- The fix pass's documentation (P10-DOCS-01): in `README.md`, the B7 bullet (the re-send rule with its three cases, `ClaimResendTooLateError`, the stale-branch reading of the node, the
+  evidence note after `ClaimNotMinedError`), the "What a resumed step does" paragraph, "What still needs a person" (five cases), the "Limits of resume" ending, and the deployment id paragraph
+  (the NEAR implicit-account limit, which that paragraph used to deny).
 - New test files, as listed above: `tests/late-claim-bundle.test.ts`, `tests/evm-sent-hash.test.ts`, `tests/btc-pin-text.test.ts`, `tests/near-pin-text.test.ts`, `tests/sol-pin-text.test.ts`,
   `tests/btc-claim-settle.test.ts`, `tests/flow-claim-mined-btc.test.ts` and `tests-regtest/claim-mined.regtest.test.ts`.
 
@@ -999,5 +1026,7 @@ they use are public values.
 
 What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/`, `contracts/`, `contracts-near/`, `contracts-sol/`, `fixtures/`, `docs/`, `bin/`, `examples/`, `package.json` and
 `package-lock.json` are byte-identical to `a59f6b2` (`git diff a59f6b2..HEAD` is empty for them); no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no
-`Date.now()` is added; no new fixture. The hermetic count after the package: 134 files, 4112 passed, 7 skipped (before it, at `a59f6b2`: 127 files, 3949 passed, 7 skipped). The regtest suite's count
-recorded by the B7 commit is 7 files, 35 passed (29 before, plus the 6 new); the live suites were not run for the documentation.
+`Date.now()` is added; no new fixture. The hermetic count after the package and its fix pass: 135 files, 4143 passed, 7 skipped (after the package alone, at `c037aaa`: 134 files, 4112 passed, 7 skipped; before it, at
+`a59f6b2`: 127 files, 3949 passed, 7 skipped; the fix pass adds 31 cases and one file, `tests/btc-asset-text.test.ts`). The regtest suite after the fix pass: 7 files, 36 passed (35 at `c037aaa`,
+plus the stale-branch case); the anvil suite: 9 files, 52 passed (seller.ts is shared flow code the EVM leg runs, so it was run again); NEAR and Solana were not run by the fix pass (the main loop
+runs them). The fix pass's documentation commit changes only `README.md`, `PROVENANCE.md` and one comment of `src/client/near-rail.ts`.

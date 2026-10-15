@@ -484,7 +484,9 @@ const KEY_SHAPED_ACCOUNT_ID = /^[0-9a-f]{64}$/;
  * config check requires of it (an account id; a base58 hash of 32 bytes) and is `unpinned` otherwise: `checkNearRailConfig` takes ANY non-empty string as `htlcCodeHash`, and this
  * id is saved in a flow record and printed whole by a record mismatch, so a key or a phrase pasted into the wrong field must not travel there. An account id that is a run of 64
  * hex digits is named by a digest of itself (still distinct per deployment, never the digits). A config that fails the shape can never connect (a live `code_hash` is never such a
- * text), so it never needs a distinct id; every config that can connect with a named account keeps the id it always had, byte for byte.
+ * text), so it never needs a distinct id; every config that can connect with a named (not 64-hex) account keeps the id it always had, byte for byte. The one exception is a contract or
+ * token account that is itself a 64-hex implicit account: its id changed with P10 (the digest above, not the digits), so a flow record written before P10 for such a deployment is refused on
+ * resume with a deployment mismatch (README, "Resume").
  */
 export function nearDeploymentId(config: NearRailConfig): string {
   const account = (text: unknown): string => {
