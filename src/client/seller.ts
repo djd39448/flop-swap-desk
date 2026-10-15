@@ -163,6 +163,7 @@ import { checkSwapDeadlines } from "../deadlines.js";
 import { checkOrientation, classifySwapOffer, legBContext } from "../profile.js";
 import { encodeFrameWith } from "../rails/custom-frames.js";
 import { SOL_RAIL_ID } from "../rails/custom-rails.js";
+import { quotedAssetNameOrPlaceholder } from "../rails/pin-text.js";
 import { EVM_RAIL_ID } from "../rails/evm-evidence.js";
 import { NEAR_RAIL_ID } from "../rails/near-evidence.js";
 import { parseNearRef } from "../rails/near-ref.js";
@@ -953,7 +954,8 @@ export class SellerFlow {
     // that declares no single asset, e.g. evm-htlc, never triggers this: no behaviour change).
     if (this.rail.assetId !== undefined && offerA.asset !== this.rail.assetId) {
       throw new Error(
-        `seller: refusing to accept leg A — asset "${offerA.asset}" does not match this rail's own asset "${this.rail.assetId}" (K3)`,
+        // P10-KEY-02: the rail's asset may be a config text (`rails.btc.asset`): quoted only when it is a short plain name
+        `seller: refusing to accept leg A - asset "${offerA.asset}" does not match this rail's own asset ${quotedAssetNameOrPlaceholder(this.rail.assetId)} (K3)`,
       );
     }
 

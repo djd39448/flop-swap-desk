@@ -145,6 +145,7 @@ import { encodeFrameWith, makeOfferWith } from "../rails/custom-frames.js";
 import { SOL_RAIL_ID } from "../rails/custom-rails.js";
 import { EvmReceiptTimeoutError } from "../rails/evm-htlc.js";
 import { NearRefundFailedError, NearTxFailedError } from "../rails/near-htlc.js";
+import { quotedAssetNameOrPlaceholder } from "../rails/pin-text.js";
 import type { Exchange } from "../rails/rpc-capture.js";
 import { SolRefundFailedError } from "../rails/sol-htlc.js";
 import { offerAcceptLockTerms } from "../swap.js";
@@ -768,7 +769,8 @@ export class BuyerFlow {
     // EVM: no behaviour change there).
     if (this.rail.assetId !== undefined && params.asset !== this.rail.assetId) {
       throw new Error(
-        `buyer: refusing to bid asset "${params.asset}" — this rail only ever settles "${this.rail.assetId}" (K3)`,
+        // P10-KEY-02: the rail's asset may be a config text (`rails.btc.asset`): quoted only when it is a short plain name
+        `buyer: refusing to bid asset "${params.asset}" - this rail only ever settles ${quotedAssetNameOrPlaceholder(this.rail.assetId)} (K3)`,
       );
     }
     // G6: refuse an amount this rail could never actually lock (below the fixed spend fee plus
@@ -1306,7 +1308,7 @@ export class BuyerFlow {
     // place to check "should never" rather than assume it.
     if (this.rail.assetId !== undefined && offerA.asset !== this.rail.assetId) {
       throw new Error(
-        `buyer: refusing to lock leg A — asset "${offerA.asset}" does not match this rail's own asset "${this.rail.assetId}" (K3)`,
+        `buyer: refusing to lock leg A - asset "${offerA.asset}" does not match this rail's own asset ${quotedAssetNameOrPlaceholder(this.rail.assetId)} (K3)`,
       );
     }
 

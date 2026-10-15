@@ -33,7 +33,7 @@ import {
   type FundingUtxo,
   type HtlcSpendBranch,
 } from "./btc-script.js";
-import { quotedPinTextOrPlaceholder } from "./pin-text.js";
+import { ASSET_NAME_SHAPE, quotedPinTextOrPlaceholder } from "./pin-text.js";
 import { RpcCaptureError, type CapturingRpc } from "./rpc-capture.js";
 
 export type BtcNetworkName = "regtest" | "signet";
@@ -208,8 +208,10 @@ export function btcRailConfigShapeReason(value: unknown): string | null {
   }
   // K3: optional here (defaults to BTC_ASSET_ID via assetIdFor) — only its shape is checked;
   // btcEvidence/the client flows are what compare it against a leg's own declared asset.
-  if (v.asset !== undefined && (typeof v.asset !== "string" || v.asset === "")) {
-    return "btc rail config: asset must be a non-empty string when present";
+  // P10-KEY-02: the asset name is printed by refusals that reach `watch.mjs --rails`, `audit-export --rails` and the flows' messages, and a rails file has no key field, so it is held to the
+  // short plain name shape (`ASSET_NAME_SHAPE`, the EVM `assets` names' own) and a value that is not one is refused by field name, never quoted.
+  if (v.asset !== undefined && (typeof v.asset !== "string" || !ASSET_NAME_SHAPE.test(v.asset))) {
+    return "btc rail config: asset must be a short plain name (1 to 32 letters, digits, - and _) when present";
   }
   return null;
 }

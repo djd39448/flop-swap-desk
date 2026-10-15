@@ -8,6 +8,10 @@
 // quotes such a text only when it is a short plain text (`PIN_TEXT_SHAPE`) and otherwise says `UNPLAIN_PIN_TEXT`, a fixed sentence
 // that holds no byte of the value. The EVM rail has applied this rule since KR3-3; the Bitcoin, NEAR and Solana rails (and their client
 // wrappers) import it from here. This module imports nothing, so a rail and the client may both import it.
+//
+// P10-KEY-02: the same rule for an ASSET name read from a hand-written config (`rails.btc.asset`, the EVM `assets` names): `ASSET_NAME_SHAPE` (moved here from the EVM rail,
+// which re-exports it) and `quotedAssetNameOrPlaceholder`. A refusal that names a configured asset quotes it only when it is a short plain name; the Bitcoin config check holds
+// `asset` to the shape and refuses anything else by field name.
 
 /**
  * The shape of a pin name or caip2 a refusal may quote: 1 to 40 letters, digits and `: _ . -` (`base-sepolia`, `anvil-local`,
@@ -21,6 +25,20 @@ export const PIN_TEXT_SHAPE = /^[A-Za-z0-9:_.-]{1,40}$/;
  * reads after "got", "is" or "network", so it carries no article of its own.
  */
 export const UNPLAIN_PIN_TEXT = "a pin name (or caip2) that is not a short plain text";
+
+/**
+ * KR2-1 (P9 review round 2), moved here by P10-KEY-02: the shape of an asset name this build prints or writes down: 1 to 32 letters, digits, `-` and `_` (`USDC`, `usdc-test`, `BTC`).
+ * The runner's config holds every EVM `assets` name to it, and the Bitcoin config check (`rails.btc.asset`) holds that asset to it too, before anything else reads the config.
+ */
+export const ASSET_NAME_SHAPE = /^[A-Za-z0-9_-]{1,32}$/;
+
+/** How a refusal speaks of an asset whose name is NOT a plain name (`ASSET_NAME_SHAPE`): it never quotes it. Fixed, like `UNPLAIN_PIN_TEXT`. */
+export const UNPLAIN_ASSET_NAME = "an asset whose name is not a short plain name";
+
+/** The asset name between double quotes when it is a plain name (`ASSET_NAME_SHAPE`), else `UNPLAIN_ASSET_NAME`: for a refusal that names a configured asset (a config text a key may have been pasted into). */
+export function quotedAssetNameOrPlaceholder(text: unknown): string {
+  return typeof text === "string" && ASSET_NAME_SHAPE.test(text) ? `"${text}"` : UNPLAIN_ASSET_NAME;
+}
 
 /** The text between double quotes when `text` is a short plain text, and `null` when it is anything else (a value that must not be quoted). */
 export function quotedPinText(text: unknown): string | null {

@@ -57,7 +57,7 @@ import {
   type EvmSignerRefusedError,
   type EvmSignerWatch,
 } from "./evm-signer.js";
-import { PIN_TEXT_SHAPE, quotedPinText, UNPLAIN_PIN_TEXT } from "./pin-text.js";
+import { ASSET_NAME_SHAPE, PIN_TEXT_SHAPE, quotedPinText, UNPLAIN_ASSET_NAME, UNPLAIN_PIN_TEXT } from "./pin-text.js";
 import { RpcCaptureError, verifiedExchangeBytes, type CapturingRpc } from "./rpc-capture.js";
 
 export { EVM_DEFAULT_MAX_FEE_PER_GAS_WEI, EVM_MAX_GAS_PER_WRITE, EvmSignerRefusedError } from "./evm-signer.js";
@@ -322,16 +322,17 @@ const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 
 /**
  * KR2-1 (P9 review round 2): the shape of an asset name this build prints or writes down: 1 to 32 letters, digits, `-` and `_`
- * (`USDC`, `usdc-test`). The runner's config holds every `assets` name to it before anything else reads the config.
+ * (`USDC`, `usdc-test`). The runner's config holds every `assets` name to it before anything else reads the config. P10-KEY-02: the definition now lives in
+ * src/rails/pin-text.ts, shared with the Bitcoin rail (its `rails.btc.asset` is held to the same shape); it is still exported from here for the runner's config check and the tests.
  */
-export const ASSET_NAME_SHAPE = /^[A-Za-z0-9_-]{1,32}$/;
+export { ASSET_NAME_SHAPE };
 
 /**
  * KR2-1: how the refusals of this module that name an asset speak of one whose name is NOT a plain name (`ASSET_NAME_SHAPE`): they never
  * quote it. A key pasted into the wrong place is the case this is for, and these texts reach terminals, logs and the output of
  * `watch.mjs` and `audit-export`, which this module cannot tell apart from the runner's.
  */
-const UNPLAIN_ASSET = "an asset whose name is not a short plain name";
+const UNPLAIN_ASSET = UNPLAIN_ASSET_NAME;
 
 /**
  * KR3-3 (P9 review round 3), P10 B4: how the refusals of this module that name a pin's `name` or `caip2` speak of one that is NOT a short plain text

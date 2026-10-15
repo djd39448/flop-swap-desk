@@ -61,7 +61,7 @@ import {
   locktimeFromRefundAfterMs,
 } from "./btc-script.js";
 import { assetIdFor, checkBtcRailConfig, scanWindowFor, type BtcChainPin, type BtcRailConfig } from "./btc-htlc.js";
-import { quotedPinTextOrPlaceholder } from "./pin-text.js";
+import { quotedAssetNameOrPlaceholder, quotedPinTextOrPlaceholder } from "./pin-text.js";
 import { readCapture, RpcCaptureError, type CapturingRpc, type Exchange } from "./rpc-capture.js";
 import { railBinding, type LockEvidence, type RailObservation } from "../types.js";
 
@@ -374,7 +374,8 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
       lock: {
         ...base,
         railVerified: false,
-        reason: `btc-htlc: leg asset "${terms.asset}" does not match this rail's own asset "${expectedAsset}" (K3)`,
+        // P10-KEY-02: the rail's own asset is a config text (`rails.btc.asset`): quoted only when it is a short plain name
+        reason: `btc-htlc: leg asset "${terms.asset}" does not match this rail's own asset ${quotedAssetNameOrPlaceholder(expectedAsset)} (K3)`,
       },
     };
   }
