@@ -18,7 +18,7 @@
 //   6  a funding output spent by another transaction is not re-sent;
 //   7  a node that refuses the saved bytes is a typed error for a person, nothing new is built.
 
-import { dealRoom, tryDecodeFrame } from "@flop-labs/tclk";
+import { dealRoom, foldTranscript, tryDecodeFrame } from "@flop-labs/tclk";
 import { describe, expect, it } from "vitest";
 
 import { RailRecoveryRefusedError } from "../src/client/counter-rail.js";
@@ -138,7 +138,7 @@ describe("P10 B7: a claim that is broadcast and not mined is not landed", () => 
     expect(record.claimOutcome).toBe("landed");
     expect(record.receiptPosted).toBe(true);
     expect((await resumedSeller(s)).next).toBe("done");
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 1, rebroadcasts: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 0 });
   });
 
   it("the same, in a resumed process: restart while the claim is unmined, mine, and the new process settles it", async () => {
@@ -150,7 +150,7 @@ describe("P10 B7: a claim that is broadcast and not mined is not landed", () => 
     await back.flow.claimLegA(statement);
     expect(await legAFrames(s.w)).toEqual({ reveal: 1, receipt: 1 });
     expect((await resumedSeller(s)).next).toBe("done");
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 1, rebroadcasts: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 0 });
   });
 
   it("on a chain that mines at once, one call settles (the fast path is unchanged)", async () => {
@@ -159,7 +159,7 @@ describe("P10 B7: a claim that is broadcast and not mined is not landed", () => 
     expect(result.receipt).toBeDefined();
     expect(await legAFrames(s.w)).toEqual({ reveal: 1, receipt: 1 });
     expect((await sellerRecordOf(s.w)).claimOutcome).toBe("landed");
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 1, rebroadcasts: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 0 });
   });
 });
 
@@ -173,7 +173,8 @@ describe("P10 B7: a claim the node still holds is never sent again, and the Buye
     const back = await resumedSeller(s);
     expect(back.next).toBe("claimLegA");
     expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
-    expect(chain.counts).toEqual(before); // nothing built, nothing sent, nothing re-sent
+    expect(chain.counts).toEqual(before); // nothing built, nothing sent, nothing re-sent, and (P10-PIN-01) the rail's claim() not called again either
+    expect(chain.counts.claimCalls).toBe(1);
     expect((await s.w.venue.read(await dealRoomA(s.w))).length).toBe(roomBefore); // no second reveal either
     expect(chain.scanFrom.length).toBeGreaterThan(0); // it read the chain, from the marker it saved with the attempt
   });
@@ -206,13 +207,13 @@ describe("P10 B7: a claim that left the mempool unmined is sent again as the SAM
     const { s, chain, statement, txid, rawTx } = await evicted();
     expect(chain.knownTxs.has(txid)).toBe(false); // the premise: the node dropped it
     expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 2, rebroadcasts: 1 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 2, rebroadcasts: 1 });
     expect(chain.knownTxs.has(txid)).toBe(true);
     expect(await claimTxOf(s.w)).toEqual({ txid, rawTx, sent: true }); // the record is untouched
     chain.mine();
     await s.c.seller.claimLegA(statement);
     expect(await legAFrames(s.w)).toEqual({ reveal: 1, receipt: 1 });
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, rebroadcasts: 1 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, rebroadcasts: 1 });
   });
 
   it("after the claim-by (and past the claim-inclusion margin): re-sent all the same, because the secret is public already", async () => {
@@ -220,7 +221,7 @@ describe("P10 B7: a claim that left the mempool unmined is sent again as the SAM
     const view = await readSwap(s.w);
     s.w.setTime(view.offerA!.claimByMs + 10 * 60_000);
     expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, rebroadcasts: 1 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, rebroadcasts: 1 });
     expect(chain.knownTxs.has(txid)).toBe(true);
   });
 
@@ -231,7 +232,7 @@ describe("P10 B7: a claim that left the mempool unmined is sent again as the SAM
     const back = await resumedSeller(s);
     expect(back.next).toBe("claimLegA");
     expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, rebroadcasts: 1 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, rebroadcasts: 1 });
     expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
     expect(chain.knownTxs.has(txid)).toBe(true);
   });
@@ -244,6 +245,10 @@ describe("P10 B7: a claim that left the mempool unmined is sent again as the SAM
     }
     expect(chain.counts.claimBuilt).toBe(1);
     expect(chain.claimBytes.size).toBe(1);
+    // P10-PIN-01: the fake signs deterministically, so claimBuilt and claimBytes cannot tell a re-send through claim() from the identical re-broadcast; these can:
+    expect(chain.counts.claimCalls, "claim() was called once, for the first claim").toBe(1);
+    expect(chain.counts.rebroadcasts, "every later send was the identical re-broadcast").toBe(3);
+    expect(chain.counts.claimSent).toBe(4);
   });
 
   it("a node that refuses the saved bytes is RailRecoveryRefusedError for a person: nothing is built, nothing is sent", async () => {
@@ -252,7 +257,7 @@ describe("P10 B7: a claim that left the mempool unmined is sent again as the SAM
     const error = await rejection(s.c.seller.claimLegA(statement));
     expect(error).toBeInstanceOf(RailRecoveryRefusedError);
     expect((error as RailRecoveryRefusedError).code).toBe("rebroadcast-refused");
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 1, rebroadcasts: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 0 });
   });
 });
 
@@ -310,7 +315,7 @@ describe("P10 B7: a claim that may never have been sent is a FIRST claim and kee
     const { s, chain } = await diedBeforeClaimSend();
     const claimTx = await claimTxOf(s.w);
     expect(claimTx.sent).toBeUndefined();
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 0 });
     expect(chain.knownTxs.has(claimTx.txid)).toBe(false);
     expect((await resumedSeller(s)).next).toBe("claimLegA");
   });
@@ -320,7 +325,7 @@ describe("P10 B7: a claim that may never have been sent is a FIRST claim and kee
     const { txid } = await claimTxOf(s.w);
     const back = await resumedSeller(s);
     expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 1, rebroadcasts: 1 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 1 });
     expect(chain.knownTxs.has(txid)).toBe(true);
     expect((await claimTxOf(s.w)).sent).toBe(true);
     chain.mine();
@@ -336,7 +341,7 @@ describe("P10 B7: a claim that may never have been sent is a FIRST claim and kee
     const error = await rejection(back.flow.claimLegA(statement));
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toMatch(/at\/after its claimByMs/);
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 0, rebroadcasts: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 0, rebroadcasts: 0 });
     expect((await legAFrames(s.w)).reveal).toBe(0);
   });
 
@@ -359,7 +364,7 @@ describe("P10 B7: a claim that may never have been sent is a FIRST claim and kee
     expect(error).toBeInstanceOf(ClaimSupersededError);
     expect((error as ClaimSupersededError).sent).toBe(false);
     expect((error as ClaimSupersededError).message).toContain("never been seen by the node");
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 0, rebroadcasts: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 0, rebroadcasts: 0 });
     expect((await legAFrames(s.w)).reveal).toBe(0); // the secret was never made public by this flow
   });
 
@@ -369,7 +374,7 @@ describe("P10 B7: a claim that may never have been sent is a FIRST claim and kee
     s.w.setTime(view.offerA!.claimByMs + 1);
     const error = await rejection(s.c.seller.claimLegA(statement));
     expect((error as Error).message).toMatch(/at\/after its claimByMs/);
-    expect(chain.counts).toMatchObject({ claimBuilt: 0, claimSent: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 0, claimCalls: 0, claimSent: 0 });
     expect((await sellerRecordOf(s.w)).claimTx).toBeUndefined();
     expect((await sellerRecordOf(s.w)).claimAttempted).toBe(false);
   });
@@ -398,7 +403,7 @@ describe("P10-FUND-01: the Buyer already holds leg B: the saved claim is sent ag
       const back = await resumedSeller(s);
       expect(back.next).toBe("claimLegA");
       expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError); // back in the mempool, not mined
-      expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 2, rebroadcasts: 1 });
+      expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 2, rebroadcasts: 1 });
       expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
       expect(chain.knownTxs.has(txid)).toBe(true);
       expect(await claimTxOf(s.w)).toEqual({ txid, rawTx, sent: true });
@@ -416,7 +421,7 @@ describe("P10-FUND-01: the Buyer already holds leg B: the saved claim is sent ag
     const back = await resumedSeller(s);
     const error = await rejection(back.flow.claimLegA(statement));
     expect((error as Error).message).toMatch(/at\/after its claimByMs/);
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 1, rebroadcasts: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 0 });
     expect((await claimTxOf(s.w)).sent).toBeUndefined();
   });
 });
@@ -464,7 +469,7 @@ describe("P10-FUND-03: a claim the node accepted and dropped is sent again only 
     expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimResendTooLateError);
     await buyerTakesLegB(s); // the reveal frame has been in the room since the first broadcast
     expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 2, rebroadcasts: 1 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 2, rebroadcasts: 1 });
     expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
     expect(chain.knownTxs.has(txid)).toBe(true);
   });
@@ -474,7 +479,7 @@ describe("P10-FUND-03: a claim the node accepted and dropped is sent again only 
     await buyerTakesLegB(s);
     s.w.setTime(s.w.refundAt.legA + 60 * 60_000);
     expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 2, rebroadcasts: 1 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 2, rebroadcasts: 1 });
     expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
     chain.mine();
     await s.c.seller.claimLegA(statement);
@@ -485,7 +490,7 @@ describe("P10-FUND-03: a claim the node accepted and dropped is sent again only 
     const { s, chain, statement, txid, rawTx } = await acceptedThenEvicted();
     s.w.setTime(notAfterMsOf(s.w) - 1);
     expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 2, rebroadcasts: 1 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 2, rebroadcasts: 1 });
     expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
     expect(chain.knownTxs.has(txid)).toBe(true);
   });
@@ -497,6 +502,85 @@ describe("P10-FUND-03: a claim the node accepted and dropped is sent again only 
     const before = { ...chain.counts };
     expect(await rejection(s.c.seller.claimLegA(statement))).toBeInstanceOf(ClaimSupersededError);
     expect(chain.counts).toEqual(before);
+  });
+});
+
+// P10-PIN-01 (P10-FIXES-R1.md decision 5): the test gaps of the B7 review. (a) `noteClaimAccepted` on the two paths that RECOGNISE a claim the node holds or has mined (the scan finds the
+// preimage; the txid reports a confirmation the scan misses): the mark `sent` is what lets a later eviction be re-sent inside the P10-FUND-03 bound instead of refused by the first-claim
+// guards. (b) `onNotBroadcastTx` at the flow level: a claim the node refused is forgotten again. The ledger fake now counts every call of the rail's claim() (`claimCalls`), so a re-send
+// through claim() instead of the identical re-broadcast is seen (the assertions of "never a new spend" and "repeated calls" above).
+describe("P10-PIN-01: a claim the chain shows is marked sent on every path that recognises it", () => {
+  it("the scan finds the claim in the mempool (the mark was lost with the process): the record gets sent=true, and a later eviction is re-sent inside the bound, not refused by the first-claim guard", async () => {
+    const { s, chain, statement } = await diedBeforeClaimSend("after-store-fail");
+    const { txid, rawTx, sent } = await claimTxOf(s.w);
+    expect(sent).toBeUndefined(); // the premise: accepted by the node, never marked
+    expect(chain.knownTxs.has(txid)).toBe(true);
+    const back = await resumedSeller(s);
+    expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
+    expect((await claimTxOf(s.w)).sent, "noteClaimAccepted ran on the path that found the claim").toBe(true);
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 0 }); // recognising it sent nothing
+
+    // behaviour that rests on the mark: evicted later, leg B unclaimed, past the claim-by and inside the bound, the identical bytes go out (an unmarked claim would be refused)
+    chain.evictClaim(txid);
+    s.w.setTime((await readSwap(s.w)).offerA!.claimByMs + 10 * 60_000);
+    expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 2, rebroadcasts: 1 });
+    expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
+  });
+
+  it("the scan misses a claim that is mined (a deep reorg below the saved marker) but the node reports a confirmation for the txid: the record gets sent=true and the swap settles, nothing is sent", async () => {
+    const { s, chain, statement } = await diedBeforeClaimSend("after-store-fail");
+    expect((await claimTxOf(s.w)).sent).toBeUndefined();
+    chain.mine();
+    const output = [...chain.outputs.values()][0]!;
+    output.claimHeight = (output.claimHeight ?? 0) - 50; // below the marker: the scan from it cannot see the claim
+    const back = await resumedSeller(s);
+    await back.flow.claimLegA(statement);
+    expect((await claimTxOf(s.w)).sent, "noteClaimAccepted ran on the path that read the txid").toBe(true);
+    expect((await sellerRecordOf(s.w)).claimOutcome).toBe("landed");
+    expect(await legAFrames(s.w)).toEqual({ reveal: 1, receipt: 1 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 0 });
+  });
+});
+
+describe("P10-PIN-01: a claim the node refused to accept is forgotten again, at the flow level (onNotBroadcastTx)", () => {
+  it("the record is saved with the claim BEFORE the send and without it after the refusal; a restarted process finds nothing recorded and nothing seen, and makes a guarded first claim", async () => {
+    const { s, chain, statement } = await lockedWorld();
+    const claimTxHistory: string[] = [];
+    s.w.stores.seller.failSaveWhen((_n, key, bytes) => {
+      const record = decodeFlowRecord(bytes, key);
+      if (record.role === "seller" && record.claimAttempted) claimTxHistory.push(record.claimTx === undefined ? "absent" : record.claimTx.sent === true ? "sent" : "recorded");
+      return undefined;
+    });
+    chain.refuseClaimAcceptance = true;
+    const error = await rejection(s.c.seller.claimLegA(statement));
+    expect((error as Error).message).toContain("testmempoolaccept refused the claim");
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 0 });
+    expect(chain.knownTxs.size, "only the Buyer's funding is known to the node").toBe(1);
+    expect(claimTxHistory.includes("recorded"), "the claim was saved before the send").toBe(true);
+    expect(claimTxHistory.at(-1), "and forgotten after the refusal").toBe("absent");
+    const record = await sellerRecordOf(s.w);
+    expect(record.claimAttempted).toBe(true);
+    expect(record.claimTx).toBeUndefined();
+    expect((await legAFrames(s.w)).reveal, "the secret was never made public").toBe(0);
+
+    chain.refuseClaimAcceptance = false;
+    const back = await resumedSeller(s);
+    expect(back.next).toBe("claimLegA");
+    expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
+    expect(chain.counts).toMatchObject({ claimCalls: 2, claimSent: 1 });
+    expect((await claimTxOf(s.w)).sent).toBe(true);
+  });
+
+  it("the guards of a first claim still apply to it: past the claim-by the restarted process refuses and sends nothing", async () => {
+    const { s, chain, statement } = await lockedWorld();
+    chain.refuseClaimAcceptance = true;
+    await rejection(s.c.seller.claimLegA(statement));
+    chain.refuseClaimAcceptance = false;
+    s.w.setTime((await readSwap(s.w)).offerA!.claimByMs + 10 * 60_000);
+    const back = await resumedSeller(s);
+    expect(((await rejection(back.flow.claimLegA(statement))) as Error).message).toMatch(/at\/after its claimByMs/);
+    expect(chain.counts).toMatchObject({ claimCalls: 1, claimSent: 0 });
   });
 });
 
@@ -532,7 +616,7 @@ describe("P10 B7: the record", () => {
     expect(error).toBeInstanceOf(ClaimNotMinedError);
     expect((error as ClaimNotMinedError).txid).toBeUndefined();
     expect((error as ClaimNotMinedError).message).toContain("kept no claim bytes");
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 1, rebroadcasts: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 0 });
     chain.mine();
     await back.flow.claimLegA(statement);
     expect(await legAFrames(s.w)).toEqual({ reveal: 1, receipt: 1 });
@@ -548,7 +632,7 @@ describe("P10 B7: the txid decides what the scan cannot (a claim mined below the
     output.claimHeight = (output.claimHeight ?? 0) - 50; // a deep reorg re-included it far below the saved marker
     await s.c.seller.claimLegA(statement);
     expect(await legAFrames(s.w)).toEqual({ reveal: 1, receipt: 1 });
-    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimSent: 1, rebroadcasts: 0 });
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 0 });
   });
 });
 
@@ -569,26 +653,51 @@ describe("P10 B7: without a store the same rule holds in the same process", () =
     const statement = seller.statement!;
     expect(await rejection(seller.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
     expect(await rejection(seller.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError);
-    expect(chain!.counts).toMatchObject({ claimBuilt: 1, claimSent: 1, rebroadcasts: 0 });
+    expect(chain!.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 0 });
     chain!.mine();
     const result = await seller.claimLegA(statement);
     expect(result.receipt).toBeDefined();
     expect(await legAFrames(w)).toEqual({ reveal: 1, receipt: 1 });
     // and an evicted claim is sent again, identically, in the same process
     expect(chain!.counts.claimBuilt).toBe(1);
+    expect(chain!.counts.claimCalls).toBe(1);
   });
 });
 
 describe("P10 B7: the frames are posted once whatever the order of events (a reveal first, then the receipt after the block)", () => {
-  it("tclk's fold accepts the reveal posted at broadcast and the receipt posted after the block: leg A ends claimed with no rejected step", async () => {
+  it("frame counts and order: one reveal at broadcast and one receipt after the block, in that order, however often claimLegA is called", async () => {
     const { s, chain, statement } = await lockedWorld();
     await rejection(s.c.seller.claimLegA(statement));
+    await rejection(s.c.seller.claimLegA(statement));
     chain.mine();
+    await s.c.seller.claimLegA(statement);
     await s.c.seller.claimLegA(statement);
     const records = await s.w.venue.read(await dealRoomA(s.w));
     const types = records.map((record) => tryDecodeFrame(record.line)?.type ?? "line");
     expect(types.filter((type) => type === "reveal")).toHaveLength(1);
     expect(types.filter((type) => type === "receipt")).toHaveLength(1);
     expect(types.indexOf("reveal")).toBeLessThan(types.indexOf("receipt"));
+  });
+
+  // P10-PIN-01: the fold itself. The old name of the test above said "tclk's fold accepts ..." but it only counted frames; this one runs tclk's machine over the offer, the accept and the deal
+  // room, after the broadcast (the reveal is in, the receipt is not) and after the block (the receipt too), and asks for the contract's status and for no rejected step.
+  it("tclk's fold: leg A has moved on from locked with no rejected step after the broadcast, and is claimed with no rejected step after the block", async () => {
+    const { s, chain, statement } = await lockedWorld();
+    const view = await readSwap(s.w);
+    const fold = async () => {
+      const room = await s.w.venue.read(await dealRoomA(s.w));
+      const folded = foldTranscript([view.offerARecord!, view.acceptARecord!, ...room]);
+      const rejected = folded.steps.filter((step) => !step.ok && step.type !== undefined).map((step) => `${step.type}@${step.seq}`);
+      return { status: folded.state?.status, rejected };
+    };
+    await rejection(s.c.seller.claimLegA(statement));
+    const afterBroadcast = await fold();
+    expect(afterBroadcast.rejected, "no rejected step after the broadcast").toEqual([]);
+    expect(afterBroadcast.status, "the reveal moved the contract on from locked").not.toBe("locked");
+    chain.mine();
+    await s.c.seller.claimLegA(statement);
+    const afterBlock = await fold();
+    expect(afterBlock.rejected, "no rejected step after the block").toEqual([]);
+    expect(afterBlock.status).toBe("claimed");
   });
 });

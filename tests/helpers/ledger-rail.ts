@@ -88,6 +88,12 @@ export interface LedgerCounts {
   /** P10 B7 (Bitcoin): claims built (signed). A claim is built once per swap, however many times it is sent. */
   claimBuilt: number;
   claimSent: number;
+  /**
+   * P10-PIN-01: EVERY call of the rail's `claim` (a signing and a send), whether or not the node already knew the bytes. `claimBuilt` and `claimSent` cannot tell a claim built a second time
+   * from the same bytes (the fake signs deterministically) nor an "already known" send from no send; this one can, so a flow that re-sends through `claim()` instead of the identical
+   * re-broadcast (`resendClaimTx`, counted in `rebroadcasts`) is seen.
+   */
+  claimCalls: number;
   /** Refunds built (signed) / actually sent. A refund built but never sent never reached the network. */
   refundBuilt: number;
   refundSent: number;
@@ -112,13 +118,15 @@ export class LedgerChain {
   readonly knownTxs = new Set<string>();
   /** What each built funding's bytes mean, by txid (the "wallet": a persisted funding can be sent again from its bytes alone). */
   readonly builtFundings = new Map<string, PreparedFunding>();
-  readonly counts: LedgerCounts = { fundBuilt: 0, fundSent: 0, claimBuilt: 0, claimSent: 0, refundBuilt: 0, refundSent: 0, rebroadcasts: 0 };
+  readonly counts: LedgerCounts = { fundBuilt: 0, fundSent: 0, claimBuilt: 0, claimSent: 0, claimCalls: 0, refundBuilt: 0, refundSent: 0, rebroadcasts: 0 };
   /** P10 B7 (Bitcoin): what the "wallet" signed, by claim txid: the identical bytes can be sent again from the txid alone. */
   readonly claimBytes = new Map<string, { ref: string; secret: string; rawTx: string }>();
   /** P10 B7 (Bitcoin): true (the default, "the chain is instant"): a sent claim is mined at once. False: it sits in the mempool until `mine()`. */
   autoMineClaims = true;
   /** P10 B7 (Bitcoin): the node refuses a recorded claim it is asked to send again (its inputs are gone, or its fee is below the minimum). */
   refuseClaimResend = false;
+  /** P10-PIN-01 (Bitcoin): the node's `testmempoolaccept` refuses the claim: the recorder hears that the signed bytes never reached the network (`onNotBroadcastTx`) and nothing is sent. */
+  refuseClaimAcceptance = false;
   /** P10-KEY-01 (Bitcoin): a signed claim's bytes embed the preimage (lower-case hex inside the transaction hex), as a real claim's witness does. By default the bytes are a label only. */
   claimBytesCarrySecret = false;
   /** P10 B7 (Bitcoin): a block is mined: every claim in the mempool is in it. */
@@ -401,6 +409,7 @@ class LedgerConnected implements ConnectedCounterAssetRail {
 
   async claim(ref: string, secret: string, notAfterMs: number, options: RailClaimOptions = {}): Promise<RailWriteEvidence> {
     this.options.hooks.alive();
+    this.chain.counts.claimCalls += 1; // P10-PIN-01: every call, however it ends
     const output = this.chain.outputs.get(ref);
     if (output === undefined) throw new Error("ledger rail: no such output");
     const btc = this.options.flavour === "btc";
@@ -422,6 +431,10 @@ class LedgerConnected implements ConnectedCounterAssetRail {
       if (this.chain.nowMs() >= notAfterMs) {
         if (options.onNotBroadcastTx !== undefined) await options.onNotBroadcastTx(handle);
         throw new Error("ledger rail: claim refused, at or after notAfterMs");
+      }
+      if (this.chain.refuseClaimAcceptance) {
+        if (options.onNotBroadcastTx !== undefined) await options.onNotBroadcastTx(handle);
+        throw new Error("ledger rail: testmempoolaccept refused the claim");
       }
     }
     await this.options.hooks.act("claim.send", async () => {

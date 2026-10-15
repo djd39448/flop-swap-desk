@@ -830,8 +830,12 @@ export class SellerFlow {
   /** The flow's live state laid over a record (the journal calls this on every save). Only things a resumed flow
    *  needs are copied; the frames, the ledger and the revision stay the record's own. */
   private project(r: SellerFlowRecord): SellerFlowRecord {
+    // P10-PIN-01: `claimTx` is the one stored field the flow can take BACK (a claim the node provably never received is forgotten again, `onNotBroadcastTx`): the live state decides, so a
+    // copy of it in `r` (the record as last saved) must not survive an undefined `#claimTx`. Every other field below is laid over `r` and replaces it.
+    const base: SellerFlowRecord = { ...r };
+    delete base.claimTx;
     return {
-      ...r,
+      ...base,
       ...(this.attemptedAcceptB === undefined ? {} : { attemptedAcceptB: this.attemptedAcceptB.contract }),
       ...(this.lockedLegBContract === undefined ? {} : { lockedLegBContract: this.lockedLegBContract }),
       ...(this.frozenLegAAccounts === undefined ? {} : { frozenLegAAccounts: accountsToJson(this.frozenLegAAccounts) }),
