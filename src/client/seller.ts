@@ -2011,7 +2011,7 @@ export class SellerFlow {
    *      leg A's refund time, that is before `notAfterMs` = leg A's `refundAfterMs` minus the claim-inclusion margin, judged against `max(chain time, clock)` here and by the rail as the last
    *      read before the send. At or past it: `ClaimResendTooLateError`, nothing sent (the Buyer may be refunding leg A, and a late claim could leave it without time to claim leg B);
    *  (c) otherwise (the claim may never have been sent: a FIRST claim, a new reveal): every first-claim guard, then the rail's last-moment read, exactly as before.
-   * A failed read of leg B's note ends the call with that error and sends nothing (a refusal is preferred to any new outward action). Returns what the rail settled.
+   * A failed read of leg B's note counts as "not shown claimed" and falls through to (b) or (c) (P10R2-FUND-01). Returns what the rail settled.
    */
   private async resendUnknownClaim(
     connected: ConnectedCounterAssetRail,
@@ -2038,14 +2038,19 @@ export class SellerFlow {
   /**
    * P10-FUND-01: whether leg B's paper note reads claimed with THIS swap's secret (`noteOpensOurStatement`, the same test `refundLegB` makes): the Buyer then holds leg B, and the secret is
    * public. `legBClaimSeen` (saved by an earlier `refundLegB` that saw it) counts as the same fact. Leg B's contract is the one this flow locked or attempted to lock; with none there is no note
-   * to read. A read that throws propagates.
+   * to read. P10R2-FUND-01: a read that throws is "not shown claimed" (`false`): this answer can only WIDEN a send (rule (a) below), so ignoring its failure is never more permissive than a
+   * read that says no, and the sends of rules (b) and (c), which do not need it, must not be blocked by a paper store that cannot be read.
    */
   private async legBTakenWithOurSecret(): Promise<boolean> {
     if (this.legBClaimSeen) return true;
     const contractB = this.lockedLegBContract ?? this.attemptedAcceptB?.contract;
     if (contractB === undefined) return false;
-    const note = await this.paperRail.read(contractB);
-    return note !== null && note.status === "claimed" && this.noteOpensOurStatement(note);
+    try {
+      const note = await this.paperRail.read(contractB);
+      return note !== null && note.status === "claimed" && this.noteOpensOurStatement(note);
+    } catch {
+      return false;
+    }
   }
 
   /**

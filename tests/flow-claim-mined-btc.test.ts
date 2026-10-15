@@ -18,7 +18,7 @@
 //   6  a funding output spent by another transaction is not re-sent;
 //   7  a node that refuses the saved bytes is a typed error for a person, nothing new is built.
 
-import { dealRoom, foldTranscript, tryDecodeFrame } from "@flop-labs/tclk";
+import { dealRoom, foldTranscript, tryDecodeFrame, type PaperRail } from "@flop-labs/tclk";
 import { describe, expect, it } from "vitest";
 
 import { RailRecoveryRefusedError } from "../src/client/counter-rail.js";
@@ -216,7 +216,7 @@ describe("P10 B7: a claim that left the mempool unmined is sent again as the SAM
     expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, rebroadcasts: 1 });
   });
 
-  it("after the claim-by (and past the claim-inclusion margin): re-sent all the same, because the secret is public already", async () => {
+  it("after the claim-by, inside the bound (before refundAfterMs minus the claim-inclusion margin): re-sent all the same", async () => {
     const { s, chain, statement, txid } = await evicted();
     const view = await readSwap(s.w);
     s.w.setTime(view.offerA!.claimByMs + 10 * 60_000);
@@ -426,16 +426,34 @@ describe("P10-FUND-01: the Buyer already holds leg B: the saved claim is sent ag
   });
 });
 
-describe("P10-FUND-03: a claim the node accepted and dropped is sent again only while it can still land before leg A's refund time, unless the Buyer holds leg B", () => {
-  async function acceptedThenEvicted(): Promise<{ s: Started; chain: LedgerChain; statement: string; txid: string; rawTx: string }> {
-    const { s, chain, statement } = await lockedWorld();
-    await rejection(s.c.seller.claimLegA(statement));
-    const { txid, rawTx, sent } = await claimTxOf(s.w);
-    expect(sent).toBe(true);
-    chain.evictClaim(txid);
-    return { s, chain, statement, txid, rawTx };
-  }
+/** A world where the Seller's claim was accepted by the node (the record says `sent`) and then evicted from the mempool, unmined. */
+async function acceptedThenEvicted(): Promise<{ s: Started; chain: LedgerChain; statement: string; txid: string; rawTx: string }> {
+  const { s, chain, statement } = await lockedWorld();
+  await rejection(s.c.seller.claimLegA(statement));
+  const { txid, rawTx, sent } = await claimTxOf(s.w);
+  expect(sent).toBe(true);
+  chain.evictClaim(txid);
+  return { s, chain, statement, txid, rawTx };
+}
 
+/** A paper rail whose `read` throws while `state.failing` is true (every other method is the real one's). */
+function paperWithFailingReads(paper: PaperRail, state: { failing: boolean }): PaperRail {
+  return new Proxy(paper, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      if (property === "read") {
+        return async (...args: unknown[]): Promise<unknown> => {
+          if (state.failing) throw new Error("test: the paper note store cannot be read");
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return (value as (...a: unknown[]) => unknown).bind(target);
+    },
+  });
+}
+
+describe("P10-FUND-03: a claim the node accepted and dropped is sent again only while it can still land before leg A's refund time, unless the Buyer holds leg B", () => {
   it.each([
     ["exactly at the bound (refundAfterMs minus the margin)", (s: Started) => notAfterMsOf(s.w)],
     ["inside the margin, before leg A's refund time", (s: Started) => s.w.refundAt.legA - 30 * 60_000],
@@ -581,6 +599,61 @@ describe("P10-PIN-01: a claim the node refused to accept is forgotten again, at 
     const back = await resumedSeller(s);
     expect(((await rejection(back.flow.claimLegA(statement))) as Error).message).toMatch(/at\/after its claimByMs/);
     expect(chain.counts).toMatchObject({ claimCalls: 1, claimSent: 0 });
+  });
+});
+
+// P10R2-FUND-01 (P10-FIXES-R2): the read of leg B's note can only WIDEN a send (rule (a)), so a note that cannot be read is "not shown claimed" and the sends of rules (b) and (c), which do
+// not need it, go on exactly as they would for a note that reads unclaimed. Before, the failed read propagated and blocked them.
+describe("P10R2-FUND-01: a failed read of leg B's note is 'not shown claimed': rules (b) and (c) go on, and nothing is widened", () => {
+  const resumeWithFailingNote = async (s: Started) => {
+    const state = { failing: false };
+    const back = await resumedSeller(s, (options) => ({ paperRail: paperWithFailingReads(options.paperRail, state) }));
+    state.failing = true; // the resume itself is done; from here every read of a paper note throws
+    return back;
+  };
+
+  it("an accepted claim evicted inside the bound, the note unreadable: one identical re-send (rule b)", async () => {
+    const { s, chain, statement, txid, rawTx } = await acceptedThenEvicted();
+    const back = await resumeWithFailingNote(s);
+    expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimNotMinedError); // back in the mempool, not mined
+    expect(chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 2, rebroadcasts: 1 });
+    expect(chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
+    expect(chain.knownTxs.has(txid)).toBe(true);
+    expect(await claimTxOf(s.w)).toEqual({ txid, rawTx, sent: true });
+  });
+
+  it("the same past the bound: the note unreadable widens nothing, so it is still ClaimResendTooLateError and nothing is sent", async () => {
+    const { s, chain, statement } = await acceptedThenEvicted();
+    s.w.setTime(notAfterMsOf(s.w));
+    const back = await resumeWithFailingNote(s);
+    const before = { ...chain.counts };
+    expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimResendTooLateError);
+    expect(chain.counts).toEqual(before);
+  });
+
+  it("the Buyer HAS taken leg B but the note cannot be read, past the bound: rule (a) is not applied, ClaimResendTooLateError, nothing is sent", async () => {
+    const { s, chain, statement } = await acceptedThenEvicted();
+    await buyerTakesLegB(s);
+    s.w.setTime(s.w.refundAt.legA + 60 * 60_000);
+    const back = await resumeWithFailingNote(s);
+    const before = { ...chain.counts };
+    expect(await rejection(back.flow.claimLegA(statement))).toBeInstanceOf(ClaimResendTooLateError);
+    expect(chain.counts).toEqual(before);
+  });
+
+  it("a claim that may never have been sent (rule c), the note unreadable: every first-claim guard still runs. Past the claim-by it refuses and sends nothing; inside the window it sends the identical bytes", async () => {
+    const late = await diedBeforeClaimSend();
+    late.s.w.setTime((await readSwap(late.s.w)).offerA!.claimByMs + 10 * 60_000);
+    const lateBack = await resumeWithFailingNote(late.s);
+    expect(((await rejection(lateBack.flow.claimLegA(late.statement))) as Error).message).toMatch(/at\/after its claimByMs/);
+    expect(late.chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 0, rebroadcasts: 0 });
+
+    const early = await diedBeforeClaimSend();
+    const { txid, rawTx } = await claimTxOf(early.s.w);
+    const earlyBack = await resumeWithFailingNote(early.s);
+    expect(await rejection(earlyBack.flow.claimLegA(early.statement))).toBeInstanceOf(ClaimNotMinedError);
+    expect(early.chain.counts).toMatchObject({ claimBuilt: 1, claimCalls: 1, claimSent: 1, rebroadcasts: 1 });
+    expect(early.chain.claimBytes.get(txid)?.rawTx).toBe(rawTx);
   });
 });
 
