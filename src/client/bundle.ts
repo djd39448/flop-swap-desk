@@ -48,7 +48,7 @@ import { SOL_RAIL_ID } from "../rails/custom-rails.js";
 import { captureSolLeg, solCaptureKey, solEvidence, type SolAccounts, type SolCapture } from "../rails/sol-evidence.js";
 import { parseSolRef, type SolRailConfig } from "../rails/sol-htlc.js";
 import { verifiedExchangeBytes, writeCapture, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
-import type { SwapView } from "../types.js";
+import type { RailObservation, SwapView } from "../types.js";
 
 /** The exact banner text `stripNoteBanner` (src/paper-evidence.ts) strips before decoding a
  *  paper note's last non-empty line — copied verbatim from the real
@@ -227,12 +227,28 @@ export function selectBundleSwap(
 }
 
 /**
+ * P10 B5: what `writeBundle` learned while it wrote, for a caller that must not call a bundle good before it has looked at what the bundle itself holds. Nothing here is written to disk
+ * beyond what `evidence/<swapId>.json` already carries; it is the same fold's own answer, handed back.
+ */
+export interface WriteBundleResult {
+  /** The status the fold derived and `evidence/<swapId>.json` records ("unpaired" when no swap of the bundle matches the evidence summary). */
+  status: string;
+  /**
+   * Leg A's rail observation exactly as the bundle's own fold bound it to this swap: what the evidence reader recorded for leg A at the finalized block's hash (`evmEvidence`'s
+   * `rail`), after `src/swap.ts` checked that it is an observation OF this pair's accepted lock. `undefined` when the bundle holds none (no capture, a capture that did not complete, a
+   * lock that reads absent, an account line missing) or the fold refused it. A caller that wants "leg A reads claimed" asks for `status === "claimed" && final === true`.
+   */
+  legARail: RailObservation | undefined;
+}
+
+/**
  * Write one swap's evidence bundle under `input.root`. Every file lands in the exact shape
  * `examples/audit-export.mjs` already reads (see the module comment); a caller that then runs
  * `node examples/audit-export.mjs --root <root> --expect <swapId>=<status>` is replaying this
- * bundle unmodified, through the same `foldCaptured` the live watcher uses.
+ * bundle unmodified, through the same `foldCaptured` the live watcher uses. P10 B5: the result
+ * hands back the status and leg A's observation that this same fold produced.
  */
-export async function writeBundle(input: WriteBundleInput): Promise<void> {
+export async function writeBundle(input: WriteBundleInput): Promise<WriteBundleResult> {
   const stamp = isoStamp(input.nowMs);
 
   if (input.offerRoomRecords.length > 0) {
@@ -408,4 +424,5 @@ export async function writeBundle(input: WriteBundleInput): Promise<void> {
     join(input.root, "evidence", `${evidence.swapId}.json`),
     `${JSON.stringify(evidence, jsonReplacer, 2)}\n`,
   );
+  return { status, legARail: ownSwap?.evidence.aRail };
 }

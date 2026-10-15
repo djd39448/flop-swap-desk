@@ -32,6 +32,10 @@
 //                          `settled` first), writes the bundle, and exits 0 with `LATE_REVEAL_SENTENCE`; the on-chain evidence is the proof.
 //                          P94-FUND-02: the runner checks that proof before it writes the bundle on that path (`lateRevealGate`: leg A must read claimed at the finalized block), and
 //                          otherwise ends with exit 6 and one fixed sentence, no bundle and no `revealed`.
+//                          P10 B5: that read is the runner's own, at the finalized block's NUMBER; the bundle's evidence reader later reads leg A at the finalized block's HASH, and behind a
+//                          load-balanced endpoint the two can disagree. So `writeAndAudit` also requires the bundle's OWN leg A observation (the fold's `rail`, handed back by
+//                          `writeBundle`) to say claimed and final before the bundle is renamed into place or `outcome.json` is written (`LATE_REVEAL_BUNDLE_NOT_CLAIMED`, exit 6, no bundle
+//                          kept, and a later `--resume` reads again).
 //                          P94-FUND-01: the claim of leg A is the one write with a deadline a person can still help (a by-hand same-nonce speed-up, README, "A stuck claim is not
 //                          re-priced"), so its hash is printed the moment it is broadcast ("claim of leg A sent: tx <hash>"), then one line a minute while it is not mined, and a
 //                          claim still pending when the wait ends is a refusal (exit 4) whose one sentence names the hash, the minutes left and the by-hand step.
@@ -46,7 +50,7 @@
 //
 // Exit codes: 0 done (or a clean dry run); 2 bad config, arguments or state; 3 pre-flight failed (nothing was sent); 4 a step refused
 // (the first line of its reason is printed); 5 not yet (a refund time has not come; run again then); 6 the bundle was written
-// but `audit-export` did not accept it (or, P94-FUND-02, a late claim whose leg A does not read claimed at the finalized block: then no bundle was written).
+// but `audit-export` did not accept it (or, P94-FUND-02 and P10 B5, a late claim whose leg A does not read claimed at the finalized block, by the runner's own read or by the bundle's: then no bundle was kept).
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -63,7 +67,7 @@ import { swapId as computeSwapId } from "../profile.js";
 import { effectiveMaxLogRange, EvmReceiptTimeoutError, evmLogScanCoverage, MAX_LOG_SCAN_CHUNKS } from "../rails/evm-htlc.js";
 import { CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import { EVM_HASH_RAIL_ABI } from "../vendor/evm-hash-rail.js";
-import { writeBundle, type BundleEvidenceSummary } from "./bundle.js";
+import { writeBundle, type BundleEvidenceSummary, type WriteBundleResult } from "./bundle.js";
 import { BuyerFlow, LockPendingError, RefundNotFinalYetError, type BuyerNextStep } from "./buyer.js";
 import type { CounterAssetRail, RailWriteEvidence } from "./counter-rail.js";
 import { describeKeyFileProblem, EvmKeyFileError, loadEvmLocalAccount } from "./evm-key-file.js";
@@ -496,6 +500,23 @@ export async function lateRevealGate(w: FinalityWorld, hashLock: string, lateRev
   if (await legAClaimedAtFinalized(w, hashLock)) return undefined;
   w.env.err(`rehearsal: ${LATE_REVEAL_NOT_ON_CHAIN}`);
   return EXIT.audit;
+}
+
+/**
+ * P10 B5 (decision 5): the end of a late-claim run whose BUNDLE does not show leg A claimed, although the runner's own read at the finalized block's number did (`lateRevealGate` passed).
+ * The two reads are separate: the runner's reads leg A at the finalized block's number, the bundle's evidence reader at the finalized block's hash, and behind a load-balanced endpoint
+ * the two answers can differ. Fixed text: no number, no value.
+ */
+export const LATE_REVEAL_BUNDLE_NOT_CLAIMED =
+  "the Seller's reveal frame came after leg A's refund time, which is how a late claim ends, and this run's own read showed leg A claimed at the finalized block, but the bundle's own read of leg A at the finalized block's hash does not show it claimed (the endpoint's reads disagree with each other), so the swap is not reported as settled and no bundle was kept; nothing was sent; look at the claim on the chain and run --resume again once the endpoint's reads agree";
+
+/**
+ * P10 B5: whether the bundle's OWN leg A observation (`writeBundle`'s `legARail`: what the evidence reader recorded for leg A, bound to this pair by the fold) says claimed and final. Anything
+ * else is a no: no observation, a locked or refunded one, one that is not final. Pure. Exported for its own tests.
+ */
+export function bundleLegAClaimed(written: Pick<WriteBundleResult, "legARail">): boolean {
+  const rail = written.legARail;
+  return rail !== undefined && rail.status === "claimed" && rail.final === true;
 }
 
 // --- small helpers --------------------------------------------------------------------------------------------------------------
@@ -1137,7 +1158,7 @@ async function writeAndAudit(w: World, parts: BundleParts): Promise<number> {
   const dealRoomB = dealRoom(parts.acceptBContract);
   const { ns, key } = paperNote(parts.acceptBContract);
   const rawNote = w.notes.raw(ns, key);
-  await writeBundle({
+  const written = await writeBundle({
     root: stage,
     nowMs,
     offerRoomRecords: await w.venue.read(OFFER_ROOM),
@@ -1160,6 +1181,14 @@ async function writeAndAudit(w: World, parts: BundleParts): Promise<number> {
       finishedAtMs: nowMs,
     },
   });
+  // P10 B5: the late path's `revealed` rests on the chain showing the swap settled. `lateRevealGate` read leg A at the finalized block's number; the bundle's own evidence reader has just read it
+  // at the finalized block's hash, and behind a load-balanced endpoint the two can disagree. The bundle that goes into place, and the outcome record, must rest on the bundle's own observation:
+  // if it does not say claimed and final, the staged copy is dropped (nothing is renamed, no `outcome.json`), the fixed sentence is printed and a later `--resume` reads again.
+  if (parts.outcome === "revealed" && !bundleLegAClaimed(written)) {
+    await fsp.rm(stage, { recursive: true, force: true }).catch(() => undefined);
+    w.env.err(`rehearsal: ${LATE_REVEAL_BUNDLE_NOT_CLAIMED}`);
+    return EXIT.audit;
+  }
   if (await exists(out)) await fsp.rmdir(out); // empty (checked above); a rename onto an existing directory is refused on Windows
   for (let attempt = 1; ; attempt += 1) {
     try {

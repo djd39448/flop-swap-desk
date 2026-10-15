@@ -132,6 +132,9 @@ export class EvmMockNode {
   contractCode: Hex = "0x6080604052348015600e575f5ffd5b50600436106100565760003560e01c8063ab12cd3414610059575b5f5ffd5b610061610063565b005b565bfea164736f6c6343000818000a";
   /** Every address `eth_getCode` was asked about, in order. */
   readonly codeReads: string[] = [];
+  /** P10 B5: when true, a `locks(hashLock)` read pinned to a block by HASH (the EIP-1898 `{ blockHash }` selector the evidence reader uses) answers a Claimed row as Locked, while a read at
+   *  any other selector (a block tag or a block number) is untouched: one node of a load-balanced endpoint that has not seen the claim's block, answering the block-hash read. */
+  hashReadsShowClaimedAsLocked = false;
   /** Fields merged into `config()` (a test sets `maxLogRange`, `receiptTimeoutMs`, or turns the code pin off with `contractCodeHash: undefined`). */
   configExtras: { [K in keyof EvmRailConfig]?: EvmRailConfig[K] | undefined } = {};
   /** See `SendHook`. */
@@ -308,7 +311,7 @@ export class EvmMockNode {
         return { result: this.getLogs(filter) };
       }
       case "eth_call":
-        return this.call(params[0] as { to?: string; data?: string });
+        return this.call(params[0] as { to?: string; data?: string }, params[1]);
       case "eth_getTransactionByHash": {
         if (!this.answerTxByHash) return { error: { code: -32601, message: `mock evm node: unexpected method ${method}` } };
         const hash = String(params[0]);
@@ -340,13 +343,15 @@ export class EvmMockNode {
       .map((log) => log.raw);
   }
 
-  private call(call: { to?: string; data?: string }): Envelope {
+  private call(call: { to?: string; data?: string }, selector?: unknown): Envelope {
     if ((call.to ?? "").toLowerCase() === this.token.toLowerCase()) return { result: `0x${"0".repeat(63)}1` }; // any ERC20 call succeeds
     const decoded = decodeFunctionData({ abi: EVM_HASH_RAIL_ABI, data: call.data as Hex });
     if (decoded.functionName === "locks") {
       const row = this.rows.get(String(decoded.args[0]).toLowerCase());
       const r = row ?? { payer: ZERO_ADDRESS, payee: ZERO_ADDRESS, token: ZERO_ADDRESS, amount: 0n, claimByMs: 0n, refundAfterMs: 0n, status: 0 as const };
-      return { result: encodeFunctionResult({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", result: [r.payer, r.payee, r.token, r.amount, r.claimByMs, r.refundAfterMs, r.status] }) };
+      const byBlockHash = typeof selector === "object" && selector !== null && "blockHash" in selector;
+      const status = this.hashReadsShowClaimedAsLocked && byBlockHash && r.status === 2 ? 1 : r.status;
+      return { result: encodeFunctionResult({ abi: EVM_HASH_RAIL_ABI, functionName: "locks", result: [r.payer, r.payee, r.token, r.amount, r.claimByMs, r.refundAfterMs, status] }) };
     }
     if (decoded.functionName === "claim") {
       // the zero-preimage pre-check: it can only revert with "does not open the statement" when the lock is open and in window
