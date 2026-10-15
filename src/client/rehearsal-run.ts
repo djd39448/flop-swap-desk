@@ -1538,7 +1538,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<number> {
       account: LocalAccount | Address,
     ): Promise<{ rail: CounterAssetRail; store: FileFlowStore; identity: Promise<RehearsalIdentity> }> => ({
       // P9-4 decision 10: the write lookup pauses about one block between its re-plans: the policy's block time on Base Sepolia, this poll interval elsewhere (anvil).
-      // P10 B6: a write's hash is the keccak256 of the signed bytes whatever the endpoint answers; an endpoint whose answer differs is reported once per write on the error stream (two public hashes, nothing else).
+      // P10 B6: a write's hash is the keccak256 of the signed bytes whatever the endpoint answers; an endpoint whose answer differs is reported once per write on the error stream (the computed hash only, never the endpoint's answer).
       rail: createEvmCounterRail({ config: evm, rpc: new CapturingRpc({ endpoint: evm.endpoint, clock }), account, clock, pollMs: config.pollMs, onWarning: errLine }),
       store: new FileFlowStore(join(stateDir, role, "flows")),
       identity: loadOrCreateIdentity(join(stateDir, role, "ed25519.seed")),

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
 //
 // tests/evm-sent-hash.test.ts - P10 B6 (P10-BACKLOG-SPEC.md decision 6; R5-KEY-INFO), the transport alone: `verifySentTransactionHash` (src/rails/evm-signer.ts) hands back the keccak256 of
-// the raw signed transaction as the answer to every `eth_sendRawTransaction`, whatever the endpoint answered, and reports an answer that is not that hash once, as one fixed sentence with
-// no value but the two public hashes. (The whole rail over the stateful mock node: tests/evm-pending-write.test.ts; the runner's printed line: tests/rehearsal-claim-watch.test.ts.)
+// the raw signed transaction as the answer to every `eth_sendRawTransaction`, whatever the endpoint answered, and reports an answer that is not that hash once, as one fixed sentence that
+// carries the computed hash only: the endpoint's answer is described, never quoted, even when it is shaped like a hash (it is the endpoint's to choose, so a hostile endpoint could put any
+// 64-hex value it has seen into a log). (The whole rail over the stateful mock node: tests/evm-pending-write.test.ts; the runner's printed line: tests/rehearsal-claim-watch.test.ts.)
 // No key is involved: the "raw transactions" here are arbitrary bytes, hashed and never parsed.
+
+import { randomBytes } from "node:crypto";
 
 import { keccak256, type Hex } from "viem";
 import { describe, expect, it } from "vitest";
@@ -42,15 +45,31 @@ describe("P10 B6: verifySentTransactionHash", () => {
     expect(warnings).toEqual([]);
   });
 
-  it("another well-formed hash is replaced by the computed one and reported once; the sentence has the answered hash and the computed hash and no other value", async () => {
+  it("another well-formed hash is replaced by the computed one and reported once; the sentence carries the computed hash and nothing else, and never the endpoint's answer", async () => {
     const warnings: string[] = [];
     const { provider } = answering(OTHER);
     expect(await send(verifySentTransactionHash(provider, (text) => void warnings.push(text)))).toBe(COMPUTED);
     expect(warnings).toEqual([sentHashMismatchWarning(COMPUTED, OTHER)]);
-    expect(warnings[0]).toBe(`evm-htlc: warning: the endpoint answered the transaction hash ${OTHER} for a transaction this process sent, but that transaction's hash is ${COMPUTED}; the computed hash is used for this write`);
-    expect(warnings[0]!.match(/0x[0-9a-fA-F]+/g)).toEqual([OTHER, COMPUTED]);
-    // an upper-case wrong answer is printed in lower case (one text for one hash)
+    expect(warnings[0]).toBe(`evm-htlc: warning: the endpoint answered a different transaction hash for a transaction this process sent; that transaction's hash is ${COMPUTED}, and the computed hash is used for this write`);
+    expect(warnings[0]!.match(/0x[0-9a-fA-F]+/g)).toEqual([COMPUTED]); // exactly one 0x-64-hex run, the computed hash
+    expect(warnings[0]!.toLowerCase().includes(OTHER.slice(2))).toBe(false);
+    // the sentence does not depend on the answer at all, so no answer can reach a log through it (upper case or lower)
     expect(sentHashMismatchWarning(COMPUTED, `0x${OTHER.slice(2).toUpperCase()}`)).toBe(warnings[0]);
+  });
+
+  it("an answer equal to some other 64-hex value, such as 32 random bytes a hostile endpoint chose, never appears in the warning, in any case or without its 0x", async () => {
+    for (let i = 0; i < 5; i += 1) {
+      const chosen = randomBytes(32).toString("hex"); // a test-time value standing for anything the endpoint has seen (a preimage in call data, say)
+      for (const answer of [`0x${chosen}`, `0x${chosen.toUpperCase()}`]) {
+        const warnings: string[] = [];
+        const { provider } = answering(answer);
+        expect(await send(verifySentTransactionHash(provider, (text) => void warnings.push(text)))).toBe(COMPUTED);
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]!.toLowerCase().includes(chosen)).toBe(false);
+        expect(warnings[0]!.match(/0x[0-9a-fA-F]{64}/g)).toEqual([COMPUTED]);
+        expect(warnings[0]).toBe(sentHashMismatchWarning(COMPUTED, OTHER)); // the same text whatever the answer was
+      }
+    }
   });
 
   it("an answer that is not a hash at all (absent, a number, an object, a short or long or non-hex string, a hash with text around it) is replaced and reported once, and none of it is quoted", async () => {
@@ -119,11 +138,11 @@ describe("P10 B6: verifySentTransactionHash", () => {
     expect(await send(verifySentTransactionHash(provider))).toBe(COMPUTED); // no listener: corrected, not reported
   });
 
-  it("the sentence is plain ASCII on one line, and the only hex runs in it are hashes", () => {
+  it("the sentence is plain ASCII on one line, and the only hex run in it is the computed hash", () => {
     for (const text of [sentHashMismatchWarning(COMPUTED, OTHER), sentHashMismatchWarning(COMPUTED, 5), sentHashMismatchWarning(COMPUTED, undefined)]) {
       expect(/^[\x20-\x7e]+$/.test(text)).toBe(true);
       expect(text.includes("\n")).toBe(false);
-      for (const run of text.match(/[0-9a-fA-F]{16,}/g) ?? []) expect([OTHER.slice(2), COMPUTED.slice(2)]).toContain(run);
+      expect(text.match(/[0-9a-fA-F]{16,}/g)).toEqual([COMPUTED.slice(2)]);
     }
   });
 });

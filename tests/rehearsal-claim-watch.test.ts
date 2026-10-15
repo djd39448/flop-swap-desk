@@ -212,8 +212,8 @@ describe("P94-FUND-01 (runner part, end to end): a claim the node accepts and ne
 
   // P10 B6 (runner part): the line the runner prints the moment a claim is broadcast, and the sentence that ends a run with a claim still pending, name the claim by the keccak256 of the
   // bytes the Seller signed, not by what the endpoint answered. The endpoint here answers another well-formed hash for the claim (the node still holds it under its true hash); the
-  // wrong hash appears only in the warning the rail reports (the runner prints that on its error stream), once.
-  it("P10 B6: an endpoint that answers the wrong hash for the claim: 'claim of leg A sent: tx <hash>', the saved hash and the ending sentence carry keccak256 of the raw claim; the wrong hash is only in the one warning", async () => {
+  // wrong hash appears in no line and in no sentence, and not in the warning the rail reports once (the runner prints that on its error stream): the warning names the computed hash only.
+  it("P10 B6: an endpoint that answers the wrong hash for the claim: 'claim of leg A sent: tx <hash>', the saved hash and the ending sentence carry keccak256 of the raw claim; the wrong hash is in no line, no sentence and not in the one warning, which names the computed hash only", async () => {
     const r = await rig(2_500);
     r.node.holdNextSend("claim");
     r.node.answerWrongHashForNextSend("claim");
@@ -227,19 +227,20 @@ describe("P94-FUND-01 (runner part, end to end): a claim the node accepts and ne
     expect(r.lines[0]).toBe(`claim of leg A sent: tx ${computed}`); // today: the endpoint's wrong hash
     expect((await r.record()).claimTxHash).toBe(computed);
     expect(r.warnings).toHaveLength(1);
-    const [wrong, ...rest] = r.warnings[0]!.match(/0x[0-9a-f]{64}/g)!;
-    expect(rest).toEqual([computed]);
+    expect(r.node.wrongHashesAnswered).toHaveLength(1);
+    const wrong = r.node.wrongHashesAnswered[0]!;
     expect(wrong).not.toBe(computed);
+    expect(r.warnings[0]!.match(/0x[0-9a-f]{64}/g)).toEqual([computed]); // the warning carries the computed hash only: exactly one 64-hex run
 
     const error = await claiming;
     expect(error).toBeInstanceOf(EvmReceiptTimeoutError);
     expect((error as EvmReceiptTimeoutError).hash).toBe(computed);
     const sentence = pendingWriteRefusal(error, { refundAfterMs: r.refundAfterMs, nowMs: r.clock() }) ?? "";
     expect(sentence).toContain(`(tx ${computed})`);
-    // the wrong answer is in no runner line and in no sentence: only in the rail's warning
-    expect([...r.lines, sentence].some((text) => text.includes(wrong!))).toBe(false);
+    // the wrong answer is in no runner line, no sentence and not in the rail's warning either (the warning describes it as "a different transaction hash", never quotes it)
+    expect([...r.lines, sentence, ...r.warnings].some((text) => text.toLowerCase().includes(wrong.slice(2)))).toBe(false);
     expect(r.warnings).toHaveLength(1);
-    expect(r.warnings[0]!.includes(computed) && r.warnings[0]!.includes(wrong!)).toBe(true);
+    expect(r.warnings[0]!.includes(computed)).toBe(true);
     const preimage = (await r.record()).preimage;
     expect([...r.lines, sentence, ...r.warnings].some((text) => text.includes(preimage) || text.includes(preimage.replace(/^0x/, "")) || r.leaks(text))).toBe(false);
   });

@@ -55,7 +55,7 @@ export interface EvmCounterRailOptions {
   pollMs?: number;
   /** P9-4 decision 10: the pause itself (a timer by default); a test injects one that records the pauses. */
   sleep?: (ms: number) => Promise<void>;
-  /** P10 B6: see `EvmHtlcRailOptions.onWarning`: told once per write when the endpoint's answer was not the hash of the signed transaction (the rail uses the computed hash either way). */
+  /** P10 B6: see `EvmHtlcRailOptions.onWarning`: told once per write when the endpoint's answer was not the hash of the signed transaction (the rail uses the computed hash either way); the sentence carries the computed hash only, never the endpoint's answer. */
   onWarning?: (text: string) => void;
 }
 

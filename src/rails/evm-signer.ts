@@ -24,8 +24,8 @@
 //   4. P10 B6, `verifySentTransactionHash`: the hash of a write is computed here, not taken on trust. For every `eth_sendRawTransaction` the transport forwards it computes keccak256 of
 //      the raw signed transaction and hands THAT back as the answer, so viem, the vendored rail's receipt wait, the broadcast event, a flow's saved `claimTxHash` and recovery handle,
 //      the runner's printed "claim of leg A sent" line and `EvmReceiptTimeoutError.hash` all carry the computed hash. An endpoint answer that is another hash, or is not a hash at all,
-//      is replaced by the computed one and reported once, as one fixed warning sentence that carries no value but the two public hashes. A transaction is named by its bytes, never by
-//      what the endpoint says it is.
+//      is replaced by the computed one and reported once, as one fixed warning sentence that carries the computed hash only; the endpoint's answer is described, never quoted (it is the
+//      endpoint's to choose, and a hostile one could choose any value it has seen). A transaction is named by its bytes, never by what the endpoint says it is.
 //
 // The refusal error carries no transaction field at all (no `data`, which for a claim holds the preimage, no gas, no fee): only
 // which rule fired and the configured limit. Nothing here ever sees, stores or prints a key.
@@ -201,12 +201,13 @@ const RAW_TRANSACTION = /^0x(?:[0-9a-fA-F]{2})+$/;
 
 /**
  * P10 B6: the ONE warning sentence (two shapes) `verifySentTransactionHash` reports when an endpoint's answer to `eth_sendRawTransaction` is not the hash of the transaction this process
- * signed. It carries the computed hash (a public value: the keccak256 of the signed bytes) and, when the endpoint's answer is itself shaped like a transaction hash, that hash (also public);
- * an answer of any other shape is described, never quoted, so no text of an endpoint's reaches a log through this sentence. `computed` is lower case, `answered` is printed lower-cased.
+ * signed. It carries the computed hash only (a public value: the keccak256 of the signed bytes, lower case). The endpoint's answer is never quoted, whatever its shape: it is the endpoint's
+ * to choose, so a hostile endpoint could put any 64-hex value it has seen (the preimage in a claim's call data, say) into a log through a quoted answer. An answer shaped like a transaction
+ * hash is described as "a different transaction hash"; any other shape as "not a transaction hash". `answered` is read for its shape only.
  */
 export function sentHashMismatchWarning(computed: Hex, answered: unknown): string {
   if (typeof answered === "string" && ANY_CASE_TX_HASH.test(answered)) {
-    return `evm-htlc: warning: the endpoint answered the transaction hash ${answered.toLowerCase()} for a transaction this process sent, but that transaction's hash is ${computed}; the computed hash is used for this write`;
+    return `evm-htlc: warning: the endpoint answered a different transaction hash for a transaction this process sent; that transaction's hash is ${computed}, and the computed hash is used for this write`;
   }
   return `evm-htlc: warning: the endpoint's answer to a transaction this process sent was not a transaction hash; the transaction's hash is ${computed}, and it is used for this write`;
 }

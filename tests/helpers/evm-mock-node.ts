@@ -149,6 +149,8 @@ export class EvmMockNode {
   private readonly rejectNext = new Set<SendKind>();
   private readonly loseNext = new Set<SendKind>();
   private readonly wrongHashNext = new Set<SendKind>();
+  /** P10 B6: every wrong hash this node has answered (see `answerWrongHashForNextSend`), in order, so a test can prove the wrong answer is in no record, error or output. */
+  readonly wrongHashesAnswered: string[] = [];
 
   constructor(
     /** The chain's time (block timestamps and the contract's `block.timestamp`), in ms. */
@@ -194,7 +196,8 @@ export class EvmMockNode {
   loseNextSendReply(fn: SendKind): void {
     this.loseNext.add(fn);
   }
-  /** P10 B6: the next send of this kind is applied (or pooled) as usual under its true hash, but the node ANSWERS another, well-formed lower-case hash (never the true one). */
+  /** P10 B6: the next send of this kind is applied (or pooled) as usual under its true hash, but the node ANSWERS another, well-formed lower-case hash (never the true one), which it
+   *  records in `wrongHashesAnswered`. */
   answerWrongHashForNextSend(fn: SendKind): void {
     this.wrongHashNext.add(fn);
   }
@@ -239,6 +242,14 @@ export class EvmMockNode {
   private nextTxHash(): Hex {
     this.txCounter += 1;
     return `0x${"c0ffee".repeat(10)}${this.txCounter.toString(16).padStart(4, "0")}` as Hex;
+  }
+
+  /** The hash a send is answered with: its true hash, or (once, after `answerWrongHashForNextSend`) another well-formed one, recorded. */
+  private answerHash(fn: SendKind, trueHash: Hex): Hex {
+    if (!this.wrongHashNext.delete(fn)) return trueHash;
+    const wrong = this.nextTxHash();
+    this.wrongHashesAnswered.push(wrong);
+    return wrong;
   }
 
   private blockHash(number: bigint): Hex {
@@ -418,7 +429,7 @@ export class EvmMockNode {
     if (!released && this.holdNext.delete(fn)) {
       const pooledHash = tx.rawHash ?? this.nextTxHash();
       this.held.push({ fn, txHash: pooledHash, tx: { from, to: tx.to, data: tx.data } });
-      return { result: this.wrongHashNext.delete(fn) ? this.nextTxHash() : pooledHash };
+      return { result: this.answerHash(fn, pooledHash) };
     }
     const hookToken = this.hook?.begin(fn, from);
 
@@ -451,6 +462,6 @@ export class EvmMockNode {
     this.sends.push({ fn, from, ...(hashLock === undefined ? {} : { hashLock }) });
     this.hook?.end(hookToken);
     if (this.loseNext.delete(fn)) return { error: { code: -32000, message: `mock evm node: connection reset after ${fn} (test)` } };
-    return { result: this.wrongHashNext.delete(fn) ? this.nextTxHash() : txHash };
+    return { result: this.answerHash(fn, txHash) };
   }
 }

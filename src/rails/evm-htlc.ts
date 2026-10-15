@@ -868,8 +868,8 @@ export interface EvmHtlcRailOptions {
   sleep?: (ms: number) => Promise<void>;
   /**
    * P10 B6: told, once per write, when the endpoint's answer to `eth_sendRawTransaction` is not the keccak256 of the signed transaction this process sent. The rail names every write by
-   * that computed hash whatever the endpoint says (see `verifySentTransactionHash` in src/rails/evm-signer.ts), so this is only a report: its one fixed sentence carries no value but the
-   * two public hashes (the computed one and, when the answer is shaped like a hash, the answered one). Local accounts only (a JSON-RPC account's node signs, and there are no bytes to
+   * that computed hash whatever the endpoint says (see `verifySentTransactionHash` in src/rails/evm-signer.ts), so this is only a report: its one fixed sentence carries the computed
+   * hash only (the endpoint's answer is described, never quoted: it is the endpoint's to choose). Local accounts only (a JSON-RPC account's node signs, and there are no bytes to
    * hash). The listener cannot change what the write does: an error it throws is swallowed. Omitted: the mismatch is corrected and not reported.
    */
   onWarning?: (text: string) => void;

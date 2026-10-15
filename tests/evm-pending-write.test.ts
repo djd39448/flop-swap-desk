@@ -682,7 +682,8 @@ describe("P94-FUND-01: the claim's hash is shown the moment it is broadcast, and
 // per write as one fixed warning. (The runner's printed line: tests/rehearsal-claim-watch.test.ts; the transport alone: tests/evm-sent-hash.test.ts.)
 describe("P10 B6: a write is named by the keccak256 of the bytes this process signed, whatever the endpoint answers", () => {
   const HASHES = /0x[0-9a-f]{64}/g;
-  const WARNING = /^evm-htlc: warning: the endpoint answered the transaction hash 0x[0-9a-f]{64} for a transaction this process sent, but that transaction's hash is 0x[0-9a-f]{64}; the computed hash is used for this write$/;
+  // The warning names the computed hash only; the endpoint's answer is described ("a different transaction hash"), never quoted.
+  const WARNING = /^evm-htlc: warning: the endpoint answered a different transaction hash for a transaction this process sent; that transaction's hash is 0x[0-9a-f]{64}, and the computed hash is used for this write$/;
 
   it("the Seller's claim: the saved claimTxHash, the runner's callback, the broadcast event and the timeout error all carry keccak256 of the raw claim, the wrong answer is nowhere but the warning, which appears once", async () => {
     const sent: string[] = [];
@@ -707,9 +708,11 @@ describe("P10 B6: a write is named by the keccak256 of the bytes this process si
     const computed = keccak256(r.sellerWire.rawSends[0]!.raw);
     expect(r.node.held[0]!.txHash, "the node holds the transaction under its true hash").toBe(computed);
     expect(warnings).toHaveLength(1);
-    const [wrong, ...rest] = warnings[0]!.match(HASHES)!;
-    expect(rest).toEqual([computed]); // the warning carries the two public hashes and nothing else
+    expect(r.node.wrongHashesAnswered, "the node answered one wrong hash").toHaveLength(1);
+    const wrong = r.node.wrongHashesAnswered[0]!;
     expect(wrong).not.toBe(computed);
+    expect(warnings[0]!.match(HASHES)).toEqual([computed]); // the warning carries the computed hash and nothing else: exactly one 64-hex run
+    expect(warnings[0]!.toLowerCase().includes(wrong.slice(2))).toBe(false); // the endpoint's answer is described, never quoted
     expect(warnings[0]).toMatch(WARNING);
 
     expect((await sellerRecord(r.stores, r.acceptA.contract)).claimTxHash).toBe(computed); // today: the wrong hash
@@ -720,10 +723,11 @@ describe("P10 B6: a write is named by the keccak256 of the bytes this process si
     const ended = await claiming;
     expect(ended).toBeInstanceOf(EvmReceiptTimeoutError);
     expect((ended as EvmReceiptTimeoutError).hash).toBe(computed);
-    expect((ended as EvmReceiptTimeoutError).message).not.toContain(wrong!);
+    expect((ended as EvmReceiptTimeoutError).message).not.toContain(wrong);
     expect(warnings, "once per write, not again at the timeout").toHaveLength(1);
     // The wrong answer is nowhere in the record either.
-    expect(Buffer.from((await r.stores.seller.load(flowKey("seller", r.acceptA.contract)))!).toString("utf8")).not.toContain(wrong!);
+    expect(Buffer.from((await r.stores.seller.load(flowKey("seller", r.acceptA.contract)))!).toString("utf8")).not.toContain(wrong);
+    expect([...sent, ...warnings, ...broadcast.map((event) => event.hash)].some((text) => text.includes(wrong))).toBe(false); // nor in the callback, the broadcast event or the warning
   });
 
   it("the Seller's claim, resumed: the saved hash is one the node knows, so the resumed claim is ClaimPendingError and no second claim is signed (with the wrong hash saved, the node would not know it)", async () => {
@@ -756,7 +760,9 @@ describe("P10 B6: a write is named by the keccak256 of the bytes this process si
     expect((await buyerRecord(r.stores, r.swapId)).lock.prepared?.recovery).toEqual({ chain: "evm", txHash: computed }); // today: the wrong hash
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toMatch(WARNING);
-    expect(warnings[0]!.endsWith(`${computed}; the computed hash is used for this write`)).toBe(true);
+    expect(warnings[0]!.endsWith(`${computed}, and the computed hash is used for this write`)).toBe(true);
+    expect(r.node.wrongHashesAnswered).toHaveLength(1);
+    expect(warnings[0]!.toLowerCase().includes(r.node.wrongHashesAnswered[0]!.slice(2))).toBe(false); // the endpoint's answer is not quoted
 
     r.exposeTxLookups();
     const sentBefore = r.buyerWire.rawSends.length;
@@ -793,7 +799,10 @@ describe("P10 B6: a write is named by the keccak256 of the bytes this process si
       { write: "lock", hash: lockHash },
     ]);
     expect(warnings).toHaveLength(1); // the lock's answer was right: one warning, for the approve
-    expect(warnings[0]!.endsWith(`${approveHash}; the computed hash is used for this write`)).toBe(true);
+    expect(warnings[0]).toMatch(WARNING);
+    expect(warnings[0]!.endsWith(`${approveHash}, and the computed hash is used for this write`)).toBe(true);
+    expect(r.node.wrongHashesAnswered).toHaveLength(1);
+    expect(warnings[0]!.toLowerCase().includes(r.node.wrongHashesAnswered[0]!.slice(2))).toBe(false);
   });
 
   it("an answer that is the right hash in another case is not a mismatch: no warning, and the hash is in lower case from the broadcast on", async () => {
