@@ -246,7 +246,7 @@ describe("P10 B4 (NEAR): what bin/watch.mjs --rails and examples/audit-export.mj
       await writeFile(railsFile, JSON.stringify({ near: block }));
 
       // watch.mjs validates the rails file before any network call, so this run is hermetic
-      const watched = spawnSync(process.execPath, [join(repoRoot, "bin", "watch.mjs"), "--root", join(root, `watch-${n}`), "--rails", railsFile, "--once"], {
+      const watched = spawnSync(process.execPath, [join(repoRoot, "bin", "watch.mjs"), "--root", join(root, `watch-${n}`), "--rails", railsFile, "--base-url", "http://127.0.0.1:1", "--once"], {
         cwd: repoRoot,
         encoding: "utf8",
       });

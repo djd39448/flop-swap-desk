@@ -181,7 +181,7 @@ describe("P10 B4: the Bitcoin rail's refusals never quote a pin text that is not
       await writeFile(railsFile, JSON.stringify({ btc: btcBlock({ ...BTC_REGTEST_PIN, [field]: key }) }));
 
       // watch.mjs validates the rails file before any network call, so this run is hermetic
-      const watched = spawnSync(process.execPath, [join(repoRoot, "bin", "watch.mjs"), "--root", join(root, `watch-${field}`), "--rails", railsFile, "--once"], {
+      const watched = spawnSync(process.execPath, [join(repoRoot, "bin", "watch.mjs"), "--root", join(root, `watch-${field}`), "--rails", railsFile, "--base-url", "http://127.0.0.1:1", "--once"], {
         cwd: repoRoot,
         encoding: "utf8",
       });
