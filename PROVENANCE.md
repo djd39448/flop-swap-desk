@@ -387,7 +387,7 @@ changed, so `docs/PROFILE.md` is unchanged, and no fixture was added or recaptur
   outside that set (`client-flows-near`, `client-flows-btc`, `evm-evidence` and others; most are fake counter-asset
   rails without the `deploymentId` that the resume work made required, the rest evidence fakes and strictness
   mismatches), which this pass did not touch. That separate hygiene pass is P9-7: `tests/` is inside the `typecheck` gate
-  now (see the P9-7 section at the end of this file).
+  now (see the P9-7 section), and since P10 (B1) so are the four live folders (see the P10 section at the end of this file).
 - Live tests (each spawns its own throwaway local node and never touches a public network):
   `tests-anvil/resume.anvil.test.ts`, `tests-regtest/resume.regtest.test.ts`, `tests-near/resume.near.test.ts` and
   `tests-sol/resume.sol.test.ts`.
@@ -410,7 +410,8 @@ keys at test time, and the loader reads a key only from a file an operator names
   a gas limit missing or above `EVM_MAX_GAS_PER_WRITE` (500,000), or a fee cap missing or above `EvmRailConfig.maxFeePerGasWei`
   (default `EVM_DEFAULT_MAX_FEE_PER_GAS_WEI`, 1,000 gwei); `refuseFillTransaction` makes the local-signing transport answer
   `eth_fillTransaction` with method-not-found in-process, so the endpoint is never asked to fill (and never fills a chain id, gas
-  or fee) a transaction this process signs. It sends nothing and holds no key.
+  or fee) a transaction this process signs. It originates no send and holds no key. Since P10 (B6) it also holds `verifySentTransactionHash`, a fourth defence: the
+  hash of a raw send that the transport forwards is the keccak256 of the signed bytes, never the endpoint's answer (see the P10 section at the end of this file).
 - Extended first-party files: `src/rails/evm-htlc.ts` (the `account` option is an `Address` or a `LocalAccount`; local
   accounts send `eth_sendRawTransaction` through the guarded account above; `EvmRailConfig.receiptTimeoutMs` and `maxFeePerGasWei`;
   the typed `EvmReceiptTimeoutError`; the public
@@ -576,11 +577,12 @@ signs). Nothing here has talked to a live signet node.
   offline in `tests/btc-htlc.test.ts` (the same procedure over mainnet's header reproduces mainnet's genesis hash). It equals
   the value G1-PREP section 4 read from a public block explorer. It has not been compared with a live node. Dropping `-UNVERIFIED`
   needs two things from a live node, not one: the genesis hash, AND `getblockchaininfo().signet_challenge` equal to the default
-  signet's `512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae`,
+  signet's `512103ad5e...2ae` (shortened here; the full value is `BTC_SIGNET_PIN.signetChallenge`),
   because a node started with another challenge (`-signetchallenge=51`) reports the same genesis hash and the same chain name
-  (checked on an offline Bitcoin Core 31.1 node in the P9 review round 1; the pin does not compare the challenge yet, which is for the
-  Bitcoin stage, F5). Likewise a small signet leg's claim and refund fee is capped at the amount minus the dust limit, below the fee
-  rule's estimate (a leg under about 8,000 satoshis at a high rate; R1-FUND-05, also for the Bitcoin stage): the README says so.
+  (checked on an offline Bitcoin Core 31.1 node in the P9 review round 1; at P9-5 the pin did not compare the challenge, F5, and P10 B3
+  made it do so: see the P10 section at the end of this file). Likewise, at P9-5 a small signet leg's claim and refund fee was capped at the
+  amount minus the dust limit, below the fee rule's estimate (a leg under about 8,000 satoshis at a high rate; R1-FUND-05); P10 B2 refuses
+  such a leg instead (the P10 section again).
 - Hermetic tests: `tests/btc-signet-fee.test.ts` (new: the size bound against the two real Core-signed spends in
   `fixtures/btc-regtest-2026-09-28/`, the rate and fee rules, the policy selection) and the P9-5 blocks of
   `tests/btc-htlc.test.ts` and `tests/btc-evidence.test.ts` (the pin, the adapter against a mocked bitcoind, the retry rule).
@@ -639,7 +641,8 @@ files with the same hashes before and after, none of them from `tests/`).
   `npm run typecheck` is now `tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json --noEmit` (the only change to
   `package.json`), so every file under `tests/` and `tests/helpers/` (142 files) is checked at the strictness `src` has
   (`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`). It replaces the earlier arrangement in which `tests/`
-  ran under vitest alone, which does not check types; the P8 and P9-1 notes above point here.
+  ran under vitest alone, which does not check types; the P8 and P9-1 notes above point here. (Since P10 B1 the `include` also lists
+  `tests-anvil/**/*.ts`, `tests-regtest/**/*.ts`, `tests-near/**/*.ts` and `tests-sol/**/*.ts`: see the P10 section at the end of this file.)
 - The count fixed: a scratch config over `src` plus `tests/` reported 79 diagnostics in 13 test files and 2 helpers at the
   start of P9-7 (the 77 in 12 files and 2 helpers recorded after P8, plus 2 in `tests/evm-log-scan.test.ts` from P9-3); it
   reports 0 now. Of the 79: 36 fake counter-asset rails without the required `deploymentId` (2 classes, 34 call sites), 17
@@ -657,9 +660,10 @@ files with the same hashes before and after, none of them from `tests/`).
   swap view `pairKey: null` (the field was absent, which the watcher read as the state key `pair:undefined`). No test on that
   fake asserts a state key or a `pairKey`; its one multi-swap case asserts only which deal rooms are fetched.
 - The hermetic count is the one before the package: 114 files, 3517 passed, 7 skipped.
-- Not in the gate: `tests-anvil/`, `tests-regtest/`, `tests-near/` and `tests-sol/`. Under a scratch config the first has 2
+- Not in the gate at P9-7: `tests-anvil/`, `tests-regtest/`, `tests-near/` and `tests-sol/`. Under a scratch config the first had 2
   diagnostics (`tests-anvil/client-flows.anvil.test.ts`, a `string` where a hex type is wanted), the third 3
-  (`tests-near/client-flows.near.test.ts`, `txHash` possibly undefined); `tests-regtest/` and `tests-sol/` report none.
+  (`tests-near/client-flows.near.test.ts`, `txHash` possibly undefined); `tests-regtest/` and `tests-sol/` reported none. All four
+  joined the gate in P10 (B1), with zero diagnostics: see the P10 section at the end of this file.
 
 ## P9 review round 1 fix pass (handoff/P9-FIXES-R1.md) - the item list
 
@@ -691,7 +695,7 @@ Every code fix has a test that was watched to fail with the fix disabled.
 
 Routed on, not done here: F4, F8, the code option of R1-FUND-04 and the other P9-4 questions (the Base Sepolia policy, the fee
 ceiling value and the runner config field for it, the known-good deadline set, the claim margin, the L1 data-fee allowance, the
-stuck-claim question, nonce handling); R1-FUND-05 and F5 (the code) for the first Bitcoin stage.
+stuck-claim question, nonce handling); R1-FUND-05 and F5 (the code) for the first Bitcoin stage (built in P10, items B2 and B3: see the P10 section at the end of this file).
 
 What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/` and `package.json` are
 byte-identical to `56103b5`; no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no new fixture; the
@@ -738,8 +742,8 @@ R2-FUND-02's pre-estimate fee check in place.
 
 What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/` and `package.json` are
 byte-identical to `9dcac37`; no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no new fixture; the
-runtime code hash is the one in the table above. `tests-anvil/` stays outside `npm run typecheck` with its two older diagnostics
-(`tests-anvil/client-flows.anvil.test.ts`, unchanged by this pass). The hermetic count after the pass: 118 files, 3714 passed, 7
+runtime code hash is the one in the table above. `tests-anvil/` stayed outside `npm run typecheck` with its two older diagnostics
+(`tests-anvil/client-flows.anvil.test.ts`, unchanged by this pass; inside the gate since P10 B1). The hermetic count after the pass: 118 files, 3714 passed, 7
 skipped (before it, at `9dcac37`: 116 files, 3629 passed, 7 skipped).
 
 ## P9 review round 3 fix pass (handoff/P9-FIXES-R3.md) - the item list
@@ -776,12 +780,13 @@ Routed on, not done here: PIN3-01 (the resume cap check compares caps, not leg A
 24-hour sample, the known-good deadline set re-derived against it, the `waitLimitMs` floor at the budget, finality pinned to the finalized tag with no
 fallback on 84532, the coupling of the late-claim wait with the leg-linking budget, and everything carried from rounds 1 and 2). Not covered by this pass:
 the Bitcoin, NEAR and Solana rails (`src/rails/btc-htlc.ts`, `near-htlc.ts`, `sol-htlc.ts`) still quote `pin.name` in refusals of the same kind as KR3-3; the
-runner and G1 are EVM-only, but a hand-written rails file for `watch.mjs` or `audit-export` with a `btc`, `near` or `sol` block would still print a pin name pasted into the wrong field.
+runner and G1 are EVM-only, but a hand-written rails file for `watch.mjs` or `audit-export` with a `btc`, `near` or `sol` block would still print a pin name pasted into the wrong field
+(closed by P10 B4: see the P10 section at the end of this file).
 
 What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/`, `fixtures/` and `package.json` are
 byte-identical to `87a3b96`; no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no new fixture; the
-runtime code hash is the one in the table above. `tests-anvil/` stays outside `npm run typecheck` with its two older diagnostics
-(`tests-anvil/client-flows.anvil.test.ts`, unchanged by this pass). The hermetic count after the pass: 120 files, 3751 passed, 7 skipped (before it, at `87a3b96`:
+runtime code hash is the one in the table above. `tests-anvil/` stayed outside `npm run typecheck` with its two older diagnostics
+(`tests-anvil/client-flows.anvil.test.ts`, unchanged by this pass; inside the gate since P10 B1). The hermetic count after the pass: 120 files, 3751 passed, 7 skipped (before it, at `87a3b96`:
 118 files, 3714 passed, 7 skipped).
 
 ## P9-4 part 1: the Base Sepolia policy and the EVM rail (handoff/P9-4-DECISIONS-2026-10-07.md decisions 1 to 5, 7, 8 and 10) - the item list
@@ -853,7 +858,8 @@ the wait functions in `tests/rehearsal-run.test.ts` set their one-minute `waitLi
 
 Routed on, not done in P9-4: an L1 data-fee allowance in the ETH rows and a re-measurement of the gas ceilings against the real USDC proxy (the README says both are open); a same-nonce
 replacement for a stuck claim (after the first real Base Sepolia rehearsal, with its numbers); the Bitcoin, NEAR and Solana rails' quoting of `pin.name` in refusals that `watch.mjs`
-and `audit-export` print (the Bitcoin and Solana devnet stages); `tests-anvil/` stays outside `npm run typecheck` with its two older diagnostics.
+and `audit-export` print (the Bitcoin and Solana devnet stages; built in P10 B4); `tests-anvil/` stayed outside `npm run typecheck` with its two older diagnostics (inside the gate since P10 B1). The
+same-nonce replacement for a stuck claim is still not built (P10 item B8: the P10 section says why).
 
 What did not change in the whole package: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/`, `fixtures/`, `package.json` and `package-lock.json` are
 byte-identical to `270cf47` (`git diff 270cf47..HEAD` is empty for them); no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no `Date.now()` is called in a flow
@@ -930,4 +936,68 @@ key and phrase in the new tests is generated at test time, and the assertions pr
 
 What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/evm-hash-rail.ts`, `contracts/`, `fixtures/`, `package.json` and `package-lock.json` are byte-identical to `2d37f15`;
 no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no `Date.now()` is called in a flow; no new fixture; the runtime code hash is the one in the table above.
-`tests-anvil/` stays outside `npm run typecheck` with its two older diagnostics. The hermetic count after the pass, with the two tests of the main loop's read (R5-KEYS-01, R5-PIN-01): 127 files, 3949 passed, 7 skipped.
+`tests-anvil/` stayed outside `npm run typecheck` with its two older diagnostics (inside the gate since P10 B1). The hermetic count after the pass, with the two tests of the main loop's read (R5-KEYS-01, R5-PIN-01): 127 files, 3949 passed, 7 skipped.
+
+## P10 backlog (handoff/P10-BACKLOG-SPEC.md) - the item list
+
+Not vendored: original to this repo. P10 builds the items that P8 and P9 recorded as backlog, on branch `phase2-backlog` from `a59f6b2` (`main` after the P9 checkpoint): ten code
+commits, `9657ba3` to `25a6bd3`, then the documentation commit(s) that carry this section. Keyless and local like every package before it: no public RPC call from any test, no
+key or seed in any file, nothing pushed. This table names each item once, with its commits, files and tests, so that none is missing. "Prefix" is the start of the test's (or the
+`describe`'s) name, which is how to find it. Every code item has a failing-without test: its commit message records the fix being disabled and the tests that then fail, and the file
+restored byte for byte.
+
+| item | commit(s) | files | pinned by |
+|---|---|---|---|
+| B1: the type gate covers the four live test folders | `9657ba3` | `tsconfig.tests.json` (`include` gains `tests-anvil/**/*.ts`, `tests-regtest/**/*.ts`, `tests-near/**/*.ts`, `tests-sol/**/*.ts`); `tests-anvil/client-flows.anvil.test.ts` (the two TS2322 errors, fixed with the `as Hex` cast that `tests-anvil/local-signer.anvil.test.ts` already uses); `tests-near/client-flows.near.test.ts` (three non-null assertions for TS2345 and TS18048). Types only: the four folders are erased at run time and no `src/` file changed | `npm run typecheck` itself: with the cast and the assertions taken out it printed five errors and failed, restored it exits 0. The program now holds 163 files under `tests/`, 10 under `tests-anvil/`, 9 under `tests-regtest/`, 6 under `tests-near/` and 5 under `tests-sol/` |
+| B5: a late claim is `revealed` only if the bundle's own leg A observation says claimed | `d6fb3df` | `src/client/bundle.ts` (`writeBundle` returns `WriteBundleResult { status, legARail }`), `src/client/rehearsal-run.ts` (`bundleLegAClaimed`, `LATE_REVEAL_BUNDLE_NOT_CLAIMED`, the check in `writeAndAudit` before the staged copy is renamed, the audit runs or `outcome.json` is written) | `tests/late-claim-bundle.test.ts` (new, 5 cases), `tests-anvil/rehearsal-runner.anvil.test.ts` (the chain proxy gains `lockedAtHashedBlocks`; one new case: exit 6, the new sentence, no bundle directory, no `outcome.json`, nothing sent, and the next `--resume` finishes `revealed`); helper knob `hashReadsShowClaimedAsLocked` in `tests/helpers/evm-mock-node.ts` |
+| B6: every EVM write is named by the keccak256 of its signed bytes | `4fdbfc8`; follow-up `dd04c52` | `src/rails/evm-signer.ts` (`verifySentTransactionHash`, `sentHashMismatchWarning`: the fourth defence of that module), `src/rails/evm-htlc.ts` (the local wallet's transport; `EvmHtlcRailOptions.onWarning`), `src/client/evm-rail.ts` (`EvmCounterRailOptions.onWarning`), `src/client/rehearsal-run.ts` (each rail gets `onWarning: errLine`). The follow-up made the warning name the computed hash only, never the endpoint's answer | `tests/evm-sent-hash.test.ts` (new, 8 cases: the wrapper alone, 15 shapes of non-hash answer none of them quoted, an error reply, other methods, a throwing listener, no state between writes, ASCII text), `tests/evm-pending-write.test.ts` (six new cases over the real flows and rail), `tests/rehearsal-claim-watch.test.ts` (the printed line and the ending sentence name the computed hash; a source pin that the runner passes `errLine`); helpers `tests/helpers/evm-mock-node.ts` (`answerWrongHashForNextSend`, `wrongHashesAnswered`, a raw send keyed under keccak256 of its bytes) and `tests/helpers/evm-local.ts` |
+| B4, Bitcoin part: pin texts quoted only when plain | `cb7f7ea` | `src/rails/pin-text.ts` (new, imports nothing: `PIN_TEXT_SHAPE`, `UNPLAIN_PIN_TEXT`, `quotedPinText`, `quotedPinTextOrPlaceholder`, moved from `src/rails/evm-htlc.ts`, which re-exports `PIN_TEXT_SHAPE`), `src/rails/btc-htlc.ts`, `src/rails/btc-evidence.ts`, `src/client/btc-rail.ts` (the deployment id), `src/client/policy.ts` | `tests/btc-pin-text.test.ts` (new, 12 cases: a generated key in five spellings and a generated phrase in three, as pin name, network, genesis hash or caip2, leave no window in the config check, the sweep's `railsConfigError` and notes, `bin/watch.mjs` output, `audit-export` `--rails FILE` and `DIR/rails.json`, `connect`, `createBtcCounterRail`, `btcFeeRuleFor`, `btcLocalPolicyFor` and the deployment id; 40 plain characters are quoted and 41 are not) |
+| B4, NEAR part: the same, and the pinned code hash by 8 characters | `73cb113` | `src/rails/pin-text.ts` (`shortPinnedValue`, `UNPLAIN_PINNED_VALUE`), `src/rails/near-htlc.ts` (`refusedByName`, `isNearCodeHash`), `src/rails/near-evidence.ts`, `src/client/near-rail.ts` (`nearDeploymentId`) | `tests/near-pin-text.test.ts` (new, 18 cases, including a key as the contract account, which the config check accepts, and a live capture through `captureNearLeg` on a mocked node) |
+| B4, Solana part: the same, and the program hash by 8 characters | `25a6bd3` | `src/rails/sol-htlc.ts`, `src/client/sol-rail.ts` (`solDeploymentId`) | `tests/sol-pin-text.test.ts` (new, 17 cases, including a key as the pinned `programHash`, which passes the config check) |
+| B3: the signet pin carries the challenge and the rail compares it | `9c12900` | `src/rails/btc-htlc.ts` (`BtcChainPin.signetChallenge`, `BTC_SIGNET_PIN`, `BtcPinMismatchError`, the compare in `assertPinnedChain`, the shape check and the config check of `pin.signetChallenge`) | `tests/btc-htlc.test.ts` (describe "P10 B3", 8 cases: the constant's structure, the default challenge connects, a node answering `51` is refused naming `signet_challenge`, a missing or odd answer is refused and never quoted, the config rules, regtest unchanged, the re-check before every write and read, the client wrapper); the signet mock node now answers the default challenge |
+| B2: a signet leg that cannot pay the fee is refused; a spend never pays below the rule's estimate | `ece90c1` | `src/rails/btc-htlc.ts` (`spendFeeSatsFor` returns the estimate or throws `BtcSpendUnaffordableError`; `BTC_HTLC_WITNESS_SCRIPT_BYTES` 118, `BTC_MAX_DESTINATION_SCRIPT_BYTES` 34, `BTC_SIGNET_MAX_SPEND_FEE_SATS` 7,600, `BTC_SIGNET_MIN_LOCKABLE_SATS` 8,646, `btcMinLockableSatsFor`), `src/client/btc-rail.ts` (the rail's `minLockableAmount` is chosen by the pin's network name) | `tests/btc-signet-fee.test.ts` (the old "dust ceiling, the floor wins" case became the refusal; an exact boundary, a grid over rates, sizes and amounts, 118 and 34 pinned against `buildHtlcScript` and `scriptPubKeyForAddress`, the real `BuyerFlow.bid` and `SellerFlow.acceptLegA` refusing 2,046 and 8,645 on signet and taking 8,646, regtest unchanged at 2,046), `tests/btc-htlc.test.ts` (a claim and a refund of a 2,046 satoshi leg throw before any wallet, acceptance or send call; an 8,646 leg pays the full cap fee) |
+| B7: a Bitcoin Seller claim counts as landed only once mined | `bb1c80f` | `src/rails/btc-htlc.ts` (`BtcClaimOptions`, the recorder in `claim`, `claimStatus`, `resendClaim`, `claimMined`, `scanMinedSpend`), `src/client/counter-rail.ts` (`RailClaimOptions.onSignedTx` and `onNotBroadcastTx`, `ClaimTxStatus`, `ClaimTxResend`, the three optional methods `claimIsMined`, `claimTxStatus`, `resendClaimTx`), `src/client/btc-rail.ts`, `src/client/flow-record.ts` (the optional Seller field `claimTx { txid, rawTx, sent? }`, record version unchanged, redaction), `src/client/seller.ts` (`ClaimNotMinedError`, `ClaimSupersededError`, `assertFirstClaimGuards` moved verbatim, `resumeBtcClaim`, `settleBtcClaim`) | `tests/flow-claim-mined-btc.test.ts` (new, 25 cases over the stateful Bitcoin ledger fake on a chain that mines only when told), `tests/btc-claim-settle.test.ts` (new, 27 cases against a mocked bitcoind), `tests/flow-record.test.ts` (24 cases for `claimTx`), `tests/helpers/ledger-rail.ts` (the Bitcoin flavour signs, records, sends, mines, evicts and has the three methods), and live `tests-regtest/claim-mined.regtest.test.ts` (new, 6 cases on a real bitcoind: a real eviction with `-mempoolexpiry=1`, an identical re-send counted from the wire, also past the claim-by, a spent funding output not re-sent); helper `tests-regtest/helpers/claim.ts` (new) and four existing regtest files adjusted (a scenario that called `claimLegA` once now broadcasts, mines and calls again) |
+
+Not built, on purpose: the backlog's two other items wait for the desk operator's word. B8, an automatic same-nonce re-pricing of a stuck EVM claim, is recommended after the first
+real Base Sepolia rehearsal, with its numbers (the README still says to speed a stuck claim up by hand). B9, the Solana program-side compute fix (store the vault bump in the escrow:
+a program build, a fixture refresh and a review round), is recommended with Solana devnet. Neither has code, a test or a fixture in this package.
+
+The signet challenge's derivation (B3). `BTC_SIGNET_PIN.signetChallenge` is a public constant (a 71-byte 1-of-2 multisig script of two public keys: OP_1, key, key, OP_2, OP_CHECKMULTISIG;
+142 hex characters, shown here shortened as `512103ad5e...2ae`) and was DERIVED, never typed from memory or fetched:
+
+1. An offline Bitcoin Core v31.1.0 node: `bitcoind -signet -datadir=<a fresh scratch directory> -connect=0 -listen=0 -dnsseed=0 -fixedseeds=0 -rpcport=<a free port>`. No peer, no DNS seed
+   and no fixed seeds, so the node never talks to a network.
+2. `bitcoin-cli -signet` with the same datadir and port, `getblockchaininfo`: the `signet_challenge` field is the value.
+3. On the same node `getblockhash 0` answered the genesis hash that `BTC_SIGNET_PIN.genesisHash` pins, so the challenge and the genesis hash come from one node that agrees with the pin.
+4. The node was stopped afterwards.
+
+To check it again, repeat steps 1 and 2 on any Core 31.1 node started that way and compare (case-insensitively) with the constant. The value has not met a live public signet peer of this
+build; that check, with the genesis hash, is the desk operator's G1 step before `-UNVERIFIED` leaves the pin's name (README, "Bitcoin signet (P9-5)").
+
+Open residuals the packages leave, each written in the README as a known limit:
+
+- B7: in one narrow window the first-claim guards refuse a re-send (the node accepted the claim, the reply was lost, the lookup then failed, the claim was evicted and the claim-by has
+  passed: a never-sent claim re-sent late would be a new reveal after the claim-by); the claim status reads need `-txindex=1`; a claim that a reorg removes after its one confirmation is
+  not sent again; a record written before this change holds no claim bytes, so its flow cannot re-send a claim it never recorded.
+- B3: the offline replay and the evidence reader do not compare the signet challenge; the live `connect()` and every write do.
+- B4: a plain pin text of at most 40 characters is quoted by design, so a key cut to 40 characters or fewer and pasted into a pin name would still be echoed; `src/rails/account-line.ts`
+  still quotes the caip2 it is given (a rail built in code, not a rails file).
+
+Documentation (the commit(s) that carry this section):
+
+- `README.md`: the type gate paragraph; the guarded-set bullet for pin texts, with its two residuals; the new paragraph "A write is named by the keccak256 of its signed bytes", with the two
+  warning sentences and `onWarning`; the lower-case hash sentence; the short pinned hash of NEAR and Solana; every place that prints `claim of leg A sent: tx <hash>`; the late-claim bullet, with its
+  second check and the new exit 6 sentence; the regtest suite list; the signet pin paragraph; the fee bullet, with the two minimums; the Bitcoin lost-reply paragraph and the new "counts as
+  landed only once it is mined" bullet; the NEAR evidence reason; the Solana pin paragraph; the deployment id sentence; and the Bitcoin bullets of "What a resumed step does", "What still
+  needs a person" and "Limits of resume".
+- `PROVENANCE.md`: the P9-5 signet paragraph, the P9-1 signer note, the P9-7 gate lines and the "stays outside the gate" notes now point here, and this section is new.
+- New test files, as listed above: `tests/late-claim-bundle.test.ts`, `tests/evm-sent-hash.test.ts`, `tests/btc-pin-text.test.ts`, `tests/near-pin-text.test.ts`, `tests/sol-pin-text.test.ts`,
+  `tests/btc-claim-settle.test.ts`, `tests/flow-claim-mined-btc.test.ts` and `tests-regtest/claim-mined.regtest.test.ts`.
+
+No key material in any of the new tests: every key and phrase in them is generated at test time and only scanned for, the assertions are on booleans, and the hashes and the signet challenge
+they use are public values.
+
+What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/`, `contracts/`, `contracts-near/`, `contracts-sol/`, `fixtures/`, `docs/`, `bin/`, `examples/`, `package.json` and
+`package-lock.json` are byte-identical to `a59f6b2` (`git diff a59f6b2..HEAD` is empty for them); no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no
+`Date.now()` is added; no new fixture. The hermetic count after the package: 134 files, 4112 passed, 7 skipped (before it, at `a59f6b2`: 127 files, 3949 passed, 7 skipped). The regtest suite's count
+recorded by the B7 commit is 7 files, 35 passed (29 before, plus the 6 new); the live suites were not run for the documentation.
