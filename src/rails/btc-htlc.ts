@@ -33,6 +33,7 @@ import {
   type FundingUtxo,
   type HtlcSpendBranch,
 } from "./btc-script.js";
+import { quotedPinTextOrPlaceholder } from "./pin-text.js";
 import { RpcCaptureError, type CapturingRpc } from "./rpc-capture.js";
 
 export type BtcNetworkName = "regtest" | "signet";
@@ -195,20 +196,26 @@ export function btcRailConfigShapeReason(value: unknown): string | null {
  *  `BtcChainPin.network`'s own type were ever widened, the runtime check still refuses a name
  *  nobody put on the list). */
 export function validateBtcRailConfig(config: BtcRailConfig): void {
+  // P10 B4 (the KR3-3 rule, src/rails/pin-text.ts): every pin text of a config that these refusals name is quoted only when it is a short plain
+  // text. The refusals reach `watch.mjs --rails` and `audit-export --rails`, whose files have no key field, and a genesis hash is a run of 64 hex
+  // digits, exactly the shape of a key, so a genesis hash is named only when it is one this build pins itself (a public constant).
   if (!ALLOWED_NETWORKS.has(config.pin.network)) {
-    throw new Error(`btc-htlc: network "${config.pin.network}" is not on the allow list (regtest, signet only)`);
+    throw new Error(`btc-htlc: network ${quotedPinTextOrPlaceholder(config.pin.network)} is not on the allow list (regtest, signet only)`);
   }
   // H3: pin names tied to their network — a config cannot rename a known (network, genesisHash)
   // pair to a different `pin.name` (e.g. an index-only rename to "bitcoin-mainnet"), and cannot
   // pin a (network, genesisHash) pair this build does not itself know about at all.
   const known = knownPinFor(config.pin.network, config.pin.genesisHash);
   if (known === null) {
+    const isPinnedGenesis = KNOWN_PINS.some((pin) => pin.genesisHash.toLowerCase() === String(config.pin.genesisHash).toLowerCase());
     throw new Error(
-      `btc-htlc: (network "${config.pin.network}", genesisHash ${config.pin.genesisHash}) does not match any known pin (btc-regtest, btc-signet-UNVERIFIED)`,
+      `btc-htlc: (network ${quotedPinTextOrPlaceholder(config.pin.network)}, genesisHash ${
+        isPinnedGenesis ? config.pin.genesisHash.toLowerCase() : "not one this build pins"
+      }) does not match any known pin (btc-regtest, btc-signet-UNVERIFIED)`,
     );
   }
   if (config.pin.name !== known.name) {
-    throw new Error(`btc-htlc: pin.name "${config.pin.name}" does not match the known pin's own name "${known.name}" for this (network, genesisHash)`);
+    throw new Error(`btc-htlc: pin.name ${quotedPinTextOrPlaceholder(config.pin.name)} does not match the known pin's own name "${known.name}" for this (network, genesisHash)`);
   }
 }
 
@@ -434,7 +441,7 @@ export const BTC_SIGNET_FEE_RULE: BtcFeeRule = Object.freeze({
 export function btcFeeRuleFor(network: string): BtcFeeRule | null {
   if (network === "regtest") return null;
   if (network === "signet") return BTC_SIGNET_FEE_RULE;
-  throw new Error(`btc-htlc: no fee rule for network "${network}" (regtest, signet only)`);
+  throw new Error(`btc-htlc: no fee rule for network ${quotedPinTextOrPlaceholder(network)} (regtest, signet only)`);
 }
 
 /**
@@ -620,13 +627,13 @@ export class BtcHtlcRail {
     }
     if (info.chain !== this.config.pin.network) {
       throw new Error(
-        `btc-htlc: connected chain "${info.chain}" does not match pin "${this.config.pin.name}" (expected "${this.config.pin.network}")`,
+        `btc-htlc: connected chain "${info.chain}" does not match pin ${quotedPinTextOrPlaceholder(this.config.pin.name)} (expected ${quotedPinTextOrPlaceholder(this.config.pin.network)})`,
       );
     }
     const genesisHash = await this.request<string>("getblockhash", [0]);
     if (genesisHash.toLowerCase() !== this.config.pin.genesisHash.toLowerCase()) {
       throw new Error(
-        `btc-htlc: genesis hash ${genesisHash} does not match pin "${this.config.pin.name}" (expected ${this.config.pin.genesisHash})`,
+        `btc-htlc: genesis hash ${genesisHash} does not match pin ${quotedPinTextOrPlaceholder(this.config.pin.name)} (expected ${this.config.pin.genesisHash})`,
       );
     }
   }

@@ -61,6 +61,7 @@ import {
   locktimeFromRefundAfterMs,
 } from "./btc-script.js";
 import { assetIdFor, checkBtcRailConfig, scanWindowFor, type BtcChainPin, type BtcRailConfig } from "./btc-htlc.js";
+import { quotedPinTextOrPlaceholder } from "./pin-text.js";
 import { readCapture, RpcCaptureError, type CapturingRpc, type Exchange } from "./rpc-capture.js";
 import { railBinding, type LockEvidence, type RailObservation } from "../types.js";
 
@@ -428,7 +429,7 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
     return { lock: { ...base2, railVerified: null, reason: "btc-htlc: malformed getblockchaininfo result" } };
   }
   if (chainName !== config.pin.network) {
-    return { lock: { ...base2, railVerified: null, reason: `captured chain "${chainName}" does not match pin "${config.pin.name}" (expected "${config.pin.network}")` } };
+    return { lock: { ...base2, railVerified: null, reason: `captured chain "${chainName}" does not match pin ${quotedPinTextOrPlaceholder(config.pin.name)} (expected ${quotedPinTextOrPlaceholder(config.pin.network)})` } };
   }
 
   // Position 1: getblockhash(0) — genesis, pinned.
@@ -441,7 +442,7 @@ export function btcEvidence(input: BtcEvidenceInput): BtcEvidenceResult {
   }
   const genesisHash = genesisBound.outcome.value;
   if (typeof genesisHash !== "string" || genesisHash.toLowerCase() !== config.pin.genesisHash.toLowerCase()) {
-    return { lock: { ...base2, railVerified: null, reason: `genesis hash does not match pin "${config.pin.name}" (expected ${config.pin.genesisHash})` } };
+    return { lock: { ...base2, railVerified: null, reason: `genesis hash does not match pin ${quotedPinTextOrPlaceholder(config.pin.name)} (expected ${config.pin.genesisHash})` } };
   }
 
   // Position 2: getrawtransaction(txid, true) — the funding tx itself.

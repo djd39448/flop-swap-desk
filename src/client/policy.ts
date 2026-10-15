@@ -24,6 +24,7 @@
 
 import { DEFAULT_POLICY_EXAMPLE } from "../deadlines.js";
 import { BTC_SIGNET_FEE_RULE, type BtcFeeRule } from "../rails/btc-htlc.js";
+import { quotedPinTextOrPlaceholder } from "../rails/pin-text.js";
 import type { DeadlinePolicy } from "../types.js";
 
 /**
@@ -260,7 +261,7 @@ export const BTC_SIGNET_POLICY: BtcSignetPolicy = Object.freeze({
 export function btcLocalPolicyFor(network: string): BtcLocalPolicy {
   if (network === "regtest") return BTC_LOCAL_POLICY;
   if (network === "signet") return BTC_SIGNET_POLICY;
-  throw new Error(`btc policy: no policy for network "${network}" (regtest, signet only)`);
+  throw new Error(`btc policy: no policy for network ${quotedPinTextOrPlaceholder(network)} (regtest, signet only)`);
 }
 
 // P5-NEAR-DECISIONS-2026-09-29.md D-N8: the NEAR-local twin of `EVM_LOCAL_POLICY`/

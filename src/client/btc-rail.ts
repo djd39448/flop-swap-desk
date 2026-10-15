@@ -34,6 +34,7 @@ import {
   BTC_MIN_LOCKABLE_SATS,
   BtcBroadcastRefusedError,
   BtcHtlcRail,
+  checkBtcRailConfig,
   type BtcHtlcTerms,
   type BtcRailConfig,
   type BtcSignerKey,
@@ -413,7 +414,11 @@ class BtcCounterRail implements CounterAssetRail {
     this.caip2 = options.config.pin.caip2;
     this.policy = btcLocalPolicyFor(options.config.pin.network);
     this.assetId = assetIdFor(options.config);
-    this.deploymentId = `btc-htlc:network=${options.config.pin.network}:genesis=${options.config.pin.genesisHash.toLowerCase().slice(0, 32)}`;
+    // P10 B4: the genesis prefix is named only for a pin this build knows (a public constant); a config that is not one (a hand-written value, a key
+    // pasted into the wrong field) can never connect, and its deployment id must not carry a window of what it holds. The network is on the
+    // allow list by here (`btcLocalPolicyFor` above refused any other).
+    const pinned = checkBtcRailConfig(options.config).ok;
+    this.deploymentId = `btc-htlc:network=${options.config.pin.network}:genesis=${pinned ? options.config.pin.genesisHash.toLowerCase().slice(0, 32) : "unpinned"}`;
   }
 
   /** D-08/§6: a `btc-htlc` leg posts a *pubkey* line, not an account/address line — the P2WSH

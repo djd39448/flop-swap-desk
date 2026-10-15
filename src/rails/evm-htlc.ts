@@ -57,6 +57,7 @@ import {
   type EvmSignerRefusedError,
   type EvmSignerWatch,
 } from "./evm-signer.js";
+import { PIN_TEXT_SHAPE, quotedPinText, UNPLAIN_PIN_TEXT } from "./pin-text.js";
 import { RpcCaptureError, verifiedExchangeBytes, type CapturingRpc } from "./rpc-capture.js";
 
 export { EVM_DEFAULT_MAX_FEE_PER_GAS_WEI, EVM_MAX_GAS_PER_WRITE, EvmSignerRefusedError } from "./evm-signer.js";
@@ -333,23 +334,13 @@ export const ASSET_NAME_SHAPE = /^[A-Za-z0-9_-]{1,32}$/;
 const UNPLAIN_ASSET = "an asset whose name is not a short plain name";
 
 /**
- * KR3-3 (P9 review round 3): the shape of a pin name or caip2 this build quotes in a refusal: 1 to 40 letters, digits and `: _ . -` (`base-sepolia`, `anvil-local`,
- * `eip155:84532`, `bip122:` plus 32 hex digits). It is the runner's own `PIN_TEXT` (src/client/rehearsal-config.ts holds its pin fields to this same shape), and
- * it is defined here because a rail module never imports from the client.
+ * KR3-3 (P9 review round 3), P10 B4: how the refusals of this module that name a pin's `name` or `caip2` speak of one that is NOT a short plain text
+ * (`PIN_TEXT_SHAPE`, `UNPLAIN_PIN_TEXT`, `quotedPinText`): they never quote it. The rule now lives in src/rails/pin-text.ts, shared with the Bitcoin
+ * rail; `PIN_TEXT_SHAPE` is still exported from here for the runner's config check (src/client/rehearsal-config.ts) and the tests that import it.
+ * The refusals reach `watch.mjs` (`report.railsConfigError`, its notes and stderr) and `audit-export --rails`, whose files have no key field, so a key
+ * pasted into the wrong field of a hand-written rails file would otherwise come back whole (the same class as `UNPLAIN_ASSET`).
  */
-export const PIN_TEXT_SHAPE = /^[A-Za-z0-9:_.-]{1,40}$/;
-
-/**
- * KR3-3: how the refusals of this module that name a pin's `name` or `caip2` speak of one that is NOT a short plain text (`PIN_TEXT_SHAPE`): they never quote it. The
- * refusals reach `watch.mjs` (`report.railsConfigError`, its notes and stderr) and `audit-export --rails`, whose files have no key field, so a key pasted into the
- * wrong field of a hand-written rails file would otherwise come back whole (the same class as `UNPLAIN_ASSET`).
- */
-const UNPLAIN_PIN_TEXT = "a pin name (or caip2) that is not a short plain text";
-
-/** The text between double quotes when `text` is a short plain text, and `null` when it is anything else (a value that must not be quoted). */
-function quotedPinText(text: unknown): string | null {
-  return typeof text === "string" && PIN_TEXT_SHAPE.test(text) ? `"${text}"` : null;
-}
+export { PIN_TEXT_SHAPE };
 
 /**
  * P22-P24-EVM-FIXES.md A3: whether `value` even has the shape of an `EvmRailConfig` — every
