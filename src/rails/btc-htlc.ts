@@ -46,6 +46,15 @@ export interface BtcChainPin {
   /** `getblockhash 0`'s result — lowercase 64-hex. */
   genesisHash: string;
   finality: { confirmations: number };
+  /**
+   * P10 B3 (signet only): the signet challenge of the chain this pin names, lowercase hex, the script a block's solution must satisfy. The genesis
+   * hash and the chain name are the same on every signet (a node started with its own `-signetchallenge` reports `signet` and the public signet's
+   * genesis hash, proven on an offline Core 31.1 node), so only this value tells the public signet from a custom one whose blocks anyone can
+   * make. `assertPinnedChain` compares `getblockchaininfo().signet_challenge` with the pin's own copy of it, never with the config's. Absent for
+   * regtest, and optional in a config (a config written before this field carries none and is still checked against the build's own value);
+   * a config that carries a different one is not a config for a chain this build knows (`validateBtcRailConfig`).
+   */
+  signetChallenge?: string;
 }
 
 /** No credentials here, ever (P4-BTC-SPEC.md §4 — "no credentials in the config"): RPC auth is
@@ -102,7 +111,8 @@ export const BTC_REGTEST_PIN: BtcChainPin = {
 /** UNVERIFIED (P4-BTC-SPEC.md §4): this genesis hash is signet's well-known default value from
  *  public references (a public block explorer's signet API, 2026-10-05, G1-PREP section 4), never
  *  confirmed by this build against a live signet node — that confirmation is the desk operator's own G1 step
- *  (`bitcoin-cli -signet getblockhash 0` must print exactly `genesisHash` below), and the
+ *  (`bitcoin-cli -signet getblockhash 0` must print exactly `genesisHash` below, and `bitcoin-cli -signet getblockchaininfo` must report a
+ *  `signet_challenge` equal to `signetChallenge` below, P10 B3), and the
  *  `-UNVERIFIED` suffix stays on `name` until it has been. Do not use this pin for a real
  *  deployment until it has; `connect()`'s own genesis check will simply refuse a live signet node
  *  if this value turns out to be wrong, so using it by mistake fails closed rather than silently
@@ -121,6 +131,14 @@ export const BTC_SIGNET_PIN: BtcChainPin = {
   caip2: "bip122:00000008819873e925422c1ff0f99f7c",
   genesisHash: "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
   finality: { confirmations: 1 },
+  // P10 B3: the DEFAULT signet's challenge, a public constant (a 1-of-2 multisig script: OP_1, two compressed public keys, OP_2,
+  // OP_CHECKMULTISIG; public keys only, no key material), derived, never typed from memory or fetched, from an offline Bitcoin Core 31.1
+  // node: `bitcoind -signet -datadir=<a fresh scratch directory> -connect=0 -listen=0 -dnsseed=0 -fixedseeds=0 -rpcport=<a free port>`, then
+  // `bitcoin-cli -signet ... getblockchaininfo` and its `signet_challenge` field (the same node answered `getblockhash 0` with the genesis
+  // hash above). The node was stopped afterwards. Like the genesis hash it has not met a live public signet peer of this build yet: the desk
+  // operator's G1 step is to check that their signet node answers exactly this value before the `-UNVERIFIED` suffix goes.
+  signetChallenge:
+    "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
 };
 
 /** Allow list, not a deny list (mirrors P22-P24-EVM-FIXES.md A3's rule for the EVM leg): only
@@ -142,6 +160,8 @@ function knownPinFor(network: string, genesisHash: string): BtcChainPin | null {
 
 const GENESIS_HASH_SHAPE = /^[0-9a-f]{64}$/;
 const CAIP2_BIP122_SHAPE = /^bip122:[0-9a-f]{32}$/;
+/** A signet challenge is a script: even-length lowercase hex, at most 1,000 bytes (a hand-written value is held to a bound; the real one is 71 bytes). */
+const SIGNET_CHALLENGE_SHAPE = /^(?:[0-9a-f]{2}){1,1000}$/;
 
 /**
  * Shape-only check on a config that could have come from untrusted/untyped data (a `--rails`
@@ -176,6 +196,10 @@ export function btcRailConfigShapeReason(value: unknown): string | null {
   const finality = pin.finality as Record<string, unknown>;
   if (typeof finality.confirmations !== "number" || !Number.isInteger(finality.confirmations) || finality.confirmations <= 0) {
     return "btc rail config: pin.finality.confirmations must be a positive integer";
+  }
+  // P10 B3: optional (a config written before the field existed has none); only its shape is checked here, and no refusal ever quotes it.
+  if (pin.signetChallenge !== undefined && (typeof pin.signetChallenge !== "string" || !SIGNET_CHALLENGE_SHAPE.test(pin.signetChallenge))) {
+    return "btc rail config: pin.signetChallenge must be lowercase hex of an even length when present";
   }
 
   if (typeof v.endpoint !== "string" || v.endpoint === "") return "btc rail config: endpoint must be a non-empty string";
@@ -216,6 +240,15 @@ export function validateBtcRailConfig(config: BtcRailConfig): void {
   }
   if (config.pin.name !== known.name) {
     throw new Error(`btc-htlc: pin.name ${quotedPinTextOrPlaceholder(config.pin.name)} does not match the known pin's own name "${known.name}" for this (network, genesisHash)`);
+  }
+  // P10 B3: a config may carry the pin's own signet challenge and nothing else (it is never quoted: a hand-written value is untrusted text). The
+  // live check always uses the build's own copy (`known.signetChallenge`), so a config that leaves the field out loses nothing.
+  if (config.pin.signetChallenge !== undefined && config.pin.signetChallenge.toLowerCase() !== known.signetChallenge) {
+    throw new Error(
+      known.signetChallenge === undefined
+        ? "btc-htlc: pin.signetChallenge is not a field of this pin (it has no signet challenge)"
+        : "btc-htlc: pin.signetChallenge is not the signet challenge this build pins for this (network, genesisHash); a custom signet is not a chain this build knows",
+    );
   }
 }
 
@@ -275,6 +308,32 @@ function validateTerms(terms: BtcHtlcTerms): void {
   if (!AMOUNT_SHAPE.test(terms.amountSats) || BigInt(terms.amountSats) <= 0n) {
     throw new Error("btc-htlc: amountSats must be a positive decimal-integer string");
   }
+}
+
+/**
+ * P10 B3: the node answered a chain identity the pin does not name. `field` is the `getblockchaininfo` field that disagreed (today
+ * `signet_challenge`), so a caller can tell this refusal from a plain wrong chain. The message quotes at most `PIN_FIELD_PREFIX_CHARS` characters
+ * of what the node said, and only when it is hex; anything else is described, never quoted (the node's answer is its own to choose).
+ */
+export class BtcPinMismatchError extends Error {
+  readonly field: string;
+  constructor(field: string, message: string) {
+    super(message);
+    this.name = "BtcPinMismatchError";
+    this.field = field;
+  }
+}
+
+/** How many characters of a node's signet challenge a refusal may quote: the first six bytes. */
+const PIN_FIELD_PREFIX_CHARS = 12;
+
+/** A node's `signet_challenge` as a refusal may say it: absent, not a string, not hex, or at most a short prefix with its length. */
+function describeSignetChallenge(value: unknown): string {
+  if (value === undefined) return "is missing";
+  if (typeof value !== "string") return "is not a string";
+  if (!/^[0-9a-fA-F]*$/.test(value)) return "is not hex";
+  const shown = value.slice(0, PIN_FIELD_PREFIX_CHARS);
+  return value.length > PIN_FIELD_PREFIX_CHARS ? `begins ${shown}... (${value.length} hex characters)` : `is ${shown === "" ? "empty" : shown}`;
 }
 
 /**
@@ -618,7 +677,7 @@ export class BtcHtlcRail {
    *  sign anywhere but the pinned chain is cheap insurance against a reused RPC endpoint having
    *  quietly started answering for a different chain since connect. */
   private async assertPinnedChain(): Promise<void> {
-    const info = await this.request<{ chain: string }>("getblockchaininfo", []);
+    const info = await this.request<{ chain: string; signet_challenge?: unknown }>("getblockchaininfo", []);
     if (!ALLOWED_NETWORKS.has(info.chain)) {
       throw new Error(
         `btc-htlc: chain "${info.chain}" is not on the allow list (regtest, signet only)` +
@@ -629,6 +688,23 @@ export class BtcHtlcRail {
       throw new Error(
         `btc-htlc: connected chain "${info.chain}" does not match pin ${quotedPinTextOrPlaceholder(this.config.pin.name)} (expected ${quotedPinTextOrPlaceholder(this.config.pin.network)})`,
       );
+    }
+    // P10 B3: on signet the chain name and the genesis hash are the same on every signet, so the challenge is what tells the public signet from a
+    // custom one (a node started with -signetchallenge=51, where anyone can mine). The expected value is this build's own copy for the pin
+    // (`knownPinFor`), never the config's; a missing field, a non-string and any other value are refused, naming the field.
+    if (this.config.pin.network === "signet") {
+      const expected = knownPinFor(this.config.pin.network, this.config.pin.genesisHash)?.signetChallenge;
+      if (expected === undefined) {
+        throw new BtcPinMismatchError("signet_challenge", "btc-htlc: this build pins no signet challenge for this signet, refusing to connect");
+      }
+      const live = info.signet_challenge;
+      if (typeof live !== "string" || live.toLowerCase() !== expected) {
+        throw new BtcPinMismatchError(
+          "signet_challenge",
+          `btc-htlc: the node's signet_challenge ${describeSignetChallenge(live)}, not the default signet's challenge pinned by ${quotedPinTextOrPlaceholder(this.config.pin.name)} ` +
+            `(it begins ${expected.slice(0, PIN_FIELD_PREFIX_CHARS)}...); a custom signet is not a chain this build knows`,
+        );
+      }
     }
     const genesisHash = await this.request<string>("getblockhash", [0]);
     if (genesisHash.toLowerCase() !== this.config.pin.genesisHash.toLowerCase()) {

@@ -25,6 +25,7 @@ import {
   BTC_REGTEST_PIN,
   BTC_SIGNET_PIN,
   BtcHtlcRail,
+  BtcPinMismatchError,
   checkBtcRailConfig,
   DEFAULT_FEE_SATS,
   DUST_LIMIT_SATS,
@@ -215,10 +216,10 @@ async function connectSignet(handlers: Handlers): Promise<{ rail: BtcHtlcRail; r
   return { rail, rpc, calls };
 }
 
-/** A healthy signet node: the signet chain name and the real signet genesis. */
+/** A healthy signet node: the signet chain name, the real signet genesis and the default signet's challenge (P10 B3). */
 function signetHandlers(overrides: Partial<Handlers> = {}): Handlers {
   return baseHandlers({
-    getblockchaininfo: () => ({ chain: "signet", blocks: 200, time: 1_690_000_000, mediantime: 1_690_000_000 }),
+    getblockchaininfo: () => ({ chain: "signet", blocks: 200, time: 1_690_000_000, mediantime: 1_690_000_000, signet_challenge: BTC_SIGNET_PIN.signetChallenge }),
     getblockhash: (params) => (params[0] === 0 ? SIGNET_GENESIS : `${"00".repeat(31)}ff`),
     ...overrides,
   });
@@ -304,6 +305,160 @@ describe("P9-5: BTC_SIGNET_PIN is the real signet genesis (rule: a pin is correc
     const other = mockBitcoind(signetHandlers({ getblockhash: () => "ff".repeat(32) }));
     const rpc3 = new CapturingRpc({ endpoint: "http://x", fetch: other.fetch });
     await expect(BtcHtlcRail.connect({ config: signetConfig(), rpc: rpc3 })).rejects.toThrow(/genesis hash .* does not match pin "btc-signet-UNVERIFIED"/);
+  });
+});
+
+// -- P10 B3: the signet challenge -------------------------------------------------------------
+//
+// The chain name and the genesis hash are the same on every signet: a node started with `-signetchallenge=51` (a challenge anyone can satisfy, so
+// anyone can mine its blocks) reports chain `signet` and the public signet's genesis hash (checked on an offline Core 31.1 node in P9). Only
+// `getblockchaininfo().signet_challenge` tells them apart, so `BTC_SIGNET_PIN` carries the default signet's challenge (derived from an offline
+// Core 31.1 signet node, see the constant's comment) and `assertPinnedChain` compares the live value with the build's own copy.
+
+describe("P10 B3: BTC_SIGNET_PIN carries the default signet challenge and every connect and write re-checks it", () => {
+  const CHALLENGE = BTC_SIGNET_PIN.signetChallenge ?? "";
+
+  async function connectOutcome(handlers: Handlers, config: BtcRailConfig = signetConfig()): Promise<{ error: Error | null; calls: RpcCallLog[] }> {
+    const { fetch: fetchImpl, calls } = mockBitcoind(handlers);
+    const rpc = new CapturingRpc({ endpoint: "http://127.0.0.1:38332", fetch: fetchImpl });
+    try {
+      await BtcHtlcRail.connect({ config, rpc });
+      return { error: null, calls };
+    } catch (error) {
+      return { error: error as Error, calls };
+    }
+  }
+
+  function nodeAnswering(signetChallenge: unknown): Handlers {
+    return signetHandlers({
+      getblockchaininfo: () => ({
+        chain: "signet",
+        blocks: 200,
+        time: 1_690_000_000,
+        mediantime: 1_690_000_000,
+        ...(signetChallenge === undefined ? {} : { signet_challenge: signetChallenge }),
+      }),
+    });
+  }
+
+  it("the constant is the 71-byte 1-of-2 multisig script of the default signet (structure checked here, value derived on an offline Core 31.1 node), and regtest has none", () => {
+    expect(CHALLENGE).toMatch(/^5121(02|03)[0-9a-f]{64}21(02|03)[0-9a-f]{64}52ae$/); // OP_1 <pubkey> <pubkey> OP_2 OP_CHECKMULTISIG
+    expect(CHALLENGE).toHaveLength(142);
+    expect(CHALLENGE.startsWith("512103ad5e0e")).toBe(true);
+    expect(CHALLENGE.endsWith("f2e6c452ae")).toBe(true);
+    expect(BTC_REGTEST_PIN.signetChallenge).toBeUndefined();
+    expect(checkBtcRailConfig({ pin: BTC_SIGNET_PIN, endpoint: "http://127.0.0.1:38332" }).ok).toBe(true);
+  });
+
+  it("the default signet's own challenge connects", async () => {
+    expect((await connectOutcome(nodeAnswering(CHALLENGE))).error).toBeNull();
+    expect((await connectOutcome(nodeAnswering(CHALLENGE.toUpperCase()))).error).toBeNull(); // the same bytes
+  });
+
+  it("a fake signet node answering signet_challenge 51 (anyone can mine) is refused, naming the field", async () => {
+    const { error } = await connectOutcome(nodeAnswering("51"));
+    expect(error).toBeInstanceOf(BtcPinMismatchError);
+    expect((error as BtcPinMismatchError).field).toBe("signet_challenge");
+    expect(error?.message).toContain("signet_challenge");
+    expect(error?.message).toContain("is 51,"); // a value this short is quoted whole
+    expect(error?.message).toContain("a custom signet is not a chain this build knows");
+  });
+
+  it("a missing field, a value that is not a string, an empty string and a value that is not hex are refused, and nothing but a short prefix is ever quoted", async () => {
+    for (const [label, answer] of [
+      ["missing", undefined],
+      ["null", null],
+      ["a number", 51],
+      ["an object", { script: CHALLENGE }],
+      ["an array", [CHALLENGE]],
+      ["empty", ""],
+    ] as const) {
+      const { error } = await connectOutcome(nodeAnswering(answer));
+      expect(error, label).toBeInstanceOf(BtcPinMismatchError);
+      expect((error as BtcPinMismatchError).field, label).toBe("signet_challenge");
+      expect(error?.message.includes(CHALLENGE), label).toBe(false);
+    }
+    // a hex lookalike with the right start and another tail: refused, and only the first 12 characters are in the sentence
+    const lookalike = `${CHALLENGE.slice(0, 130)}${"00".repeat(6)}`;
+    expect(lookalike).toHaveLength(142);
+    const lookalikeError = (await connectOutcome(nodeAnswering(lookalike))).error;
+    expect(lookalikeError).toBeInstanceOf(BtcPinMismatchError);
+    expect(lookalikeError?.message.includes(lookalike)).toBe(false);
+    expect(lookalikeError?.message.includes(lookalike.slice(0, 20))).toBe(false); // at most 12 characters of it
+    expect(lookalikeError?.message).toContain("begins 512103ad5e0e... (142 hex characters)");
+    // text that is not hex is described, never quoted
+    const text = "a long text that is not hex and could be anything the node chose to say";
+    const textError = (await connectOutcome(nodeAnswering(text))).error;
+    expect(textError).toBeInstanceOf(BtcPinMismatchError);
+    expect(textError?.message.includes("not hex")).toBe(true);
+    expect(textError?.message.includes("long text")).toBe(false);
+  });
+
+  it("is the build's own copy that decides: a config with no signetChallenge (written before the field) is still checked, and one that names another is not a known pin", async () => {
+    const { signetChallenge: omitted, ...withoutField } = BTC_SIGNET_PIN;
+    expect(omitted).toBeDefined();
+    const plain: BtcRailConfig = { pin: withoutField, endpoint: "http://127.0.0.1:38332" };
+    expect(checkBtcRailConfig(plain).ok).toBe(true);
+    expect((await connectOutcome(nodeAnswering(CHALLENGE), plain)).error).toBeNull();
+    expect((await connectOutcome(nodeAnswering("51"), plain)).error).toBeInstanceOf(BtcPinMismatchError);
+
+    // a config that names a different challenge (here the one the fake node answers) is refused before any call, without quoting it
+    const custom = checkBtcRailConfig({ pin: { ...BTC_SIGNET_PIN, signetChallenge: "51" }, endpoint: "http://127.0.0.1:38332" });
+    expect(custom.ok).toBe(false);
+    if (!custom.ok) {
+      expect(custom.reason).toContain("pin.signetChallenge is not the signet challenge this build pins");
+      expect(custom.reason.includes("51")).toBe(false);
+    }
+    const { calls } = await connectOutcome(nodeAnswering("51"), { pin: { ...BTC_SIGNET_PIN, signetChallenge: "51" }, endpoint: "http://127.0.0.1:38332" });
+    expect(calls).toHaveLength(0); // refused by the static check: the node was never asked
+    // the shape: lowercase hex of an even length, nothing else
+    for (const bad of ["5", "zz", 51, null, "", "AB", "51".repeat(1001)]) {
+      const checked = checkBtcRailConfig({ pin: { ...BTC_SIGNET_PIN, signetChallenge: bad }, endpoint: "http://127.0.0.1:38332" });
+      expect(checked.ok, JSON.stringify(typeof bad)).toBe(false);
+    }
+    // regtest has no signet challenge to carry
+    const regtestWithOne = checkBtcRailConfig({ pin: { ...BTC_REGTEST_PIN, signetChallenge: CHALLENGE }, endpoint: "http://127.0.0.1:19000" });
+    expect(regtestWithOne.ok).toBe(false);
+    if (!regtestWithOne.ok) expect(regtestWithOne.reason).toContain("is not a field of this pin");
+  });
+
+  it("regtest is unchanged: its node reports no signet_challenge and connects, and a stray one is not looked at", async () => {
+    const { calls } = await connectRail(baseHandlers());
+    expect(calls.map((c) => c.method)).toEqual(["getblockchaininfo", "getblockhash"]);
+    const stray = baseHandlers({ getblockchaininfo: () => ({ chain: "regtest", blocks: 200, time: 1_690_000_000, mediantime: 1_690_000_000, signet_challenge: "51" }) });
+    await expect(connectRail(stray)).resolves.toBeDefined();
+  });
+
+  it("is re-checked before every write and read of the adapter, not only at connect (a node that changes its answer is refused)", async () => {
+    const live: { challenge: unknown } = { challenge: CHALLENGE };
+    const handlers = signetHandlers({
+      getblockchaininfo: () => ({ chain: "signet", blocks: 200, time: 1_690_000_000, mediantime: 1_690_000_000, signet_challenge: live.challenge }),
+      gettxout: () => ({ bestblock: "00", confirmations: 1, value: 1 }),
+    });
+    const { fetch: fetchImpl } = mockBitcoind(handlers);
+    const rpc = new CapturingRpc({ endpoint: "http://127.0.0.1:38332", fetch: fetchImpl });
+    const rail = await BtcHtlcRail.connect({ config: signetConfig(), rpc });
+    await expect(rail.fundingOutputUnspent(REF)).resolves.toBe(true);
+    live.challenge = "51"; // the endpoint now answers for a custom signet
+    await expect(rail.fundingOutputUnspent(REF)).rejects.toBeInstanceOf(BtcPinMismatchError);
+    await expect(rail.recoverFunding(FUND_TXID)).rejects.toBeInstanceOf(BtcPinMismatchError);
+    await expect(rail.claim(REF, TERMS, `0x${PREIMAGE_HEX}`, SELLER, DESTINATION_ADDRESS, 1_800_000_000_000)).rejects.toBeInstanceOf(BtcPinMismatchError);
+    await expect(rail.refund(REF, TERMS, BUYER, DESTINATION_ADDRESS)).rejects.toBeInstanceOf(BtcPinMismatchError);
+    await expect(rail.prepareFunding(TERMS, BUYER)).rejects.toBeInstanceOf(BtcPinMismatchError);
+  });
+
+  it("the client wrapper (createBtcCounterRail) refuses a custom signet at connect, so no flow step runs against one", async () => {
+    const { fetch: fetchImpl } = mockBitcoind(nodeAnswering("51"));
+    const rpc = new CapturingRpc({ endpoint: "http://127.0.0.1:38332", fetch: fetchImpl });
+    const rail = createBtcCounterRail({
+      config: signetConfig(),
+      rpc,
+      wallet: "buyer",
+      key: BUYER.key,
+      destinationAddress: DESTINATION_ADDRESS,
+      clock: () => 0,
+    });
+    await expect(rail.connect({ lock: "hash" } as never, {})).rejects.toBeInstanceOf(BtcPinMismatchError);
   });
 });
 
