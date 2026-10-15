@@ -977,6 +977,21 @@ What the fix pass found beyond the list: the drop of a claim the node refused (`
 undefined `#claimTx` left the stale one in place (a restarted process re-sent the old bytes, or ended in a `RailRecoveryRefusedError`, instead of making a fresh guarded first claim; no fund was
 at risk, the bytes had never reached the network). Fixed in the P10-PIN-01 commit.
 
+### The second review's fix pass (the reviewer's re-read of the first)
+
+The re-read found no fund loss and no key leak and closed every earlier finding; it raised two low items and two small ones, fixed in two commits and this documentation.
+
+| finding | commit | files | pinned by |
+|---|---|---|---|
+| P10R2-FUND-01: a failed read of leg B's note blocked the re-sends that do not need it; and a test name said "past the claim-inclusion margin" while it ran inside the bound | `d94ea1d` | `src/client/seller.ts` (`legBTakenWithOurSecret` answers false for a read that throws) | `tests/flow-claim-mined-btc.test.ts` (4 new cases over a paper rail whose read throws: the identical re-send inside the bound, still `ClaimResendTooLateError` past it and when leg B was claimed, the first-claim guards of a never-sent claim; the renamed case) |
+| P10R2-FUND-02: a claim the node accepted whose `sent` mark was lost counted as a first claim; the Seller's own wallet now says it was accepted. Also the `ClaimSupersededError` sentence for `sent` false | `ade6687` | `src/rails/btc-htlc.ts` (`walletKnowsTransaction`), `src/client/btc-rail.ts` and `src/client/counter-rail.ts` (`claimTxKnownToWallet`), `src/client/seller.ts` (`noteClaimKnownToWallet`; the new sentence) | `tests/flow-claim-mined-btc.test.ts` (6 new cases over the ledger fake's wallet), `tests/btc-claim-settle.test.ts` (5 new cases against the mocked bitcoind), `tests-regtest/claim-mined.regtest.test.ts` (a real node: the wallet still answers after an expiry, with no confirmation; the identical re-send past the claim-by) |
+| documentation of both | the commit that carries this part | `README.md`, `PROVENANCE.md` | none |
+
+What Core 31.1 answered (observed on a regtest node with `-mempoolexpiry=1`, the claim paying to the Seller's wallet, the node's mock time moved two hours and an unrelated transaction submitted so that the
+mempool dropped the claim): `gettransaction <claim txid>` on the Seller's wallet still answers, with `confirmations` 0, `trusted` false, no `blockhash`, empty `walletconflicts` and `mempoolconflicts`, and no
+`abandoned` or `in_mempool` key; for a transaction the wallet has no part in (the Buyer's funding) it answers code -5. A wallet that was restored from a backup without a rescan, or a claim whose destination
+is another wallet's address, would not know the transaction: that is the residual, written in the README's limit (1).
+
 Not built, on purpose: the backlog's two other items wait for the desk operator's word. B8, an automatic same-nonce re-pricing of a stuck EVM claim, is recommended after the first
 real Base Sepolia rehearsal, with its numbers (the README still says to speed a stuck claim up by hand). B9, the Solana program-side compute fix (store the vault bump in the escrow:
 a program build, a fixture refresh and a review round), is recommended with Solana devnet. Neither has code, a test or a fixture in this package.
@@ -996,7 +1011,8 @@ build; that check, with the genesis hash, is the desk operator's G1 step before 
 Open residuals the packages leave, each written in the README as a known limit:
 
 - B7: in one narrow window the first-claim guards refuse a re-send (the node accepted the claim, the reply was lost, the lookup then failed, the claim was evicted, the claim-by has
-  passed and leg B's note does not read claimed with the swap's secret: a never-sent claim re-sent late would be a new reveal after the claim-by); an accepted claim that was dropped is
+  passed, leg B's note does not read claimed with the swap's secret and the Seller's own node wallet does not know the transaction, because the claim's destination is not an address of that
+  wallet, the wallet never saw the claim, or the wallet read failed: a never-sent claim re-sent late would be a new reveal after the claim-by); an accepted claim that was dropped is
   not re-sent past leg A's refund time minus the claim-inclusion margin unless the Buyer has claimed leg B (`ClaimResendTooLateError`, a person acts); the claim status reads need
   `-txindex=1`; a claim that a reorg removes after its one confirmation is not sent again; a record written before this change holds no claim bytes, so its flow cannot re-send a claim it
   never recorded.
@@ -1026,7 +1042,8 @@ they use are public values.
 
 What did not change: no wire or protocol change; `vendor/tclk`, `src/vendor/`, `contracts/`, `contracts-near/`, `contracts-sol/`, `fixtures/`, `docs/`, `bin/`, `examples/`, `package.json` and
 `package-lock.json` are byte-identical to `a59f6b2` (`git diff a59f6b2..HEAD` is empty for them); no new dependency; no environment variable is read by `src/`, `bin/` or `examples/`; no
-`Date.now()` is added; no new fixture. The hermetic count after the package and its fix pass: 135 files, 4143 passed, 7 skipped (after the package alone, at `c037aaa`: 134 files, 4112 passed, 7 skipped; before it, at
-`a59f6b2`: 127 files, 3949 passed, 7 skipped; the fix pass adds 31 cases and one file, `tests/btc-asset-text.test.ts`). The regtest suite after the fix pass: 7 files, 36 passed (35 at `c037aaa`,
-plus the stale-branch case); the anvil suite: 9 files, 52 passed (seller.ts is shared flow code the EVM leg runs, so it was run again); NEAR and Solana were not run by the fix pass (the main loop
-runs them). The fix pass's documentation commit changes only `README.md`, `PROVENANCE.md` and one comment of `src/client/near-rail.ts`.
+`Date.now()` is added; no new fixture. The hermetic count after the package and its two fix passes: 135 files, 4158 passed, 7 skipped (after the first fix pass: 135 files, 4143 passed; after the package alone, at `c037aaa`: 134 files,
+4112 passed; before it, at `a59f6b2`: 127 files, 3949 passed, 7 skipped; the first fix pass adds 31 cases and one file, `tests/btc-asset-text.test.ts`, the second adds 15 cases and no file). The regtest
+suite after the second pass: 7 files, 37 passed (35 at `c037aaa`, plus the stale-branch case and the wallet case); the anvil suite: 9 files, 52 passed (seller.ts is shared flow code the EVM leg runs, so
+it was run again at the end of both passes); NEAR and Solana were not run by the fix passes (the main loop runs them). The first pass's documentation commit changes only `README.md`, `PROVENANCE.md`
+and one comment of `src/client/near-rail.ts`; the second pass's changes only `README.md` and `PROVENANCE.md`.

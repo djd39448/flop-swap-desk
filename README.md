@@ -1190,7 +1190,7 @@ own outpoint has already been spent by the Buyer's refund), and `tests-regtest/c
 (P10 B7, from the wire: a claim that is broadcast and not mined leaves the Seller at its claim step; a restarted Seller whose claim is in the
 mempool signs, tests and sends nothing; a claim that a real eviction took out of the mempool (`-mempoolexpiry=1`) is sent again as exactly the
 recorded bytes by a restarted process that makes no signing call, also after the claim-by; a claim that was mined, then taken out of the best chain with
-`invalidateblock` and expired from the mempool (so `getrawtransaction` answers it with no confirmation) is read as dropped and sent again as the same bytes; a funding output spent by another transaction is not
+`invalidateblock` and expired from the mempool (so `getrawtransaction` answers it with no confirmation) is read as dropped and sent again as the same bytes; a claim the node accepted and then expired, whose `sent` mark was lost, is sent again as the same bytes because the Seller's wallet still knows it; a funding output spent by another transaction is not
 re-sent; see "Known limits of the Bitcoin leg" and "Resume"). `npm test` never spawns `bitcoind`: a
 missing binary fails `test:regtest` loudly instead.
 
@@ -1427,9 +1427,16 @@ party or reveal the secret without payment.
   too): the IDENTICAL saved bytes are sent again, once (`testmempoolaccept` first), never a new spend and never another fee,
   under this rule. (a) If leg B's note reads claimed with this swap's secret, the Buyer already holds leg B and the secret
   is public, so the bytes go out again at any time, also after the claim-by, after leg A's refund time, and also when the
-  record has no `sent` mark. (b) Otherwise, for a claim the node had accepted, they go out again only while the claim can
+  record has no `sent` mark. A note that cannot be read counts as not shown claimed, and the flow goes on to (b) or (c): the
+  read can only widen a send, so its failure never blocks the sends that do not need it and never makes one more permissive.
+  (b) Otherwise, for a claim the node had accepted, they go out again only while the claim can
   still land before leg A's refund time: before `refundAfterMs` minus the claim-inclusion margin (60 minutes on Bitcoin),
-  which the rail reads again as its last-moment guard. The first broadcast may have been evicted before the Buyer saw it,
+  which the rail reads again as its last-moment guard. A claim counts as accepted when the record says so (`sent`) or when
+  the Seller's own node wallet knows the transaction (`gettransaction` on the wallet the rail signs with, read only): a wallet
+  is told of a transaction that pays to it when the node accepts it and keeps it after the mempool drops it (Core 31.1,
+  observed: after an expiry it still answers, with no confirmation), so a `sent` mark lost with the process no longer turns
+  the re-send into a first claim. The wallet's answer is saved as the mark, and it is never read as mined or as in the
+  mempool. The first broadcast may have been evicted before the Buyer saw it,
   and then the re-send is the Buyer's first chance to learn the secret; a claim that lands later could leave a Buyer who
   may be refunding leg A without the time to claim leg B. Past that moment the call ends with the typed
   `ClaimResendTooLateError` and sends nothing. A person can read leg B's note and leg A's funding output; once the Buyer has
@@ -1437,14 +1444,18 @@ party or reveal the secret without payment.
   the node ever accepted it, may never have been sent, and sending it late would be a new reveal. So its re-send goes
   through every guard of a first claim (claim-by, claim margin, leg A's lock verified final) and the rail's last-moment
   deadline read. A funding output spent by another transaction (the Buyer's refund, most likely) is not re-sent: the call
-  ends with the typed `ClaimSupersededError`. A node that refuses the saved bytes is a
+  ends with the typed `ClaimSupersededError` (its `sent` says whether this flow knows the node accepted the claim, by the record or by the wallet;
+  `sent` false is "no record", and its sentence says so: it does not claim the node never saw it). A node that refuses the saved bytes is a
   `RailRecoveryRefusedError` (`rebroadcast-refused`): a person decides, and the claim is never re-priced. A claim the node
   refused to accept at the first send (never on the network) is forgotten again, in the saved record too, so a restarted
   process makes a fresh first claim under every first-claim guard. EVM, NEAR and
   Solana behave as before. Four limits remain. (1) In one narrow window the re-send is still refused: the node accepted the
-  claim, the reply was lost, the lookup then failed, the claim was evicted, the claim-by has passed, and leg B's note does
-  not read claimed with the secret. The flow cannot show the claim was ever sent, so the first-claim guards apply and a
-  person acts (once the Buyer has claimed leg B, rule (a) lets the next call send it). (2) The claim status reads ask the node for the
+  claim, the reply was lost, the lookup then failed, the claim was evicted, the claim-by has passed, leg B's note does
+  not read claimed with the secret, and the Seller's own wallet does not know the transaction (the claim's destination is
+  not an address of the wallet the rail signs with, the claim never reached that wallet, say after a restore from a backup
+  without a rescan, or the wallet read failed). The flow cannot show the claim was ever sent, so the first-claim guards
+  apply and a person acts (once the Buyer has claimed leg B, rule (a) lets the next call send it). With the claim's
+  destination an address of the Seller's own wallet, as the regtest suite runs it, this window is closed. (2) The claim status reads ask the node for the
   claim's txid, which needs `-txindex=1` (the node flags above already include it). (3) A claim that a reorg removes after
   its one confirmation is not sent again: once mined it counts as landed and is not watched. (4) A record written before this
   change holds no claim bytes, so its flow cannot re-send a claim it never recorded (`ClaimNotMinedError` then carries no txid
@@ -2450,9 +2461,9 @@ the refusal and the latch stay as they were.
   claim is recorded, it asks the node about the txid. Known and mined: it settles. Known and unmined: the same
   `ClaimNotMinedError`. Unknown while the funding output is still unspent (the node holds a claim only if its mempool has it
   or a block of the best chain does): the identical recorded bytes are sent again, once, at any time when leg B's note reads
-  claimed with the swap's secret, else for a claim marked `sent` only before leg A's refund time minus the claim-inclusion
-  margin (`ClaimResendTooLateError` past it, nothing sent), and behind every first-claim guard plus the rail's last-moment
-  deadline read when the claim may never have been sent. Unknown because another
+  claimed with the swap's secret, else for a claim marked `sent` (or whose transaction the Seller's own wallet knows) only
+  before leg A's refund time minus the claim-inclusion margin (`ClaimResendTooLateError` past it, nothing sent), and behind
+  every first-claim guard plus the rail's last-moment deadline read when the claim may never have been sent. Unknown because another
   transaction spent the output: `ClaimSupersededError`, nothing sent. If nothing is recorded and nothing is found, the guarded
   first claim follows. A flow without a store reads the chain the same way on a retry in the same process. The
   marker is the tip minus `CLAIM_MARKER_REORG_MARGIN_BTC` (6 blocks, floored at 0), for the same reorg reason: a claim
@@ -2516,8 +2527,9 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
   inputs are gone, or a mempool minimum fee has risen); the claim is never re-priced. (2) The funding output was spent by
   another transaction (`ClaimSupersededError`); if the node had accepted the claim, the secret is public and leg B is exposed
   until its refund time. (3) The narrow window described under "Known limits of the Bitcoin leg", where the first-claim guards
-  refuse the re-send. (4) The claim had been accepted by the node, was dropped, leg B is not claimed and the last safe moment
-  (leg A's refund time minus the claim-inclusion margin) has passed (`ClaimResendTooLateError`, nothing sent): read leg B's
+  refuse the re-send (the record has no `sent` mark and the Seller's wallet does not know the claim either). (4) The claim had been accepted by the node, was dropped, leg B is not claimed and the last safe moment
+  (leg A's refund time minus the claim-inclusion margin) has passed (`ClaimResendTooLateError`, nothing sent; the claim counts
+  as accepted by the record or by the Seller's own wallet): read leg B's
   note and leg A's funding output by hand; once the Buyer has claimed leg B, call `claimLegA()` again and the saved claim goes
   out; otherwise the desk operator decides whether to broadcast the saved claim by hand, knowing the Buyer may already hold
   leg A's refund. (5) A record written before P10, which holds no claim bytes: a person re-broadcasts the Seller's claim
