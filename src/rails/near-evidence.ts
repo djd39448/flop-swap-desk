@@ -59,6 +59,7 @@ import { hexToBytes } from "@noble/hashes/utils.js";
 
 import { checkNearRailConfig, NEAR_ASSET_ID, type NearRailConfig } from "./near-htlc.js";
 import { NEAR_HASH_LOCK_SHAPE, parseNearRef } from "./near-ref.js";
+import { quotedPinTextOrPlaceholder, shortPinnedValue } from "./pin-text.js";
 import { readCapture, RpcCaptureError, type CapturingRpc, type Exchange } from "./rpc-capture.js";
 import { railBinding, type LockEvidence, type RailObservation } from "../types.js";
 
@@ -465,7 +466,9 @@ function contractPinReason(
     return "near-htlc: malformed view_account result (code_hash missing or not at the finalized block)";
   }
   if (a.code_hash !== config.htlcCodeHash) {
-    return `near-htlc: contract "${config.contract}" code_hash "${a.code_hash}" is not the pinned htlcCodeHash "${String(config.htlcCodeHash)}" (H8)`;
+    // P10 B4 (the KR3-3 and K2 rules, src/rails/pin-text.ts): this reason reaches `audit-export` and the replayed board, and a rails file has no key field. The contract is
+    // quoted only as a short plain text, the pinned hash only in its short form (it has the shape of a key); the captured `code_hash` is the hash of public code.
+    return `near-htlc: contract ${quotedPinTextOrPlaceholder(config.contract)} code_hash "${a.code_hash}" is not the pinned htlcCodeHash ${shortPinnedValue(config.htlcCodeHash)} (H8)`;
   }
 
   const keysBound = bindExchange(capture, exchangeAt(exchanges, 4, "query"), "view_access_key_list");
@@ -487,7 +490,7 @@ function contractPinReason(
     return "near-htlc: malformed view_access_key_list result (keys missing or not at the finalized block)";
   }
   if (k.keys.length !== 0) {
-    return `near-htlc: contract "${config.contract}" still holds ${String(k.keys.length)} access key(s) -- not the locked deployment (H8)`;
+    return `near-htlc: contract ${quotedPinTextOrPlaceholder(config.contract)} still holds ${String(k.keys.length)} access key(s) -- not the locked deployment (H8)`;
   }
   return null;
 }
@@ -638,7 +641,7 @@ export function nearEvidence(input: NearEvidenceInput): NearEvidenceResult {
       lock: {
         ...base2,
         railVerified: null,
-        reason: `captured chain "${statusDecoded.chainId}" does not match pin "${capturedConfig.pin.name}" (expected "${capturedConfig.pin.chainId}")`,
+        reason: `captured chain "${statusDecoded.chainId}" does not match pin ${quotedPinTextOrPlaceholder(capturedConfig.pin.name)} (expected ${quotedPinTextOrPlaceholder(capturedConfig.pin.chainId)})`,
       },
     };
   }

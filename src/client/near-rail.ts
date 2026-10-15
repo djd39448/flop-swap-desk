@@ -31,6 +31,9 @@
 
 import type { LockTerms, TranscriptRecord } from "@flop-labs/tclk";
 
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
+
 import { accountProofMessage, formatAccountLine, resolveAccounts } from "../rails/account-line.js";
 import { base58 } from "@scure/base";
 
@@ -42,6 +45,7 @@ import {
   NEAR_ASSET_ID,
   NEAR_LOCK_REREAD_DELAY_MS,
   NearHtlcRail,
+  isNearCodeHash,
   type NearHtlcTerms,
   type NearRailConfig,
   type NearHtlcRailOptions,
@@ -49,7 +53,7 @@ import {
   type NearWriteEvidence,
 } from "../rails/near-htlc.js";
 import { nep413Verifier, signNep413 } from "../rails/near-proof.js";
-import { parseNearRef } from "../rails/near-ref.js";
+import { NEAR_ACCOUNT_ID, parseNearRef } from "../rails/near-ref.js";
 import { NearRpc, NearTimeoutError } from "../rails/near-rpc.js";
 import { verifiedExchangeBytes, type CapturingRpc, type Exchange } from "../rails/rpc-capture.js";
 import {
@@ -472,6 +476,24 @@ class ConnectedNearCounterRail implements ConnectedCounterAssetRail {
   }
 }
 
+/** 64 lowercase hex digits: a valid NEAR account id (an implicit account) and also exactly the shape of a private key, which a deployment id must not carry whole. */
+const KEY_SHAPED_ACCOUNT_ID = /^[0-9a-f]{64}$/;
+
+/**
+ * R1-05, P10 B4: the deployment a NEAR leg runs on: the contract account, the token account and the pinned contract code hash. Each part is named only when it has the shape the
+ * config check requires of it (an account id; a base58 hash of 32 bytes) and is `unpinned` otherwise: `checkNearRailConfig` takes ANY non-empty string as `htlcCodeHash`, and this
+ * id is saved in a flow record and printed whole by a record mismatch, so a key or a phrase pasted into the wrong field must not travel there. An account id that is a run of 64
+ * hex digits is named by a digest of itself (still distinct per deployment, never the digits). A config that fails the shape can never connect (a live `code_hash` is never such a
+ * text), so it never needs a distinct id; every config that can connect with a named account keeps the id it always had, byte for byte.
+ */
+export function nearDeploymentId(config: NearRailConfig): string {
+  const account = (text: unknown): string => {
+    if (typeof text !== "string" || !NEAR_ACCOUNT_ID.test(text)) return "unpinned";
+    return KEY_SHAPED_ACCOUNT_ID.test(text) ? `sha256-${bytesToHex(sha256(new TextEncoder().encode(text))).slice(0, 32)}` : text;
+  };
+  return `near-htlc:contract=${account(config.contract)}:token=${account(config.assets.USDC)}:code=${isNearCodeHash(config.htlcCodeHash) ? config.htlcCodeHash : "unpinned"}`;
+}
+
 class NearCounterRail implements CounterAssetRail {
   readonly railId: string = NEAR_RAIL_ID;
   readonly caip2: string;
@@ -488,7 +510,7 @@ class NearCounterRail implements CounterAssetRail {
   constructor(options: NearCounterRailOptions) {
     this.options = options;
     this.caip2 = options.config.pin.caip2;
-    this.deploymentId = `near-htlc:contract=${options.config.contract}:token=${options.config.assets.USDC}:code=${options.config.htlcCodeHash ?? "unpinned"}`;
+    this.deploymentId = nearDeploymentId(options.config);
   }
 
   /** D-N5: a near-htlc leg posts an *account-id* line, not a pubkey line (mirrors

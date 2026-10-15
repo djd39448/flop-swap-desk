@@ -45,6 +45,7 @@ import {
   type NearTxOutcome,
 } from "./near-rpc.js";
 import { formatNearRef, NEAR_ACCOUNT_ID, NEAR_HASH_LOCK_SHAPE, requireNearRef } from "./near-ref.js";
+import { quotedPinTextOrPlaceholder, shortPinnedValue } from "./pin-text.js";
 import type { CapturingRpc } from "./rpc-capture.js";
 
 // --- H1: typed write-result errors ---------------------------------------------------------
@@ -216,6 +217,28 @@ function knownPinFor(chainId: string): NearChainPin | null {
   return KNOWN_PINS.find((pin) => pin.chainId === chainId) ?? null;
 }
 
+/**
+ * P10 B4: `"; refusing mainnet by name"` for a chain id that IS a denied name, and `""` for anything else. The name printed is the one on this build's own deny list (the
+ * build's constant, found by comparing), never the caller's string, so a refusal never echoes a chain id it does not itself pin.
+ */
+function refusedByName(chainId: string): string {
+  for (const name of DENY_CHAIN_NAMES) if (name === chainId) return `; refusing ${name} by name`;
+  return "";
+}
+
+/**
+ * P10 B4: whether `text` is a NEAR contract code hash as this build's own tools write one: base58 of exactly 32 bytes (the sha256 of the wasm). `checkNearRailConfig` accepts
+ * any non-empty string as `htlcCodeHash` (a live node's `code_hash` can then never equal it), so a text that is not this shape is not named in a deployment id.
+ */
+export function isNearCodeHash(text: unknown): text is string {
+  if (typeof text !== "string" || text.length < 32 || text.length > 44) return false; // 32 bytes encode to 43 or 44 characters (fewer only with leading zero bytes)
+  try {
+    return base58.decode(text).length === 32;
+  } catch {
+    return false;
+  }
+}
+
 /** D-N8: this build's single settled asset (USDC on every USD leg, per the handoff's own
  *  cross-chain decision) — always `"USDC"`, never configurable per swap. */
 export const NEAR_ASSET_ID = "USDC";
@@ -302,18 +325,19 @@ export function nearRailConfigShapeReason(value: unknown): string | null {
  *  reused here). `connect()` additionally checks the LIVE `status().chain_id` against this same
  *  allow list before ever comparing it to the pin. */
 export function validateNearRailConfig(config: NearRailConfig): void {
+  // P10 B4 (the KR3-3 rule, src/rails/pin-text.ts): a chain id and a pin name of a config are quoted only when they are a short plain text. These refusals reach
+  // `watch.mjs --rails` and `audit-export --rails`, whose files have no key field, so a key or a phrase pasted into the wrong field must not come back in them.
   if (!ALLOWED_CHAIN_IDS.has(config.pin.chainId)) {
     throw new Error(
-      `near-htlc: chain id "${config.pin.chainId}" is not on the allow list (near-sandbox-flop, testnet only)` +
-        (DENY_CHAIN_NAMES.has(config.pin.chainId) ? `; refusing ${config.pin.chainId} by name` : ""),
+      `near-htlc: chain id ${quotedPinTextOrPlaceholder(config.pin.chainId)} is not on the allow list (near-sandbox-flop, testnet only)` + refusedByName(config.pin.chainId),
     );
   }
   const known = knownPinFor(config.pin.chainId);
   if (known === null) {
-    throw new Error(`near-htlc: chain id "${config.pin.chainId}" does not match any known pin (near-sandbox, near-testnet-UNVERIFIED)`);
+    throw new Error(`near-htlc: chain id ${quotedPinTextOrPlaceholder(config.pin.chainId)} does not match any known pin (near-sandbox, near-testnet-UNVERIFIED)`);
   }
   if (config.pin.name !== known.name) {
-    throw new Error(`near-htlc: pin.name "${config.pin.name}" does not match the known pin's own name "${known.name}" for this chain id`);
+    throw new Error(`near-htlc: pin.name ${quotedPinTextOrPlaceholder(config.pin.name)} does not match the known pin's own name "${known.name}" for this chain id`);
   }
 }
 
@@ -618,14 +642,16 @@ export class NearHtlcRail {
     const ref: NearBlockRef = { blockId: block.header.height };
     const account = await this.near.viewAccount(this.config.contract, ref);
     if (account.codeHash !== this.config.htlcCodeHash) {
+      // P10 B4: the contract is quoted only as a short plain text, and the pinned hash only in its short form (it has the shape of a key: K2); the live
+      // `code_hash` is the hash of public code and is named whole.
       throw new Error(
-        `near-htlc: refusing to connect — contract "${this.config.contract}" code_hash "${account.codeHash}" does not match the pinned htlcCodeHash "${String(this.config.htlcCodeHash)}"`,
+        `near-htlc: refusing to connect — contract ${quotedPinTextOrPlaceholder(this.config.contract)} code_hash "${account.codeHash}" does not match the pinned htlcCodeHash ${shortPinnedValue(this.config.htlcCodeHash)}`,
       );
     }
     const keyList = await this.near.viewAccessKeyList(this.config.contract, ref);
     if (keyList.keys.length !== 0) {
       throw new Error(
-        `near-htlc: refusing to connect — contract "${this.config.contract}" still holds ${String(keyList.keys.length)} access key(s) (must be locked to zero keys, H6)`,
+        `near-htlc: refusing to connect — contract ${quotedPinTextOrPlaceholder(this.config.contract)} still holds ${String(keyList.keys.length)} access key(s) (must be locked to zero keys, H6)`,
       );
     }
   }
@@ -637,13 +663,12 @@ export class NearHtlcRail {
     const status = await this.near.status();
     if (!ALLOWED_CHAIN_IDS.has(status.chainId)) {
       throw new Error(
-        `near-htlc: chain "${status.chainId}" is not on the allow list (near-sandbox-flop, testnet only)` +
-          (DENY_CHAIN_NAMES.has(status.chainId) ? `; refusing ${status.chainId} by name` : ""),
+        `near-htlc: chain "${status.chainId}" is not on the allow list (near-sandbox-flop, testnet only)` + refusedByName(status.chainId),
       );
     }
     if (status.chainId !== this.config.pin.chainId) {
       throw new Error(
-        `near-htlc: connected chain "${status.chainId}" does not match pin "${this.config.pin.name}" (expected "${this.config.pin.chainId}")`,
+        `near-htlc: connected chain "${status.chainId}" does not match pin ${quotedPinTextOrPlaceholder(this.config.pin.name)} (expected ${quotedPinTextOrPlaceholder(this.config.pin.chainId)})`,
       );
     }
   }
