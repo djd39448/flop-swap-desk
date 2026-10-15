@@ -64,9 +64,10 @@ npm test
 commit `5cc4ab9`, because the npm release `0.1.0` predates the transcript fold this desk
 depends on. `npm test` builds it first. Clone with `--recurse-submodules`.
 
-`npm run typecheck` checks `src/` and, since P9, every file under `tests/` (with `tests/helpers/`) through
-`tsconfig.tests.json`, at the same strictness; the live suites' folders (`tests-anvil/`, `tests-regtest/`, `tests-near/`,
-`tests-sol/`) are not part of it.
+`npm run typecheck` checks `src/`, every file under `tests/` (with `tests/helpers/`; since P9) and, since P10, every file
+of the four live suites' folders (`tests-anvil/`, `tests-regtest/`, `tests-near/`, `tests-sol/`) through
+`tsconfig.tests.json`, all at the same strictness and with zero diagnostics. The type gate therefore covers every test file a
+suite runs, though `npm test` itself still never runs a live suite.
 
 ## Audit replay
 
@@ -167,7 +168,7 @@ process: the dry run, a settle, a kill and a resume, and the refund paths, among
 whose Buyer record lost its lock's block number, a lock attempt that never landed (the signer refuses the lock after the approve; the
 runner waits for the finalized block, refunds leg B and replays to `refunded-b`, and a `--resume` continues the same way) and a refund
 for a Buyer below the pre-flight's ceiling-sized reservation (a warning, and the refund goes ahead), a claim that lands late and is finished by `--resume` (the bundle replays to `revealed`
-and the run exits 0: see "Known limits of the runner"), a late claim whose leg A reads Locked at the finalized block (exit 6, no bundle), and a claim the endpoint accepts and never mines (the runner
+and the run exits 0: see "Known limits of the runner"), a late claim whose leg A reads Locked at the finalized block, whether the runner's own read or the bundle's (two cases; exit 6, no bundle kept), and a claim the endpoint accepts and never mines (the runner
 prints its hash at once and ends with the sentence that names the hash, the minutes left and the by-hand step, on `--resume` too with nothing signed; once the held transaction is mined, `--resume` settles); every output, state file and bundle is scanned for the two keys, the venue seeds and the
 key files' directory and names, and the stop-after-lock, resume and refund cases also for the Seller's secret, which may sit only in the
 Seller's own flow record before a reveal; see "Deploying EvmHashRail to Base Sepolia"). `npm test` never
@@ -288,7 +289,14 @@ holds an invisible character (an emoji written with U+FE0F, for example), and a 
 - `rails.evm.pin.name` and `caip2` must be short plain texts (letters, digits and `- _ . :`, at most 40) or the config is refused by
   field name; the rail's own refusals (which `watch.mjs` and `audit-export --rails` share, for rails files that have no key field) quote `pin.name` or
   `pin.caip2` only when it has that same shape, and otherwise say "a pin name (or caip2) that is not a short plain text" (KR3-3); and a key pasted into
-  `contractCodeHash` is never printed back (see "Trust the contract by its code").
+  `contractCodeHash` is never printed back (see "Trust the contract by its code"). **Since P10 (B4) the same rule holds for the Bitcoin, NEAR and Solana rails,
+  through one helper shared with the EVM rail (`src/rails/pin-text.ts`).** Their refusals quote a pin name, a caip2, a network name or a chain id only as such a short plain text
+  (the same fixed sentence otherwise). They name a Bitcoin genesis hash only when it is one this build pins itself. They show a pinned NEAR `htlcCodeHash` or Solana `programHash`
+  only by its first eight characters (see "Trust the contract by its code", and "Bitcoin signet", "NEAR leg" and "Solana leg" below).
+  The deployment id each of those rails saves in a flow record follows the rule too (see "Resume").
+  Two residuals, stated plainly. A plain text of at most 40 characters is quoted on purpose, so a key cut down to 40 characters or fewer and pasted into a pin name would still come back
+  (the rails files that `watch.mjs` and `audit-export` read have no key field to catch it first). And `src/rails/account-line.ts` still quotes the caip2 it is given in its own
+  refusals (a malformed caip2, a wrong namespace); that is the path of a rail built in code, not of a rails file, and it was not changed.
 
 What the check cannot see, stated plainly: the endpoint's PATH (a provider's API-key path looks the same as a key, the path is never
 printed, and the URL, path included, goes into the bundle's `rails.json`, so use a keyless endpoint); and the forms still unseen:
@@ -340,6 +348,26 @@ once the node has the transaction, so a restart decides from the chain (a lock r
 status), as before; the one addition (P9-4 decision 7) comes AFTER a send whose receipt wait timed out: the hash of a lock or claim write is
 then saved, and a resumed flow asks the node about it (see "Receipt waits").
 
+**A write is named by the keccak256 of its signed bytes, never by the endpoint's answer (P10 B6, R5-KEY-INFO).** For a local account,
+`verifySentTransactionHash` (`src/rails/evm-signer.ts`, a fourth defence beside the three in that module) wraps the wallet's transport: for every
+`eth_sendRawTransaction` it computes the keccak256 of the raw signed transaction, forwards the request, and returns THAT hash as the answer, whatever the endpoint
+said. So viem, the vendored rail's receipt wait, the broadcast event (`onWriteBroadcast`), the Seller's saved `claimTxHash`, the Buyer's lock recovery handle, the hash the
+runner prints and `EvmReceiptTimeoutError.hash` all carry the computed hash. Before P10 they carried the endpoint's answer, checked for shape only: an endpoint that
+answered another well-formed hash sent the receipt wait to a transaction that was never mined, put a hash into the record that the node does not know (so a resumed
+flow's question "is it still pending?" came back "unknown" and a second claim or lock went out), and printed a hash the operator could not use for the by-hand speed-up.
+An answer equal to the computed hash (a case-only difference is the same hash) changes nothing and reports nothing. Any other answer, whether another well-formed hash or
+anything that is not a hash (a number, an object, a short or long or non-hex string), is not trusted: it is replaced and reported once per write, on the error stream, as one of two fixed
+sentences: `evm-htlc: warning: the endpoint answered a different transaction hash for a transaction this process sent; that transaction's hash is <computed>, and the computed
+hash is used for this write`, or, for an answer that is not shaped like a hash, `evm-htlc: warning: the endpoint's answer to a transaction this process sent was not a
+transaction hash; the transaction's hash is <computed>, and it is used for this write`. The sentence holds the computed hash (public) and never the endpoint's answer,
+whatever its shape: the answer is the endpoint's to choose, and a hostile endpoint could otherwise put any 64-hex value it had seen (the swap secret in a claim's call data, say)
+into the operator's terminal. An error reply, every other method, a JSON-RPC account's `eth_sendTransaction` (the node signs there, so there are no bytes to hash) and a
+parameter that is not a raw transaction pass through unchanged; what became of a write is decided by the chain reads that follow, never by this wrapper. The warning
+reaches a caller through the new optional `onWarning` (`EvmHtlcRailOptions`, passed through by `EvmCounterRailOptions`): the rehearsal runner gives each party's rail its
+error-line printer, so the sentence appears on stderr with the endpoint redacted like every line, and a listener that throws changes nothing. Left out, the mismatch is corrected
+and not reported. The decoders stay strict (lower-case `0x` and 64 hex digits), and `src/vendor/evm-hash-rail.ts` and `vendor/tclk` are untouched
+(`tests/evm-sent-hash.test.ts`, `tests/evm-pending-write.test.ts`, `tests/rehearsal-claim-watch.test.ts`).
+
 **The fee ceiling is judged before the gas estimate; the gas ceiling cannot be (R2-FUND-02, P9 review round 2).** viem prepares a
 local transaction in this order: nonce, block, fee caps, gas estimate, then signing. A claim's estimate carries the preimage in its
 call data, so a refusal that fired only at signing would already have shown the preimage to the endpoint, and every retry would show
@@ -373,8 +401,9 @@ starts, not when the wait ends:** the rail tells the flow of every write's hash 
 Both are strictly decoded optional fields added in place:
 the record version is unchanged and every older record still reads. An approve's hash is not saved (an approve is harmless to repeat) and neither is a
 refund's (a repeated refund is recognised from the lock's own state); the hash is a public value (no key, no preimage) and is saved only after the send,
-because viem returns it only once the node holds the transaction. A hash is kept in lower case whatever case the node answers (P94-PIN-01: the records decode a lower-case hash only,
-and a hash saved as an upper-case node wrote it would silently switch this protection off). A resumed Buyer (`recoverLock`) that reads no lock row asks the node
+because viem returns it only once the node holds the transaction. A hash is lower case because the rail computes it itself, as the keccak256 of the signed bytes (P10 B6, see "A write is named by the
+keccak256 of its signed bytes"), whatever case, or whatever value, the node answers (P94-PIN-01: the records decode a lower-case hash only, and a hash saved as an
+upper-case node wrote it would silently switch this protection off). A resumed Buyer (`recoverLock`) that reads no lock row asks the node
 (`EvmHtlcRail.transactionStatus`: `eth_getTransactionByHash`, then for a mined one its receipt) and gets `pending`, `success`, `reverted` or `unknown`;
 a failed read or a malformed answer throws and is never read as `unknown`. A transaction the node still holds is `pending` and the flow ends with its
 `LockPendingError`, nothing sent; one mined successfully whose row this endpoint's read does not show yet is `pending` too (the endpoint's answers
@@ -399,7 +428,12 @@ as a private key, so an operator who pastes a key into `contractCodeHash` by mis
 first mismatch, and a hash cannot be told from a key by its shape. The same text is the dry run's `escrow code` row and the evidence
 reader's reason (so `audit-export` prints no pinned value either); the error's typed `expected` field holds the same short form
 (ten characters and `...`, a string), never the configured value (R2-NOTE-a), so `util.inspect`, `console.error` or `JSON.stringify` of
-the error cannot carry a pasted key either; only `observed`, the hash of public code, is whole. The evidence
+the error cannot carry a pasted key either; only `observed`, the hash of public code, is whole. **The NEAR and Solana pins follow the same rule since P10 (B4), with
+eight characters instead of ten.** A refusal shows the NEAR rail's pinned `htlcCodeHash` and the Solana rail's pinned `programHash` only as their first eight characters between
+quotes and `...` (for example `"5CVXgVR5..."`). The NEAR config check takes any non-empty string as `htlcCodeHash`, and the Solana `programHash` is 64 lowercase hex digits,
+the shape of a key, so neither can be told from a pasted key. A pinned value that is not one run of letters and digits (a phrase) is shown as the fixed sentence "a pinned
+value that is not a hash". The NEAR `code_hash` that the node answers is the hash of public code and is still named whole (the Solana refusal names no observed hash).
+The EVM `contractCodeHash` keeps its ten characters. The evidence
 reader records the same read in every capture of a pinned config and judges it against the auditor's own pin: a leg whose code
 differs, whose capture never read the code, or that was taken without the pin reads `railVerified: null` with the reason, so the
 board never folds on an unpinned contract (a capture cannot opt itself out of the auditor's pin). `node bin/evm-code-hash.mjs
@@ -708,7 +742,7 @@ The session that wrote this never sees a key (see "Key files").
    means on Base Sepolia, are in "The config"). One URL serves the whole run: do not switch endpoints between `--yes`, `--resume` and `--refund`.
 5. Run the dry run (no flag), read the table, fix every `FAIL` row, and run it again just before `--yes`: the `fee ceiling` and the two
    nonce rows are readings of the moment, and the `finality budget` row prints the lag of the moment. Then run `--yes`. A settle takes the
-   lock's finalized lag (about 20 minutes, up to about 52 in the sample) plus a few minutes. When the claim is sent the runner prints `claim of leg A sent: tx <hash>` and, while it is not mined, a line a minute: if it
+   lock's finalized lag (about 20 minutes, up to about 52 in the sample) plus a few minutes. When the claim is sent the runner prints `claim of leg A sent: tx <hash>` (the keccak256 of the signed claim, computed by the rail and not taken from the endpoint's answer: P10 B6) and, while it is not mined, a line a minute: if it
    stays unmined as leg A's refund time nears, speed it up by hand with that hash (see "A stuck claim is not re-priced" under "Known limits of the runner"). For the refund path run `--yes --stop-after lock`
    (in a NEW state directory and a NEW or empty `out`: one state directory is one swap), then `--refund` (add `--wait` to keep it waiting
    here; wall clock: 4 hours 45 minutes from the run's start, to leg B's refund time, see "Deadlines").
@@ -787,7 +821,7 @@ back the first report of a stuck claim; approve, lock and refund keep the field'
 | `rails.evm.pin` | the chain pin, as in every `EvmRailConfig` (84532 is tied to the name `base-sepolia`); `finality` must be `{ "mode": "tag", "tag": "finalized" }` on 84532, the one the lag is measured against: confirmations mode and any `fallbackConfirmations` are refused by field name there (P9-4 decision 3), so that no read a flow routes on, and not the Buyer's permanent never-locked verdict, rests on a block a fixed number of confirmations below the head (the tag answered in 288 of 288 samples; anvil keeps both). `name` and `caip2` must be short plain texts (letters, digits and `- _ . :`, at most 40), refused by field name otherwise; the rail's own refusals quote them only when they are such texts (KR3-3) |
 | `rails.evm.endpoint` | the JSON-RPC URL, ONE for the whole run (there is no nonce manager and nothing re-prices a transaction that is already out: a load balancer that answers some calls from a node a block behind can make a write fail with `nonce too low`, which costs liveness only, and the `buyer nonce` and `seller nonce` rows read both counts from this one URL). It may carry no credentials, query or fragment (refused); a key in its PATH cannot be told from a path, so use a keyless endpoint such as `https://sepolia.base.org`: the URL is written into the bundle. Its HOST must not be key material (refused by field name: it is printed on every run) |
 | `rails.evm.contract`, `assets.USDC` | the deployed escrow, and Circle's Base Sepolia USDC (an asset book entry is the token allow list). Every asset NAME must be a short plain name (1 to 32 letters, digits, `-` and `_` only: `USDC.e`, with a dot, is refused) and not key material, refused by position and never quoted |
-| `rails.evm.contractCodeHash` | required on 84532 (see above); a mismatch prints the observed hash in full and this value only as its first ten characters |
+| `rails.evm.contractCodeHash` | required on 84532 (see above); a mismatch prints the observed hash in full and this value only as its first ten characters (the NEAR `htlcCodeHash` and the Solana `programHash` are shown by their first eight, P10 B4: see "Trust the contract by its code") |
 | `rails.evm.maxLogRange` | the endpoint's `eth_getLogs` cap in blocks (500 on the public endpoint; the default on 84532; at least 257, a smaller value is refused by field name); the dry run probes it, and for a new swap checks that 100 calls of it cover leg A's window (the `log scan reach` row). A fresh `--yes` records the effective cap in `run.json`, and `--resume` checks that the cap in force still reaches leg A's window (P9-4 decision 11, see "Log scans fit the endpoint's range cap") |
 | `rails.evm.maxFeePerGasWei` | the local signer's fee ceiling in wei per gas, a positive integer given as a number or a decimal string (P9-4 decision 5): omitted, it is the chain's default, 50 gwei (50000000000) on Base Sepolia (1,000 gwei on anvil); a value under 1 gwei is refused on 84532 (a ceiling under the chain's own fee would refuse every write), and a decimal string that looks like key material is refused by field name. The signer refuses any transaction whose fee cap is above it, before a claim's preimage leaves the process. The dry run's `fee ceiling` row sets the fee viem would sign for now against it (see "What the dry-run table means"). Claims keep viem's 1.2 base-fee multiplier. It is carried into the bundle's `rails.json` |
 | `rails.evm.receiptTimeoutMs` | how long one receipt wait lasts (default 180 s; on 84532 between 10,000 and 3,600,000 ms, refused by field name outside it). **On 84532 the claim's own receipt wait is at most 180 s whatever this says** (a smaller value is kept; approve, lock and refund keep the value: P94-FUND-01). A timeout is a typed error that says the transaction was sent and may still be mined, the flow saves the hash of a lock or claim (the claim's the moment it is broadcast), and `--resume` asks the node about it and reads the chain before it sends anything (see "Receipt waits") |
@@ -937,7 +971,8 @@ venue and a local paper-note file, signing with the two local key files. Modes (
 - **`--yes`.** Runs the same checks first and refuses (exit 3, nothing sent) unless they hold. Then it runs the choreography the anvil
   suite runs: bid, accept, the leg B lock on paper, both account lines (signed locally), the leg A approve and lock on the chain, a real
   wait until the lock reads at the finalized block, the claim (the runner prints `claim of leg A sent: tx <hash>` the moment the claim is broadcast, and, while it is not mined, `still not mined,
-  N min before leg A's refund time` once a minute: P94-FUND-01), the Buyer learning the secret and claiming leg B, a real wait until the
+  N min before leg A's refund time` once a minute: P94-FUND-01; the hash is the keccak256 of the signed claim, computed by the rail, and an endpoint that answered another hash is
+  reported once on the error stream as a warning that names the computed hash only: P10 B6), the Buyer learning the secret and claiming leg B, a real wait until the
   claim is final; then it writes the bundle to `out` and replays it with `examples/audit-export.mjs --expect <swapId>=settled` (or `=revealed`, for a reveal frame that came after leg A's refund time,
   and only after the runner has read leg A claimed at the finalized block: see "Known limits of the runner"). Each
   step prints one `step <role>.<method> done` line. `--stop-after lock` ends after the lock is recorded: the Seller never claims (the
@@ -999,7 +1034,7 @@ directory (`out`) and its steps; it never prints a key, and never a key file's p
 
 Exit codes: 0 done (or a clean dry run); 2 bad arguments, config or state; 3 the pre-flight failed (nothing was sent); 4 a step refused
 (the first line of its reason is printed, with the endpoint removed); 5 not yet (a refund time has not come); 6 the bundle was written
-but `audit-export` did not accept it (6 also means a late claim whose leg A does not read claimed at the finalized block: then no bundle was written, P94-FUND-02). A run that is settled on the chain but replays to `revealed` (a late claim: see "Known limits of the runner") is not an audit failure:
+but `audit-export` did not accept it (6 also means a late claim whose leg A does not read claimed at the finalized block, by the runner's own read, P94-FUND-02, or by the bundle's own, P10 B5: then no bundle was kept). A run that is settled on the chain but replays to `revealed` (a late claim: see "Known limits of the runner") is not an audit failure:
 once the runner has read leg A claimed at the finalized block, it exits 0 and prints one fixed sentence.
 
 ### What the dry-run table means
@@ -1038,12 +1073,13 @@ the two nonce rows are warnings in `--resume` and `--refund` for the same reason
   it does not claim ("the Seller's claim window has closed"), and both legs go back to their owners. Nothing is routed on a read that is not final, and no value is lost.
 - **A stuck claim is not re-priced: speed it up by hand, before leg A's refund time (P9-4 decision 6).** The Seller's claim pays the price viem computed when it was sent
   (the latest block's base fee x 1.2 plus the priority fee), nothing in this build re-prices or replaces it, and there is no same-nonce replacement code: that waits for the
-  first real rehearsal and its numbers. A claim that sits pending past leg A's refund time can lose the swap's atomicity (see "Known limits of the EVM leg"): its preimage is
+  first real rehearsal and its numbers (an automatic re-pricing of a stuck claim is the P10 backlog's item B8; it is not built and waits for the desk operator's word). A claim that sits pending past leg A's refund time can lose the swap's atomicity (see "Known limits of the EVM leg"): its preimage is
   already public in the pool, so the Buyer can claim leg B with it and refund leg A. What the build does instead is to refuse a start that would queue a claim behind something
   (the fresh-run `buyer nonce` and `seller nonce` rows), to keep the claim's margin at 10 minutes, and to refuse a second claim while the node still holds the first (the next
   bullet). If a claim stays pending and leg A's refund time is near, replace it yourself from a wallet that holds the Seller's key (the key file's key; the runner never prints one):
-  1. Find the pending claim's hash. The runner prints it the moment the claim is broadcast, in the line `claim of leg A sent: tx <hash>` (P94-FUND-01), and the sentence that ends a run
-     with a claim still pending names it again (`a claim of leg A this run sent (tx <hash>) is not mined yet, N min before leg A's refund time: ...`): these are the first sources, so look
+  1. Find the pending claim's hash. The runner prints it the moment the claim is broadcast, in the line `claim of leg A sent: tx <hash>` (P94-FUND-01). Since P10 (B6) that hash is the keccak256 of the signed claim,
+     computed by the rail, so it names the transaction this process sent even when the endpoint answered another hash (a line on the error stream that starts `evm-htlc: warning:` says it did, and carries the computed hash only).
+     The sentence that ends a run with a claim still pending names it again (`a claim of leg A this run sent (tx <hash>) is not mined yet, N min before leg A's refund time: ...`): these are the first sources, so look
      in the run's output first. Failing that: on a Base Sepolia block explorer, the Seller's address page shows a transaction the node holds, if the explorer shows pending ones; or it is the
      `claimTxHash` field of the Seller's record (saved at the broadcast), `<state dir>/seller/flows/seller-0x....json` (a public value in a secret-grade file that also holds the swap's secret: open the
      file in an editor you trust, read that one field, close it without saving, and paste the record nowhere).
@@ -1064,7 +1100,7 @@ the two nonce rows are warnings in `--resume` and `--refund` for the same reason
   claim is not re-priced"), then run --resume again; nothing new was signed". Once leg A's refund time has passed it says the claim can no longer land, that a speed-up cannot help, and to run
   `--resume` first (if the claim landed in time, it finishes the swap) and then `--refund`; a claim the node says is mined (the endpoint's reads lag) gets the plain "is mined, but the endpoint's
   reads do not show it yet ... run --resume again in a few minutes", with the hash. A first run's claim ends the same way when its receipt wait runs out (at most 180 s on Base Sepolia).
-  While the claim's receipt wait lasts the runner prints the hash at once (`claim of leg A sent: tx <hash>`) and one line a minute (`still not mined, N min before leg A's refund time`, or
+  While the claim's receipt wait lasts the runner prints the hash at once (`claim of leg A sent: tx <hash>`, the hash the rail computed from the signed bytes: P10 B6) and one line a minute (`still not mined, N min before leg A's refund time`, or
   `still not mined, leg A's refund time has passed`); the line only informs, nothing is sent, and a person runs `--resume` again. A transaction that the node holds and never mines (underpriced) keeps the run here until leg A's
   refund time: for a lock that is harmless (it can no longer land after that time, and the Buyer's refund path decides by the finalized-block verdict), and for a claim see the bullet above.
 - **A run is one endpoint (P9-4 decision 7).** There is no failover and no nonce manager, and none is planned: use ONE RPC URL for the whole run, the same one for
@@ -1091,10 +1127,17 @@ the two nonce rows are warnings in `--resume` and `--refund` for the same reason
   refund window is open" and "leg A claimed on chain but its reveal frame was not recorded"). The runner decides this BEFORE the audit, from the reveal frame's own stamp (at or
   after leg A's refund time is exactly tclk's own rule; it never asks for `settled` and falls back). **Then it checks the chain (P94-FUND-02): it reads leg A at the finalized block and
   requires it to read Claimed there.** The exit 0 rests on the chain, not on the transcript's grade, which is `revealed` just as well when leg A still reads Locked (a lagging node of a
-  load-balanced endpoint, a claim a reorg dropped). Only when leg A reads claimed at the finalized block does the runner run `audit-export --expect <swap>=revealed`, write `revealed` into
-  `outcome.json` and exit 0 with one fixed sentence; otherwise it exits 6 with one fixed sentence ("... leg A's lock does not read claimed at the finalized block (the claim is not final, or the
-  endpoint's reads disagree), so the swap is not reported as settled and no bundle was written; nothing was sent; look at the claim on the chain and run --resume again once it is final"),
-  writes no bundle and no `outcome.json`, and a later `--resume` reads again. The exit 0 sentence is: "the swap is settled on chain (leg A was claimed by the Seller and leg B by the Buyer), and the Seller's reveal frame came
+  load-balanced endpoint, a claim a reorg dropped). **There is a second check (P10 B5, R5-FUND-01).** The runner's read above is at the finalized block's NUMBER; the evidence reader that writes the bundle
+  later reads leg A at the finalized block's HASH, and behind a load-balanced endpoint the two reads can disagree, so the run used to end `revealed`, exit 0, over a bundle whose own leg A
+  observation says Locked. Now `writeAndAudit` also looks at what the bundle itself holds: `writeBundle` hands back the status its fold derived and leg A's rail observation exactly as the fold
+  bound it to this swap, and the runner requires that observation to say claimed and final (`bundleLegAClaimed`) before it renames the staged bundle into place, runs the audit or writes
+  `outcome.json`. Only when leg A reads claimed at the finalized block, by the runner's read AND by the bundle's own, does the runner run `audit-export --expect <swap>=revealed`, write `revealed` into
+  `outcome.json` and exit 0 with one fixed sentence. Otherwise it exits 6 with one fixed sentence, and which one depends on the read that failed. For the runner's read it is "... leg A's lock does not read claimed
+  at the finalized block (the claim is not final, or the endpoint's reads disagree), so the swap is not reported as settled and no bundle was written; nothing was sent; look at the claim on the chain and run
+  --resume again once it is final", and no bundle was written. For the bundle's read it is "... this run's own read showed leg A claimed at the finalized block, but the bundle's own read of leg A at the finalized
+  block's hash does not show it claimed (the endpoint's reads disagree with each other), so the swap is not reported as settled and no bundle was kept; nothing was sent; look at the claim on the chain and run
+  --resume again once the endpoint's reads agree", and the staged copy is removed first. In both cases no bundle is kept, there is no `outcome.json`, nothing is sent, and a later `--resume` reads again.
+  The on-time path and the refund path are untouched. The exit 0 sentence is: "the swap is settled on chain (leg A was claimed by the Seller and leg B by the Buyer), and the Seller's reveal frame came
   after leg A's refund time, so the bundle replays offline to revealed and not settled: the on-chain evidence is the proof, and the transcript's grade says only that the reveal
   was late". A repeated `--resume` reports the finished run as a success and says the same sentence; `--refund` of it says the run settled. Read `revealed` as the transcript's
   grade for a reveal that came late, not as a half-finished swap: one lock, one claim and the claim of leg B are on the chain, and anyone can check them with their own RPC access
@@ -1143,7 +1186,11 @@ path to `settled`; both refund paths, `refunded` and `refunded-b`; a claim refus
 file's own 2-confirmation finality and allowed once it is reached; the Buyer learning the secret
 from the chain alone when the Seller never posts a reveal frame; a well-formed claim — right
 secret, right script, right fee — refused by `testmempoolaccept`, and never broadcast, once its
-own outpoint has already been spent by the Buyer's refund). `npm test` never spawns `bitcoind` — a
+own outpoint has already been spent by the Buyer's refund), and `tests-regtest/claim-mined.regtest.test.ts`
+(P10 B7, from the wire: a claim that is broadcast and not mined leaves the Seller at its claim step; a restarted Seller whose claim is in the
+mempool signs, tests and sends nothing; a claim that a real eviction took out of the mempool (`-mempoolexpiry=1`) is sent again as exactly the
+recorded bytes by a restarted process that makes no signing call, also after the claim-by; a funding output spent by another transaction is not
+re-sent; see "Known limits of the Bitcoin leg" and "Resume"). `npm test` never spawns `bitcoind`: a
 missing binary fails `test:regtest` loudly instead.
 
 **Fixture capture is opt-in**, identical in shape to the EVM leg's own `CAPTURE_EVM_FIXTURES`:
@@ -1218,15 +1265,25 @@ hash). That shows the constant is the genesis of that header; it does not show t
 So the pin keeps the name `btc-signet-UNVERIFIED` until it has met a live signet node, which is
 the desk operator's step at G1 time, and dropping `-UNVERIFIED` needs BOTH of these from that node:
 `bitcoin-cli -signet getblockhash 0` must print exactly the value above, AND `bitcoin-cli -signet
-getblockchaininfo` must report a `signet_challenge` equal to the default signet's,
-`512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae`.
+getblockchaininfo` must report a `signet_challenge` equal to the default signet's (`BTC_SIGNET_PIN.signetChallenge`,
+shown here shortened as `512103ad5e...2ae`: 142 hex characters, a 71-byte 1-of-2 multisig script of two public keys).
 The genesis hash alone does not tell a node on the public signet from a node on a private one: a node started with
 `-signetchallenge=51` (a challenge anyone can satisfy, so anyone can mine its blocks) reports chain `signet` and the very same
 genesis hash (checked on an offline Bitcoin Core 31.1 node, 2026-10), and only its `signet_challenge` (`51`) differs.
-`BtcHtlcRail.connect` makes the genesis comparison and refuses a node that reports another chain name or another genesis, before any
-write; it does NOT compare the challenge yet, so it accepts such a custom signet, which would let a counterparty rewrite its own
-lock's confirmations on a chain it can mine. Testnet only and not part of G1; adding the default challenge to the pin and comparing
-it in `assertPinnedChain` is for the first Bitcoin stage.
+**Since P10 (B3) the pin carries the challenge and the rail compares it.** `BTC_SIGNET_PIN.signetChallenge` is the default signet's
+challenge, DERIVED (never typed from memory or fetched) on an offline Bitcoin Core 31.1 signet node; `PROVENANCE.md` records how.
+`BtcHtlcRail.assertPinnedChain`, which runs at `connect()` and again before every write and read of the adapter, compares the node's
+`getblockchaininfo().signet_challenge` (case-insensitively) with the BUILD's own copy for the pin, never with the config's, after the
+chain-name check and before the genesis check, on signet only. A missing field, a value that is not a string, an empty string and any other
+value are refused with the typed `BtcPinMismatchError` (its `field` is `signet_challenge`); the sentence quotes at most the first 12
+characters of the node's answer, and only when it is hex (anything else is described, never quoted). So a node on a custom signet, whose
+blocks a counterparty could mine to rewrite its own lock's confirmations, is refused before any write. Regtest is unchanged and has no
+challenge. A rail config may carry `pin.signetChallenge`, optional: a config written before the field, or a captured `rails.json`, carries
+none and is still checked live against the build's value; when present it must be lower-case hex of an even length and must equal the
+known pin's own value (a config that names another challenge is not a config for a chain this build knows, and is refused before any call,
+without quoting it); a regtest config may not carry one. **What is not covered:** the evidence reader and the offline replay do not compare the
+challenge (a capture's `getblockchaininfo` is read as it always was); the live `connect()` and every write do. And, like the genesis hash,
+the challenge has not met a live public signet node of this build: that check is the desk operator's G1 step. Testnet only.
 
 **The node.** A signet node for this client is started with `-signet -txindex=1`: the client reads
 arbitrary funding and spending transactions by txid (`getrawtransaction`), so the transaction index
@@ -1250,7 +1307,7 @@ they carry over unchanged; a test pins both policies.
 
 **The fee.** Regtest pays the fixed `DEFAULT_FEE_SATS` (1,000 satoshis) exactly as before: no
 estimate call, and the same requests in the same order (a test pins the sequence; the live regtest
-suite still passes its 29 tests and the committed fixtures still replay). On signet the lock, the
+suite passed its 29 tests at the time and has 35 with P10's claim-mined file; the committed fixtures still replay). On signet the lock, the
 claim and the refund price their fee from the node:
 
 - The rate is the node's `estimatesmartfee 6 conservative`. Six blocks (`BTC_SIGNET_FEE_TARGET_BLOCKS`)
@@ -1263,16 +1320,26 @@ claim and the refund price their fee from the node:
 - A claim or refund pays that rate times an upper bound for its own size (`htlcSpendVsizeBound`: 140
   and 132 virtual bytes to a P2WPKH address, 152 and 144 to a P2WSH one; the real Core-signed claim
   and refund in the committed regtest fixtures are 139 and 131, which a test checks), never less than
-  1,000 satoshis in total, and never so much that its output falls under the 546 satoshi dust limit (a
-  leg of the 2,046 satoshi minimum pays at most 1,500). At the cap a claim pays 7,000 satoshis to a
-  P2WPKH address and 7,600 to a P2WSH one. **Small signet legs pay below the estimate at high fee
-  rates:** the dust limit caps the fee at the leg's amount minus 546 satoshis, so a leg under about
-  8,000 satoshis (a claim at the cap pays 7,600 to a P2WSH payee, and 7,600 plus 546 is 8,146) cannot
-  always pay the rate it asks for. At 30 sat/vB a 2,046 satoshi leg's claim pays 1,500 satoshis (about 10.9 sat/vB) where the
-  rule asks for 4,110 (30 x 137 virtual bytes), which leaves an underpriced claim in the mempool with its
-  preimage visible. Signet only and not part of G1: the fix (raise the signet minimum lockable amount
-  to cover a claim at the cap rate, or refuse a leg that cannot pay it) is for the first Bitcoin stage;
-  until then keep a signet leg above about 8,000 satoshis.
+  1,000 satoshis in total. At the cap a claim pays 7,000 satoshis to a P2WPKH address and 7,600 to a
+  P2WSH one. **A spend never pays below the rule's own estimate (P10 B2, R1-FUND-05).** `spendFeeSatsFor`
+  returns exactly `ceil(rate x size / 1000)`, at least the 1,000 satoshi floor, and never cuts it to fit a
+  small leg. Before P10 the fee was capped at the leg's amount less the 546 satoshi dust limit, so a 2,046
+  satoshi leg at 30 sat/vB paid 1,500 where the rule asked for 4,110 (30 x 137 virtual bytes): an
+  underpriced claim sitting in the mempool with its preimage visible, which the Buyer could use to take
+  the other leg while its own refund was still open. Now a leg that cannot pay the fee and keep its single
+  output at or above the dust limit is refused instead, in two places. (1) At the lock guard: **the
+  minimum lockable amount is no longer one number for both networks.** Regtest keeps 2,046 satoshis
+  (`BTC_MIN_LOCKABLE_SATS`: the fixed 1,000 fee, the 546 dust limit and a 500 satoshi margin); signet's is
+  **8,646 satoshis** (`BTC_SIGNET_MIN_LOCKABLE_SATS`): 7,600 (the cap rate of 50 sat/vB over the largest
+  claim, 152 virtual bytes to a 34-byte destination script, `BTC_SIGNET_MAX_SPEND_FEE_SATS`) plus the dust
+  limit plus the same 500 satoshi margin. The rail chooses it by the pin's network name
+  (`btcMinLockableSatsFor`), and `BuyerFlow.bid` / `lockLegA` and `SellerFlow.acceptLegA` refuse a smaller
+  signet leg before anything is locked, posted or minted; at or above it the rule's fee at any rate it
+  allows leaves the output above dust. (2) In the fee itself: `spendFeeSatsFor` throws the typed
+  `BtcSpendUnaffordableError` (the amount, the fee, the dust limit, the size and the rate, in the message
+  and as fields) for a leg that would still need a cut. The spend is priced before the wallet is asked for
+  anything, so a refused spend signs, tests and sends nothing and remembers no fee; the lock guard keeps a
+  leg the flows accepted out of that case.
 - The funding transaction asks the wallet for the same rate (`fee_rate`, in sat/vB, on
   `walletcreatefundedpsbt`). The cap is a rate: a wallet that builds a funding from very many inputs
   pays it on a larger transaction.
@@ -1292,7 +1359,7 @@ claim and the refund price their fee from the node:
   below).
 
 What is still the desk operator's at G1 time, and what has not been measured: the live check of the genesis hash
-above, a synced signet node with `-txindex=1` and funded wallets for both parties, and what
+and of the signet challenge above, a synced signet node with `-txindex=1` and funded wallets for both parties, and what
 `estimatesmartfee` actually answers on that node (a node that has just started answers with no data,
 which prices everything at the floor).
 
@@ -1334,8 +1401,38 @@ party or reveal the secret without payment.
   retry, `refundLegA` fails with the node's raw rejection instead of posting its refund frames; the
   Buyer already has its BTC back. In both cases the watcher's evidence still shows the leg's real
   state from the chain. With a `store` both are closed: a resumed (or retried) `claimLegA` looks for its own
-  claim on chain, mempool first, from the block marker saved with the attempt and posts the reveal and receipt
-  frames, and `refundLegA` resolves its recorded refund by txid and posts the refund frames (see "Resume").
+  claim on chain, mempool first, from the block marker saved with the attempt. A claim it finds mined gets the reveal and
+  receipt frames; a claim it finds only in the mempool gets the reveal frame (the secret is public there), while the receipt
+  waits for a block and the call ends with the typed `ClaimNotMinedError` (P10 B7: see the next bullet). `refundLegA`
+  resolves its recorded refund by txid and posts the refund frames (see "Resume").
+- **A Seller's claim counts as landed only once it is mined (P10 B7).** Until P10 the Seller counted a Bitcoin claim as landed
+  the moment the node accepted the broadcast: the receipt was posted and `next` said `done`. A claim seen only in the mempool
+  has already shown the preimage. If the Seller stopped there and the claim was dropped (an expiry, a restart without the
+  mempool, a replacement), the Buyer could learn the secret, claim leg B and refund leg A after its refund time, and the Seller
+  lost leg A: nothing sent the dropped claim again, because every flow read as finished. Now, on the Bitcoin rail only:
+  the claim's txid and exact signed bytes are saved in the Seller's record (`claimTx`, one optional field, the record
+  version unchanged) BEFORE anything is sent, and a refused save stops the claim. When the node accepts the claim the reveal
+  frame is posted at once, because the secret is public in the mempool and tclk's machine takes a reveal only before
+  `refundAfterMs`, so it cannot wait for a block. The receipt, `claimOutcome` `landed` and a normal return wait for one
+  confirmation. Until then `next` stays `claimLegA`, and `claimLegA` throws the typed `ClaimNotMinedError` ("broadcast but
+  not mined"; it carries the txid and the write evidence and sends nothing). A later call reads the chain and decides.
+  Mined: it settles. Still in the mempool: the same error, nothing sent. Dropped from the mempool while leg A's funding
+  output is unspent: the IDENTICAL saved bytes are sent again, once (`testmempoolaccept` first), never a new spend and never
+  another fee. That re-send is allowed also after the claim-by and after leg A's refund time, because the secret is public
+  already; refusing it would only leave a dropped claim's Seller without leg A after the Buyer has used the secret. A
+  funding output spent by another transaction (the Buyer's refund, most likely) is not re-sent: the call ends with the typed
+  `ClaimSupersededError`. A claim that is only recorded, with no sign that the node ever accepted it, may never have been sent,
+  and sending it late would be a new reveal. So its re-send goes through every guard of a first claim (claim-by, claim
+  margin, leg A's lock verified final) and the rail's last-moment deadline read. A node that refuses the saved bytes is a
+  `RailRecoveryRefusedError` (`rebroadcast-refused`): a person decides, and the claim is never re-priced. EVM, NEAR and
+  Solana behave as before. Four limits remain. (1) In one narrow window the re-send is refused: the node accepted the claim,
+  the reply was lost, the lookup then failed, the claim was evicted, and the claim-by has passed. The flow cannot show the
+  claim was ever sent, so the first-claim guards apply and a person acts. (2) The claim status reads ask the node for the
+  claim's txid, which needs `-txindex=1` (the node flags above already include it). (3) A claim that a reorg removes after
+  its one confirmation is not sent again: once mined it counts as landed and is not watched. (4) A record written before this
+  change holds no claim bytes, so its flow cannot re-send a claim it never recorded (`ClaimNotMinedError` then carries no txid
+  and says so; a person re-broadcasts, see "What still needs a person"). The real-node proof is
+  `tests-regtest/claim-mined.regtest.test.ts`.
 - **The refund waits for median time past, which lags wall clock.** `T = refundAfterMs / 1000` is
   checked against the chain's median time of its last 11 blocks (BIP113), not the tip block's own
   timestamp or wall-clock "now" — so a refund's real, chain-observable availability lags
@@ -1362,8 +1459,8 @@ party or reveal the secret without payment.
   outpoint) after its own guards, and never re-prepares.
 - **Fees: a fixed constant on regtest, the node's estimate on signet, and never bumped.**
   `DEFAULT_FEE_SATS` (`src/rails/btc-htlc.ts`) is subtracted from every regtest claim/refund's single
-  output; on signet the fee follows the node's estimate between a floor and a cap (see "Bitcoin signet
-  (P9-5)"). Neither re-prices a transaction that is already out: there is no replace-by-fee and no
+  output; on signet the fee follows the node's estimate between a floor and a cap, is never cut to fit a small
+  leg, and a leg too small to pay it is refused (see "Bitcoin signet (P9-5)"). Neither re-prices a transaction that is already out: there is no replace-by-fee and no
   child-pays-for-parent, so a claim priced under a rising fee market can wait in the mempool with its
   preimage public, and if it misses `A.refundAfterMs` the Buyer can claim the other leg and refund
   this one. The 60 minute claim margin, the conservative six-block target and the claim's last
@@ -1488,7 +1585,13 @@ hash-lock ref, or one naming another hash lock, is rejected everywhere.
 as `get_lock`, and the reader binds both like `get_lock` (request type, contract account, block
 hash; the result must itself name that block). It reports a verdict only when the contract's
 `code_hash` equals the config's `htlcCodeHash` and it holds zero access keys; otherwise
-`railVerified` is null with the reason. `htlcCodeHash` also joins the captured-versus-auditor config
+`railVerified` is null with the reason. Since P10 (B4) that reason names the contract only as a short plain text (otherwise the
+fixed sentence "a pin name (or caip2) that is not a short plain text") and the pinned hash only by its first eight characters.
+It reaches `audit-export` and the replayed board, and a rails file has no key field. A contract account may be a run of 64 hex digits (an
+implicit account id), exactly the shape of a key, and `htlcCodeHash` is any non-empty string to the config check. The captured `code_hash` is the hash of
+public code and is named whole. The same holds for the contract, chain id and pin name that `NearHtlcRail.connect`'s refusals and
+the config check name. The "refusing mainnet by name" suffix prints the name from the build's own deny list, never the caller's string.
+`htlcCodeHash` also joins the captured-versus-auditor config
 comparison, so a capture taken under a different pin never replays under the auditor's. The fixed
 read order is now status, block, `get_lock`, `view_account`, `view_access_key_list`, then
 `storage_balance_of` (only when a payee account line exists), then one `view_access_key` per proven
@@ -1665,6 +1768,16 @@ only its own rail ids and must not change, so a Solana leg cannot use a bare id 
 per-caller registry (no module state) that admits this one id with the `solana` account-line
 namespace and refuses every id tclk already knows. The id is spelled in exactly one constant
 (`SOL_RAIL_ID`); a test scans `src/` for a second occurrence.
+
+**What a refusal may print of the pins (P10 B4).** The config check and the genesis check of `sol-htlc.ts` (the second is shared by
+`connect()` and the evidence reader) reach `bin/watch.mjs --rails` and `examples/audit-export.mjs --rails`, whose files have no key
+field. They quote a pin name, a caip2 or a pin reference only when it is a short plain text (letters, digits and `- _ . :`, at most 40),
+and `connect()` shows the pinned `programHash`, which is 64 hex digits and so has the shape of a key, only by its first eight
+characters between quotes and `...`. The program id and the mint are named by no refusal. The deployment id
+(`sol-htlc:program=<id>:mint=<id>`, which a flow record saves and a record mismatch prints) names the program id and the mint only when
+each is a public key (base58 of exactly 32 bytes) and says `unpinned` otherwise; every config that can connect keeps the id it always
+had. So a key or a phrase pasted into the wrong field of a hand-written `rails.sol` block does not come back in these messages
+(`tests/sol-pin-text.test.ts`).
 
 Run the live suites (needs WSL Ubuntu with Rust and Agave v4.3.0 under
 `~/.local/share/agave/v4.3.0/bin`, see `handoff/research/sol-probe/README.md`):
@@ -1872,7 +1985,7 @@ Only what the tests prove is claimed; the rest is written down.
   at the 1,000 floor, on top of the 5,000-lamport base fee and the payee account's rent. The limits are that high
   because the program derives the vault address at run time on every claim and refund, at 1,500 compute units per
   bump attempt and a number of attempts that depends on the escrow (the measured base plus 1,500 per attempt; 120,000
-  and 60,000 cover thirty-plus attempts); storing the vault bump in the escrow is on the Solana-leg backlog.
+  and 60,000 cover thirty-plus attempts); storing the vault bump in the escrow is on the Solana-leg backlog (the P10 backlog's item B9: a program build, a fixture refresh and a review round; it is not built and waits for the desk operator's word).
   The Seller then keeps claiming up to the landing bound (not the
   5-minute policy margin) and reports `neverLandedClaims` / `SolClaimStarvedError` ("secret broadcast but not
   landed, possibly seen"). Known limit: write-lock starvation on a busy cluster; the fee policy mitigates it,
@@ -2031,7 +2144,12 @@ restarted against another contract is refused instead of reading "no lock there"
 while the first lock can still land. The EVM id covers every asset the rail is configured with, not only the swap's
 own: any change to the EVM asset list (a token added to the config, say) refuses `resume` of every swap in flight with
 a `FlowRecordMismatchError` on `deploymentId` until the config is put back. That fails closed, on purpose; the swap
-itself is not harmed.
+itself is not harmed. The id is saved in the record and printed whole by a mismatch, so since P10 (B4) it never carries a key or a phrase pasted into the
+wrong field of a hand-written config. The NEAR contract and token accounts are named only when each is an account id. An account id that is a run of 64 hex digits
+(an implicit account, and so the shape of a key) is named by a digest of itself instead, still one id per deployment. The NEAR code hash is named only when it is a base58
+hash of 32 bytes. The Solana program id and mint are named only when each is a public key. The Bitcoin genesis prefix is named only for a pin this build knows. Anything else is
+the word `unpinned`. A config like that can never connect, and every config that can connect with a named account keeps the id it always had, so no saved
+flow is refused because of this.
 
 ### What a resumed flow promises
 
@@ -2043,7 +2161,8 @@ itself is not harmed.
    still land, never signs a second claim while an earlier one could still land (Solana), never SENDS a second
    Bitcoin refund while the first may be pending (at most one Bitcoin refund is sent; a refund whose handle save was
    refused after signing never left the process and may be built once more after the restart, see "Limits of
-   resume"), and keeps the Solana Buyer rule (leg B is claimed only once leg A reads Claimed). It decides by reading
+   resume"), never builds a second Bitcoin claim once one is recorded (it sends the saved bytes again if the node dropped them, P10 B7),
+   and keeps the Solana Buyer rule (leg B is claimed only once leg A reads Claimed). It decides by reading
    the chain and the venue, never by assuming the crash came before the action.
 3. **Same bytes, once.** A frame or account line is re-posted only as the identical saved text, and only after a read
    of the room shows it absent; an identical text already in the room is adopted; a line the record shows as landed is
@@ -2303,8 +2422,18 @@ the refusal and the latch stay as they were.
   bytes are re-sent once. A refund is saved the same way: known with a confirmation is `landed`, known without one is
   `pending`, unknown while the funding output is still unspent means the identical refund bytes are re-sent, and unknown
   because another transaction spent the output means it can no longer land (no second refund is built; the Buyer is
-  told to call `learnSecret()`). The Seller's claim is looked for on chain, mempool first, from the block marker saved
-  with the attempt; a claim whose reply was lost and which mined before the retry now gets its frames posted. The
+  told to call `learnSecret()`). **The Seller's claim is saved the same way, and counts as landed only once it is mined
+  (P10 B7).** Its txid and complete signed bytes (`claimTx` in the record) are written before anything is sent, and the
+  flow marks the claim `sent` once the node holds it. A resumed or retried `claimLegA` reads the chain in this order. First
+  it looks for its own preimage, mempool first, from the block marker saved with the attempt. A claim it finds in a block
+  gets its frames posted and settles; a claim it finds only in the mempool gets the reveal frame and ends with
+  `ClaimNotMinedError`, nothing sent (recognising a claim that is there is never gated by a clock). If it finds nothing and a
+  claim is recorded, it asks the node about the txid. Known and mined: it settles. Known and unmined: the same
+  `ClaimNotMinedError`. Unknown while the funding output is still unspent: the identical recorded bytes are sent again,
+  once, with no clock guard when the node is known to have accepted them before (also after the claim-by), and behind every
+  first-claim guard plus the rail's last-moment deadline read when they may never have been sent. Unknown because another
+  transaction spent the output: `ClaimSupersededError`, nothing sent. If nothing is recorded and nothing is found, the guarded
+  first claim follows. A flow without a store reads the chain the same way on a retry in the same process. The
   marker is the tip minus `CLAIM_MARKER_REORG_MARGIN_BTC` (6 blocks, floored at 0), for the same reorg reason: a claim
   that a reorg mines below the tip is found, not claimed again.
 - **NEAR.** A lock or refund is saved as its transaction hash plus its complete signed bytes before it is sent. The
@@ -2358,13 +2487,16 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
 - **Bitcoin.** If the node refuses to re-broadcast a saved funding (its inputs spent, a conflicting transaction, a
   policy rejection), the flow stops with a typed error (`RailRecoveryRefusedError`, code `rebroadcast-refused`). Check
   the wallet before any new attempt: a second funding is a second outpoint, and the flow never builds one by itself.
-  Also: a Seller's claim that was broadcast and then left the mempool without being mined (evicted or replaced) leaves
-  leg A unspent while the flows can read as finished. The Seller counts a broadcast claim as landed and posts its
-  reveal, a Buyer that saw the claim only in the mempool follows `next` to `learnSecret`, learns the secret from the
-  reveal and claims leg B, and the Seller's flow does not look at the claim again. A person re-broadcasts the Seller's
-  claim before leg A's `refundAfterMs`; after that time the claim races the Buyer's refund (see "Known limits of the
-  Bitcoin leg"). A runner that only follows `next` never does this. Recording the claim as landed only at one
-  confirmation is on the Bitcoin-leg backlog and is not built.
+  Also: a Seller's claim that was broadcast and then left the mempool without being mined (evicted or replaced) used to
+  leave leg A unspent while the flows read as finished. Since P10 (B7) the Seller's `next` stays `claimLegA` until the claim is
+  mined, and the flow itself sends the same saved bytes again, once, whenever leg A's funding output is still unspent. A
+  person is needed in four cases. (1) The node refuses the saved bytes (`RailRecoveryRefusedError`, `rebroadcast-refused`: the
+  inputs are gone, or a mempool minimum fee has risen); the claim is never re-priced. (2) The funding output was spent by
+  another transaction (`ClaimSupersededError`); if the node had accepted the claim, the secret is public and leg B is exposed
+  until its refund time. (3) The narrow window described under "Known limits of the Bitcoin leg", where the first-claim guards
+  refuse the re-send. (4) A record written before P10, which holds no claim bytes: a person re-broadcasts the Seller's claim
+  before leg A's `refundAfterMs`, and after that time the claim races the Buyer's refund. A runner that follows `next` and calls
+  `claimLegA` again after each block does the rest.
 - **EVM.** A lock under this hash lock that is not this account's (`lock-conflict`).
 - **Any rail.** A lock or funding created outside the record (for example by another instance that ran without a store,
   or against a store since lost) is never refunded by the flow: find it on chain and refund it by hand after its
@@ -2380,8 +2512,10 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
   leaves the refund available. By design, if this flow's own claim of leg B landed and its reply was lost, and nobody
   claimed leg A, the Buyer may refund leg A after its refund time and end with both legs on the paper rail. On testnet
   the paper leg moves no value. A guarantee of "never refund after a leg B claim" that survives a lost reply would need
-  claimant-bound notes, which the vendored paper rail does not have. The same ending is reachable on Bitcoin when the
-  Seller's claim of leg A drops out of the mempool after the Buyer adopted its own lost-reply claim of leg B; it too
+  claimant-bound notes, which the vendored paper rail does not have. The same ending is reachable on Bitcoin only when the
+  Buyer adopted its own lost-reply claim of leg B and then its refund of leg A took the funding output: the Seller's claim of leg A can
+  no longer land, and the Seller's flow ends in `ClaimSupersededError` without sending it again (P10 B7). A claim that merely dropped
+  out of the mempool is sent again while the output is unspent, so that case no longer ends this way. It too
   matters only once leg B carries value, and claimant-bound notes would close it as well.
 - **A bundle written after a resume lacks the crashed process's RPC exchanges.** Those exchanges are evidence, not
   state, and are not persisted. Board and watcher captures stay replayable.
@@ -2458,7 +2592,8 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
   late (`lockLegB`; the late accept A of the previous bullet is the same wait). Whatever was locked on the OTHER side
   has its own doorway: the Seller refunds leg B after leg B's `refundAfterMs`, the Buyer refunds leg A after leg A's. A
   runner driven only by `next` needs a time limit of its own, or a stop after repeated errors.
-- **The Bitcoin tests use a ledger fake.** The hermetic Bitcoin ledger fake mines instantly and always picks other
+- **The Bitcoin tests use a ledger fake.** The hermetic Bitcoin ledger fake mines instantly (since P10 B7 a test can switch that off, so a claim
+  sits in the mempool until the test mines a block or evicts it) and always picks other
   inputs for a second funding; real Bitcoin Core coin selection differs (on a real wallet that holds the coins, a second
   preparation after the first broadcast would fund again; argued, not run). The double-funding tests therefore prove the
   flow logic, not the node's behaviour. The funding and refund re-sends are also run against a real `bitcoind`
@@ -2487,7 +2622,9 @@ for the Seller to call (a liveness cost only: `next` then names a call that refu
   inside a save, the `reason` and wording of each lock refusal, the begin scan's error naming its record, and a Solana
   lock whose first status read lags (the real rail over the stateful node, `tests/flow-resume-sol-lag.test.ts`). P9-4 added the Buyer's lock re-included
   below its marker with its claim, and a lock write and a claim write that the node holds without mining (hermetic on the mock node, and live in
-  `tests-anvil/pending-write.anvil.test.ts` on a real anvil with its automine switched off).
+  `tests-anvil/pending-write.anvil.test.ts` on a real anvil with its automine switched off). P10 (B7) added the Bitcoin claim record and the mined-only
+  rule: hermetically over the ledger fake and a mocked bitcoind (`tests/flow-claim-mined-btc.test.ts`, `tests/btc-claim-settle.test.ts`, `tests/flow-record.test.ts`) and live on a
+  real bitcoind (six scenarios in `tests-regtest/claim-mined.regtest.test.ts`, among them a real eviction with `-mempoolexpiry=1`).
 - **First-party and unaudited.** `src/client/flow-store.ts`, `flow-record.ts`, `flow-resume.ts` and the resume tests are
   first-party, unaudited and testnet-only (`PROVENANCE.md`).
 
