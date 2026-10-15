@@ -69,6 +69,7 @@ import {
   type SolTransaction,
   type SolTxSigner,
 } from "./sol-tx.js";
+import { quotedPinTextOrPlaceholder, shortPinnedValue } from "./pin-text.js";
 import type { CapturingRpc } from "./rpc-capture.js";
 
 // --- constants -----------------------------------------------------------------------------------------------
@@ -288,12 +289,14 @@ function pinReference(pin: SolChainPin): string {
 export function solGenesisProblem(pin: SolChainPin, genesis: string): string | null {
   const prefix = genesis.slice(0, 32);
   if (prefix === MAINNET_GENESIS_PREFIX) return "sol-htlc: this endpoint is mainnet (genesis hash); refusing by genesis";
+  // P10 B4 (the KR3-3 rule, src/rails/pin-text.ts): the pin's name and reference are the config's text and are quoted only when they are a short plain text; the genesis
+  // hash is the endpoint's answer (public), not the config's.
   if (pin.caip2 === SOL_LOCAL_PIN.caip2) {
     if (PUBLIC_GENESIS_PREFIXES.includes(prefix)) {
-      return `sol-htlc: pin "${pin.name}" is a local validator but the endpoint reports a public cluster's genesis hash`;
+      return `sol-htlc: pin ${quotedPinTextOrPlaceholder(pin.name)} is a local validator but the endpoint reports a public cluster's genesis hash`;
     }
   } else if (prefix !== pinReference(pin)) {
-    return `sol-htlc: connected genesis "${genesis}" does not match pin "${pin.name}" (expected reference "${pinReference(pin)}")`;
+    return `sol-htlc: connected genesis "${genesis}" does not match pin ${quotedPinTextOrPlaceholder(pin.name)} (expected reference ${quotedPinTextOrPlaceholder(pinReference(pin))})`;
   }
   return null;
 }
@@ -341,12 +344,14 @@ export function validateSolRailConfig(config: SolRailConfig): void {
   if (isMainnetish(config.pin)) {
     throw new Error("sol-htlc: refusing mainnet by name (this build never touches mainnet)");
   }
+  // P10 B4 (the KR3-3 rule, src/rails/pin-text.ts): a caip2 and a pin name of a config are quoted only when they are a short plain text. These refusals reach
+  // `watch.mjs --rails` and `audit-export --rails`, whose files have no key field, so a key or a phrase pasted into the wrong field must not come back in them.
   const known = KNOWN_PINS.find((pin) => pin.caip2 === config.pin.caip2);
   if (known === undefined) {
-    throw new Error(`sol-htlc: chain "${config.pin.caip2}" is not on the allow list (${KNOWN_PINS.map((p) => p.caip2).join(", ")} only)`);
+    throw new Error(`sol-htlc: chain ${quotedPinTextOrPlaceholder(config.pin.caip2)} is not on the allow list (${KNOWN_PINS.map((p) => p.caip2).join(", ")} only)`);
   }
   if (config.pin.name !== known.name) {
-    throw new Error(`sol-htlc: pin.name "${config.pin.name}" does not match the known pin's own name "${known.name}" for this chain`);
+    throw new Error(`sol-htlc: pin.name ${quotedPinTextOrPlaceholder(config.pin.name)} does not match the known pin's own name "${known.name}" for this chain`);
   }
   if (config.programId !== SOL_HTLC_PROGRAM_ID) {
     throw new Error(`sol-htlc: programId must be the fixed keyless id ${SOL_HTLC_PROGRAM_ID} (the program refuses to run under any other id)`);
@@ -746,7 +751,8 @@ export class SolHtlcRail {
     const exact = bytesToHex(sha256(elf));
     const trimmed = bytesToHex(sha256(elf.slice(0, end)));
     if (exact !== this.config.programHash && trimmed !== this.config.programHash) {
-      throw new Error(`sol-htlc: refusing to connect - the ProgramData hash does not match the pinned programHash "${this.config.programHash}"`);
+      // P10 B4: the pinned hash has the shape of a key (64 hex digits), so it is named only in its short form (K2, as the EVM code hash is).
+      throw new Error(`sol-htlc: refusing to connect - the ProgramData hash does not match the pinned programHash ${shortPinnedValue(this.config.programHash)}`);
     }
     if (mint === null || mint === undefined) throw new Error("sol-htlc: refusing to connect - the USDC mint account does not exist");
     if (mint.owner !== TOKEN_PROGRAM_ID || mint.data.length !== SPL_MINT_LEN) {

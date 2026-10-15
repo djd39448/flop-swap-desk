@@ -53,6 +53,7 @@ import {
   type SolSigner,
   type SolWriteEvidence,
 } from "../rails/sol-htlc.js";
+import { isValidPubkeyBase58 } from "../rails/sol-tx.js";
 import {
   RailRecoveryRefusedError,
   type ConnectedCounterAssetRail,
@@ -393,6 +394,17 @@ function escrowTermsProblem(
   return null;
 }
 
+/**
+ * R1-05, P10 B4: the deployment a Solana leg runs on: the program id and the mint. Each is named only when it has the shape of a public key (the shape the config check
+ * requires of it: base58 of exactly 32 bytes) and is `unpinned` otherwise. This id is saved in a flow record and printed whole by a record mismatch, so a key or a phrase pasted
+ * into the wrong field of a hand-written config must not travel there; a hex key, a phrase or any text that is not a public key is not one. A config that fails the shape can never
+ * connect, and every config that can keeps the id it always had, byte for byte.
+ */
+export function solDeploymentId(config: SolRailConfig): string {
+  const named = (text: unknown): string => (isValidPubkeyBase58(text) ? text : "unpinned");
+  return `sol-htlc:program=${named(config.programId)}:mint=${named(config.assets.USDC)}`;
+}
+
 class SolCounterRail implements CounterAssetRail {
   readonly railId: string = SOL_RAIL_ID;
   readonly caip2: string;
@@ -411,7 +423,7 @@ class SolCounterRail implements CounterAssetRail {
 
   constructor(options: SolCounterRailOptions) {
     this.options = options;
-    this.deploymentId = `sol-htlc:program=${options.config.programId}:mint=${options.config.assets.USDC}`;
+    this.deploymentId = solDeploymentId(options.config);
     const skewMs = options.maxChainClockSkewMs ?? SOL_CHAIN_CLOCK_SKEW_MS;
     if (skewMs > SOL_CHAIN_CLOCK_SKEW_MS && options.unsafeAllowWideClockSkewForTests !== true) {
       throw new Error(
