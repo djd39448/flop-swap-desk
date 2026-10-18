@@ -49,6 +49,7 @@ import { describe, expect, it } from "vitest";
 import { BuyerFlow } from "../src/client/buyer.js";
 import { createEvmCounterRail } from "../src/client/evm-rail.js";
 import { SellerFlow } from "../src/client/seller.js";
+import { FlopBurnShareNonzeroError, FlopFinalityStalledError, FlopGuardUnreadableError, type FlopChainGuard } from "../src/client/flop-chain-guard.js";
 import { MemoryVenue } from "../src/client/venue.js";
 import { EVM_LOCAL_POLICY } from "../src/client/policy.js";
 import { ANVIL_LOCAL_PIN, type EvmRailConfig } from "../src/rails/evm-htlc.js";
@@ -202,7 +203,7 @@ interface Harness {
 function harness(
   buyerTag: number,
   sellerTag: number,
-  opts?: { buyerRpc?: CapturingRpc; sellerRpc?: CapturingRpc; mintHashLock?: () => HashLock },
+  opts?: { buyerRpc?: CapturingRpc; sellerRpc?: CapturingRpc; mintHashLock?: () => HashLock; flopGuard?: FlopChainGuard },
 ): Harness {
   const buyer = ident(buyerTag);
   const seller = ident(sellerTag);
@@ -225,6 +226,7 @@ function harness(
     rail: createEvmCounterRail({ config, rpc: opts?.sellerRpc ?? unreachableRpc(), account: SELLER_ACCOUNT, clock }),
     clock,
     ...(opts?.mintHashLock === undefined ? {} : { mintHashLock: opts.mintHashLock }),
+    ...(opts?.flopGuard === undefined ? {} : { flopGuard: opts.flopGuard }),
   });
   return { buyer, seller, venue, clockRef, clock, buyerFlow, sellerFlow };
 }
@@ -992,5 +994,73 @@ describe("SellerFlow.claimLegA — E4 (re-checks chain time again after verifyLo
     await expect(h.sellerFlow.claimLegA(h.sellerFlow.statement!)).rejects.toThrow(
       /at\/after its claimByMs \(chain time, re-checked after verifyLockFinal\) \(E4\)/,
     );
+  });
+});
+
+describe("SellerFlow.lockLegB - FLOP chain guard (finality-open gate and timeout-burn share, yellow paper sync of 2026-10-13)", () => {
+  const guard = (lag: number | (() => Promise<number>), share: number | (() => Promise<number>) = 0): FlopChainGuard & { reads: string[] } => {
+    const reads: string[] = [];
+    return {
+      reads,
+      finalityLagBlocks: async () => (reads.push("lag"), typeof lag === "function" ? lag() : lag),
+      htlcBurnSharePpt: async () => (reads.push("share"), typeof share === "function" ? share() : share),
+    };
+  };
+  async function readyToLock(g: FlopChainGuard | undefined, tag: number) {
+    const h = harness(tag, tag + 1, g === undefined ? undefined : { flopGuard: g });
+    const { offerBRecord, acceptARecord } = await bidAndAcceptA(h, "00000001");
+    const { acceptBRecord } = await h.buyerFlow.acceptLegB(offerBRecord, acceptARecord, T0);
+    return { h, acceptBRecord };
+  }
+
+  it("locks when the lag is under 120 blocks and the burn share is zero", async () => {
+    const g = guard(119);
+    const { h, acceptBRecord } = await readyToLock(g, 201);
+    await expect(h.sellerFlow.lockLegB(acceptBRecord)).resolves.toBeDefined();
+    expect(g.reads).toEqual(["lag", "share"]);
+  });
+
+  it("refuses at exactly 120 blocks of lag (equality is stalled) and reads nothing further", async () => {
+    const g = guard(120);
+    const { h, acceptBRecord } = await readyToLock(g, 203);
+    await expect(h.sellerFlow.lockLegB(acceptBRecord)).rejects.toBeInstanceOf(FlopFinalityStalledError);
+    expect(g.reads).toEqual(["lag"]);
+  });
+
+  it("a refusal leaves the flow free to retry: once the lag drops the same accept locks", async () => {
+    let lag = 500;
+    const { h, acceptBRecord } = await readyToLock(guard(async () => lag), 205);
+    await expect(h.sellerFlow.lockLegB(acceptBRecord)).rejects.toBeInstanceOf(FlopFinalityStalledError);
+    lag = 3;
+    await expect(h.sellerFlow.lockLegB(acceptBRecord)).resolves.toBeDefined();
+  });
+
+  it("refuses a nonzero burn share of 1 part per thousand", async () => {
+    const { h, acceptBRecord } = await readyToLock(guard(0, 1), 207);
+    await expect(h.sellerFlow.lockLegB(acceptBRecord)).rejects.toBeInstanceOf(FlopBurnShareNonzeroError);
+  });
+
+  it.each([
+    ["a read that throws", () => Promise.reject(new Error("rpc down"))],
+    ["a negative lag", () => Promise.resolve(-1)],
+    ["a fractional lag", () => Promise.resolve(1.5)],
+    ["NaN", () => Promise.resolve(Number.NaN)],
+  ])("refuses, rather than assume safe, on %s (lag)", async (_name, read) => {
+    const { h, acceptBRecord } = await readyToLock(guard(read), 209);
+    await expect(h.sellerFlow.lockLegB(acceptBRecord)).rejects.toBeInstanceOf(FlopGuardUnreadableError);
+  });
+
+  it.each([
+    ["a read that throws", () => Promise.reject(new Error("rpc down"))],
+    ["above 1000", () => Promise.resolve(1001)],
+    ["negative", () => Promise.resolve(-1)],
+  ])("refuses, rather than assume safe, on a burn share that is %s", async (_name, read) => {
+    const { h, acceptBRecord } = await readyToLock(guard(0, read), 211);
+    await expect(h.sellerFlow.lockLegB(acceptBRecord)).rejects.toBeInstanceOf(FlopGuardUnreadableError);
+  });
+
+  it("with no guard configured nothing is checked (today's behaviour)", async () => {
+    const { h, acceptBRecord } = await readyToLock(undefined, 213);
+    await expect(h.sellerFlow.lockLegB(acceptBRecord)).resolves.toBeDefined();
   });
 });

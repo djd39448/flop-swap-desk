@@ -205,6 +205,7 @@ import { chainClockProblem } from "./policy.js";
 
 export type { SellerNextStep } from "./flow-resume.js";
 import type { Signer, Venue } from "./venue.js";
+import { assertFlopLockAllowed, type FlopChainGuard } from "./flop-chain-guard.js";
 
 /** P94-FUND-01: the one shape of a transaction hash the flow's record keeps (`claimTxHash` decodes `0x` and 64 lower-case hex digits and nothing else). */
 const EVM_TX_HASH_SHAPE = /^0x[0-9a-f]{64}$/;
@@ -239,6 +240,12 @@ export interface SellerFlowOptions {
    * hash. Not called for a claim that was refused or failed before it was sent. An error it throws is swallowed; it is handed nothing but the hash.
    */
   onClaimSent?: (txHash: string) => void;
+  /**
+   * Yellow paper sync of 2026-10-13: read from the FLOP chain right before leg B is locked. A finality lag at or above the paper's 120-block limit, or a
+   * nonzero HTLC timeout-burn share, refuses the lock (nothing is saved, latched or locked, so the flow may retry); an unreadable value refuses too.
+   * Absent = no check, which is today's behaviour while the FLOP leg is the `paper` rail. See `flop-chain-guard.ts`.
+   */
+  flopGuard?: FlopChainGuard;
 }
 
 /** `SellerFlow.resume` options: the constructor's, plus the store and the swap to continue. `contractA` /
@@ -488,6 +495,7 @@ export class SellerFlow {
   private readonly identity: Signer;
   private readonly venue: Venue;
   private readonly paperRail: PaperRail;
+  private readonly flopGuard: FlopChainGuard | undefined;
   private readonly rail: CounterAssetRail;
   private readonly clock: () => number;
 
@@ -596,6 +604,7 @@ export class SellerFlow {
     this.identity = options.identity;
     this.venue = options.venue;
     this.paperRail = options.paperRail;
+    this.flopGuard = options.flopGuard;
     this.rail = options.rail;
     this.clock = options.clock;
     this.revealPostTimeoutMs = options.revealPostTimeoutMs ?? SOL_REVEAL_POST_TIMEOUT_MS;
@@ -1364,6 +1373,10 @@ export class SellerFlow {
         const problem = chainClockProblem(await this.rail.chainClockMs(), this.clock(), this.rail.maxChainClockSkewMs);
         if (problem !== null) throw new Error(`seller: refusing to lock leg B - ${problem}`);
       }
+
+      // Yellow paper sync of 2026-10-13: the FLOP chain's own finality-open gate and its (zero) timeout-burn share, read right before leg B's value moves
+      // and before the E2 latch, so a refusal leaves the flow free to retry. Only a first lock: an attempt already saved is recovered, not reopened.
+      if (this.flopGuard !== undefined && this.attemptedAcceptB === undefined) await assertFlopLockAllowed(this.flopGuard);
 
       const acceptB = frame;
       const termsB = offerAcceptLockTerms(offerB, acceptB);
